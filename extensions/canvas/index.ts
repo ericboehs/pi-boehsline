@@ -1094,11 +1094,11 @@ type Registry = {
   complete?: (model: unknown, req: unknown, opts: Record<string, unknown>) => Promise<CompleteResult>;
 };
 
-const KINDS = ["markdown", "html", "html-plan", "image", "mermaid", "chart", "terminal", "stats", "table", "compare", "steps", "pipeline", "kanban", "json", "timeline", "diff", "code", "tree", "options", "pdf", "video", "finding"] as const;
+const KINDS = ["markdown", "html", "html-plan", "image", "mermaid", "chart", "terminal", "stats", "table", "compare", "steps", "pipeline", "kanban", "json", "timeline", "diff", "code", "tree", "options", "pdf", "video", "tracker", "finding"] as const;
 
 // Kinds whose body is a JSON spec the page draws, and the extension each is stored under.
 // (Not .json for the json kind: a section called "meta" or "sections" would overwrite the page's own files.)
-const SPEC_EXT: Record<string, string> = { terminal: "term", stats: "stats", table: "table", steps: "steps", pipeline: "pipe", kanban: "kanban", json: "jsonv", timeline: "timeline", tree: "tree", options: "options", jobs: "jobs" }; // jobs: the Background jobs card only, not a tool kind
+const SPEC_EXT: Record<string, string> = { terminal: "term", stats: "stats", table: "table", steps: "steps", pipeline: "pipe", kanban: "kanban", json: "jsonv", timeline: "timeline", tree: "tree", options: "options", tracker: "tracker", jobs: "jobs" }; // jobs: the Background jobs card only, not a tool kind
 const VIDEO_EXT = new Set([".mp4", ".m4v", ".webm", ".mov"]);
 const VIDEO_MAX = 200 * 1024 * 1024;
 const PDF_MAX = 50 * 1024 * 1024;
@@ -1493,7 +1493,28 @@ export function parseDelimited(text: string, sep = ","): { columns: { label: str
 }
 
 /**
- * A terminal, stats or table body checked and normalised to the JSON the page
+ * One tracked item: a title, and an optional number, state, note and link.
+ * The page draws it as a sidebar card above Contents. The section title names the tracker.
+ */
+export function normalizeTracker(s: any): string {
+  if (!s || typeof s !== "object" || Array.isArray(s)) throw new Error('tracker needs { "title", "id"?, "state"?, "note"?, "href"? }');
+  if (typeof s.title !== "string" || !s.title.trim()) throw new Error("tracker needs a title");
+  if (s.id != null && s.id !== "" && typeof s.id !== "string" && !Number.isInteger(s.id)) throw new Error("tracker.id must be text or a whole number");
+  for (const k of ["state", "note", "href"]) optString(s[k], k);
+  if (s.href && (!/^https?:\/\/\S+$/i.test(s.href) || s.href.length > 2000)) throw new Error("tracker.href must be an http(s) URL");
+  const rawId = s.id != null ? String(s.id).trim().replace(/^#/, "") : "";
+  const id = rawId ? oneLine(rawId, 24) : undefined;
+  return JSON.stringify({
+    title: oneLine(s.title, 300),
+    ...(id ? { id } : {}),
+    ...(s.state?.trim() ? { state: oneLine(s.state, 24) } : {}),
+    ...(s.note?.trim() ? { note: oneLine(s.note, 200) } : {}),
+    ...(s.href ? { href: s.href } : {}),
+  });
+}
+
+/**
+ * A terminal, stats, table or tracker body checked and normalised to the JSON the page
  * draws. Throws with a message that says what to fix. `ext` is the source
  * file's extension when the body came from a path (.csv/.tsv for tables).
  */
@@ -1528,6 +1549,7 @@ export function normalizeSpec(kind: string, text: string, ext = ""): string {
     });
     return JSON.stringify({ items });
   }
+  if (kind === "tracker") return normalizeTracker(parseJson(text, "tracker"));
   if (kind === "table") {
     const s = ext === ".csv" || ext === ".tsv" ? parseDelimited(text, ext === ".tsv" ? "\t" : ",") : parseJson(text, "table");
     const spec = Array.isArray(s) ? { rows: s } : s;
@@ -2366,6 +2388,7 @@ export default function canvas(pi: ExtensionAPI) {
       "- steps: a multi-step plan as it runs. [{label,status:done|active|todo|failed|skipped|blocked,note?,detail?}]|{title,steps}; strings = todo",
       "- pipeline: a multi-stage or multi-agent workflow (parallel work, reviews that send work back). {title?,stages:[{label,note?,status?,steps?:[{label,note?,badge?,status:todo|active|done|back|failed|skipped}]|lanes?:[{label?,steps}],loop?:{label,note?}}]}; lanes = parallel; loop = revise arc last→first; a stage without steps is a node; back = sent back",
       "- kanban: work items by state (a triage, a review queue). {title?,progress?(count bar),columns:[{label,tone?,limit?(WIP),more?(cards left out),compact?(one-line cards),cards:[text|{title,id?,note?,tag?,owner?,tone?,href?}]}],caption?}; ≤8 columns",
+      "- tracker: the one thing this session is tracking (a card, an issue). {title, id?, state?, note?, href?}. The section title names the tracker. On a wide window it sits above Contents. Another tracker uses its own id.",
       "- json: an API response or config to explore (body or .json path)",
       "- timeline: an incident or a sequence of events. [{at(ISO|text),title,note?,tag?,tone?}]|{events,caption,order:time|given}; dated events group by day",
       "- mermaid: flows and structure",

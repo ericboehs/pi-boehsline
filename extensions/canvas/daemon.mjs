@@ -53,7 +53,7 @@ export const VENDOR = {
 };
 
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const FILE_NAME = /^[a-z0-9][a-z0-9-]{0,63}\.(md|mmd|html|png|jpe?g|gif|webp|svg|patch|txt|chart|term|stats|table|compare|steps|pipe|kanban|jsonv|timeline|jobs|code|tree|options|pdf|mp4|m4v|webm|mov)$/;
+const FILE_NAME = /^[a-z0-9][a-z0-9-]{0,63}\.(md|mmd|html|png|jpe?g|gif|webp|svg|patch|txt|chart|term|stats|table|compare|steps|pipe|kanban|jsonv|timeline|jobs|code|tree|options|tracker|pdf|mp4|m4v|webm|mov)$/;
 
 const TYPES = {
   ".md": "text/markdown; charset=utf-8",
@@ -74,6 +74,7 @@ const TYPES = {
   ".code": "application/json; charset=utf-8",
   ".tree": "application/json; charset=utf-8",
   ".options": "application/json; charset=utf-8",
+  ".tracker": "application/json; charset=utf-8",
   ".pdf": "application/pdf",
   ".mp4": "video/mp4",
   ".m4v": "video/mp4",

@@ -14,7 +14,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import canvasExtension, { ActivityTracker, daemonVersion, STATUS_PROMPT, checkChart, compareOptions, normalizeSpec, parseDelimited, diffSkipReason, fileId, filesMarkdown, syncCopies, gitDiff, isSensitivePath, jobsSpec, logTail, looksLikeDiff, makePatch, findingLine, findingTexts, isSectionId, newFindings, parseExtras, shotsMarkdown, agentTraffic, agentsMarkdown, bashExit, runSpec, streamable, tailLines, readPeers, resolvePeerName, tallyFiles, lastReply, sessionInfo, uniichatInfo, lastTurn, normalizeCode, normalizeOptions, normalizeTree, parseLineRange, nextSteps, claimInbox, ackInbox, withoutNextSteps, leftHalfBounds, openTodos, parseStatus, tmuxMeta, todoBoard, turnDigest, upsertSection, worthStatus } from "../extensions/canvas/index.ts";
+import canvasExtension, { ActivityTracker, daemonVersion, STATUS_PROMPT, checkChart, compareOptions, normalizeSpec, parseDelimited, diffSkipReason, fileId, filesMarkdown, syncCopies, gitDiff, isSensitivePath, jobsSpec, logTail, looksLikeDiff, makePatch, findingLine, findingTexts, isSectionId, newFindings, parseExtras, shotsMarkdown, agentTraffic, agentsMarkdown, bashExit, runSpec, streamable, tailLines, readPeers, resolvePeerName, tallyFiles, lastReply, sessionInfo, uniichatInfo, lastTurn, normalizeCode, normalizeOptions, normalizeTracker, normalizeTree, parseLineRange, nextSteps, claimInbox, ackInbox, withoutNextSteps, leftHalfBounds, openTodos, parseStatus, tmuxMeta, todoBoard, turnDigest, upsertSection, worthStatus } from "../extensions/canvas/index.ts";
 import { allowedHost, byteRange, clipTarget, latestClient, listSessions, parseFindings, prune, queueMessage, readAcks, readReply, readWatch, replyPreview, sessionForPane, sessionState, tmuxOf, withKit, PLAN_JS, SANDBOXED_SECTION_CSP, scriptableType, parseGitStatus, usageRows, gitInfo, sessionInfoOf } from "../extensions/canvas/daemon.mjs";
 
 const msg = (role, content, extra = {}) => ({ type: "message", message: { role, content, ...extra } });
@@ -536,6 +536,18 @@ test("normalizeOptions checks choices, scores and one recommendation", () => {
   assert.throws(() => normalizeOptions([{ label: "a", scores: { x: 6 } }, "b"]), /from 0 to 5/);
   assert.throws(() => normalizeOptions([{ label: "a", pros: "fast" }, "b"]), /array of strings/);
   assert.throws(() => normalizeOptions([{}, "b"]), /needs a label/);
+});
+
+test("a tracker is a title, and an optional number, state, note and link", () => {
+  const t = JSON.parse(normalizeTracker({ id: 213, title: "Show the card", state: "doing", note: "waiting on Alex", href: "http://bench.lab.home/#/projects/4/features/213" }));
+  assert.equal(t.source, undefined);
+  assert.equal(t.id, "213");
+  assert.equal(t.state, "doing");
+  assert.equal(t.href, "http://bench.lab.home/#/projects/4/features/213");
+  assert.equal(JSON.parse(normalizeTracker({ id: "#42", title: "x" })).id, "42");
+  assert.throws(() => normalizeTracker({}), /title/);
+  assert.throws(() => normalizeTracker({ title: "x", href: "ftp://nope" }), /http/);
+  assert.equal(JSON.parse(normalizeSpec("tracker", JSON.stringify({ title: "An issue", source: "GitHub" }))).source, undefined);
 });
 
 test("byteRange reads a Range header against a size", () => {

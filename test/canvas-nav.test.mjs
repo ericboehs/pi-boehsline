@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { asQuote, boardMarks, boardMoves, boardSnapshot, cardPrompt, dismissPipe, pipeStripHidden, slackText, fuzzyScore, inlineTokens, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, ownerSession, pipeRows, placeBefore, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions, wrapLabel, buildTree, codeLayout, lineLabel, optionPrompt, optionsText, treeText, fenceFor, reviewLabel, reviewMessage, fmtBytes, fmtCount, gitSummary, infoRows, uniichatSummary } from "../extensions/canvas/nav.mjs";
+import { asQuote, boardMarks, boardMoves, boardSnapshot, cardPrompt, dismissPipe, pipeStripHidden, slackText, fuzzyScore, inlineTokens, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, ownerSession, pipeRows, placeBefore, placeTrackers, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions, wrapLabel, buildTree, codeLayout, lineLabel, optionPrompt, optionsText, treeText, fenceFor, reviewLabel, reviewMessage, fmtBytes, fmtCount, gitSummary, infoRows, uniichatSummary } from "../extensions/canvas/nav.mjs";
 import { mix, prettyName, readPair, readPrefs, swatch, systemTheme, themeDefault, themeMode, themeVars } from "../extensions/canvas/theme.mjs";
 import { parseColors } from "../extensions/canvas/build-themes.mjs";
 
@@ -249,6 +249,9 @@ test("side panel order: saved order kept, new cards at their default place, move
   // "jobs" is new since the order was saved: it lands after its default neighbour (Contents); unknown ids drop.
   assert.deepEqual(mergeOrder(D, ["agents", "_contents", "gone", "tasks", "files", "agents"]), ["agents", "_contents", "jobs", "tasks", "files"]);
   assert.deepEqual(mergeOrder(D, ["files"]), D);
+  assert.deepEqual(placeTrackers(["_contents", "jobs"], ["bench"]), ["bench", "_contents", "jobs"]);
+  assert.deepEqual(placeTrackers(["jobs", "bench", "_contents"], ["bench"]), ["jobs", "bench", "_contents"]);
+  assert.deepEqual(placeTrackers(["jobs"], ["bench", "gh"]), ["bench", "gh", "jobs"]);
   // J / K step past the next card on the page; a card not shown keeps its slot.
   assert.deepEqual(moveAmong(D, "agents", -1), ["_contents", "jobs", "agents", "tasks", "files"]);
   assert.deepEqual(moveAmong(D, "agents", -1, ["_contents", "jobs", "agents", "files"]), ["_contents", "agents", "jobs", "tasks", "files"]);

@@ -3,7 +3,7 @@
 // sections whose timestamp moved, so iframes and scroll position survive.
 
 import { readPair, readPrefs, prettyName, swatch, themeMode, themeVars } from "/assets/theme.mjs";
-import { asQuote, boardMarks, buildTree, codeLayout, dismissPipe, lineLabel, optionLetter, optionPrompt, optionsText, pipeRows, pipeStripHidden, REVIEW_VERDICTS, reviewLabel, reviewMessage, infoRows, slackText, treeText, wrapLabel, cardKey, cardPrompt, inlineTokens, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, ownerSession, placeBefore, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions } from "/assets/nav.mjs";
+import { asQuote, boardMarks, buildTree, codeLayout, dismissPipe, lineLabel, optionLetter, optionPrompt, optionsText, pipeRows, pipeStripHidden, REVIEW_VERDICTS, reviewLabel, reviewMessage, infoRows, slackText, treeText, wrapLabel, cardKey, cardPrompt, inlineTokens, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, ownerSession, placeBefore, placeTrackers, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions } from "/assets/nav.mjs";
 
 const CSS = `
 :root { color-scheme: light dark; --bg:#f7f5f0; --card:#fff; --ink:#1c1b19; --dim:#8a8578; --line:#e6e1d6; --soft:#f0ece3; --accent:#b4541f; --ok:#1f7a52; --warn:#a86a00; --bad:#c0392b; --code:#f3f0e8; --tint:#fbf3ec; --hl-kw:#285880; --hl-str:#42632a; --hl-num:#805424; --hl-com:#5b6a7f; --hl-title:#68448b; --c1:#3b7dd8; --c2:#e0703a; --c3:#2f9e72; --c4:#c4475b; --c5:#8a63c9; --c6:#b8901c; --c7:#2e9bb0; --c8:#8c8577; }
@@ -43,6 +43,19 @@ header.top .tools .back { margin-left: 8px; }
   .side { position: sticky; top: 14px; max-height: calc(100vh - 28px); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 }
 .side .card > h2 .meta button.btn { display: none; }
+.tracker { display: flex; flex-direction: column; gap: 4px; }
+.tk-line { display: flex; gap: 8px; align-items: baseline; font-size: 12px; }
+.tk-id { font-weight: 600; font-variant-numeric: tabular-nums; }
+.tk-state { font-weight: 600; }
+.tk-state.ok { color: var(--ok); }
+.tk-state.warn { color: var(--warn); }
+.tk-state.bad { color: var(--bad); }
+.tk-state.go { color: var(--c1); }
+.tk-state.dim { color: var(--dim); }
+.tk-title { font-size: 13.5px; line-height: 1.35; }
+.tk-title a { color: inherit; text-decoration: none; }
+.tk-title a:hover { color: var(--accent); }
+.tk-note { color: var(--dim); font-size: 12px; line-height: 1.35; }
 .side .card > .bd { padding: 10px 12px; }
 .side .md table { font-size: 12px; }
 .side .md th, .side .md td { padding: 3px 6px; }
@@ -1150,6 +1163,29 @@ window.addEventListener("message", (e) => {
   }
 });
 
+function trackerTone(state) {
+  const s = String(state || "").toLowerCase();
+  if (/^(done|closed|merged|shipped)$/.test(s)) return "ok";
+  if (/^(review|waiting)$/.test(s)) return "warn";
+  if (/^(blocked|failed|error)$/.test(s)) return "bad";
+  if (/^(doing|open|active|started|in[ _-]progress)$/.test(s)) return "go";
+  return "dim";
+}
+
+/** A compact card: number, state, title (a link when href is set), note. The header is the section title. */
+function renderTracker(spec) {
+  const title = spec.href
+    ? h("a", { href: spec.href, target: "_blank", rel: "noopener" }, spec.title)
+    : spec.title;
+  return h(
+    "div",
+    { class: "tracker" },
+    spec.id || spec.state ? h("div", { class: "tk-line" }, spec.id ? h("span", { class: "tk-id" }, `#${spec.id}`) : null, spec.state ? h("span", { class: `tk-state ${trackerTone(spec.state)}` }, spec.state) : null) : null,
+    h("div", { class: "tk-title" }, title),
+    spec.note ? h("div", { class: "tk-note" }, spec.note) : null,
+  );
+}
+
 async function sectionBody(id, sec) {
   if (sec.kind === "watch") return renderWatch(sec.data || {});
   const url = `/s/${encodeURIComponent(id)}/f/${encodeURIComponent(sec.file)}?v=${encodeURIComponent(sec.at || "")}`;
@@ -1205,6 +1241,8 @@ async function sectionBody(id, sec) {
       return renderTree(JSON.parse(await (await fetch(url)).text()), sec.id);
     case "options":
       return renderOptions(JSON.parse(await (await fetch(url)).text()));
+    case "tracker":
+      return renderTracker(JSON.parse(await (await fetch(url)).text()));
     case "pdf":
       return h("iframe", { class: "pdf", src: url, title: sec.title || sec.id, loading: "lazy" });
     case "video":
@@ -2124,7 +2162,7 @@ function sectionCard(id, sec) {
     src.dataset.yank = "source"; // yc presses it, yC ⇧-presses it
     meta.append(src);
   }
-  if (sec.file && sec.kind !== "jobs") meta.append(clipButton(() => rawUrl(id, sec, false), "Copy the file (yy)", "clip"));
+  if (sec.file && sec.kind !== "jobs" && sec.kind !== "tracker") meta.append(clipButton(() => rawUrl(id, sec, false), "Copy the file (yy)", "clip"));
   if (sec.file) meta.append(h("a", { class: "btn ico", href: rawUrl(id, sec, false), target: "_blank", title: "Open in a new tab", "aria-label": "Open in a new tab" }, icon("open")));
   const flush = sec.kind === "html" || sec.kind === "html-plan";
   const bd = h("div", { class: `bd${flush ? " flush" : ""}` });
@@ -4564,7 +4602,7 @@ async function sessionView(id) {
   function place() {
     const sections = lastSections;
     const { pinned, rest } = splitPinned(sections, readPins(id));
-    const aside = (s) => wide.matches && WIDGETS.includes(s.id);
+    const aside = (s) => wide.matches && (WIDGETS.includes(s.id) || s.kind === "tracker");
     const lay = (slot, els) =>
       els.forEach((el, i) => {
         // Move a card only when its place changed: moving a frame reloads it.
@@ -4585,7 +4623,8 @@ async function sessionView(id) {
     lay(pinSlot, elsOf(pinned));
     pinHead.hidden = !pinned.length;
     lay(sectionsSlot, elsOf(mainList));
-    const sideEls = readSideOrder()
+    const trackerIds = rest.filter((s) => s.kind === "tracker" && aside(s)).map((s) => s.id);
+    const sideEls = placeTrackers(readSideOrder(), trackerIds)
       .map((sid) => (sid === "_contents" ? tocSlot : rest.find((s) => s.id === sid && aside(s)) && cards.get(sid).el))
       .filter(Boolean);
     lay(widgetSlot, sideEls);
@@ -4593,7 +4632,7 @@ async function sessionView(id) {
     for (const [sid, { el }] of cards) {
       el.dataset.side = sideEls.includes(el) ? sid : "";
       const h2 = el.querySelector(":scope > h2");
-      if (h2) h2.draggable = sideEls.includes(el);
+      if (h2) h2.draggable = sideEls.includes(el) && el.dataset.kind !== "tracker";
     }
     if (!mainList.length && !pinned.length) sectionsSlot.append(h("p", { class: "empty" }, "No sections yet."));
     renderToc([...pinned, ...mainList]);
@@ -4630,7 +4669,7 @@ async function sessionView(id) {
     widgetSlot.querySelector(".dragging")?.classList.remove("dragging");
   };
   /** The item the pointer is above (null: past the last one). */
-  const dropBefore = (y) => [...widgetSlot.children].find((c) => c.dataset.side !== dragId && y < c.getBoundingClientRect().top + c.getBoundingClientRect().height / 2) || null;
+  const dropBefore = (y) => [...widgetSlot.children].find((c) => c.dataset.side !== dragId && c.dataset.kind !== "tracker" && y < c.getBoundingClientRect().top + c.getBoundingClientRect().height / 2) || null;
   widgetSlot.addEventListener("dragstart", (e) => {
     const item = e.target.closest?.("h2") && sideItem(e.target);
     if (!item || !sideIdOf(item)) return;

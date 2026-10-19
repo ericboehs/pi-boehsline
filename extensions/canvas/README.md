@@ -76,7 +76,7 @@ the agent's last response.
   (GFM, with ```` ```mermaid ```` fences), `html` (a page in a frame that fits
   its height), `html-plan` (a packed `/html-plan` file), `image`, `mermaid`,
   `chart`, `terminal`, `stats`, `table`, `compare`, `steps`, `pipeline`, `kanban`, `json`,
-  `timeline`, `diff`, `code`, `tree`, `options`, `pdf`, `video`, and `finding`
+  `timeline`, `diff`, `code`, `tree`, `options`, `tracker`, `pdf`, `video`, and `finding`
   (one append-only line in the findings log).
   The tool's guidelines tell the agent to pick the lightest kind that fits:
   markdown for short tables, table for data, stats for headline numbers,
@@ -343,8 +343,10 @@ the agent's last response.
   collapsed. On a window 1200px or wider, a sticky sidebar holds Contents (every
   section with its age; a click opens and scrolls to it; past six, older
   collapsed sections wait behind "Show N older"), Agents, Files changed and
-  Screenshots. Narrower, those widgets sit among the sections in time
-  order.
+  Screenshots. A `tracker` section sits just above Contents: one card, a number,
+  a title, a state, a note and a link. The section title names the tracker.
+  Canvas does not know which tracker it is. Narrower, those widgets sit among
+  the sections in time order.
 - **Last turn.** Sections, findings and side cards written since the current
   (or last) turn began get an accent bar down the left edge, and the age's
   tooltip says when that turn ran ("Changed in the last turn (7:10–7:24

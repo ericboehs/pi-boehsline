@@ -426,6 +426,19 @@ export function mergeOrder(defaults, saved) {
 }
 
 /**
+ * Tracker cards sit just above Contents. An id already in the order stays
+ * where a saved order put it; a new one is inserted before Contents.
+ */
+export function placeTrackers(order, ids) {
+  const fresh = [...new Set(ids.filter((id) => id && !order.includes(id)))];
+  if (!fresh.length) return order;
+  const at = order.indexOf("_contents");
+  const next = order.slice();
+  next.splice(at < 0 ? 0 : at, 0, ...fresh);
+  return next;
+}
+
+/**
  * Move one card up (dir < 0) or down past the next card that is on the page
  * (`present`); cards not shown keep their places. Unchanged at either end.
  */
