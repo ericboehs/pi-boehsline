@@ -344,7 +344,10 @@ the agent's last response.
   section with its age; a click opens and scrolls to it; past six, older
   collapsed sections wait behind "Show N older"), Agents, Files changed and
   Screenshots. A `tracker` section sits just above Contents: one card, a number,
-  a title, a state, a note and a link. The section title names the tracker.
+  a title, a state, a note and a link. Common states get a color: blue for
+  open or in progress, amber for review, red for blocked or failed, green for
+  done or merged, teal for approved, violet for draft; others are dim. The
+  section title names the tracker.
   Canvas does not know which tracker it is. Narrower, those widgets sit among
   the sections in time order.
 - **Last turn.** Sections, findings and side cards written since the current

@@ -16,10 +16,12 @@ test("checksText counts check runs and status contexts, skipping neutral ones", 
 
 test("trackerFor picks a state canvas colors and a note that says why", () => {
   assert.deepEqual(trackerFor(pr({ statusCheckRollup: [run("SUCCESS")], reviewDecision: "APPROVED" })), {
-    title: "A card", id: "4", state: "open", note: "1/1 checks passed · approved · ready to merge", href: "https://github.com/o/r/pull/4",
+    title: "A card", id: "4", state: "approved", note: "1/1 checks passed · approved · ready to merge", href: "https://github.com/o/r/pull/4",
   });
   assert.equal(trackerFor(pr({ statusCheckRollup: [run("FAILURE")] })).state, "failed");
   assert.equal(trackerFor(pr({ reviewDecision: "REVIEW_REQUIRED" })).state, "review");
+  assert.equal(trackerFor(pr()).state, "open");
+  assert.equal(trackerFor(pr({ reviewDecision: "APPROVED", statusCheckRollup: [run("FAILURE")] })).state, "failed");
   assert.equal(trackerFor(pr({ isDraft: true, statusCheckRollup: [run("FAILURE")] })).state, "draft");
   const merged = trackerFor(pr({ state: "MERGED", statusCheckRollup: [run("SUCCESS")], reviewDecision: "APPROVED" }));
   assert.equal(merged.state, "merged");

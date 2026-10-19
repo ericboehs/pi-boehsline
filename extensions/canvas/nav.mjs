@@ -439,6 +439,21 @@ export function placeTrackers(order, ids) {
 }
 
 /**
+ * A tracker state's color class. Common words get one (approved and draft their
+ * own, so they don't read as merged or as an unknown word); anything else is dim.
+ */
+export function trackerTone(state) {
+  const s = String(state || "").toLowerCase();
+  if (/^(done|closed|merged|shipped)$/.test(s)) return "ok";
+  if (s === "approved") return "approved";
+  if (s === "draft") return "draft";
+  if (/^(review|waiting)$/.test(s)) return "warn";
+  if (/^(blocked|failed|error)$/.test(s)) return "bad";
+  if (/^(doing|open|active|started|in[ _-]progress)$/.test(s)) return "go";
+  return "dim";
+}
+
+/**
  * Move one card up (dir < 0) or down past the next card that is on the page
  * (`present`); cards not shown keep their places. Unchanged at either end.
  */

@@ -3,7 +3,7 @@
 // sections whose timestamp moved, so iframes and scroll position survive.
 
 import { readPair, readPrefs, prettyName, swatch, themeMode, themeVars } from "/assets/theme.mjs";
-import { asQuote, boardMarks, buildTree, codeLayout, dismissPipe, lineLabel, optionLetter, optionPrompt, optionsText, pipeRows, pipeStripHidden, REVIEW_VERDICTS, reviewLabel, reviewMessage, infoRows, slackText, treeText, wrapLabel, cardKey, cardPrompt, inlineTokens, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, ownerSession, placeBefore, placeTrackers, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions } from "/assets/nav.mjs";
+import { asQuote, boardMarks, buildTree, codeLayout, dismissPipe, lineLabel, optionLetter, optionPrompt, optionsText, pipeRows, pipeStripHidden, REVIEW_VERDICTS, reviewLabel, reviewMessage, infoRows, slackText, treeText, wrapLabel, cardKey, cardPrompt, inlineTokens, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, ownerSession, placeBefore, placeTrackers, trackerTone, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions } from "/assets/nav.mjs";
 
 const CSS = `
 :root { color-scheme: light dark; --bg:#f7f5f0; --card:#fff; --ink:#1c1b19; --dim:#8a8578; --line:#e6e1d6; --soft:#f0ece3; --accent:#b4541f; --ok:#1f7a52; --warn:#a86a00; --bad:#c0392b; --code:#f3f0e8; --tint:#fbf3ec; --hl-kw:#285880; --hl-str:#42632a; --hl-num:#805424; --hl-com:#5b6a7f; --hl-title:#68448b; --c1:#3b7dd8; --c2:#e0703a; --c3:#2f9e72; --c4:#c4475b; --c5:#8a63c9; --c6:#b8901c; --c7:#2e9bb0; --c8:#8c8577; }
@@ -51,6 +51,8 @@ header.top .tools .back { margin-left: 8px; }
 .tk-state.warn { color: var(--warn); }
 .tk-state.bad { color: var(--bad); }
 .tk-state.go { color: var(--c1); }
+.tk-state.approved { color: var(--c7); }
+.tk-state.draft { color: var(--c5); }
 .tk-state.dim { color: var(--dim); }
 .tk-title { font-size: 13.5px; line-height: 1.35; }
 .tk-title a { color: inherit; text-decoration: none; }
@@ -1162,15 +1164,6 @@ window.addEventListener("message", (e) => {
     return;
   }
 });
-
-function trackerTone(state) {
-  const s = String(state || "").toLowerCase();
-  if (/^(done|closed|merged|shipped)$/.test(s)) return "ok";
-  if (/^(review|waiting)$/.test(s)) return "warn";
-  if (/^(blocked|failed|error)$/.test(s)) return "bad";
-  if (/^(doing|open|active|started|in[ _-]progress)$/.test(s)) return "go";
-  return "dim";
-}
 
 /** A compact card: number, state, title (a link when href is set), note. The header is the section title. */
 function renderTracker(spec) {

@@ -4,8 +4,8 @@
  * On session start, after every run, and once a minute while the PR is open, it
  * asks `gh pr view` about the branch and posts a `tracker` section (id
  * `github-pr`, titled "GitHub") through canvas's `canvas:put` event. The card
- * shows the PR number, a state word canvas colors (draft, failed, review, open,
- * merged, closed), the PR title linked to the PR, and a note with checks,
+ * shows the PR number, a state word canvas colors (draft, failed, review,
+ * approved, open, merged, closed), the PR title linked to the PR, and a note with checks,
  * review and merge status.
  *
  * It stays quiet: no `gh`, no git repo, or a branch with no PR posts nothing, and
@@ -71,6 +71,7 @@ export function trackerFor(pr: Pr): Tracker {
   else if (pr.isDraft) state = "draft";
   else if (checks.failed) state = "failed";
   else if (pr.reviewDecision === "REVIEW_REQUIRED" || pr.reviewDecision === "CHANGES_REQUESTED") state = "review";
+  else if (pr.reviewDecision === "APPROVED") state = "approved";
   else state = "open";
   const open = pr.state === "OPEN";
   const note = [
