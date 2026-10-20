@@ -24,8 +24,47 @@ import { chromeBinary, userAgentString } from "./ua.ts";
 let playwrightPromise: Promise<typeof import("playwright-core")> | undefined;
 
 function playwright(): Promise<typeof import("playwright-core")> {
+	installStrayReplyGuard();
 	playwrightPromise ??= import("playwright-core");
 	return playwrightPromise;
+}
+
+/**
+ * Playwright bug: when a renderer crashes, CRSession._markAsCrashed clears the
+ * pending callbacks, and a reply that arrives later for one of those ids trips
+ * `assert(!object.id)` in CRSession._onMessage. CRConnection._onMessage is
+ * async, so the assert becomes an unhandled rejection, which Node escalates to
+ * uncaughtException and pi exits. The reply belongs to a command that was
+ * already rejected, so dropping it is safe.
+ *
+ * Swallow only that rejection. Anything else keeps Node's default behavior
+ * (rethrown as uncaughtException) unless some other listener handles it.
+ * Keyed on globalThis so /reload does not stack listeners.
+ */
+const GUARD_KEY = Symbol.for("pi-boehsline.web-fetch.playwright-stray-reply-guard");
+
+function isStrayReplyAssert(reason: unknown): boolean {
+	if (!(reason instanceof Error)) return false;
+	const stack = reason.stack ?? "";
+	return (
+		reason.message.startsWith("Assertion error") &&
+		stack.includes("CRSession._onMessage") &&
+		stack.includes("playwright-core")
+	);
+}
+
+function installStrayReplyGuard(): void {
+	const g = globalThis as Record<symbol, unknown>;
+	if (g[GUARD_KEY]) return;
+	const handler = (reason: unknown) => {
+		if (isStrayReplyAssert(reason)) return;
+		if (process.listenerCount("unhandledRejection") > 1) return; // someone else owns it
+		process.nextTick(() => {
+			throw reason;
+		});
+	};
+	g[GUARD_KEY] = handler;
+	process.on("unhandledRejection", handler);
 }
 
 const STARTUP_TIMEOUT_MS = 30_000;
