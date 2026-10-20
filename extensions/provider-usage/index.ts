@@ -73,6 +73,8 @@ interface CachedEntry {
   commandText?: string;
   resetMs?: number;
   resetDate?: string;
+  /** The numbers behind `value`, so tools (botsun's budget) needn't parse it. */
+  quota?: CopilotQuotaMeta;
   fetchedAt: number;
 }
 
@@ -108,6 +110,7 @@ async function writeSharedEntry(driverId: string, display: UsageDisplay, fetched
       ...(display.commandText !== undefined ? { commandText: display.commandText } : {}),
       ...(display.resetMs !== undefined ? { resetMs: display.resetMs } : {}),
       ...(display.resetDate !== undefined ? { resetDate: display.resetDate } : {}),
+      ...(display.quota !== undefined ? { quota: display.quota } : {}),
       fetchedAt,
     };
     // Atomic write: tmp + rename so concurrent readers never see half a JSON doc.
@@ -164,6 +167,8 @@ interface UsageDisplay {
   resetMs?: number;
   /** Calendar date only: do not imply a precise midnight reset. */
   resetDate?: string;
+  /** Copilot only: the same numbers `value` formats, as data. */
+  quota?: CopilotQuotaMeta;
 }
 
 interface Driver {
@@ -928,17 +933,25 @@ function startOfLocalDay(ms: number): number {
  * pace color ignores weekends. ↓ is the share left per workday from today on
  * (today counts whole), what to spend daily to land on the reset.
  */
-function formatCopilotQuota(
+interface CopilotWindow {
+  percent: number;
+  reset: Date;
+  /** Workdays Mon–Fri used so far in the cycle. */
+  elapsed: number;
+  /** Workdays in the whole cycle (elapsed + what's ahead, minus OOO). */
+  total: number;
+  /** Workdays from today to the reset, minus OOO: what the rest must cover. */
+  allowanceDays: number;
+}
+
+function copilotWindow(
   quota: QuotaSnapshot,
   resetDateValue?: string,
   nowMs = Date.now(),
   oooDays = 0,
-): string | undefined {
-  if (quota.unlimited) return "unlimited";
-
+): CopilotWindow | undefined {
   const percent = copilotUsedPercent(quota);
-  const resetValue = quota.reset_date ?? resetDateValue;
-  const reset = parseResetDate(resetValue);
+  const reset = parseResetDate(quota.reset_date ?? resetDateValue);
   if (percent === undefined || !reset) return undefined;
 
   const start = previousMonthlyReset(reset);
@@ -951,16 +964,80 @@ function formatCopilotQuota(
   const ahead = Math.max(0, workdaysBetween(now, resetMs) - ooo);
   const total = elapsed + ahead;
   if (!(total > 0)) return undefined;
+  const allowanceDays = workdaysBetween(Math.max(start.getTime(), startOfLocalDay(now)), resetMs) - ooo;
+  return { percent, reset, elapsed, total, allowanceDays };
+}
+
+function formatCopilotQuota(
+  quota: QuotaSnapshot,
+  resetDateValue?: string,
+  nowMs = Date.now(),
+  oooDays = 0,
+): string | undefined {
+  if (quota.unlimited) return "unlimited";
+
+  const window = copilotWindow(quota, resetDateValue, nowMs, oooDays);
+  if (!window) return undefined;
+
   // 100% is not actionable; the reset is. Footer colors ↻ red.
-  if (formatNumber(percent) === "100") {
+  if (formatNumber(window.percent) === "100") {
+    const resetValue = quota.reset_date ?? resetDateValue;
     const when = /^\d{4}-\d{2}-\d{2}$/.test(resetValue ?? "")
       ? resetValue
-      : formatResetClock(resetMs, nowMs);
-    return `${formatNumber(elapsed)}/${formatNumber(total)}W: ↻${when}`;
+      : formatResetClock(window.reset.getTime(), nowMs);
+    return `${formatNumber(window.elapsed)}/${formatNumber(window.total)}W: ↻${when}`;
   }
-  const allowanceDays = workdaysBetween(Math.max(start.getTime(), startOfLocalDay(now)), resetMs) - ooo;
-  const allowance = allowanceDays > 0 ? ` ${formatNumber((100 - percent) / allowanceDays)}%/d` : "";
-  return `${formatNumber(elapsed)}/${formatNumber(total)}W: ${formatNumber(percent)}%${allowance}`;
+  const allowance =
+    window.allowanceDays > 0 ? ` ${formatNumber((100 - window.percent) / window.allowanceDays)}%/d` : "";
+  return `${formatNumber(window.elapsed)}/${formatNumber(window.total)}W: ${formatNumber(window.percent)}%${allowance}`;
+}
+
+/** What the Copilot chip says, as numbers: no parsing "%/d" out of the text. */
+export interface CopilotQuotaMeta {
+  unlimited?: boolean;
+  /** Premium interactions in the cycle (GitHub's own count, not tokens). */
+  entitlement?: number;
+  remaining?: number;
+  /** 0–100; a rising number means less left. */
+  usedPercent?: number;
+  remainingPercent?: number;
+  /** Percent of the allowance to spend per workday from today to the reset. */
+  perDayPercent?: number;
+  workdaysElapsed?: number;
+  workdaysTotal?: number;
+  allowanceWorkdays?: number;
+  /** The billing-cycle reset, as GitHub reports it (usually a date). */
+  resetDate?: string;
+}
+
+export function copilotQuotaMeta(
+  quota: QuotaSnapshot,
+  resetDateValue?: string,
+  nowMs = Date.now(),
+  oooDays = 0,
+): CopilotQuotaMeta {
+  const resetValue = quota.reset_date ?? resetDateValue;
+  const meta: CopilotQuotaMeta = {
+    ...(quota.unlimited ? { unlimited: true } : {}),
+    ...(typeof quota.entitlement === "number" ? { entitlement: quota.entitlement } : {}),
+    ...(typeof quota.remaining === "number" ? { remaining: quota.remaining } : {}),
+    ...(resetValue ? { resetDate: resetValue } : {}),
+  };
+  if (quota.unlimited) return meta;
+
+  const window = copilotWindow(quota, resetDateValue, nowMs, oooDays);
+  if (!window) return meta;
+  return {
+    ...meta,
+    usedPercent: window.percent,
+    remainingPercent: 100 - window.percent,
+    ...(window.allowanceDays > 0
+      ? { perDayPercent: (100 - window.percent) / window.allowanceDays }
+      : {}),
+    workdaysElapsed: window.elapsed,
+    workdaysTotal: window.total,
+    allowanceWorkdays: window.allowanceDays,
+  };
 }
 
 /** Footer's /footer OOO row: { days, setAt }; days set before this cycle began no longer count. */
@@ -1007,13 +1084,14 @@ export function copilotUsageDisplay(
 ): UsageDisplay | undefined {
   const value = formatCopilotQuota(quota, resetDateValue, nowMs, oooDays);
   if (!value) return undefined;
-  if (quota.unlimited) return { value };
+  const meta = copilotQuotaMeta(quota, resetDateValue, nowMs, oooDays);
+  if (quota.unlimited) return { value, quota: meta };
   const resetValue = quota.reset_date ?? resetDateValue;
   const reset = parseResetDate(resetValue);
   if (!reset) return undefined;
   return /^\d{4}-\d{2}-\d{2}$/.test(resetValue ?? "")
-    ? { value, resetDate: resetValue }
-    : { value, resetMs: reset.getTime() };
+    ? { value, resetDate: resetValue, quota: meta }
+    : { value, resetMs: reset.getTime(), quota: meta };
 }
 
 async function fetchCopilot(ctx: ExtensionContext): Promise<UsageDisplay> {
