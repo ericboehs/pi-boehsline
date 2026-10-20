@@ -36,6 +36,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [image-preview](extensions/image-preview/README.md) | Real images inside tmux, and a full-size popup | `/preview` |
 | [next-steps](extensions/next-steps/README.md) | Type `/2` to pick option 2 of a "Next steps:" list |  |
 | [openrouter-route](extensions/openrouter-route/README.md) | Which upstream OpenRouter routed each turn to, in the footer |  |
+| [pr-tracker](extensions/pr-tracker/README.md) | A canvas card for the current branch's GitHub PR, kept up to date | `/pr-tracker` |
 | [prompt-history](extensions/prompt-history/README.md) | Shell-style prompt history shared by every pi, with Ctrl+R search | Ctrl+R |
 | [provider-usage](extensions/provider-usage/README.md) | Usage and quota chips for codex, copilot, grok and more | `provider_usage` tool |
 | [stash](extensions/stash/README.md) | Park a draft with Ctrl+S and get it back later | Ctrl+S, `/stash` |
