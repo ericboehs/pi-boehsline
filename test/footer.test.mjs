@@ -607,6 +607,7 @@ test("provider aliases", async () => {
     ["github-copilot", "gh"],
     ["openai-codex", "o"],
     ["openai", "o"],
+    ["opencode-go", "oc"],
     ["xai", "x"],
     ["baseten", "b10"],
     ["cerebras", "cb"],
@@ -1042,6 +1043,42 @@ test("'unless default' hides provider, model and thinking only while they match"
   assert.equal(defaultChipHidden("thinking", "unless default", { ...on, model: "gpt-6", thinking: "xhigh" }, perModel), true, "other models use the global default");
   assert.equal(defaultChipHidden("provider", "unless default", on, { thinking: "medium" }), false, "no default provider: always shown");
   assert.equal(defaultChipHidden("model", "unless default", on, { thinking: "medium" }), false, "no default model: always shown");
+  const perProvider = { ...defaults, defaultModels: { "opencode-go": "deepseek-v4.1-flash" } };
+  const ds = { provider: "opencode-go", model: "deepseek-v4.1-flash", thinking: "max" };
+  assert.equal(defaultChipHidden("model", "unless default", ds, perProvider), true, "footer.json's provider default");
+  assert.equal(defaultChipHidden("model", "always", ds, perProvider), false, "the condition still governs it");
+  assert.equal(defaultChipHidden("model", "unless default", { ...ds, provider: "inco" }, perProvider), false, "the same id on another provider is another route");
+  assert.equal(defaultChipHidden("model", "unless default", { ...ds, model: "glm-5.3" }, perProvider), false, "another model on that provider");
+  assert.equal(defaultChipHidden("model", "unless default", { provider: "opencode-go" }, perProvider), false, "no model: nothing to hide");
+});
+
+test("defaultModels hides the model chip for a provider's everyday model, under 'unless default'", async () => {
+  await withAgentDir(async (dir) => {
+    writeFileSync(path.join(dir, "footer.json"), JSON.stringify({
+      modelWhen: "unless default",
+      defaultModels: { "opencode-go": "deepseek-v4.1-flash" },
+    }));
+    const onDefault = await mount({ model: { id: "deepseek-v4.1-flash", provider: "opencode-go", reasoning: true }, thinkingLevel: "max" });
+    assert.equal((await onDefault.settled())[0], "dotfiles master* oc max 41/1m");
+    // The same id elsewhere and another model on the provider keep the chip.
+    const elsewhere = await mount({ model: { id: "deepseek-v4.1-flash", provider: "inco", reasoning: true }, thinkingLevel: "max" });
+    assert.ok((await elsewhere.settled())[0].includes(" inco ds4.1f max "));
+    const sibling = await mount({ model: { id: "glm-5.3", provider: "opencode-go", reasoning: true }, thinkingLevel: "max" });
+    assert.ok((await sibling.settled())[0].includes(" oc glm-5.3 max "));
+  });
+});
+
+test("defaultModels survives a /footer save; non-string entries are dropped", async () => {
+  await withAgentDir(async (dir) => {
+    writeFileSync(path.join(dir, "footer.json"), JSON.stringify({ defaultModels: { "opencode-go": "deepseek-v4.1-flash", "xai": 3 } }));
+    const config = readFooterConfig();
+    assert.deepEqual(config.defaultModels, { "opencode-go": "deepseek-v4.1-flash" });
+    config.hidden.add("rate");
+    writeFooterConfig(config);
+    const saved = JSON.parse(readFileSync(path.join(dir, "footer.json"), "utf8"));
+    assert.deepEqual(saved.defaultModels, { "opencode-go": "deepseek-v4.1-flash" });
+    assert.deepEqual(saved.hidden, ["rate"]);
+  });
 });
 
 test("with 'unless default' saved, the footer drops provider/model/thinking at their defaults and shows them once they differ", async () => {

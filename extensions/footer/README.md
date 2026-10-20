@@ -75,6 +75,14 @@ ignores it). `/footer` keeps it when it saves:
 { "dirNames": { "~/Code/dotfiles": ".", "~/Documents/Notes": "" } }
 ```
 
+To leave the model chip out on a provider's everyday model, name it under
+`defaultModels`; with the Model condition at `unless default` those pairs
+count as defaults too (the same id on another provider still shows):
+
+```json
+{ "defaultModels": { "opencode-go": "deepseek-v4.1-flash" } }
+```
+
 In a linked git worktree, the Worktree chip after it names the main repository
 (`eert-feature ⎇ eert`); it's hidden in a main checkout. It reads the `.git`
 file and `commondir` rather than running git, so a submodule doesn't count.
@@ -85,8 +93,9 @@ out so the name shows once: `⎇ eert feature` rather than
 Settings that belong to a chip sit indented under it: Git condition, Context
 threshold, Copilot OOO days, and a condition each for Provider, Model and
 Thinking. Set those to "unless default" to hide the chip while it matches the
-`defaultProvider` or `defaultModel` a new session starts on, or the thinking
-level this model starts on: its `modelThinkingLevels` entry, else
+`defaultProvider` or `defaultModel` a new session starts on (or the
+provider's `defaultModels` entry in `footer.json`), or the thinking level
+this model starts on: its `modelThinkingLevels` entry, else
 `defaultThinkingLevel`, else pi's `medium` (settings.json, a project's
 `.pi/settings.json` first). Switching away shows it again.
 

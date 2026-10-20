@@ -9,7 +9,12 @@
 
 ### Added
 
+- footer: `defaultModels` in `footer.json` names each provider's everyday model (`{ "opencode-go": "deepseek-v4.1-flash" }`); with the Model condition at `unless default` the model chip hides for that model too. Hand-edited like `dirNames`, and kept when `/footer` saves.
 - image-prune (opt-in): pi resends every image in context on every request until compaction, and base64 doesn't compress. Once the visible images pass `thresholdMB` (default 5), one batch of `context_edit` replacements at `turn_end` swaps every image older than the last `keepTurns` (2) user turns for a note with a path the read tool can open; pasted images are saved under `~/.pi/agent/tmp/image-prune/` first. One batch, not one image per turn, so the prompt cache is rewritten once. `/image-prune` shows the images in context; `/image-prune now` forces a batch. Tool result images over `shrinkMinKB` (512 KB) are also re-encoded on arrival to at most `shrinkMaxPx` (1568) and under 512 KB, with a note giving the coordinate scale: earl's 3.3 MB PNG camera photos become ~200 KB JPEGs.
+
+### Changed
+
+- footer: OpenCode Go's provider chip reads `oc` (was `ocg`).
 
 ## 0.2.6 — 2026-10-17
 

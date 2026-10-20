@@ -193,6 +193,12 @@ export interface FooterConfig {
    * name hides the chip there. Not editable in /footer; kept when it saves.
    */
   dirNames?: Record<string, string>;
+  /**
+   * Each provider's everyday model, so the Model condition counts it as a
+   * default too: `{ "opencode-go": "deepseek-v4.1-flash" }`. Hand-edited like
+   * dirNames; kept when /footer saves. Not editable in /footer.
+   */
+  defaultModels?: Record<string, string>;
   /** "top border left"/"right" puts the chips in the editor's top border, after the name or at the end; "bottom border left"/"right" in its bottom one; absent means below. */
   placement?: string;
 }
@@ -223,7 +229,7 @@ export const CONDITION_ROWS = [
     key: "modelWhen",
     chip: "model",
     label: "Model condition",
-    description: "Hide the model chip while it is the default model in settings.json.",
+    description: "Hide the model chip while it is the default model in settings.json, or the provider's defaultModels model in footer.json.",
     values: ["always", "unless default"],
   },
   {
@@ -438,7 +444,7 @@ export function footerConfigPath(): string {
 
 /** The saved config; unknown ids, unknown modes and a missing or broken file fall back to defaults. */
 export function readFooterConfig(): FooterConfig {
-  let parsed: { hidden?: unknown; modes?: unknown; order?: unknown; dirNames?: unknown } & Partial<Record<SettingKey, unknown>> = {};
+  let parsed: { hidden?: unknown; modes?: unknown; order?: unknown; dirNames?: unknown; defaultModels?: unknown } & Partial<Record<SettingKey, unknown>> = {};
   try {
     parsed = JSON.parse(readFileSync(footerConfigPath(), "utf8")) ?? {};
   } catch {
@@ -479,6 +485,12 @@ export function readFooterConfig(): FooterConfig {
     );
     if (names.length > 0) config.dirNames = Object.fromEntries(names);
   }
+  if (parsed.defaultModels && typeof parsed.defaultModels === "object" && !Array.isArray(parsed.defaultModels)) {
+    const models = Object.entries(parsed.defaultModels as Record<string, unknown>).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string",
+    );
+    if (models.length > 0) config.defaultModels = Object.fromEntries(models);
+  }
   if (config.copilotOoo) {
     const setAt = (parsed as { copilotOooSetAt?: unknown }).copilotOooSetAt;
     if (typeof setAt === "string") config.copilotOooSetAt = setAt;
@@ -500,6 +512,7 @@ export function writeFooterConfig(config: FooterConfig): void {
     order?: FooterLineChipId[];
     copilotOooSetAt?: string;
     dirNames?: Record<string, string>;
+    defaultModels?: Record<string, string>;
   } & Partial<Record<SettingKey, string>> = {
     hidden: FOOTER_CHIPS.map((chip) => chip.id).filter((id) => config.hidden.has(id)),
   };
@@ -514,6 +527,7 @@ export function writeFooterConfig(config: FooterConfig): void {
   }
   if (out.copilotOoo && config.copilotOooSetAt) out.copilotOooSetAt = config.copilotOooSetAt;
   if (config.dirNames && Object.keys(config.dirNames).length > 0) out.dirNames = config.dirNames;
+  if (config.defaultModels && Object.keys(config.defaultModels).length > 0) out.defaultModels = config.defaultModels;
   mkdirSync(agentDir(), { recursive: true });
   writeFileSync(footerConfigPath(), `${JSON.stringify(out, null, 2)}\n`);
 }
@@ -538,6 +552,8 @@ export interface ChipDefaults {
   thinking: string;
   /** settings.json's modelThinkingLevels ("provider/id" → level), which beat `thinking` for that model. */
   modelThinking?: Record<string, string>;
+  /** footer.json's defaultModels ("provider" → model id): the model that provider runs by default. */
+  defaultModels?: Record<string, string>;
 }
 
 /** pi's thinking level when settings.json names none (DEFAULT_THINKING_LEVEL). */
@@ -640,6 +656,8 @@ export function defaultChipHidden(
   if (when !== "unless default") return false;
   if (chip === "provider") return !!defaults.provider && current.provider === defaults.provider;
   if (chip === "model") {
+    // footer.json's defaultModels names the model a provider runs by default.
+    if (current.model && defaults.defaultModels?.[current.provider ?? ""] === current.model) return true;
     // A model is the default only on the default provider: the same id elsewhere is a different route.
     return !!defaults.model && current.model === defaults.model && (!defaults.provider || current.provider === defaults.provider);
   }
@@ -869,7 +887,7 @@ const PROVIDER_NAMES: Record<string, string> = {
   "openai-codex": "o",
   openai: "o",
   opencode: "oc",
-  "opencode-go": "ocg",
+  "opencode-go": "oc",
   xai: "x",
   baseten: "b10",
   cerebras: "cb",
@@ -2562,12 +2580,16 @@ export default function footerExtension(pi: ExtensionAPI): void {
           branch &&
           dirLabel(ctx.cwd, false, shown().dirNames) === branch
         );
+        // footer.json's defaultModels names each provider's everyday model; the
+        // Model condition treats those pairs as defaults too.
+        const defaultModels = shown().defaultModels;
+        const defaults: ChipDefaults = defaultModels ? { ...chipDefaults, defaultModels } : chipDefaults;
         const hideAsDefault = (chip: "provider" | "model" | "thinking") =>
           defaultChipHidden(
             chip,
             shown()[`${chip}When`],
             { provider: ctx.model?.provider, model: ctx.model?.id, thinking: pi.getThinkingLevel() },
-            chipDefaults,
+            defaults,
           );
         const chips: Array<readonly [Exclude<FooterChipId, "name" | "statuses">, string]> = [
           ["dir", dirChipShown ? color(BLUE, dirLabel(ctx.cwd, showFullPath, shown().dirNames)) : ""],
