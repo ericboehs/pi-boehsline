@@ -7,6 +7,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
@@ -1203,7 +1204,7 @@ test("daemon serves pages, state and sections, and refuses bad hosts and paths",
     const pdf = await get(port, "/s/s1/f/d.pdf");
     assert.equal(pdf.headers["content-type"], "application/pdf");
     assert.match(pdf.headers["content-security-policy"], /connect-src 'none'/, "a pdf gets the section CSP");
-    for (const a of ["page.mjs", "theme.mjs", "nav.mjs", "theme-boot.js"]) assert.equal((await get(port, `/assets/${a}`)).headers["content-type"], "text/javascript; charset=utf-8", a);
+    for (const a of ["page.mjs", "render.mjs", "theme.mjs", "nav.mjs", "theme-boot.js"]) assert.equal((await get(port, `/assets/${a}`)).headers["content-type"], "text/javascript; charset=utf-8", a);
     assert.ok(Object.keys(JSON.parse((await get(port, "/assets/themes.json")).body).themes).length >= 20, "Omarchy themes are served");
     assert.match(page.body, /<script src="\/assets\/theme-boot\.js"><\/script>[\s\S]*page\.mjs/, "the theme boot script runs before the page module");
     assert.match(sec.body, /canvasTheme/, "html frames listen for the theme");
@@ -1360,6 +1361,12 @@ test("daemonVersion includes PI_CANVAS_THEME, so changing it restarts a running 
   assert.match(plain, /^[0-9a-f]{12}$/);
   assert.equal(daemonVersion({ PI_CANVAS_THEME: " System " }), `${plain}+theme=system`);
   assert.equal(daemonVersion({ PI_CANVAS_THEME: "tokyo-night" }), plain, "ignored values don't restart it");
+});
+
+test("daemonVersion hashes every page module, so editing one restarts a running daemon", () => {
+  const h = createHash("sha1");
+  for (const f of ["daemon.mjs", "page.mjs", "render.mjs", "nav.mjs", "theme.mjs"]) h.update(readFileSync(fileURLToPath(new URL(`../extensions/canvas/${f}`, import.meta.url))));
+  assert.equal(daemonVersion({}), h.digest("hex").slice(0, 12));
 });
 
 test("PI_CANVAS_THEME=system puts the default in the page shell; unset leaves it out", async () => {

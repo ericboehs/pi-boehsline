@@ -38,6 +38,8 @@ export const STATUS_MODEL = process.env.PI_CANVAS_MODEL || "github-copilot/claud
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DAEMON = join(HERE, "daemon.mjs");
 const PAGE = join(HERE, "page.mjs");
+/** Everything the page loads from /assets/ as code, hashed by daemonVersion(). */
+const PAGE_MODULES = [PAGE, join(HERE, "render.mjs"), join(HERE, "nav.mjs"), join(HERE, "theme.mjs")];
 
 const MAX_BODY = 2 * 1024 * 1024;
 const MAX_FILE = 20 * 1024 * 1024;
@@ -970,14 +972,16 @@ function readJson<T>(path: string, fallback: T): T {
 // ── daemon ───────────────────────────────────────────────────────────────────
 
 /**
- * Hash of the daemon and page code on disk, so every pi agrees on one version.
+ * Hash of the daemon and page module code on disk, so every pi agrees on one
+ * version, and so a change to any module restarts a running daemon and makes
+ * open tabs reload.
  * PI_CANVAS_THEME is read once at daemon start, so it's part of the version:
  * setting it while a daemon runs restarts that daemon on the next canvas write
  * instead of waiting for a code change. (Same parse as theme.mjs themeDefault.)
  */
 export function daemonVersion(env: Record<string, string | undefined> = process.env): string {
   const h = createHash("sha1");
-  for (const f of [DAEMON, PAGE]) {
+  for (const f of [DAEMON, ...PAGE_MODULES]) {
     try {
       h.update(readFileSync(f));
     } catch {}

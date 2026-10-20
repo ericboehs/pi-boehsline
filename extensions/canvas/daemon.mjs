@@ -414,6 +414,7 @@ const ASSETS = {
   "/assets/page.mjs": ["page.mjs", JS],
   "/assets/theme.mjs": ["theme.mjs", JS],
   "/assets/nav.mjs": ["nav.mjs", JS],
+  "/assets/render.mjs": ["render.mjs", JS],
   "/assets/theme-boot.js": ["theme-boot.js", JS],
   "/assets/themes.json": ["themes.json", "application/json; charset=utf-8"],
 };

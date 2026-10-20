@@ -8,7 +8,9 @@ that is too wide or long for the terminal. One shared daemon
 sessions at `/`, and one page per session at `/s/<session-id>`. The page
 updates through server-sent events with no reload. Each row of the index
 shows the session's goal, its Now line and a one-line plain-text preview of
-the agent's last response.
+the agent's last response. The markdown, table and chart renderers live in
+[`render.mjs`](render.mjs), which the page loads as `/assets/render.mjs`;
+botsun's chat bubbles use the same file.
 
 - **Status.** After each settled turn that ran tools, Claude Haiku 5.5 on
   Copilot rewrites the status block (goal, now, done, open, next) from a
