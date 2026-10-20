@@ -16,6 +16,11 @@ const dom = new JSDOM("<!doctype html><body></body>");
 globalThis.window = dom.window;
 globalThis.document = dom.window.document;
 globalThis.Node = dom.window.Node;
+globalThis.NodeFilter = dom.window.NodeFilter; // markRanges walks text nodes
+// renderKanban asks whether text is selected before opening a card (a browser global).
+globalThis.getSelection = () => "";
+// renderTerminal scrolls a running body into view one frame later (a browser global).
+globalThis.requestAnimationFrame = (fn) => fn();
 // renderChart sizes itself from its container; jsdom never lays out, so it needs a stub.
 globalThis.ResizeObserver = class {
   observe() {}
@@ -26,9 +31,50 @@ const tag = (el) => el.tagName.toLowerCase();
 const text = (el) => el.textContent;
 
 test("render.mjs exports the shared renderers, with no DOM at import time", () => {
-  for (const name of ["h", "svg", "tip", "renderMarkdown", "renderTable", "renderChart", "sparkSvg", "niceScale", "fmtValue", "drawXY", "drawPie", "seriesColor", "textW", "clip"]) assert.equal(typeof render[name], "function", name);
+  for (const name of [
+    "h",
+    "svg",
+    "tip",
+    "renderMarkdown",
+    "renderTable",
+    "renderChart",
+    "sparkSvg",
+    "niceScale",
+    "fmtValue",
+    "drawXY",
+    "drawPie",
+    "seriesColor",
+    "textW",
+    "clip",
+    "renderStats",
+    "renderSteps",
+    "renderTimeline",
+    "renderJson",
+    "renderCode",
+    "renderTree",
+    "renderOptions",
+    "renderKanban",
+    "renderTracker",
+    "renderTerminal",
+    "renderDiff",
+    "renderMermaid",
+    "parsePatch",
+    "diffBlock",
+    "diffFileList",
+    "langFor",
+    "counts",
+    "inline",
+    "noteParas",
+    "toneVar",
+    "tilde",
+    "clock",
+    "dayLabel",
+  ])
+    assert.equal(typeof render[name], "function", name);
   assert.ok(render.NAMED.has("accent"), "named colours");
   assert.equal(render.TAG_TONE.length, 3, "tag tones");
+  assert.equal(render.STATUS.added, "new", "diff statuses");
+  assert.ok(render.BIG_FILE > 0, "the big-file cutoff");
 });
 
 test("h builds elements with attributes, listeners and children", () => {
@@ -351,4 +397,423 @@ test("renderMarkdown leaves a big unlabelled fence unguessed and falls back with
   assert.equal(tag(plain.firstChild), "pre");
   assert.equal(text(plain), "# raw & *text*");
   stubHost();
+});
+
+// ── the rest of the shared renderers ─────────────────────────────────────────
+
+test("toneVar, inline and noteParas are the page's little helpers, shared", () => {
+  assert.equal(render.toneVar("ok"), "var(--ok)");
+  assert.equal(render.toneVar("c7"), "var(--c7)");
+  assert.equal(render.toneVar("evil"), "");
+  const line = render.h("div", {}, ...render.inline("a `b` **c** [d](https://x.test/) e"));
+  assert.equal(text(line), "a b c d e");
+  assert.equal(line.querySelector("code").textContent, "b");
+  assert.equal(line.querySelector("a").getAttribute("href"), "https://x.test/");
+  const bare = render.h("div", {}, ...render.inline("`x` [y](https://x.test/)", false));
+  assert.equal(bare.querySelector("a"), null, "links become text inside a link");
+  assert.equal(text(bare), "x y");
+  const paras = render.noteParas("one\n\ntwo", render.h("span", { class: "at" }, "L1"));
+  assert.equal(paras.length, 2);
+  assert.equal(paras[0].firstChild.className, "at", "the lead sits in the first paragraph only");
+  assert.equal(render.tilde("/Users/me/Code/x"), "~/Code/x");
+});
+
+test("renderTracker puts the id, state tone, title link and note in one card", () => {
+  const el = render.renderTracker({ id: "4", state: "Merged", title: "PR #4", href: "https://x.test/4", note: "n" });
+  assert.equal(el.className, "tracker");
+  assert.equal(text(el.querySelector(".tk-id")), "#4");
+  assert.equal(el.querySelector(".tk-state").className, "tk-state ok", "merged reads as done");
+  assert.equal(el.querySelector(".tk-title a").getAttribute("href"), "https://x.test/4");
+  assert.equal(text(el.querySelector(".tk-note")), "n");
+  assert.equal(render.renderTracker({ title: "plain" }).querySelector(".tk-line"), null);
+  assert.equal(render.renderTracker({ title: "x", href: "javascript:alert(1)" }).querySelector(".tk-title a"), null, "only http(s) links");
+});
+
+test("renderStats formats values, tones deltas and draws sparks", () => {
+  const el = render.renderStats({
+    items: [
+      { label: "Users", value: 1234, spark: [1, 2, 3], note: "n" },
+      { label: "Down", value: 5, delta: -2, good: "down", color: "ok" },
+      { label: "Up", value: "3", unit: "ms", prefix: "~" },
+    ],
+  });
+  assert.equal(el.className, "stats");
+  const [a, b, c] = el.querySelectorAll(".stat");
+  assert.equal(text(a.querySelector(".stat-value")), "1,234");
+  assert.ok(a.querySelector("svg.spark"), "a sparkline");
+  assert.equal(text(a.querySelector(".stat-note")), "n");
+  assert.equal(b.querySelector(".stat-value").getAttribute("style"), "color:var(--ok)", "a named colour");
+  assert.equal(b.querySelector(".stat-delta").className, "stat-delta ok", "down is good here");
+  assert.equal(text(c.querySelector(".stat-value")), "~3\u2009ms", "prefix and unit for a string value");
+  assert.equal(c.querySelector(".stat-delta"), null);
+});
+
+test("renderSteps counts, bars and marks each step's state", () => {
+  const el = render.renderSteps({
+    title: "Plan",
+    steps: [
+      { label: "one", status: "done" },
+      { label: "two", status: "active", note: "n", detail: "d" },
+      { label: "three", status: "failed" },
+      { label: "four", status: "skipped" },
+    ],
+  });
+  assert.equal(text(el.querySelector(".steps-count")), "1 of 3 done · 1 failed · 1 skipped", "skipped steps don't count");
+  assert.equal(el.querySelector(".steps-bar i").getAttribute("style"), "width:33.3%");
+  assert.equal(el.querySelectorAll("li.step").length, 4);
+  assert.deepEqual([...el.querySelectorAll(".smark")].map(text), ["✓", "", "✕", "–"]);
+  assert.equal(el.querySelector("li.s-active .snote").textContent, "n");
+  assert.equal(el.querySelector("li.s-active .sdetail").textContent, "d");
+});
+
+test("renderTimeline sorts by time, groups by day and shows the gaps", () => {
+  const at = (h) => `2026-01-0${h < 24 ? 2 : 3}T${String(h % 24).padStart(2, "0")}:00:00Z`;
+  const el = render.renderTimeline({
+    events: [
+      { at: at(25), title: "later" },
+      { at: at(1), title: "first", tone: "ok", tag: "ok", note: "n" },
+    ],
+    caption: "cap",
+  });
+  const titles = [...el.querySelectorAll(".ttitle")].map((t) => t.textContent);
+  assert.match(titles[0], /^first/, "sorted by time");
+  assert.equal(el.querySelectorAll(".tday").length, 2, "a day heading per day");
+  assert.equal(el.querySelector(".ctag").className, "ctag ok");
+  assert.match(text(el.querySelector(".tgap")), /^\+1d/, "the gap since the previous event");
+  assert.match(text(el.querySelector(".chart-cap")), /^cap · 2 events over 1d/);
+  const given = render.renderTimeline({ events: [{ at: "midnight", title: "a" }, { at: "nothing", title: "b" }] });
+  assert.deepEqual([...given.querySelectorAll(".ttitle")].map(text), ["a", "b"], "undated events keep their order as written");
+  assert.equal(given.querySelector(".tday"), null);
+});
+
+test("renderJson folds lazily, filters and copies a path", async () => {
+  const copied = [];
+  const el = render.renderJson(JSON.stringify({ a: 1, b: [true, null, "s"], c: { d: 2 } }), { copyText: (t) => (copied.push(t), Promise.resolve()) });
+  assert.ok(el.querySelector(".jt"));
+  const rows = () => [...el.querySelectorAll(".jrow")];
+  assert.equal(rows().length, 3, "the root and its two levels");
+  assert.equal(el.querySelector(".j-string").textContent, '"s"', "a string keeps its quotes");
+  const rootWrap = el.querySelector(".jt > .jn");
+  assert.ok(rootWrap.classList.contains("open"), "the root starts open");
+  rows()[0].dispatchEvent(new dom.window.Event("click"));
+  assert.equal(rootWrap.classList.contains("open"), false, "a click folds the root");
+  rows()[0].dispatchEvent(new dom.window.Event("click"));
+  assert.ok(rootWrap.classList.contains("open"));
+  el.querySelector(".jk").dispatchEvent(new dom.window.Event("click"));
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(copied, [".a"], "a key copies its jq path");
+  const filter = el.querySelector(".tbl-filter");
+  filter.value = "true";
+  filter.dispatchEvent(new dom.window.Event("input"));
+  assert.equal(text(el.querySelector(".tbl-count")), "1 match");
+  filter.value = "zzz";
+  filter.dispatchEvent(new dom.window.Event("input"));
+  assert.equal(text(el.querySelector(".term-none")), "Nothing matches");
+  assert.equal(render.renderJson("{oops").className, "err");
+});
+
+test("renderJson and renderTerminal use the host's copy buttons", () => {
+  const seen = [];
+  const copyButton = (getText, label) => {
+    const b = render.h("button", { class: "host-copy" }, label);
+    b.addEventListener("click", () => seen.push([label, getText()]));
+    return b;
+  };
+  const json = render.renderJson('{"a":1}', { copyButton });
+  assert.equal(json.querySelector(".host-copy").textContent, "Copy JSON");
+  const term = render.renderTerminal({ output: "a\nb\n" }, { copyButton });
+  assert.equal(term.querySelector(".host-copy").textContent, "Copy output");
+  term.querySelector(".host-copy").dispatchEvent(new dom.window.Event("click"));
+  assert.deepEqual(seen.at(-1), ["Copy output", "a\nb"], "the plain text of every line");
+});
+
+test("renderTerminal keeps ANSI colours, tints by line and filters", () => {
+  const el = render.renderTerminal({ command: "ls", cwd: "/Users/me/x", exit: 0, duration: 1.5, output: "\u001b[32mok\u001b[0m done\nwarning: thing\nerror: bad\n" });
+  assert.equal(text(el.querySelector(".term-cmd")), "$ ls");
+  assert.match(text(el.querySelector(".term-meta")), /^~\/x[\s\S]*exit 0[\s\S]*3 lines/);
+  assert.equal(el.querySelector(".term-exit").className, "term-exit ok");
+  assert.equal(el.querySelector(".term-copy, .copy").textContent, "Copy", "the host's copy button, via the page's real one");
+  const spans = [...el.querySelectorAll(".tl .tx span")];
+  assert.equal(spans[0].getAttribute("style"), "color:var(--t2)", "ANSI 32 is --t2");
+  assert.deepEqual([...el.querySelectorAll(".tl")].map((l) => l.className), ["tl", "tl", "tl"], "colours, so no line tint");
+  const plain = render.renderTerminal({ output: "ok\nwarning: x\nerror: y\n" });
+  assert.deepEqual([...plain.querySelectorAll(".tl")].map((l) => l.className), ["tl ok", "tl warn", "tl bad"]);
+  const long = render.renderTerminal({ output: Array.from({ length: 200 }, (_, i) => `line ${i}`).join("\n") });
+  assert.equal(long.querySelectorAll(".tl").length, 70, "head and tail while it is long");
+  const fold = long.querySelector(".term-fold");
+  assert.match(text(fold), /^Show 130 more lines$/);
+  fold.dispatchEvent(new dom.window.Event("click"));
+  assert.equal(long.querySelectorAll(".tl").length, 200);
+  const filt = render.renderTerminal({ output: Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n") });
+  const f = filt.querySelector(".term-filter");
+  f.value = "line 3";
+  f.dispatchEvent(new dom.window.Event("input"));
+  assert.equal(text(filt.querySelector(".term-count")), "11 of 40");
+  assert.ok(filt.querySelector(".tl mark"), "matches are marked");
+});
+
+test("renderCode numbers the lines, marks ranges and notes, and highlights via the host", async () => {
+  stubHost({ html: "" });
+  const loads = [];
+  const el = render.renderCode(
+    { path: "a.ts", lang: "typescript", start: 40, total: 3, code: "const a = 1;\nconst b = 2;\nconst c = 3;", highlight: [[41, 41]], notes: [{ from: 42, to: 42, text: "note **here**", tone: "warn" }], caption: "cap" },
+    {
+      loadHighlight: () => {
+        loads.push(1);
+        // One span per line, as the real highlighter returns for this input.
+        return Promise.resolve({ getLanguage: () => true, highlight: (code) => ({ value: code.split("\n").map((l) => `<span class="hljs-keyword">${l.slice(0, 5)}</span>${l.slice(5)}`).join("\n") }) });
+      },
+    },
+  );
+  assert.equal(el.className, "code");
+  assert.equal(el.querySelectorAll(".cl").length, 3);
+  assert.deepEqual([...el.querySelectorAll(".cl .ln")].map(text), ["40", "41", "42"]);
+  assert.equal(el.querySelector(".cl.hl"), el.querySelectorAll(".cl")[1], "the highlighted band");
+  const note = el.querySelector(".code-note");
+  assert.equal(note.querySelector(".at").textContent, "L42");
+  assert.equal(note.querySelector("b").textContent, "here");
+  assert.equal(note.getAttribute("style"), "--tone:var(--warn)");
+  assert.equal(el.querySelector(".code-head .path").textContent, "a.ts");
+  assert.equal(el.querySelector(".ctag").textContent, "typescript");
+  assert.equal(text(el.querySelector(".code-cap")), "cap");
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(loads.length, 1, "the host's loader");
+  assert.equal(el.querySelectorAll(".lc .hljs-keyword").length, 3, "each line gets its own spans");
+});
+
+test("renderCode accepts a text body (a bubble's file text) and normalises it", () => {
+  const body = Array.from({ length: 12 }, (_, i) => `line ${i + 1}`).join("\n");
+  const el = render.renderCode({ path: "a.js", text: body, lines: "2-3", highlight: ["3"], notes: [{ lines: "3", text: "here" }] });
+  assert.deepEqual([...el.querySelectorAll(".cl .ln")].map(text), ["2", "3"]);
+  assert.equal(el.querySelectorAll(".cl.hl").length, 1, "the highlighted line");
+  assert.equal(el.querySelector(".code-note .at").textContent, "L3");
+  assert.equal(el.querySelector(".ctag").textContent, "javascript", "lang from the path");
+  assert.match(text(el.querySelectorAll(".code-head span")[1]), /lines 2–3 of 12/);
+  const empty = render.renderCode({ text: "" });
+  assert.equal(empty.querySelector(".code-body .cl .ln").textContent, "1");
+  assert.match(text(empty.querySelectorAll(".code-head span")[1]), /1 line/);
+});
+
+test("renderTree folds by path through the host's store, and counts tags", () => {
+  const store = {};
+  const writes = [];
+  const opts = { foldKey: (p) => `s1/tree/${p}`, folds: { read: () => store, write: (v) => (writes.push(v), Object.assign(store, v)) } };
+  const el = render.renderTree({ root: "src", entries: [{ path: "a/b.ts", tag: "changed", note: "note" }, { path: "c.ts" }], caption: "cap" }, opts);
+  assert.equal(text(el.querySelector(".tree-root")), "src/");
+  assert.equal(el.querySelector(".tr .ttag").textContent, "changed");
+  assert.match(text(el.querySelector(".tr.t-changed .nm")), /b\.ts$/);
+  assert.equal(el.querySelector(".tr .note").textContent, "note");
+  assert.equal(text(el.querySelector(".tr .sum")), "1 changed", "a folder sums the tags below it");
+  const dir = el.querySelector(".tr.dir");
+  const sub = dir.closest("li").querySelector("ul");
+  assert.equal(sub.hidden, false, "a small tree starts open");
+  dir.dispatchEvent(new dom.window.Event("click"));
+  assert.equal(sub.hidden, true);
+  assert.equal(store["s1/tree/a"], false, "the host's store learns the fold");
+  assert.equal(writes.length, 1);
+  const shut = render.renderTree({ entries: [{ path: "x/" }] }, { foldKey: (p) => p, folds: { read: () => ({ x: false }), write: () => {} } });
+  assert.equal(shut.querySelector("li ul").hidden, true, "a saved fold wins");
+});
+
+test("renderOptions sends a Pick to the host, or copies it with no host", async () => {
+  const sent = [];
+  const spec = { question: "Which?", options: [{ label: "A", recommended: true, pros: ["p"], cons: ["c"], scores: { speed: 4 } }, { label: "B", cost: "$" }] };
+  const el = render.renderOptions(spec, { onSend: (prompt, e) => sent.push([prompt, e.type]) });
+  assert.equal(el.querySelectorAll(".opt").length, 2);
+  assert.equal(el.querySelector(".opt.rec .opt-badge").textContent, "Recommended");
+  assert.equal(el.querySelector(".opt-scores .cbar i").getAttribute("style"), "width:80%");
+  const pick = el.querySelectorAll(".opt .btn")[1];
+  assert.match(pick.getAttribute("title"), /Send this choice to pi/);
+  pick.dispatchEvent(new dom.window.Event("click"));
+  assert.deepEqual(sent, [['Go with option B: B (for "Which?")', "click"]]);
+  const copied = [];
+  const bare = render.renderOptions(spec, { onCopy: (t) => copied.push(t) });
+  assert.equal(bare.querySelector(".opt .btn").getAttribute("title"), "Copy this choice");
+  bare.querySelector(".opt .btn").dispatchEvent(new dom.window.Event("click"));
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(copied, ['Go with option A: A (for "Which?")'], "a bubble copies the prompt instead");
+});
+
+test("renderKanban draws columns, moved marks, owner chips and the details hook", () => {
+  const opened = [];
+  const spec = {
+    title: "Board",
+    columns: [
+      { label: "Open", tone: "ok", cards: [{ id: "#1", title: "a `code` card", note: "n", tag: "ok", tone: "ok", owner: "pi-abcd" }, { title: "b", href: "https://x.test/" }] },
+      { label: "Doing", cards: [], limit: 2 },
+      { label: "Done", compact: true, cards: [{ title: "c" }] },
+    ],
+    progress: true,
+    caption: "cap",
+  };
+  const el = render.renderKanban(spec, {
+    section: "board",
+    moves: { "id:#1": "new", "t:b": "Doing" },
+    ownerChip: (name) => render.h("a", { class: "kb-owner", "data-owner": name }, `@${name}`),
+    onCard: (k, c) => opened.push([k.title, c.label]),
+  });
+  assert.equal(el.className, "kanban");
+  assert.equal(text(el.querySelector(".kb-head b")), "Board");
+  assert.equal(el.querySelectorAll(".kb-col").length, 3);
+  assert.equal(el.querySelectorAll(".kb-card").length, 3);
+  assert.equal(text(el.querySelector(".kb-moved")), "new");
+  assert.equal(text(el.querySelectorAll(".kb-moved")[1]), "→ Doing");
+  assert.equal(el.querySelector(".kb-owner").getAttribute("data-owner"), "pi-abcd", "the host's chip");
+  assert.equal(el.querySelector(".kb-card").getAttribute("aria-haspopup"), "dialog");
+  el.querySelector(".kb-card").dispatchEvent(new dom.window.Event("click"));
+  assert.deepEqual(opened, [["a `code` card", "Open"]]);
+  el.querySelectorAll(".kb-card")[0].dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Enter" }));
+  assert.equal(opened.length, 2, "Enter opens it too");
+  el.querySelector(".kb-card a").dispatchEvent(new dom.window.Event("click", { bubbles: true }));
+  assert.equal(opened.length, 2, "a link inside the card keeps its own click");
+  const folded = () => el.querySelectorAll(".kb-col")[2].className;
+  assert.doesNotMatch(folded(), /folded/, "a busy board keeps its Done column open");
+  el.querySelector(".kb-fold").dispatchEvent(new dom.window.Event("click"));
+  assert.match(folded(), /folded/, "the fold button still closes it");
+});
+
+test("renderKanban remembers folds through the host and gives a bubble a Send button", () => {
+  const store = {};
+  const spec = { columns: [{ label: "Open", cards: [{ id: "#4", title: "card" }] }, { label: "Done", compact: true, cards: [{ title: "x" }] }] };
+  const el = render.renderKanban(spec, { section: "auto-tasks", folds: { read: () => store, write: (v) => Object.assign(store, v) }, foldKey: (l) => `s1/${l}` });
+  el.querySelector(".kb-fold").dispatchEvent(new dom.window.Event("click"));
+  assert.equal(store["s1/Done"], true, "the host's store remembers it");
+  // No modal: the card carries the prompt itself, in the todo tool's own words.
+  const sent = [];
+  const bubble = render.renderKanban(spec, { section: "auto-tasks", onSend: (p) => sent.push(p) });
+  assert.equal(bubble.querySelector(".kb-card").getAttribute("aria-haspopup"), null);
+  const send = bubble.querySelector(".kb-meta .btn");
+  assert.equal(send.textContent, "Send to pi");
+  send.dispatchEvent(new dom.window.Event("click"));
+  assert.deepEqual(sent, ["Claim todo #4 (card) and start on it."]);
+  const plain = render.renderKanban({ columns: [{ label: "Open", cards: [{ title: "t", owner: "sam" }] }] });
+  assert.equal(text(plain.querySelector(".kb-owner")), "@sam", "a bare @name with no host chip");
+  // The page passes both onCard and onSend: the modal means no per-card Send.
+  const page = render.renderKanban({ columns: [{ label: "Open", cards: [{ title: "t", tag: "ok" }] }] }, { onSend: () => {}, onCard: () => {} });
+  assert.ok(page.querySelector(".kb-meta"), "the card's meta row");
+  assert.equal(page.querySelector(".kb-meta .btn"), null, "no Send button where a modal exists");
+  assert.equal(render.renderKanban({ columns: [{ label: "Open", cards: [{ title: "x", href: "javascript:alert(1)" }] }] }).querySelector(".kb-card a"), null, "only http(s) links");
+  const more = render.renderKanban({ columns: [{ label: "A", cards: [], more: "1;background:red" }] });
+  assert.equal(more.querySelector(".kb-cols").getAttribute("style"), "--kb-tpl:36px", "a string `more` stays out of CSS");
+});
+
+test("renderKanban and renderTree never need localStorage without a host", () => {
+  const saved = Object.getOwnPropertyDescriptor(dom.window, "localStorage");
+  Object.defineProperty(dom.window, "localStorage", { configurable: true, get() { throw new Error("no storage here"); } });
+  try {
+    assert.doesNotThrow(() => render.renderKanban({ columns: [{ label: "Open", cards: [{ title: "t" }] }, { label: "Done", compact: true, cards: [{ title: "x" }] }] }));
+    assert.doesNotThrow(() => render.renderTree({ root: "src", entries: [{ path: "a/b.ts" }] }));
+  } finally {
+    if (saved) Object.defineProperty(dom.window, "localStorage", saved);
+    else delete dom.window.localStorage;
+  }
+});
+
+test("parsePatch and langFor read a patch into files, hunks and rows", () => {
+  const files = render.parsePatch(
+    "diff --git a/a.rb b/a.rb\n--- a/a.rb\n+++ b/a.rb\n@@ -1,2 +1,2 @@\n-old line\n+new line\n same\ndiff --git a/b.ts b/b.ts\nnew file mode 100644\n--- /dev/null\n+++ b/b.ts\n@@ -0,0 +1 @@\n+hi\n",
+  );
+  assert.equal(files.length, 2);
+  assert.equal(files[0].path, "a.rb");
+  assert.equal(files[0].adds, 1);
+  assert.equal(files[0].dels, 1);
+  assert.deepEqual(files[0].hunks[0].rows.map((r) => [r.t, r.a, r.b]), [["del", 1, undefined], ["add", undefined, 1], ["ctx", 2, 2]]);
+  assert.equal(files[1].status, "added");
+  assert.equal(render.langFor("a/b.rb"), "ruby");
+  assert.equal(render.langFor("Gemfile"), "ruby");
+  assert.equal(render.langFor("x.unknown"), "");
+});
+
+test("renderDiff draws each file, marks the changed words and lists the files", () => {
+  stubHost({ html: "" });
+  const patch = "diff --git a/a.rb b/a.rb\n--- a/a.rb\n+++ b/a.rb\n@@ -1,2 +1,2 @@\n-let a = 1\n+let a = 2\n keep\ndiff --git a/b.ts b/b.ts\n--- a/b.ts\n+++ b/b.ts\n@@ -1 +1 @@\n-x\n+y\n";
+  const el = render.renderDiff(patch);
+  assert.equal(el.className, "diffview");
+  assert.equal(el.querySelectorAll(".dv-file").length, 2);
+  assert.equal(el.querySelectorAll(".dv-files li").length, 2, "a file list for several files");
+  assert.equal(el.querySelector(".dv-file table.diff").className, "diff", "unified");
+  assert.match(text(el.querySelector(".dv-files")), /a\.rb/);
+  const marks = [...el.querySelectorAll("tr.del mark, tr.add mark")].map(text);
+  assert.deepEqual(marks, ["1", "2"], "the changed words, not the whole line");
+  const one = render.renderDiff("diff --git a/a.rb b/a.rb\n--- a/a.rb\n+++ b/a.rb\n@@ -1 +1 @@\n-a\n+b\n");
+  assert.equal(one.querySelector(".dv-files"), null, "one file needs no list");
+  const split = render.renderDiff(patch, { split: true });
+  assert.match(split.querySelector("table.diff").className, /split/);
+  assert.equal(render.renderDiff("").textContent, "No changes in this patch.");
+});
+
+test("diffBlock re-runs onBody after a redraw, so the page can repaint comments", async () => {
+  stubHost({ html: "" });
+  const [f] = render.parsePatch("diff --git a/a.rb b/a.rb\n--- a/a.rb\n+++ b/a.rb\n@@ -1 +1 @@\n-a\n+b\n");
+  const seen = [];
+  render.diffBlock(f, { onBody: (b) => seen.push(b.querySelectorAll("tr").length) });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(seen.length, 1, "once after the first fill");
+  assert.ok(seen[0] >= 2, "with the changed rows in place");
+  assert.equal(render.diffFileList([f], [render.diffBlock(f, {})]), null, "no list for a single file");
+});
+
+test("a running terminal's timer stops on dispose, and when its body never attaches", (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: 0 });
+  const timers = new Set();
+  const set = globalThis.setInterval;
+  const clear = globalThis.clearInterval;
+  globalThis.setInterval = (fn, ms) => (timers.add(set(fn, ms)), [...timers].at(-1));
+  globalThis.clearInterval = (id) => (timers.delete(id), clear(id));
+  try {
+    const el = render.renderTerminal({ output: "hi\n", running: true, started: new Date(0).toISOString() });
+    document.body.append(el);
+    const label = el.querySelector(".term-running span:last-child");
+    t.mock.timers.tick(1000);
+    assert.equal(label.textContent, "running 1s");
+    assert.equal(timers.size, 1, "one clock");
+    assert.equal(typeof el.dispose, "function", "a host can stop the clock itself");
+    el.dispose();
+    assert.equal(timers.size, 0, "stopped");
+    t.mock.timers.tick(30_000);
+    assert.equal(label.textContent, "running 1s", "and it stays stopped");
+    el.remove();
+    // A body rendered but never attached has no one watching it: it stops on its own.
+    render.renderTerminal({ output: "hi\n", running: true, started: new Date(0).toISOString() });
+    assert.equal(timers.size, 1, "one clock");
+    t.mock.timers.tick(11_000);
+    assert.equal(timers.size, 0, "dropped after a few idle ticks");
+  } finally {
+    globalThis.setInterval = set;
+    globalThis.clearInterval = clear;
+  }
+});
+
+test("renderMermaid asks the host for mermaid and draws, or reports the failure", async () => {
+  let loaded = 0;
+  const el = render.h("div");
+  await render.renderMermaid(el, "graph TD; A-->B;", {
+    loadMermaid: () => {
+      loaded++;
+      return Promise.resolve({ render: async (id, src) => ({ svg: `<svg id="${id}" data-src="${src}"></svg>` }) });
+    },
+  });
+  assert.equal(loaded, 1);
+  assert.ok(el.classList.contains("mmd"));
+  assert.equal(el._src, "graph TD; A-->B;", "kept so a theme change can draw it again");
+  assert.equal(el.querySelector("svg").getAttribute("data-src"), "graph TD; A-->B;");
+  assert.match(el.querySelector("svg").id, /^mmd-/);
+  const remote = render.h("div");
+  await render.renderMermaid(remote, "graph TD; A-->B;", {
+    loadMermaid: () =>
+      Promise.resolve({
+        render: async () => ({
+          svg: '<svg><image href="https://evil.test/a.png" xlink:href="data:image/png;base64,AA"></image><image href="data:image/png;base64,BB"></image></svg><img src="https://evil.test/b.png">',
+        }),
+      }),
+  });
+  const [img, kept] = remote.querySelectorAll("image");
+  assert.equal(img.getAttribute("href"), null, "a remote image loses its href");
+  assert.equal(img.getAttribute("xlink:href"), "data:image/png;base64,AA", "a data: image stays");
+  assert.equal(remote.querySelector("img").getAttribute("src"), null, "so does an HTML img's src");
+  assert.equal(kept.getAttribute("href"), "data:image/png;base64,BB", "a data: image stays");
+  const bad = render.h("div");
+  await render.renderMermaid(bad, "nope", { loadMermaid: () => Promise.reject(new Error("no script")) });
+  assert.equal(text(bad.querySelector(".err")), "mermaid: no script");
+  assert.equal(bad.querySelector("pre").textContent, "nope");
 });

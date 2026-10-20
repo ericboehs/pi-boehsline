@@ -415,6 +415,7 @@ const ASSETS = {
   "/assets/theme.mjs": ["theme.mjs", JS],
   "/assets/nav.mjs": ["nav.mjs", JS],
   "/assets/render.mjs": ["render.mjs", JS],
+  "/assets/render.css": ["render.css", "text/css; charset=utf-8"],
   "/assets/theme-boot.js": ["theme-boot.js", JS],
   "/assets/themes.json": ["themes.json", "application/json; charset=utf-8"],
 };
@@ -426,6 +427,7 @@ const SHELL = `<!doctype html>
 <title>Canvas</title>
 <link rel="icon" href="data:,">
 ${THEME_DEFAULT ? `<meta name="canvas-theme-default" content="${THEME_DEFAULT}">\n` : ""}<script src="/assets/theme-boot.js"></script>
+<link rel="stylesheet" href="/assets/render.css">
 <script src="/assets/vendor/marked.js" defer></script>
 <script src="/assets/vendor/purify.js" defer></script>
 <script src="/assets/page.mjs" type="module"></script>

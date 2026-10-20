@@ -540,6 +540,50 @@ export function codeLayout(spec) {
     });
 }
 
+const LINE_RANGE = /^\s*(\d+)\s*(?:[-–—]\s*(\d+)\s*)?$/;
+
+/** "42" or "40–45" as a [from, to] pair, or null for anything else. */
+function lineRange(value) {
+  const m = LINE_RANGE.exec(String(value ?? ""));
+  if (!m) return null;
+  const a = Number(m[1]);
+  const b = m[2] ? Number(m[2]) : a;
+  return a > 0 && b >= a ? [a, b] : null;
+}
+
+/**
+ * A code body written as text — { text, lines?, highlight?, notes?, path?, lang?,
+ * caption? }, what a host with the file's own text can send — as the shape the
+ * renderer reads: { start, total, code, highlight: [[from, to]], notes: [{ from,
+ * to, text, tone? }] }. Lines outside the file are clamped, not refused: the
+ * tool's normaliser is the one that validates. `langFor(path)` is the host's
+ * own language map, if it has one.
+ */
+export function codeFromText(spec, langFor) {
+  const all = String(spec?.text ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/\n$/, "")
+    .split("\n");
+  const asked = spec?.lines != null ? lineRange(spec.lines) : null;
+  const start = Math.min(asked?.[0] ?? 1, all.length);
+  const end = Math.min(asked?.[1] ?? all.length, all.length);
+  const lang = spec?.lang ? String(spec.lang).toLowerCase() : (langFor?.(spec?.path) ?? "");
+  const notes = (spec?.notes ?? []).map((n) => {
+    const r = lineRange(n?.lines);
+    return r ? { from: r[0], to: r[1], text: String(n.text ?? ""), ...(n.tone ? { tone: n.tone } : {}) } : null;
+  });
+  return {
+    path: spec?.path ?? "",
+    ...(lang ? { lang } : {}),
+    start,
+    total: all.length,
+    code: all.slice(start - 1, end).join("\n"),
+    highlight: (spec?.highlight ?? []).map(lineRange).filter(Boolean),
+    notes: notes.filter(Boolean),
+    ...(spec?.caption ? { caption: spec.caption } : {}),
+  };
+}
+
 /** "L42" or "L40–45". */
 export const lineLabel = (a, b) => (a === b ? `L${a}` : `L${a}–${b}`);
 

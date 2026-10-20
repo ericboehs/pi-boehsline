@@ -1,7 +1,15 @@
-// Rendering shared by the canvas page (served as /assets/render.mjs) and
-// botsun's chat bubbles (render/bubble.html): markdown, tables and charts.
+// Rendering shared by the canvas page (served as /assets/render.mjs, with its
+// styles in render.css) and botsun's chat bubbles (render/bubble.html): markdown,
+// tables, charts, stats, steps, timeline, JSON, code, tree, options, kanban,
+// tracker, terminal, diff and mermaid.
 // Plain DOM nodes with CSS-variable colours, so a host stylesheet themes them;
-// nothing here reads the page's state, storage or session globals.
+// nothing here reads the page's state, storage or session globals. Where a
+// renderer needs page behaviour (clipboard buttons, highlight.js loading, the
+// kanban modal, owner links, remembered folds, talk-back) the page passes it in
+// through that renderer's opts instead.
+//
+// A host that supplies window.mermaid itself must initialize it first
+// ({ securityLevel: "strict", startOnLoad: false }); see the mermaid section.
 //
 // A host must NOT call DOMPurify.setConfig(): in DOMPurify 3.x a global config
 // wins over every later per-call config, which would quietly drop MD_CLEAN's
@@ -20,6 +28,10 @@
 //     .md pre           the code; a highlighted one is pre > code.hljs
 //   .md table           GFM/pipe tables
 //   .chart, .tbl        renderChart / renderTable (see below)
+//   .stats, .steps, .tlw, .jsonv, .code, .tree, .opts, .kanban, .tracker,
+//   .term, .diffview, .mmd   the rest; their rules are in render.css
+
+import { buildTree, cardKey, cardPrompt, codeFromText, codeLayout, inlineTokens, lineLabel, optionLetter, optionPrompt, trackerTone } from "./nav.mjs";
 
 export const h = (tag, attrs = {}, ...kids) => {
   const el = document.createElement(tag);
@@ -587,4 +599,1050 @@ export function renderTable(spec) {
     more,
     spec.caption ? h("div", { class: "chart-cap" }, spec.caption) : null,
   );
+}
+
+// ── hosts ──────────────────────────────────────────────────────────────────────
+// The page passes its own copy button (⌥-click quotes, ⇧-click Slack markup) and
+// its own clipboard (with an execCommand fallback); a bubble host gets ours.
+
+/** The copy button a host wants, or this module's own. */
+const copyButtonFor = (opts) => opts?.copyButton ?? ((getText, _label, _ico, o) => copyButton(getText, { ...opts, ...o }));
+const copyTextFor = (opts) => opts?.copyText ?? ((text) => copyText(text, opts));
+
+/** ~/Code/x for /Users/me/Code/x, as the page writes paths. */
+export const tilde = (p) => String(p || "").replace(/^\/(?:Users|home)\/[^/]+/, "~");
+
+/** "3:42 PM" in the reader's locale. */
+export const clock = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+/** Today, Yesterday, or the date, for a timeline's day headings. */
+export function dayLabel(d) {
+  const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = Math.round((day(new Date()) - day(d)) / 86400000);
+  if (diff === 0) return "Today";
+  if (diff === 1) return "Yesterday";
+  return d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+}
+
+/** A colour name a spec may use for a tone; anything else gets no inline style. */
+export const toneVar = (t) => (/^(ok|warn|bad|accent|dim|c[1-8])$/.test(t || "") ? `var(--${t})` : "");
+
+/** Inline `code`, **bold** and links as DOM; links become text inside a card that is itself a link. */
+export const inline = (text, links = true) =>
+  inlineTokens(text).map((t) => (t.t === "code" ? h("code", {}, t.v) : t.t === "b" ? h("b", {}, t.v) : t.t === "a" && links ? h("a", { href: t.href, target: "_blank", rel: "noopener noreferrer" }, t.v) : t.v));
+
+/** An href safe to put in a link: http(s) only, else null. */
+const httpHref = (u) => (/^https?:\/\//i.test(String(u ?? "")) ? String(u) : null);
+
+/** Note text: paragraphs split on blank lines, with inline `code`, **bold** and links. */
+export const noteParas = (text, lead = null) => String(text).split(/\n\s*\n/).map((p, i) => h("p", {}, i ? null : lead, inline(p)));
+
+// ── tracker ────────────────────────────────────────────────────────────────────
+// One line of card state above the board or the title: id, state, title, note.
+
+export function renderTracker(spec) {
+  const href = httpHref(spec.href);
+  const title = href ? h("a", { href, target: "_blank", rel: "noopener" }, spec.title) : spec.title;
+  return h(
+    "div",
+    { class: "tracker" },
+    spec.id || spec.state ? h("div", { class: "tk-line" }, spec.id ? h("span", { class: "tk-id" }, `#${spec.id}`) : null, spec.state ? h("span", { class: `tk-state ${trackerTone(spec.state)}` }, spec.state) : null) : null,
+    h("div", { class: "tk-title" }, title),
+    spec.note ? h("div", { class: "tk-note" }, spec.note) : null,
+  );
+}
+
+// ── stats ──────────────────────────────────────────────────────────────────────
+// A row of big numbers, each with an optional delta, sparkline and note.
+
+export function renderStats(spec) {
+  const items = spec.items || [];
+  return h(
+    "div",
+    { class: "stats" },
+    items.map((it) => {
+      const color = /^c[1-8]$/.test(it.color) || NAMED.has(it.color) ? `var(--${it.color})` : "var(--accent)";
+      const value = typeof it.value === "number" ? fmtValue(it.value, it) : `${it.prefix ?? ""}${it.value}${it.unit ? `\u2009${it.unit}` : ""}`;
+      let delta = null;
+      if (it.delta != null && it.delta !== "") {
+        const dir = typeof it.delta === "number" ? Math.sign(it.delta) : /^\s*-/.test(it.delta) ? -1 : /^\s*\+/.test(it.delta) ? 1 : 0;
+        const text = typeof it.delta === "number" ? fmtValue(Math.abs(it.delta), { unit: it.unit === "%" ? "%" : "" }) : String(it.delta).replace(/^\s*[+-]\s*/, "");
+        const good = it.good || "up";
+        const cls = !dir || good === "none" ? "flat" : (dir > 0) === (good === "up") ? "ok" : "bad";
+        delta = h("span", { class: `stat-delta ${cls}` }, `${dir > 0 ? "↑" : dir < 0 ? "↓" : "→"} ${text}`);
+      }
+      return h(
+        "div",
+        { class: "stat" },
+        h("div", { class: "stat-label" }, it.label),
+        h("div", { class: "stat-row" }, h("b", { class: "stat-value", style: it.color ? `color:${color}` : null }, value), delta),
+        it.spark ? sparkSvg(it.spark, 120, 28, color) : null,
+        it.note ? h("div", { class: "stat-note" }, it.note) : null,
+      );
+    }),
+  );
+}
+
+// ── steps ──────────────────────────────────────────────────────────────────────
+// A checklist with a progress bar; the agent replaces the section as steps move.
+
+const STEP_ICON = { done: "✓", active: "", failed: "✕", skipped: "–", blocked: "!", todo: "" };
+
+export function renderSteps(spec) {
+  const steps = spec.steps || [];
+  const n = (s) => steps.filter((x) => x.status === s).length;
+  const counted = steps.length - n("skipped");
+  const pct = counted ? (n("done") / counted) * 100 : 100;
+  const extra = [n("failed") && h("span", { class: "bad" }, `${n("failed")} failed`), n("blocked") && h("span", { class: "warn" }, `${n("blocked")} blocked`), n("skipped") && h("span", {}, `${n("skipped")} skipped`)].filter(Boolean);
+  return h(
+    "div",
+    { class: "steps" },
+    h(
+      "div",
+      { class: "steps-head" },
+      spec.title ? h("b", {}, spec.title) : null,
+      h("span", { class: "steps-count" }, `${n("done")} of ${counted} done`, extra.flatMap((e) => [" · ", e])),
+      h("span", { class: `steps-bar${n("failed") ? " bad" : ""}`, role: "progressbar", "aria-valuenow": Math.round(pct), "aria-valuemin": 0, "aria-valuemax": 100 }, h("i", { style: `width:${pct.toFixed(1)}%` })),
+    ),
+    h(
+      "ol",
+      { class: "steps-list" },
+      steps.map((s) =>
+        h(
+          "li",
+          { class: `step s-${s.status}` },
+          h("span", { class: "smark", title: s.status }, STEP_ICON[s.status] ?? ""),
+          h("div", { class: "sbody" }, h("div", { class: "slabel" }, s.label), s.note ? h("div", { class: "snote" }, s.note) : null, s.detail ? h("pre", { class: "sdetail" }, s.detail) : null),
+        ),
+      ),
+    ),
+  );
+}
+
+// ── terminal ───────────────────────────────────────────────────────────────────
+// Command output with its ANSI colours (mapped to --t0…--t15 so they follow
+// the theme), a line count, a filter for long logs, and a tail while it runs.
+
+function applySgr(style, params) {
+  const p = params === "" ? [0] : params.split(";").map(Number);
+  const c256 = (n) => {
+    if (n < 16) return n;
+    if (n >= 232) return `rgb(${[0, 0, 0].map(() => 8 + (n - 232) * 10).join(",")})`;
+    const v = (x) => (x ? x * 40 + 55 : 0);
+    n -= 16;
+    return `rgb(${v(Math.floor(n / 36))},${v(Math.floor(n / 6) % 6)},${v(n % 6)})`;
+  };
+  for (let i = 0; i < p.length; i++) {
+    const n = p[i];
+    if (n === 0) for (const k of Object.keys(style)) delete style[k];
+    else if (n === 1) style.b = 1;
+    else if (n === 2) style.dim = 1;
+    else if (n === 3) style.i = 1;
+    else if (n === 4) style.u = 1;
+    else if (n === 7) style.inv = 1;
+    else if (n === 22) delete style.b, delete style.dim;
+    else if (n === 23) delete style.i;
+    else if (n === 24) delete style.u;
+    else if (n === 27) delete style.inv;
+    else if (n >= 30 && n <= 37) style.fg = n - 30;
+    else if (n >= 90 && n <= 97) style.fg = n - 90 + 8;
+    else if (n === 39) delete style.fg;
+    else if (n >= 40 && n <= 47) style.bg = n - 40;
+    else if (n >= 100 && n <= 107) style.bg = n - 100 + 8;
+    else if (n === 49) delete style.bg;
+    else if (n === 38 || n === 48) {
+      const key = n === 38 ? "fg" : "bg";
+      if (p[i + 1] === 5) (style[key] = c256(p[i + 2] || 0)), (i += 2);
+      else if (p[i + 1] === 2) (style[key] = `rgb(${p[i + 2] || 0},${p[i + 3] || 0},${p[i + 4] || 0})`), (i += 4);
+    }
+  }
+}
+
+/** Output split into lines of [text, style] runs, with \r redraws applied and other escapes dropped. */
+function parseAnsi(text) {
+  const lines = [];
+  const style = {};
+  let segs = [];
+  let plain = "";
+  const push = (t) => {
+    t = t.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+    if (t) segs.push([t, { ...style }]), (plain += t);
+  };
+  const end = () => {
+    lines.push({ segs, plain });
+    segs = [];
+    plain = "";
+  };
+  text = text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
+  const re = /\x1b\[([0-9;?]*)([A-Za-z])|\r\n|\n|\r/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    push(text.slice(last, m.index));
+    last = re.lastIndex;
+    if (m[0] === "\n" || m[0] === "\r\n") end();
+    else if (m[0] === "\r") (segs = []), (plain = "");
+    else if (m[2] === "m") applySgr(style, m[1]);
+  }
+  push(text.slice(last));
+  if (segs.length || plain) end();
+  return lines;
+}
+
+function ansiCss(st) {
+  const color = (c) => (typeof c === "number" ? `var(--t${c})` : c);
+  let fg = st.fg != null ? color(st.fg) : null;
+  let bg = st.bg != null ? color(st.bg) : null;
+  if (st.inv) [fg, bg] = [bg || "var(--code)", fg || "var(--ink)"];
+  return [fg && `color:${fg}`, bg && `background:${bg}`, st.b && "font-weight:700", st.dim && "opacity:.65", st.i && "font-style:italic", st.u && "text-decoration:underline"].filter(Boolean).join(";");
+}
+
+const lineTint = (s) =>
+  /(?<!\b0 )\b(error|errors|failed|failure|fatal|panic|exception)\b|✖|✗|^\s*not ok\b|^\s*FAIL\b/i.test(s)
+    ? " bad"
+    : /\b(warn|warning|deprecated)\b/i.test(s)
+      ? " warn"
+      : /✔|✓|^\s*ok\b|^\s*PASS\b|(?<!\b0 )\bpassed\b/.test(s)
+        ? " ok"
+        : "";
+
+function fmtSeconds(s) {
+  if (s < 1) return `${Math.round(s * 1000)} ms`;
+  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)} s`;
+  return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+}
+
+export function renderTerminal(spec, opts = {}) {
+  const output = spec.output || "";
+  const lines = parseAnsi(output);
+  const colored = /\x1b\[[0-9;]*m/.test(output);
+  const running = spec.running && spec.started;
+  const count = h("span", { class: "term-count" });
+  const filter = lines.length > 15 ? h("input", { class: "term-filter", type: "search", placeholder: "Filter lines", "aria-label": "Filter lines" }) : null;
+  // A command still going: a pulse and an elapsed time that ticks between writes.
+  let clock = null;
+  let stop = null;
+  if (running) {
+    const t0 = Date.parse(spec.started);
+    const label = h("span");
+    const tick = () => {
+      const s = Math.max(0, Math.floor((Date.now() - t0) / 1000));
+      label.textContent = `running ${s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`}`;
+    };
+    tick();
+    let was = false;
+    let idle = 0;
+    const iv = setInterval(() => {
+      if (label.isConnected) (was = true), (idle = 0), tick();
+      // Re-rendered or closed, or rendered but never attached (a 3 s refresh
+      // can replace a body before inserting it): stop ticking either way.
+      else if (was || ++idle > 10) clearInterval(iv);
+    }, 1000);
+    stop = () => clearInterval(iv);
+    clock = h("span", { class: "term-running" }, h("span", { class: "pulse working" }), label);
+  }
+  const head = h(
+    "div",
+    { class: "term-head" },
+    h("code", { class: "term-cmd" }, spec.command ? [h("span", { class: "term-ps" }, "$ "), spec.command] : h("span", { class: "term-ps" }, "output")),
+    h(
+      "span",
+      { class: "term-meta" },
+      spec.cwd ? h("span", { title: spec.cwd }, tilde(spec.cwd)) : null,
+      clock,
+      !running && spec.duration != null ? h("span", {}, typeof spec.duration === "number" ? fmtSeconds(spec.duration) : spec.duration) : null,
+      spec.exit != null ? h("span", { class: `term-exit ${spec.exit === 0 ? "ok" : "bad"}` }, `exit ${spec.exit}`) : null,
+      h("span", {}, `${lines.length.toLocaleString()} line${lines.length === 1 ? "" : "s"}`),
+    ),
+  );
+  const copy = copyButtonFor(opts)(() => lines.map((l) => l.plain).join("\n"), "Copy output", null, { slack: "code" });
+  const tools = filter ? h("div", { class: "term-tools" }, filter, count, copy) : null;
+  if (!filter) head.lastChild.append(copy);
+  const body = h("div", { class: "term-body" });
+  const lineEl = (l, i, q) => {
+    const text = h("span", { class: "tx" });
+    if (q) {
+      // Filtered lines show plain text with the matches marked.
+      const low = l.plain.toLowerCase();
+      let at = 0;
+      for (let k = low.indexOf(q); k >= 0; k = low.indexOf(q, at)) {
+        text.append(l.plain.slice(at, k), h("mark", {}, l.plain.slice(k, k + q.length)));
+        at = k + q.length;
+      }
+      text.append(l.plain.slice(at));
+    } else for (const [t, st] of l.segs) text.append(Object.keys(st).length ? h("span", { style: ansiCss(st) }, t) : t);
+    return h("div", { class: `tl${colored ? "" : lineTint(l.plain)}` }, h("span", { class: "ln" }, i + 1), text);
+  };
+  const HEAD = 30;
+  const TAIL = 40;
+  let expanded = false;
+  const draw = () => {
+    const q = filter?.value.trim().toLowerCase() || "";
+    body.replaceChildren();
+    if (q) {
+      const hits = [];
+      lines.forEach((l, i) => l.plain.toLowerCase().includes(q) && hits.push(i));
+      for (const i of hits.slice(0, 2000)) body.append(lineEl(lines[i], i, q));
+      if (!hits.length) body.append(h("div", { class: "term-none" }, "No lines match"));
+      count.textContent = `${hits.length.toLocaleString()} of ${lines.length.toLocaleString()}`;
+      return;
+    }
+    count.textContent = "";
+    if (expanded || lines.length <= HEAD + TAIL + 10) lines.forEach((l, i) => body.append(lineEl(l, i)));
+    else if (running) {
+      // Still going: the newest lines matter, so only the tail shows.
+      const hidden = lines.length - TAIL;
+      body.append(h("button", { class: "term-fold", type: "button", onclick: () => ((expanded = true), draw()) }, `Show ${hidden.toLocaleString()} earlier lines`));
+      lines.slice(-TAIL).forEach((l, k) => body.append(lineEl(l, hidden + k)));
+    } else {
+      lines.slice(0, HEAD).forEach((l, i) => body.append(lineEl(l, i)));
+      const hidden = lines.length - HEAD - TAIL;
+      body.append(h("button", { class: "term-fold", type: "button", onclick: () => ((expanded = true), draw()) }, `Show ${hidden.toLocaleString()} more lines`));
+      lines.slice(-TAIL).forEach((l, k) => body.append(lineEl(l, lines.length - TAIL + k)));
+    }
+    if (!lines.length) body.append(h("div", { class: "term-none" }, running ? "No output yet" : "No output"));
+  };
+  filter?.addEventListener("input", draw);
+  draw();
+  // Follow the newest line while it runs (once in the page).
+  if (running) requestAnimationFrame(() => (body.scrollTop = body.scrollHeight));
+  const el = h("div", { class: `term${running ? " running" : ""}` }, head, tools, body);
+  // A host that drops a running body before inserting it stops the clock here.
+  if (stop) el.dispose = stop;
+  return el;
+}
+
+// ── timeline ───────────────────────────────────────────────────────────────────
+// Events down a line. When every event has a real time they are sorted
+// (unless order is "given"), grouped under day headings, and the gap since
+// the previous event is shown; text times are shown as written.
+
+function fmtGap(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 1) return "";
+  if (m < 60) return `${m}m`;
+  if (m < 1440) return `${Math.floor(m / 60)}h${m % 60 ? ` ${m % 60}m` : ""}`;
+  const d = Math.floor(m / 1440);
+  const hr = Math.round((m % 1440) / 60);
+  return `${d}d${hr ? ` ${hr}h` : ""}`;
+}
+
+export function renderTimeline(spec) {
+  const toDate = (at) => (typeof at === "number" ? new Date(at) : typeof at === "string" && /\d{4}-\d{2}-\d{2}|^\d{1,2}:\d{2}/.test(at) ? new Date(/^\d{1,2}:\d{2}/.test(at) ? `1970-01-01T${at.padStart(5, "0")}` : at) : null);
+  let events = (spec.events || []).map((e, i) => ({ ...e, i, d: toDate(e.at) }));
+  const dated = events.every((e) => e.d && !Number.isNaN(e.d.getTime()));
+  const timeOnly = dated && events.every((e) => typeof e.at === "string" && /^\d{1,2}:\d{2}/.test(e.at));
+  if (dated && spec.order !== "given") events = [...events].sort((a, b) => a.d - b.d || a.i - b.i);
+  const list = h("ol", { class: "tline" });
+  let lastDay = "";
+  let prev = null;
+  for (const e of events) {
+    if (dated && !timeOnly) {
+      const day = e.d.toDateString();
+      if (day !== lastDay) list.append(h("li", { class: "tday" }, dayLabel(e.d)));
+      lastDay = day;
+    }
+    const gap = dated && prev ? fmtGap(e.d - prev.d) : "";
+    const tone = /^(ok|warn|bad|accent|dim|c[1-8])$/.test(e.tone) ? `var(--${e.tone})` : "var(--line)";
+    list.append(
+      h(
+        "li",
+        { class: `tev${e.tone ? " toned" : ""}`, style: `--tone:${tone}` },
+        h("div", { class: "twhen" }, h("span", { title: dated && !timeOnly ? e.d.toLocaleString() : null }, dated ? (timeOnly ? e.at : clock(e.d)) : e.at ?? ""), gap ? h("span", { class: "tgap" }, `+${gap}`) : null),
+        h("span", { class: "tdot" }),
+        h(
+          "div",
+          { class: "tbody" },
+          h("div", { class: "ttitle" }, e.title, e.tag ? h("span", { class: `ctag${/^(ok|warn|bad)$/.test(e.tone) ? ` ${e.tone}` : ""}` }, e.tag) : null),
+          e.note ? h("div", { class: "tnote" }, e.note) : null,
+        ),
+      ),
+    );
+    prev = e;
+  }
+  const span = dated && events.length > 1 ? fmtGap(events.at(-1).d - events[0].d) : "";
+  return h("div", { class: "tlw" }, list, spec.caption || span ? h("div", { class: "chart-cap" }, [spec.caption, span && `${events.length} events over ${span}`].filter(Boolean).join(" · ")) : null);
+}
+
+// ── json ───────────────────────────────────────────────────────────────────────
+// A collapsible tree, built lazily as nodes open. Two levels open to start;
+// the filter keeps the paths to matching keys and values and opens them.
+// Clicking a key copies its jq-style path.
+
+export function renderJson(text, opts = {}) {
+  let root;
+  try {
+    root = JSON.parse(text);
+  } catch (e) {
+    return h("pre", { class: "err" }, `Not JSON: ${e.message}`);
+  }
+  const copy = copyButtonFor(opts);
+  const copyTextNow = copyTextFor(opts);
+  const isObj = (v) => v && typeof v === "object";
+  // jq-style paths: the root is ".", its children ".key" and ".[0]".
+  const childPath = (p, k) => {
+    const b = p === "." ? "" : p;
+    if (typeof k === "number") return `${b || "."}[${k}]`;
+    return /^[A-Za-z_$][\w$]*$/.test(k) ? `${b}.${k}` : `${b || "."}[${JSON.stringify(k)}]`;
+  };
+  const entriesOf = (v) => (Array.isArray(v) ? v.map((x, i) => [i, x]) : Object.entries(v));
+  const filter = h("input", { class: "tbl-filter", type: "search", placeholder: "Filter keys and values", "aria-label": "Filter keys and values" });
+  const count = h("span", { class: "tbl-count" });
+  const tree = h("div", { class: "jt" });
+  let state = { open: "auto", keep: null, q: "", budget: 0 };
+
+  const marked = (s, q) => {
+    if (!q) return s;
+    const k = s.toLowerCase().indexOf(q);
+    return k < 0 ? s : [s.slice(0, k), h("mark", {}, s.slice(k, k + q.length)), s.slice(k + q.length)];
+  };
+  const prim = (v) => {
+    const t = v === null ? "null" : typeof v;
+    return h("span", { class: `jv j-${t}` }, marked(t === "string" ? JSON.stringify(v) : String(v), state.q));
+  };
+  const keyEl = (k, path) =>
+    k == null
+      ? null
+      : h(
+          "button",
+          {
+            type: "button",
+            class: `jk${typeof k === "number" ? " idx" : ""}`,
+            title: `Copy path ${path}`,
+            onclick: async (e) => {
+              e.stopPropagation();
+              await copyTextNow(path).catch(() => {});
+              e.target.classList.add("copied");
+              setTimeout(() => e.target.classList.remove("copied"), 900);
+            },
+          },
+          typeof k === "number" ? String(k) : marked(k, state.q),
+        );
+  const node = (k, v, path, depth, free) => {
+    if (!isObj(v)) return h("div", { class: "jn leaf" }, h("span", { class: "jtog" }), keyEl(k, path), k != null ? h("span", { class: "jp" }, ": ") : null, prim(v));
+    const entries = entriesOf(v);
+    const arr = Array.isArray(v);
+    const kids = h("div", { class: "jc" });
+    const tog = h("span", { class: "jtog" }, entries.length ? "▸" : "");
+    const preview = h("span", { class: "jprev" }, arr ? `[ ${entries.length} item${entries.length === 1 ? "" : "s"} ]` : `{ ${entries.length} key${entries.length === 1 ? "" : "s"} }`);
+    const row = h("div", { class: "jrow" }, tog, keyEl(k, path), k != null ? h("span", { class: "jp" }, ": ") : null, preview);
+    const wrap = h("div", { class: "jn" }, row, kids);
+    let built = false;
+    const build = () => {
+      built = true;
+      const keep = free ? null : state.keep;
+      let shown = entries.filter(([ck]) => !keep || keep.has(childPath(path, ck)));
+      const LIMIT = 200;
+      const add = (from) => {
+        for (const [ck, cv] of shown.slice(from, from + LIMIT)) {
+          const cp = childPath(path, ck);
+          // Below a match, everything shows; elsewhere the filter keeps only paths that lead to one.
+          kids.append(node(ck, cv, cp, depth + 1, free || (keep && state.hits.has(cp))));
+        }
+        if (shown.length > from + LIMIT) {
+          const more = h("button", { type: "button", class: "term-fold jmore", onclick: () => (more.remove(), add(from + LIMIT)) }, `Show ${Math.min(LIMIT, shown.length - from - LIMIT)} more of ${shown.length - from - LIMIT}`);
+          kids.append(more);
+        }
+      };
+      add(0);
+    };
+    const set = (open) => {
+      if (open && !built) build();
+      wrap.classList.toggle("open", open);
+      tog.textContent = entries.length ? (open ? "▾" : "▸") : "";
+    };
+    row.addEventListener("click", () => entries.length && set(!wrap.classList.contains("open")));
+    let open;
+    if (state.keep && !free) open = true;
+    else if (state.open === "all") open = state.budget-- > 0;
+    else if (state.open === "none") open = depth === 0;
+    else open = depth < 2 && entries.length <= 60;
+    if (open && entries.length) set(true);
+    return wrap;
+  };
+
+  const draw = () => {
+    const q = filter.value.trim().toLowerCase();
+    state.q = q;
+    state.keep = null;
+    state.hits = new Set();
+    if (q) {
+      const keep = new Set(["."]);
+      let seen = 0;
+      const walk = (v, path, k, trail) => {
+        if (++seen > 50000 || state.hits.size >= 500) return;
+        const hit = (k != null && typeof k === "string" && k.toLowerCase().includes(q)) || (!isObj(v) && String(v).toLowerCase().includes(q));
+        if (hit) {
+          state.hits.add(path);
+          for (const t of trail) keep.add(t);
+          keep.add(path);
+        }
+        if (isObj(v)) for (const [ck, cv] of entriesOf(v)) walk(cv, childPath(path, ck), ck, [...trail, path]);
+      };
+      walk(root, ".", null, []);
+      state.keep = keep;
+      count.textContent = `${state.hits.size >= 500 ? "500+" : state.hits.size} match${state.hits.size === 1 ? "" : "es"}`;
+    } else count.textContent = "";
+    tree.replaceChildren(node(null, root, ".", 0, false));
+    if (q && !state.hits.size) tree.replaceChildren(h("div", { class: "term-none" }, "Nothing matches"));
+  };
+  filter.addEventListener("input", () => ((state.open = "auto"), draw()));
+  const btn = (label, mode) => h("button", { type: "button", class: "btn", onclick: () => ((state.open = mode), (state.budget = 3000), (filter.value = ""), draw()) }, label);
+  draw();
+  return h("div", { class: "jsonv" }, h("div", { class: "tbl-tools" }, filter, count, h("span", { class: "jtools" }, btn("Expand all", "all"), btn("Collapse", "none"), copy(() => JSON.stringify(root, null, 2), "Copy JSON"))), tree);
+}
+
+// ── code ───────────────────────────────────────────────────────────────────────
+// A file's lines with numbers, highlighted bands, notes under their lines, and
+// the language coloured. A bubble has no daemon to read a file, so its spec
+// carries `text` (the VM tool sends the file's own text).
+
+export function renderCode(spec, opts = {}) {
+  // A host with the file's own text (a bubble, which has no daemon to read it)
+  // sends { text, lines, highlight, notes }: normalise that to the shape below.
+  if (spec?.text != null && spec.code == null) spec = codeFromText(spec, opts.langFor ?? langFor);
+  const load = opts.loadHighlight ?? (() => Promise.resolve(window.hljs ?? null));
+  const rows = codeLayout(spec);
+  const last = rows.at(-1)?.n || 1;
+  const body = h("div", { class: "code-body", style: `--gut:${String(last).length + 0.5}ch`, "data-rv-file": spec.path || "code", "data-rv-lang": spec.lang || "" });
+  const cells = [];
+  for (const r of rows) {
+    const lc = h("span", { class: "lc" }, r.text || "\u200b");
+    cells.push(lc);
+    body.append(h("div", { class: `cl${r.hl ? " hl" : ""}${r.tone ? " toned" : ""}`, style: r.tone ? `--tone:${toneVar(r.tone)}` : null, "data-line": r.n }, h("span", { class: "ln", "data-rv": `:${r.n}` }, String(r.n)), lc));
+    for (const n of r.notes) body.append(h("div", { class: "code-note", style: n.tone ? `--tone:${toneVar(n.tone)}` : null }, ...noteParas(n.text, h("span", { class: "at" }, lineLabel(n.from, n.to)))));
+  }
+  const shown = rows.length ? `lines ${rows[0].n}–${last} of ${spec.total}` : "";
+  const head = h("div", { class: "code-head" }, h("span", { class: "path" }, spec.path || ""), h("span", {}, rows.length === spec.total ? `${spec.total} lines` : shown), spec.lang ? h("span", { class: "ctag" }, spec.lang) : null);
+  // Highlight the whole range at once (a string or comment can span lines), then split the result back into rows.
+  if (spec.lang && !PLAIN.has(spec.lang) && String(spec.code).length <= 200000)
+    load().then((hl) => {
+      if (!hl?.getLanguage(spec.lang) || !window.DOMPurify) return;
+      try {
+        const tmp = document.createElement("code");
+        tmp.innerHTML = window.DOMPurify.sanitize(hl.highlight(String(spec.code), { language: spec.lang, ignoreIllegals: true }).value, HL_CLEAN);
+        const lines = lineNodes(tmp);
+        if (lines.length === cells.length) cells.forEach((c, i) => lines[i].length && c.replaceChildren(...lines[i]));
+      } catch {}
+    });
+  return h("div", { class: "code" }, head, body, spec.caption ? h("div", { class: "code-cap" }, inline(spec.caption)) : null);
+}
+
+/** A highlighted element's content as one list of nodes per line; a span that crosses a line break is split, so every line stands alone. */
+function lineNodes(root) {
+  const lines = [[]];
+  const walk = (node, chain) => {
+    for (const ch of node.childNodes) {
+      if (ch.nodeType === Node.TEXT_NODE) {
+        ch.textContent.split("\n").forEach((part, i) => {
+          if (i) lines.push([]);
+          if (!part) return;
+          let el = document.createTextNode(part);
+          for (let j = chain.length - 1; j >= 0; j--) {
+            const c = chain[j].cloneNode(false);
+            c.append(el);
+            el = c;
+          }
+          lines.at(-1).push(el);
+        });
+      } else if (ch.nodeType === Node.ELEMENT_NODE) walk(ch, [...chain, ch]);
+    }
+  };
+  walk(root, []);
+  return lines;
+}
+
+// ── tree ───────────────────────────────────────────────────────────────────────
+// Folders fold; a tag colours the name; a folder's row sums the tags below it.
+// Where a fold is remembered is the host's business: opts.folds reads and writes
+// one map, opts.foldKey names this tree's entry in it. A bubble passes none and
+// starts with the default (open when the tree is small).
+
+const TREE_TONE = { added: "ok", changed: "warn", deleted: "bad", renamed: "c5", moved: "c5" };
+const FOLDER_ICON = ["M1.8 4.2c0-.6.4-1 1-1h3.4l1.4 1.5h5.6c.6 0 1 .4 1 1v6.6c0 .6-.4 1-1 1H2.8c-.6 0-1-.4-1-1z"];
+const FILE_ICON = ["M4 1.8h5l3.2 3.2v9.2H4z", "M9 1.8V5h3.2"];
+
+export function renderTree(spec, opts = {}) {
+  const nodes = buildTree(spec.entries);
+  const total = spec.entries?.length || 0;
+  const folds = opts.folds ?? { read: () => ({}), write: () => {} };
+  const foldKey = opts.foldKey ?? ((path) => path);
+  const saved = folds.read();
+  const glyph = (paths) => svg("svg", { class: "ico", viewBox: "0 0 16 16", width: 13, height: 13, "aria-hidden": "true" }, ...paths.map((d) => svg("path", { d, fill: "none", stroke: "currentColor", "stroke-width": "1.3", "stroke-linejoin": "round" })));
+  const list = (kids, depth) =>
+    h(
+      "ul",
+      {},
+      kids.map((n) => {
+        const tone = TREE_TONE[n.tag];
+        const sum = n.dir ? Object.entries(n.counts || {}).map(([t, c]) => `${c} ${t}`).join(" · ") || `${n.files} file${n.files === 1 ? "" : "s"}` : "";
+        const row = h(
+          "div",
+          { class: `tr${n.dir ? " dir" : ""}${n.tag ? ` t-${n.tag}` : ""}`, title: n.path, ...(n.dir ? { role: "button", tabindex: "0" } : {}) },
+          n.dir ? h("span", { class: "caret", "aria-hidden": "true" }, "▸") : h("span", { class: "caret" }),
+          glyph(n.dir ? FOLDER_ICON : FILE_ICON),
+          h("span", { class: "nm" }, n.dir ? `${n.name}/` : n.name),
+          n.tag ? h("span", { class: "ttag", style: `--tone:${toneVar(tone)}` }, n.tag) : null,
+          n.note ? h("span", { class: "note" }, inline(n.note)) : null,
+          n.dir ? h("span", { class: "sum" }, sum) : null,
+        );
+        const li = h("li", {}, row);
+        if (n.dir) {
+          const sub = list(n.kids, depth + 1);
+          const key = foldKey(n.path);
+          const set = (open) => ((sub.hidden = !open), row.classList.toggle("open", open), row.setAttribute("aria-expanded", String(open)));
+          set(saved[key] ?? (total <= 150 || depth < 1));
+          const flip = () => {
+            const open = sub.hidden;
+            set(open);
+            folds.write({ ...folds.read(), [key]: open });
+          };
+          row.addEventListener("click", flip);
+          row.addEventListener("keydown", (e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), flip()));
+          li.append(sub);
+        }
+        return li;
+      }),
+    );
+  return h("div", { class: "tree" }, spec.root ? h("div", { class: "tree-root" }, `${spec.root}/`) : null, list(nodes, 0), spec.caption ? h("div", { class: "tree-cap" }, inline(spec.caption)) : null);
+}
+
+// ── options ────────────────────────────────────────────────────────────────────
+// Choices side by side: a letter, the label, pros and cons, scores, and a Pick
+// button whose prompt (`optionPrompt`) goes to the host: the page sends it to pi
+// (⌥-click copies), a bubble posts it back to the app.
+
+export function renderOptions(spec, opts = {}) {
+  const pick = (prompt) => (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (opts.onSend) return opts.onSend(prompt, e);
+    return copyText(prompt, opts).catch(() => {});
+  };
+  const title = opts.onSend ? "Send this choice to pi (⌥-click: copy the prompt)" : "Copy this choice";
+  const cards = (spec.options || []).map((o, i) =>
+    h(
+      "div",
+      { class: `opt${o.recommended ? " rec" : ""}` },
+      h("div", { class: "opt-hd" }, h("span", { class: "letter" }, optionLetter(i)), h("b", {}, inline(o.label)), o.recommended ? h("span", { class: "opt-badge" }, "Recommended") : null),
+      o.cost ? h("div", { class: "opt-cost" }, o.cost) : null,
+      o.summary ? h("div", {}, inline(o.summary)) : null,
+      o.pros ? h("ul", { class: "pros" }, o.pros.map((p) => h("li", {}, h("span", {}, inline(p))))) : null,
+      o.cons ? h("ul", { class: "cons" }, o.cons.map((p) => h("li", {}, h("span", {}, inline(p))))) : null,
+      o.scores
+        ? h(
+            "div",
+            { class: "opt-scores" },
+            Object.entries(o.scores).flatMap(([k, v]) => [h("span", {}, k), h("span", { class: "cbar", title: `${k}: ${v}/5` }, h("i", { style: `width:${(v / 5) * 100}%` })), h("span", {}, String(v))]),
+          )
+        : null,
+      h("div", { class: "opt-ft" }, h("button", { class: "btn", type: "button", title, onclick: pick(optionPrompt(spec, i)) }, "Pick")),
+    ),
+  );
+  return h("div", {}, spec.question ? h("div", { class: "opts-q" }, inline(spec.question)) : null, h("div", { class: "opts" }, cards), spec.caption ? h("div", { class: "opt-cap" }, inline(spec.caption)) : null);
+}
+
+// ── kanban ─────────────────────────────────────────────────────────────────────
+// Columns side by side, or stacked when the card is narrow (the side panel, a
+// phone): a container query, so the same board fits both places.
+// opts.onCard(card, column) opens the host's detail modal; opts.moves carries the
+// "new" / → column marks the host stores; opts.ownerChip(owner) links an owner
+// to its session. With no modal (a bubble), each card carries a Send instead.
+
+export function renderKanban(spec, opts = {}) {
+  const cols = spec.columns || [];
+  const boardName = spec.title || opts.title || "Board";
+  const todo = opts.section === "auto-tasks";
+  const count = (c) => (c.cards || []).length + (Number(c.more) || 0);
+  const busy = cols.some((c) => !c.compact && count(c));
+  const marks = opts.moves || {};
+  const folds = opts.folds ?? { read: () => ({}), write: () => {} };
+  const foldKey = opts.foldKey ?? ((label) => label);
+  const saved = folds.read();
+  const owner = opts.ownerChip ?? ((name) => h("span", { class: "kb-owner", "data-owner": name }, `@${name}`));
+
+  const card = (k, c) => {
+    const mv = marks[cardKey(k)];
+    const href = httpHref(k.href);
+    const prompt = () => cardPrompt(k, c.label, { todo, board: boardName });
+    // A bubble has no card modal, so the card's own Send hands it to the app.
+    const send = !opts.onCard && opts.onSend ? h("button", { class: "btn", type: "button", title: "Send this card to pi", onclick: (e) => (e.preventDefault(), e.stopPropagation(), opts.onSend(prompt(), e)) }, "Send to pi") : null;
+    const li = h(
+      "li",
+      { class: `kb-card${toneVar(k.tone) ? " toned" : ""}${mv ? " moved" : ""}`, style: toneVar(k.tone) ? `--card-tone:${toneVar(k.tone)}` : null, ...(opts.onCard ? { tabindex: "0", "aria-haspopup": "dialog" } : {}) },
+      h(
+        "div",
+        { class: "kb-title", title: c.compact ? k.title : null },
+        k.id ? h("span", { class: "kb-id" }, k.id) : null,
+        href ? h("a", { href, target: "_blank", rel: "noopener noreferrer" }, inline(k.title, false)) : inline(k.title),
+        mv ? h("span", { class: "kb-moved", title: mv === "new" ? "New since you last looked" : `Moved to ${mv} since you last looked` }, mv === "new" ? "new" : `→ ${mv}`) : null,
+      ),
+      k.note && !c.compact ? h("div", { class: "kb-note" }, inline(k.note)) : null,
+      (k.tag || k.owner || send) && !c.compact ? h("div", { class: "kb-meta" }, k.tag ? h("span", { class: `ctag${/^(ok|warn|bad)$/.test(k.tone) ? ` ${k.tone}` : ""}` }, k.tag) : null, k.owner ? owner(k.owner) : null, send) : null,
+    );
+    // A click (not on a link, not a text selection) or Enter opens the card's details.
+    if (opts.onCard) {
+      li.addEventListener("click", (e) => !e.target.closest("a, button") && !String(getSelection?.() || "") && opts.onCard(k, c));
+      li.addEventListener("keydown", (e) => {
+        if (e.target !== li || (e.key !== "Enter" && e.key !== " ")) return;
+        e.preventDefault();
+        e.stopPropagation();
+        opts.onCard(k, c);
+      });
+    }
+    return li;
+  };
+
+  const column = (c) => {
+    const n = count(c);
+    const over = c.limit && n > c.limit;
+    const key = foldKey(c.label);
+    const foldable = c.compact && n > 0;
+    const label = [foldable ? h("span", { class: "kb-chev", "aria-hidden": "true" }, "›") : null, h("span", { class: "kb-label" }, c.label), h("span", { class: "kb-n", title: c.limit ? `${n} cards, WIP limit ${c.limit}${over ? " (over)" : ""}` : `${n} cards` }, c.limit ? `${n}/${c.limit}` : String(n))];
+    // A compact column (Done) folds when nothing else is on the board, unless opened by hand.
+    const shut = foldable && (saved[key] ?? !busy);
+    const head = foldable ? h("button", { class: "kb-fold", type: "button", "aria-expanded": String(!shut) }, label) : h("header", {}, label);
+    const col = h(
+      "section",
+      { class: `kb-col${over ? " over" : ""}${n ? "" : " empty"}${c.compact ? " compact" : ""}${shut ? " folded" : ""}`, style: toneVar(c.tone) ? `--tone:${toneVar(c.tone)}` : null },
+      head,
+      n ? h("ul", { class: "kb-cards" }, (c.cards || []).map((k) => card(k, c))) : h("div", { class: "kb-empty" }, "Nothing here"),
+      c.more ? h("div", { class: "kb-more" }, `+${c.more} more`) : null,
+    );
+    if (foldable)
+      head.addEventListener("click", () => {
+        const now = !col.classList.contains("folded");
+        col.classList.toggle("folded", now);
+        head.setAttribute("aria-expanded", String(!now));
+        folds.write({ ...folds.read(), [key]: now });
+      });
+    return col;
+  };
+
+  const parts = cols.map((c) => ({ c, n: count(c) })).filter((p) => p.n);
+  const progress = spec.progress
+    ? h(
+        "div",
+        { class: "kb-progress" },
+        h("div", { class: "kb-bar", "aria-hidden": "true" }, parts.map((p) => h("i", { style: `flex:${p.n};background:${toneVar(p.c.tone) || "var(--line)"}`, title: `${p.c.label}: ${p.n}` }))),
+        h("div", { class: "kb-sum" }, parts.map((p) => `${p.n} ${p.c.label.toLowerCase()}`).join(" · ") || "Nothing on the board"),
+      )
+    : null;
+  // Empty columns shrink to a thin labelled strip when the columns sit side by side.
+  const tpl = cols.map((c) => (count(c) ? "minmax(170px, 1fr)" : "36px")).join(" ");
+  const board = h("div", { class: "kb-cols", style: `--kb-tpl:${tpl}` }, cols.map(column));
+  return h("div", { class: "kanban" }, spec.title ? h("div", { class: "kb-head" }, h("b", {}, spec.title)) : null, progress, board, spec.caption ? h("div", { class: "chart-cap" }, spec.caption) : null);
+}
+
+// ── diffs ──────────────────────────────────────────────────────────────────────
+// A patch splits into files, each a block with old and new line numbers, its
+// lines coloured by the file's extension, and the words that changed marked in
+// paired -/+ lines. The page adds a summary bar, the Unified / Split switch,
+// review comments and the modal on top; a bubble shows the blocks alone.
+
+export const DIFF_LANGS = { rb: "ruby", rake: "ruby", gemspec: "ruby", js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript", ts: "typescript", tsx: "typescript", mts: "typescript", json: "json", py: "python", rs: "rust", go: "go", sh: "bash", bash: "bash", zsh: "bash", yml: "yaml", yaml: "yaml", md: "markdown", html: "xml", erb: "xml", xml: "xml", svg: "xml", css: "css", scss: "scss", less: "less", sql: "sql", java: "java", kt: "kotlin", swift: "swift", c: "c", h: "c", cpp: "cpp", cs: "csharp", ini: "ini", toml: "ini", php: "php", lua: "lua", pl: "perl", graphql: "graphql", mk: "makefile", diff: "diff", patch: "diff" };
+
+export function langFor(path) {
+  const name = String(path || "").split("/").pop().toLowerCase();
+  if (["gemfile", "rakefile", "guardfile", "brewfile"].includes(name)) return "ruby";
+  if (name === "makefile") return "makefile";
+  return DIFF_LANGS[name.includes(".") ? name.split(".").pop() : ""] || "";
+}
+
+/** A patch as files: { from, to, path, status, binary, hunks: [{ head, rows: [{ t, a, b, text }] }], adds, dels }. */
+export function parsePatch(text) {
+  const files = [];
+  let f = null;
+  let hunk = null;
+  let remA = 0;
+  let remB = 0;
+  const start = () => {
+    f = { from: "", to: "", path: "", status: "modified", binary: false, hunks: [], adds: 0, dels: 0, minus: false };
+    files.push(f);
+    hunk = null;
+  };
+  const strip = (p) => (p === "/dev/null" ? "" : p.replace(/\t.*$/, "").replace(/^[ab]\//, ""));
+  for (const line of text.split("\n")) {
+    // Inside a hunk the header's counts say which lines belong to it, so a
+    // removed line that reads "-- x" is never taken for a file header.
+    if (hunk && (remA > 0 || remB > 0)) {
+      const c = line[0];
+      if (c === "+") (hunk.rows.push({ t: "add", b: hunk.b++, text: line.slice(1) }), f.adds++, remB--);
+      else if (c === "-") (hunk.rows.push({ t: "del", a: hunk.a++, text: line.slice(1) }), f.dels++, remA--);
+      else if (c === " " || line === "") (hunk.rows.push({ t: "ctx", a: hunk.a++, b: hunk.b++, text: line.slice(1) }), remA--, remB--);
+      else if (c === "\\") hunk.rows.push({ t: "note", text: line.slice(2) });
+      else hunk = null;
+      if (hunk) continue;
+    }
+    if (hunk && line.startsWith("\\")) {
+      hunk.rows.push({ t: "note", text: line.slice(2) });
+      continue;
+    }
+    let m;
+    if ((m = line.match(/^diff --git a\/(.+?) b\/(.+)$/))) {
+      start();
+      f.from = m[1];
+      f.to = m[2];
+    } else if (line.startsWith("--- ")) {
+      if (!f || f.hunks.length || f.minus) start();
+      f.minus = true;
+      f.from = strip(line.slice(4));
+      if (!f.from) f.status = "added";
+    } else if (line.startsWith("+++ ") && f) {
+      f.to = strip(line.slice(4));
+      if (!f.to) f.status = "deleted";
+    } else if (f && line.startsWith("new file mode")) f.status = "added";
+    else if (f && line.startsWith("deleted file mode")) f.status = "deleted";
+    else if (f && line.startsWith("rename from ")) (f.status = "renamed"), (f.from = line.slice(12));
+    else if (f && line.startsWith("rename to ")) (f.status = "renamed"), (f.to = line.slice(10));
+    else if (line.startsWith("Binary files ")) {
+      if (!f) start();
+      f.binary = true;
+    } else if ((m = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/))) {
+      if (!f) start();
+      hunk = { head: line, a: Number(m[1]), b: Number(m[3]), rows: [] };
+      f.hunks.push(hunk);
+      remA = m[2] === undefined ? 1 : Number(m[2]);
+      remB = m[4] === undefined ? 1 : Number(m[4]);
+    }
+  }
+  for (const x of files) x.path = x.to || x.from;
+  return files.filter((x) => x.hunks.length || x.binary || x.status !== "modified");
+}
+
+const wordTokens = (s) => s.match(/\w+|\s+|[^\w\s]/g) || [];
+
+/** The changed character ranges of a and b (LCS over words), or null when too long or too different to help. */
+export function wordRanges(a, b) {
+  const x = wordTokens(a);
+  const y = wordTokens(b);
+  if (!x.length || !y.length || x.length * y.length > 40000) return null;
+  const n = x.length;
+  const m = y.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i][j] = x[i] === y[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const ra = [];
+  const rb = [];
+  let i = 0;
+  let j = 0;
+  let pa = 0;
+  let pb = 0;
+  let same = 0;
+  const add = (r, s, e) => (r.length && r[r.length - 1][1] === s ? (r[r.length - 1][1] = e) : r.push([s, e]));
+  while (i < n || j < m) {
+    if (i < n && j < m && x[i] === y[j]) {
+      same += x[i].length;
+      pa += x[i++].length;
+      pb += y[j++].length;
+    } else if (j < m && (i >= n || dp[i][j + 1] >= dp[i + 1][j])) {
+      add(rb, pb, (pb += y[j++].length));
+    } else {
+      add(ra, pa, (pa += x[i++].length));
+    }
+  }
+  // Mostly rewritten lines read better whole than speckled with marks.
+  if (same < 0.4 * Math.max(a.length, b.length)) return null;
+  return [ra, rb];
+}
+
+/** Wrap character ranges of el's text in <mark>, across any highlight spans. */
+export function markRanges(el, ranges) {
+  if (!ranges?.length) return;
+  const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  for (let n; (n = walk.nextNode()); ) nodes.push(n);
+  let pos = 0;
+  for (const node of nodes) {
+    const start = pos;
+    const end = (pos += node.data.length);
+    const cuts = ranges.filter(([s, e]) => s < end && e > start).map(([s, e]) => [Math.max(s, start) - start, Math.min(e, end) - start]);
+    if (!cuts.length) continue;
+    const frag = document.createDocumentFragment();
+    let at = 0;
+    for (const [s, e] of cuts) {
+      if (s > at) frag.append(node.data.slice(at, s));
+      frag.append(h("mark", {}, node.data.slice(s, e)));
+      at = e;
+    }
+    if (at < node.data.length) frag.append(node.data.slice(at));
+    node.replaceWith(frag);
+  }
+}
+
+function codeCell(row, hl, lang, ranges) {
+  const td = h("td", { class: "code" });
+  if (!row) return (td.classList.add("blank"), td);
+  let html = null;
+  if (hl && lang && row.t !== "note" && row.text.length <= 2000 && window.DOMPurify) {
+    try {
+      html = window.DOMPurify.sanitize(hl.highlight(row.text, { language: lang, ignoreIllegals: true }).value, HL_CLEAN);
+    } catch {}
+  }
+  if (html != null) td.innerHTML = html;
+  else td.textContent = row.text;
+  markRanges(td, ranges);
+  return td;
+}
+
+/** Each del paired with the add at the same place in its change block: Map row -> ranges. */
+export function pairWords(rows) {
+  const marks = new Map();
+  for (let i = 0; i < rows.length; ) {
+    if (rows[i].t !== "del" && rows[i].t !== "add") {
+      i++;
+      continue;
+    }
+    const dels = [];
+    const adds = [];
+    while (i < rows.length && rows[i].t === "del") dels.push(rows[i++]);
+    while (i < rows.length && rows[i].t === "add") adds.push(rows[i++]);
+    for (let k = 0; k < Math.min(dels.length, adds.length); k++) {
+      const r = wordRanges(dels[k].text, adds[k].text);
+      if (r) (marks.set(dels[k], r[0]), marks.set(adds[k], r[1]));
+    }
+  }
+  return marks;
+}
+
+export function hunkRows(hunk, split, hl, lang) {
+  const marks = pairWords(hunk.rows);
+  const out = [h("tr", { class: "hunk" }, h("td", { colspan: split ? 4 : 3 }, hunk.head))];
+  // A gutter cell that takes review comments carries data-rv="side:n".
+  const ln = (n, side) => h("td", { class: "ln", ...(side && n != null ? { "data-rv": `${side}:${n}` } : {}) }, n ?? "");
+  if (!split) {
+    // Unified: one commentable cell per row, the new line's (the old one's for a deletion).
+    for (const r of hunk.rows) out.push(h("tr", { class: r.t }, ln(r.a, r.t === "del" ? "old" : null), ln(r.b, r.t === "add" || r.t === "ctx" ? "new" : null), codeCell(r, hl, lang, marks.get(r))));
+    return out;
+  }
+  const rows = hunk.rows;
+  for (let i = 0; i < rows.length; ) {
+    const r = rows[i];
+    if (r.t === "ctx" || r.t === "note") {
+      const side = r.t === "ctx";
+      out.push(h("tr", { class: r.t }, ln(r.a, side && "old"), codeCell(r, hl, lang), ln(r.b, side && "new"), codeCell(r, hl, lang)));
+      i++;
+      continue;
+    }
+    const dels = [];
+    const adds = [];
+    while (i < rows.length && rows[i].t === "del") dels.push(rows[i++]);
+    while (i < rows.length && rows[i].t === "add") adds.push(rows[i++]);
+    for (let k = 0; k < Math.max(dels.length, adds.length); k++) {
+      const d = dels[k];
+      const a = adds[k];
+      out.push(h("tr", { class: "pair" }, ln(d?.a, d && "old"), codeCell(d, hl, lang, marks.get(d)), ln(a?.b, a && "new"), codeCell(a, hl, lang, marks.get(a))));
+      const tr = out[out.length - 1];
+      if (d) (tr.children[0].classList.add("del"), tr.children[1].classList.add("del"));
+      if (a) (tr.children[2].classList.add("add"), tr.children[3].classList.add("add"));
+    }
+  }
+  return out;
+}
+
+/** A file bigger than this opens on a click: a 200 KB hunk would stall the page. */
+export const BIG_FILE = 1500;
+export const STATUS = { added: "new", deleted: "deleted", renamed: "renamed" };
+export const counts = (adds, dels) => [h("span", { class: "n-add" }, `+${adds}`), " ", h("span", { class: "n-del" }, `\u2212${dels}`)];
+
+/**
+ * One file's block: a collapsible header (path, status, counts) and its body.
+ * onBody(body) runs after every fill, so the page can put review comments back
+ * on a redraw; a bubble passes none.
+ */
+export function diffBlock(f, { split = false, hl = null, showHead = true, onBody = null } = {}) {
+  const lang = langFor(f.path);
+  const lines = f.hunks.reduce((n, x) => n + x.rows.length, 0);
+  const body = h("div", { class: "dv-body", "data-rv-file": f.path, "data-rv-lang": "diff" });
+  const fill = () => {
+    if (f.binary) return body.replaceChildren(h("div", { class: "empty" }, "Binary file changed."));
+    if (!f.hunks.length) return body.replaceChildren(h("div", { class: "empty" }, f.status === "renamed" ? "Renamed without changes." : "No content changes."));
+    body.replaceChildren(h("table", { class: `diff${split ? " split" : ""}` }, split ? h("colgroup", {}, h("col", { class: "c-ln" }), h("col"), h("col", { class: "c-ln" }), h("col")) : null, h("tbody", {}, f.hunks.flatMap((x) => hunkRows(x, split, hl, lang)))));
+    if (onBody) queueMicrotask(() => onBody(body)); // a redraw (Split / Unified, Show this diff) brings the comments back
+  };
+  if (lines > BIG_FILE && !f.loaded) body.append(h("button", { class: "btn dv-load", type: "button", onclick: () => ((f.loaded = true), fill()) }, `Show this diff (${lines} lines)`));
+  else fill();
+  if (!showHead) return h("section", { class: "dv-file bare" }, body);
+  const block = h("section", { class: `dv-file${f.shut ? " shut" : ""}` });
+  const head = h(
+    "header",
+    { title: f.shut ? "Expand" : "Collapse" },
+    h("button", { class: "chev", type: "button", "aria-label": "Toggle file" }),
+    h("span", { class: "dv-path" }, f.status === "renamed" && f.from !== f.to ? `${f.from} \u2192 ${f.to}` : f.path),
+    STATUS[f.status] ? h("span", { class: `dv-status ${f.status}` }, STATUS[f.status]) : null,
+    h("span", { class: "dv-n" }, f.binary ? "binary" : counts(f.adds, f.dels)),
+  );
+  head.addEventListener("click", () => {
+    f.shut = !f.shut;
+    block.classList.toggle("shut", f.shut);
+  });
+  block.append(head, body);
+  return block;
+}
+
+/** The file list above several blocks: each entry opens its file and scrolls to it. (null for one file.) */
+export function diffFileList(files, blocks) {
+  if (files.length < 2) return null;
+  return h(
+    "ol",
+    { class: "dv-files" },
+    files.map((f, i) =>
+      h(
+        "li",
+        {},
+        h(
+          "a",
+          {
+            href: "#",
+            onclick: (e) => {
+              e.preventDefault();
+              if (f.shut) blocks[i].querySelector("header").click();
+              blocks[i].scrollIntoView({ behavior: "smooth", block: "start" });
+            },
+          },
+          f.path,
+        ),
+        STATUS[f.status] ? h("span", { class: `dv-status ${f.status}` }, STATUS[f.status]) : null,
+        h("span", { class: "dv-n" }, f.binary ? "binary" : counts(f.adds, f.dels)),
+      ),
+    ),
+  );
+}
+
+/** A patch as unified file blocks and, for several files, the list above them. */
+export function renderDiff(text, opts = {}) {
+  const files = parsePatch(text);
+  if (!files.length) return h("div", { class: "empty" }, text.trim() ? "No file changes in this patch." : "No changes in this patch.");
+  const hl = opts.hl !== undefined ? opts.hl : files.some((f) => langFor(f.path)) ? (window.hljs ?? null) : null;
+  const blocks = files.map((f) => diffBlock(f, { split: !!opts.split, hl, showHead: opts.showHead ?? files.length > 1, onBody: opts.onBody }));
+  return h("div", { class: `diffview${opts.inModal ? " in-modal" : ""}` }, diffFileList(files, blocks) ?? "", ...blocks);
+}
+
+// ── mermaid ────────────────────────────────────────────────────────────────────
+// Diagram source drawn by mermaid, which the host loads lazily (opts.loadMermaid)
+// and configures itself: the page re-themes it, a bubble has one theme. A host
+// that has no `loadMermaid` (so window.mermaid is already there) must have called
+// mermaid.initialize({ securityLevel: "strict", startOnLoad: false }) first: strict
+// is what refuses scripts and HTML labels. Even then the drawn SVG is mermaid's,
+// not ours, so any non-data image it carries loses its href before it goes in.
+
+let mermaidSeq = 0;
+
+export async function renderMermaid(el, source, opts = {}) {
+  const loadMermaid = opts.loadMermaid ?? (() => Promise.resolve(window.mermaid));
+  // Not "mermaid": mermaid's own startOnLoad scans for that class when its
+  // script loads and would empty this box before render() fills it.
+  el.classList.add("mmd");
+  el._src = source; // kept so a theme change can draw it again
+  try {
+    const mermaid = await loadMermaid();
+    const { svg: drawn } = await mermaid.render(`mmd-${++mermaidSeq}`, source);
+    el.innerHTML = drawn;
+    for (const n of el.querySelectorAll("img, image"))
+      for (const a of ["href", "xlink:href", "src"]) {
+        const v = n.getAttribute(a);
+        if (v != null && !DATA_IMG.test(v.trim())) n.removeAttribute(a);
+      }
+  } catch (e) {
+    el.replaceChildren(h("div", { class: "err" }, `mermaid: ${e.message || e}`), h("pre", {}, source));
+  }
 }

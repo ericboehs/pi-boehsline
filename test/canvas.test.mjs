@@ -908,6 +908,16 @@ test("withKit puts the kit and frame script at the top of the head, unless the p
   assert.match(off, /<script>[\s\S]*canvasFrame/, "the frame script stays, so the frame still sizes");
 });
 
+test("the page links render.css before its own <style>", () => {
+  const daemon = readFileSync(new URL("../extensions/canvas/daemon.mjs", import.meta.url), "utf8");
+  const page = readFileSync(new URL("../extensions/canvas/page.mjs", import.meta.url), "utf8");
+  const link = daemon.indexOf('<link rel="stylesheet" href="/assets/render.css">');
+  assert.ok(link > 0, "the shell links the renderers' stylesheet");
+  assert.ok(link < daemon.indexOf('<script src="/assets/page.mjs"'), "before the page module runs");
+  // The page appends its own rules to <head> while that module runs, so the link comes first.
+  assert.match(page, /const style = document\.createElement\("style"\);\nstyle\.textContent = CSS;\ndocument\.head\.append\(style\);/);
+});
+
 test("checkChart accepts good specs and explains bad ones", () => {
   const ok = (s) => assert.equal(checkChart(JSON.stringify(s)), "");
   ok({ type: "bar", labels: ["a", "b"], series: [{ name: "x", data: [1, null] }] });
@@ -1205,6 +1215,12 @@ test("daemon serves pages, state and sections, and refuses bad hosts and paths",
     assert.equal(pdf.headers["content-type"], "application/pdf");
     assert.match(pdf.headers["content-security-policy"], /connect-src 'none'/, "a pdf gets the section CSP");
     for (const a of ["page.mjs", "render.mjs", "theme.mjs", "nav.mjs", "theme-boot.js"]) assert.equal((await get(port, `/assets/${a}`)).headers["content-type"], "text/javascript; charset=utf-8", a);
+    const renderCss = await get(port, "/assets/render.css");
+    assert.equal(renderCss.headers["content-type"], "text/css; charset=utf-8", "the renderers' stylesheet");
+    assert.match(renderCss.body, /\.kb-card/, "it carries the kanban rules");
+    assert.match(renderCss.body, /^\.chev\b/m, "and the base rules the renderers' own markup needs, not just page chrome");
+    assert.match(renderCss.body, /^\.btn\b/m);
+    assert.match(page.body, /<link rel="stylesheet" href="\/assets\/render\.css">/, "the page links it before its own style");
     assert.ok(Object.keys(JSON.parse((await get(port, "/assets/themes.json")).body).themes).length >= 20, "Omarchy themes are served");
     assert.match(page.body, /<script src="\/assets\/theme-boot\.js"><\/script>[\s\S]*page\.mjs/, "the theme boot script runs before the page module");
     assert.match(sec.body, /canvasTheme/, "html frames listen for the theme");

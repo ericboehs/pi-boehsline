@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { asQuote, boardMarks, boardMoves, boardSnapshot, cardPrompt, dismissPipe, pipeStripHidden, slackText, fuzzyScore, inlineTokens, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, ownerSession, pipeRows, placeBefore, placeTrackers, trackerTone, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions, wrapLabel, buildTree, codeLayout, lineLabel, optionPrompt, optionsText, treeText, fenceFor, reviewLabel, reviewMessage, fmtBytes, fmtCount, gitSummary, infoRows, uniichatSummary } from "../extensions/canvas/nav.mjs";
+import { asQuote, boardMarks, boardMoves, boardSnapshot, cardPrompt, dismissPipe, pipeStripHidden, slackText, fuzzyScore, inlineTokens, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, ownerSession, pipeRows, placeBefore, placeTrackers, trackerTone, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions, wrapLabel, buildTree, codeFromText, codeLayout, lineLabel, optionPrompt, optionsText, treeText, fenceFor, reviewLabel, reviewMessage, fmtBytes, fmtCount, gitSummary, infoRows, uniichatSummary } from "../extensions/canvas/nav.mjs";
 import { mix, prettyName, readPair, readPrefs, swatch, systemTheme, themeDefault, themeMode, themeVars } from "../extensions/canvas/theme.mjs";
 import { parseColors } from "../extensions/canvas/build-themes.mjs";
 
@@ -361,6 +361,25 @@ test("codeLayout numbers lines and places bands and callouts", () => {
   assert.equal(codeLayout({ code: "" }).length, 1);
   assert.equal(lineLabel(4, 4), "L4");
   assert.equal(lineLabel(4, 9), "L4–9");
+});
+
+test("codeFromText turns a text body into the renderer's code spec", () => {
+  const text = Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\r\n");
+  const spec = codeFromText({ path: "a.ts", text, lines: "40-45", highlight: ["42", "nope"], notes: [{ lines: "43-44", text: "n", tone: "warn" }, { lines: "1", text: "out" }], caption: "c" });
+  assert.equal(spec.start, 40);
+  assert.equal(spec.total, 60);
+  assert.deepEqual(spec.code.split("\n"), ["line 40", "line 41", "line 42", "line 43", "line 44", "line 45"]);
+  assert.deepEqual(spec.highlight, [[42, 42]], "only real ranges");
+  assert.deepEqual(spec.notes, [
+    { from: 43, to: 44, text: "n", tone: "warn" },
+    { from: 1, to: 1, text: "out" },
+  ]);
+  assert.equal(spec.caption, "c");
+  assert.equal(spec.lang, undefined, "the tool's map is not here");
+  assert.equal(codeFromText({ text, lines: "58-90" }).code.split("\n").at(-1), "line 60", "a range past the end is clamped");
+  assert.equal(codeFromText({ text, lang: "Ruby" }).lang, "ruby");
+  assert.equal(codeFromText({ path: "Gemfile", text: "x" }, (p) => (p === "Gemfile" ? "ruby" : "")).lang, "ruby", "the host's langFor");
+  assert.deepEqual(codeFromText({ text: "" }), { path: "", start: 1, total: 1, code: "", highlight: [], notes: [] });
 });
 
 test("buildTree nests paths, folders first, merges lone folders and counts tags", () => {
