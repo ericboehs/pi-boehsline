@@ -112,8 +112,13 @@ the three. Its Usage condition hides the chip by pace in any mode: `unless on
 pace` (within ±5), `when > 10 ahead`, `when > 20 ahead`. A limit or an
 unreadable format always shows. Usage pace `on` adds each window's pace after its %:
 `↓8` is 8 points ahead (slow down), `↑12` is 12 behind (speed up), nothing
-within ±5, on the same colour ladders (`4%↑66/22%↓8`, `61.4%↓8 4.3%/d`); mini
-then shows `↓8` instead of `↓`. Copilot's `4.3%/d` is the share left per
+within ±5, on the same colour ladders (`4%↑66h/22%↓8w`, `61.4%↓8 4.3%/d`);
+mini then shows `↓8` instead of `↓`. When a provider has more than one window
+the mark also names the window's span — `h` under a day (the 5h), `d` under a
+week, `w` under a month (the weekly), `m` beyond — so `↓6w` is 6 points ahead
+of the weekly window; single-window chips (Copilot, Grok, Cerebras) stay bare.
+In mini the letter rides the bare arrow too (`↓w`), since there are no window
+labels around it. Copilot's `4.3%/d` is the share left per
 remaining workday, not pace.
 
 The Token rate chip's Rate condition (`after 2s`, `5s`, `10s`, `30s`) shows it

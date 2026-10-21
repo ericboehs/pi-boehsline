@@ -1144,7 +1144,13 @@ test("/footer's Copilot OOO row sits under Rate limits, emits the change and sav
 });
 
 test("usagePace: a limit wins, then the most-ahead window; anything unreadable is unknown", () => {
-  assert.deepEqual(usagePace("1.0/5H: 4% 3.5/7D: 70%"), { worst: 70 - 50 });
+  assert.deepEqual(usagePace("1.0/5H: 4% 3.5/7D: 70%"), { worst: 70 - 50, letter: "w" });
+  // The letter names the worst window's span: h under a day, d under a week,
+  // w under a month, m beyond (opencode's 5h/7d/1m → h/w/m).
+  assert.deepEqual(usagePace("1.0/5H: 30% 3.5/7D: 20%"), { worst: 10, letter: "h" });
+  assert.deepEqual(usagePace("0.5/1D: 90% 1/7D: 20%"), { worst: 40, letter: "d" });
+  // One window (Copilot, Grok, Cerebras): nothing to tell apart, no letter.
+  assert.deepEqual(usagePace("3.5/7D: 55%"), { worst: 55 - 50 });
   assert.ok(Math.abs(usagePace("12.1/20.2W: 61.4% ↓4.3%/d").worst - (61.4 - (12.1 / 20.2) * 100)) < 1e-9);
   assert.deepEqual(usagePace("1.0/5H: 4% 3.5/7D: 100% ↻2h"), { limit: true });
   assert.deepEqual(usagePace("$1.20 (11%)"), { unknown: true });
@@ -1181,7 +1187,7 @@ test("mini: ↓ on the slow-down ladder, ↑ on a green one, nothing on pace", (
   assert.equal(renderMiniUsage(chip(42)), "\x1b[32m↑\x1b[39m", ">5 behind: green");
   assert.equal(renderMiniUsage(chip(35)), "\x1b[92m↑\x1b[39m", ">10 behind: bright green");
   assert.equal(renderMiniUsage(chip(20)), "\x1b[1;92m↑\x1b[22;39m", ">20 behind: bold green");
-  assert.equal(renderMiniUsage("1.0/5H: 30% 3.5/7D: 20%"), "\x1b[33m↓\x1b[39m", "worst window: 5h is 10 ahead, so slow down despite the week being 30 behind");
+  assert.equal(renderMiniUsage("1.0/5H: 30% 3.5/7D: 20%"), "\x1b[33m↓h\x1b[39m", "worst window: 5h is 10 ahead, so slow down despite the week being 30 behind — and the letter names it");
   assert.equal(renderMiniUsage("$1.20 (11%)"), undefined, "unreadable: the caller falls back to compact");
 });
 
@@ -1225,6 +1231,9 @@ test("paceMark: ↓N ahead, ↑N behind, rounded, colored on the two ladders, no
   assert.equal(paceMark(-12.4), "\x1b[92m↑12\x1b[39m");
   assert.equal(paceMark(-30), "\x1b[1;92m↑30\x1b[22;39m");
   assert.equal(paceMark(8, false), "\x1b[33m↓\x1b[39m", "without points: the bare arrow");
+  assert.equal(paceMark(7.6, true, "w"), "\x1b[33m↓8w\x1b[39m", "the letter names the window's span");
+  assert.equal(paceMark(-12.4, true, "m"), "\x1b[92m↑12m\x1b[39m");
+  assert.equal(paceMark(8, false, "h"), "\x1b[33m↓h\x1b[39m", "the bare arrow still carries the letter");
 });
 
 test("Usage pace on: each window's mark follows its %, in compact, detailed and mini", async () => {
@@ -1237,9 +1246,9 @@ test("Usage pace on: each window's mark follows its %, in compact, detailed and 
 
     writeFileSync(path.join(dir, "footer.json"), JSON.stringify({ usagePace: "on" }));
     let ui = await mount({ statuses: codex });
-    assert.match(ui.plain()[0], / 4%↑66\/22%↓8$/, "compact, per window");
-    assert.match(ui.raw()[0], /\x1b\[1;92m↑66\x1b\[22;39m/, "66 behind: bold green");
-    assert.match(ui.raw()[0], /\x1b\[33m22%\x1b\[39m\x1b\[33m↓8\x1b\[39m/, "the % keeps its pace color, the mark its own");
+    assert.match(ui.plain()[0], / 4%↑66h\/22%↓8w$/, "compact, per window, each naming its span");
+    assert.match(ui.raw()[0], /\x1b\[1;92m↑66h\x1b\[22;39m/, "66 behind: bold green");
+    assert.match(ui.raw()[0], /\x1b\[33m22%\x1b\[39m\x1b\[33m↓8w\x1b\[39m/, "the % keeps its pace color, the mark its own");
     ui = await mount({ statuses: copilot });
     assert.match(ui.plain()[0], / 75%↓15 1\.2%\/d$/, "Copilot: the mark sits after the %, before the allowance");
     ui = await mount({ statuses: onPace });
@@ -1247,7 +1256,7 @@ test("Usage pace on: each window's mark follows its %, in compact, detailed and 
 
     writeFileSync(path.join(dir, "footer.json"), JSON.stringify({ usagePace: "on", modes: { usage: "detailed" } }));
     ui = await mount({ statuses: codex });
-    assert.match(ui.plain()[0], / 3\.5\/5H: 4%↑66 1\/7D: 22%↓8$/, "detailed, per window");
+    assert.match(ui.plain()[0], / 3\.5\/5H: 4%↑66h 1\/7D: 22%↓8w$/, "detailed, per window");
 
     writeFileSync(path.join(dir, "footer.json"), JSON.stringify({ usagePace: "on", modes: { usage: "mini" } }));
     ui = await mount({ statuses: copilot });
@@ -1279,7 +1288,7 @@ test("provider usage defaults compact and cycles to long, mini and back", async 
 
   assert.deepEqual(ui.click(line.indexOf("3.5/5H") + 1, 0), { handled: true });
   line = ui.plain()[0];
-  assert.match(line, / ↓$/, "mini: the week is ~8 ahead");
+  assert.match(line, / ↓w$/, "mini: the week is ~8 ahead, and the letter says so");
 
   assert.deepEqual(ui.click(line.lastIndexOf("↓"), 0), { handled: true });
   assert.match(ui.plain()[0], /4%\/22%$/);
