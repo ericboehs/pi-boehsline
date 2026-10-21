@@ -1,7 +1,7 @@
 /**
- * All usage/quota chips in one extension: codex, copilot, grok,
- * claude-bridge, claude (pi's Anthropic OAuth), cerebras, opencode-go (status-line windows) and baseten, openrouter,
- * ollama (cost-slot chips).
+ * All usage/quota chips in one extension: codex, copilot, grok, claude (pi's
+ * Anthropic OAuth), cerebras, opencode-go (status-line windows) and baseten,
+ * openrouter, ollama (cost-slot chips).
  *
  * Each provider is a Driver: a provider gate, a fetch, and a display mode.
  * The display mode decides where the value lands:
@@ -27,7 +27,6 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { spawn } from "node:child_process";
 import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -175,6 +174,10 @@ interface Driver {
   /** Log prefix, e.g. "[codex-window] usage fetch failed". */
   id: string;
   provider: string;
+  /** Shared-cache variant when the chip's value varies by model (claude
+   *  filters its weekly meters to the model's family): sessions on different
+   *  variants must not adopt each other's entries. */
+  cacheVariant?: (ctx: ExtensionContext) => string | undefined;
   statusKey?: string;
   stashKey?: string;
   updateEvent?: string;
@@ -191,6 +194,9 @@ interface Driver {
 interface DriverState {
   generation: number;
   last: UsageDisplay | undefined;
+  /** Which cache variant `last` is from, so a variant switch (claude family)
+   *  retires the in-memory value instead of serving the old family's windows. */
+  lastCacheKey?: string;
   lastFetchMs: number;
   lastFailureMs: number;
   rateLimited: boolean;
@@ -206,6 +212,19 @@ function stateFor(driver: Driver): DriverState {
     states.set(driver.id, state);
   }
   return state;
+}
+
+/** The shared-cache key: the driver id, plus a variant when the chip varies by
+ *  model (claude's family filter), so a session never adopts another family's
+ *  weekly windows. */
+function cacheKeyFor(driver: Driver, ctx: ExtensionContext): string {
+  try {
+    const variant = driver.cacheVariant?.(ctx);
+    return variant ? `${driver.id}:${variant}` : driver.id;
+  } catch (err) {
+    if (isStaleCtxError(err)) throw err;
+    return driver.id;
+  }
 }
 
 // ---------- shared helpers ----------
@@ -562,20 +581,14 @@ async function fetchCodex(ctx: ExtensionContext): Promise<UsageDisplay> {
   return { value, commandText: `${value}\nResets: ${resetSummary}` };
 }
 
-// ---------- claude-bridge ----------
+// ---------- claude ----------
 
 const USAGE_URL_CLAUDE = "https://api.anthropic.com/api/oauth/usage";
-// The endpoint rate-limits per OAuth token, and a non-claude-code User-Agent
-// lands in an aggressively-429'd bucket; ~180s is the community-established
-// safe cadence, so no point polling faster than that.
-const CLAUDE_USAGE_CACHE_TTL_MS = 180_000;
 // pi's own Anthropic login refreshes on the 2-minute poll. fetchedAt is
 // stamped when the response lands, so a TTL of exactly POLL_INTERVAL_MS would
 // still read as cached on the next tick (120s minus the request latency) and
 // slip to every other tick; 110s leaves room for the 10s request timeout.
 const CLAUDE_WINDOW_CACHE_TTL_MS = 110_000;
-const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
-const CLAUDE_CREDENTIALS_FILE = join(homedir(), ".claude", ".credentials.json");
 const FIVE_HOURS_SECONDS = 5 * 3_600;
 const SEVEN_DAYS_SECONDS = 7 * 86_400;
 
@@ -584,11 +597,29 @@ interface ClaudeUsageWindow {
   resets_at?: string | null;
 }
 
+/** One meter in `/api/oauth/usage`'s `limits[]`: the same numbers as the
+ *  per-family windows, plus an explicit span and which meter is being enforced.
+ *
+ *  `is_active` is NOT "has usage": Anthropic reports `weekly_all` with
+ *  `is_active: false` while it still carries 33% of used quota, alongside an
+ *  active `session` meter. It flags the window currently being enforced, so it
+ *  must never gate rendering — only a missing reset does that. */
+interface ClaudeLimit {
+  kind?: string;
+  group?: string;
+  percent?: number;
+  severity?: string;
+  resets_at?: string | null;
+  scope?: string | null;
+  is_active?: boolean;
+}
+
 interface ClaudeUsageResponse {
   five_hour?: ClaudeUsageWindow | null;
   seven_day?: ClaudeUsageWindow | null;
   seven_day_opus?: ClaudeUsageWindow | null;
   seven_day_sonnet?: ClaudeUsageWindow | null;
+  limits?: ClaudeLimit[] | null;
   extra_usage?: {
     is_enabled?: boolean;
     monthly_limit?: number | null;
@@ -597,75 +628,14 @@ interface ClaudeUsageResponse {
   } | null;
 }
 
-interface ClaudeOauthBlob {
-  claudeAiOauth?: {
-    accessToken?: string;
-    /** Epoch ms; the CLI refreshes hourly, we never refresh ourselves. */
-    expiresAt?: number;
-  };
-}
-
-/** macOS Keychain generic-password lookup (`security` is darwin-only). */
-function keychainPassword(service: string): Promise<string | undefined> {
-  return new Promise((resolve) => {
-    let out = "";
-    try {
-      const child = spawn("security", ["find-generic-password", "-s", service, "-w"], {
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      child.stdout.on("data", (chunk) => (out += chunk));
-      child.on("error", () => resolve(undefined));
-      child.on("close", (code) => resolve(code === 0 && out.trim() ? out.trim() : undefined));
-    } catch {
-      resolve(undefined);
-    }
-  });
-}
-
-/** Claude Code's OAuth token, from where the CLI itself keeps it: an env
- *  override, the macOS Keychain, then ~/.claude/.credentials.json. Access
- *  tokens expire hourly and only the running CLI refreshes them, so an all-
- *  expired result is surfaced (the 401 path explains the fix) rather than
- *  refreshed here. */
-async function claudeOauthToken(): Promise<string | undefined> {
-  const fromEnv = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-  if (fromEnv) return fromEnv;
-
-  const blobs: string[] = [];
-  if (process.platform === "darwin") {
-    const fromKeychain = await keychainPassword(CLAUDE_KEYCHAIN_SERVICE);
-    if (fromKeychain) blobs.push(fromKeychain);
-  }
-  try {
-    blobs.push(await readFile(CLAUDE_CREDENTIALS_FILE, "utf8"));
-  } catch {
-    // No file credential; the Keychain result (if any) stands alone.
-  }
-
-  let unexpired: string | undefined;
-  let expired: string | undefined;
-  for (const blob of blobs) {
-    try {
-      const oauth = (JSON.parse(blob) as ClaudeOauthBlob).claudeAiOauth;
-      const token = oauth?.accessToken;
-      if (!token) continue;
-      // 60s buffer for clock skew; a missing expiresAt is trusted (401 catches liars).
-      if (typeof oauth.expiresAt === "number" && oauth.expiresAt <= Date.now() + 60_000) {
-        expired ??= token;
-      } else {
-        unexpired = token;
-        break;
-      }
-    } catch {
-      // Corrupt blob; try the next source.
-    }
-  }
-  return unexpired ?? expired;
-}
-
 /** Map an /api/oauth/usage window onto the generic UsageWindow shape so the
  *  codex formatters (pace warnings, ↻-at-limit, elapsed/total labels) apply
- *  unchanged: both scales are 0–100 with an ISO reset and a fixed span. */
+ *  unchanged: both scales are 0–100 with an ISO reset and a fixed span.
+ *
+ *  Anthropic nulls `resets_at` for an idle window (`five_hour` at 0%, which
+ *  happens until you use Claude in a session). Without a reset there is no
+ *  elapsed/total or reset to show, so the window is dropped here: the 5h chip
+ *  is absent until you use Claude again, not missing from the response. */
 function claudeWindowToUsageWindow(
   window: ClaudeUsageWindow | null | undefined,
   limitSeconds: number,
@@ -680,17 +650,125 @@ function claudeWindowToUsageWindow(
   };
 }
 
-async function fetchClaudeBridge(_ctx: ExtensionContext): Promise<UsageDisplay> {
-  const token = await claudeOauthToken();
-  if (!token) {
-    throw new Error(
-      "no Claude Code OAuth credential (Keychain, ~/.claude/.credentials.json, or CLAUDE_CODE_OAUTH_TOKEN)",
+/** A paced window plus the name the detail block gives it. */
+interface ClaudeWindow {
+  window: UsageWindow;
+  label: string;
+  severity?: string;
+}
+
+const CLAUDE_LIMIT_KINDS: Record<string, { spanSeconds: number; label: string }> = {
+  session: { spanSeconds: FIVE_HOURS_SECONDS, label: "5h session" },
+  weekly_all: { spanSeconds: SEVEN_DAYS_SECONDS, label: "Weekly (all models)" },
+  weekly_opus: { spanSeconds: SEVEN_DAYS_SECONDS, label: "Weekly Opus" },
+  weekly_sonnet: { spanSeconds: SEVEN_DAYS_SECONDS, label: "Weekly Sonnet" },
+};
+
+/** Span and label for a limit, falling back to its group for kinds we have not
+ *  seen yet (Anthropic adds meters without notice: `seven_day_cowork`, etc.). */
+function claudeLimitSpan(limit: ClaudeLimit): { spanSeconds: number; label: string } {
+  const known = CLAUDE_LIMIT_KINDS[limit.kind ?? ""];
+  if (known) return known;
+  const spanSeconds = limit.group === "weekly" ? SEVEN_DAYS_SECONDS : FIVE_HOURS_SECONDS;
+  const name = (limit.kind ?? limit.scope ?? "limit").replace(/_/g, " ");
+  return { spanSeconds, label: limit.scope && limit.kind ? `${name} (${limit.scope})` : name };
+}
+
+/** The `limits[]` meters as paced windows. A meter with no reset cannot be
+ *  paced (nothing to show elapsed/total against), which is the only reason one
+ *  is skipped: an unused meter reports `percent: 0` with `resets_at: null`. */
+export function claudeLimitWindows(limits: readonly ClaudeLimit[]): ClaudeWindow[] {
+  const windows: ClaudeWindow[] = [];
+  for (const limit of limits) {
+    if (typeof limit.percent !== "number" || !limit.resets_at) continue;
+    const resetMs = Date.parse(limit.resets_at);
+    if (!Number.isFinite(resetMs)) continue;
+    const { spanSeconds, label } = claudeLimitSpan(limit);
+    windows.push({
+      label,
+      ...(limit.severity !== undefined && limit.severity !== "normal" ? { severity: limit.severity } : {}),
+      window: {
+        used_percent: limit.percent,
+        reset_at: Math.floor(resetMs / 1000),
+        limit_window_seconds: spanSeconds,
+      },
+    });
+  }
+  return windows;
+}
+
+/** The model family of an Anthropic model id, for the chip's weekly window. */
+export function claudeModelFamily(modelId: string | undefined): string | undefined {
+  const id = modelId?.toLowerCase();
+  if (!id) return undefined;
+  for (const family of ["opus", "sonnet", "haiku"] as const) {
+    if (id.includes(family)) return family;
+  }
+  return undefined;
+}
+
+/** The chip's windows for the model in use: the 5h session plus the weekly
+ *  meter of that model's family. Without a family meter in the response —
+ *  Pro's single weekly_all, or the family's window idle (no reset) — every
+ *  meter stays. The /command detail always lists them all. */
+export function claudeWindowsForFamily(
+  windows: readonly ClaudeWindow[],
+  family: string | undefined,
+): ClaudeWindow[] {
+  if (!family) return [...windows];
+  const isFamilyWeekly = (entry: ClaudeWindow) =>
+    entry.window.limit_window_seconds === SEVEN_DAYS_SECONDS &&
+    new RegExp(`\\b${family}\\b`, "i").test(entry.label);
+  if (!windows.some(isFamilyWeekly)) return [...windows];
+  return windows.filter(
+    (entry) => entry.window.limit_window_seconds !== SEVEN_DAYS_SECONDS || isFamilyWeekly(entry),
+  );
+}
+
+/** Responses from before `limits[]` existed: the same shape from the per-family
+ *  windows, so a payload without limits still renders. */
+function claudeLegacyWindows(usage: ClaudeUsageResponse): ClaudeWindow[] {
+  const rows: Array<[string, ClaudeUsageWindow | null | undefined, number]> = [
+    ["5h session", usage.five_hour, FIVE_HOURS_SECONDS],
+    ["Weekly (all models)", usage.seven_day, SEVEN_DAYS_SECONDS],
+    ["Weekly Opus", usage.seven_day_opus, SEVEN_DAYS_SECONDS],
+    ["Weekly Sonnet", usage.seven_day_sonnet, SEVEN_DAYS_SECONDS],
+  ];
+  const windows: ClaudeWindow[] = [];
+  for (const [label, raw, seconds] of rows) {
+    const window = claudeWindowToUsageWindow(raw, seconds);
+    if (window) windows.push({ label, window });
+  }
+  return windows;
+}
+
+/** The detail block: every meter, including the idle ones the chip leaves out. */
+function claudeDetail(usage: ClaudeUsageResponse, nowMs: number): string {
+  const lines: string[] = [];
+  for (const limit of usage.limits ?? []) {
+    if (typeof limit.percent !== "number") continue;
+    const resetMs = limit.resets_at ? Date.parse(limit.resets_at) : NaN;
+    const notes = [
+      Number.isFinite(resetMs) ? `resets ${formatResetClock(resetMs, nowMs)}` : undefined,
+      limit.severity !== undefined && limit.severity !== "normal" ? limit.severity : undefined,
+    ].filter((note): note is string => note !== undefined);
+    const suffix = notes.length > 0 ? ` — ${notes.join(", ")}` : "";
+    lines.push(`${claudeLimitSpan(limit).label}: ${formatNumber(limit.percent)}%${suffix}`);
+  }
+  if (lines.length === 0) {
+    for (const { label, window } of claudeLegacyWindows(usage)) {
+      const reset = typeof window.reset_at === "number" ? ` — resets ${formatResetClock(window.reset_at * 1000, nowMs)}` : "";
+      lines.push(`${label}: ${formatNumber(toNumber(window.used_percent))}%${reset}`);
+    }
+  }
+  const extra = usage.extra_usage;
+  if (extra?.is_enabled) {
+    lines.push(
+      `Extra usage: ${formatDollars(toNumber(extra.used_credits))} of ` +
+        `${formatDollars(toNumber(extra.monthly_limit))} (${formatNumber(extra.utilization ?? 0)}%)`,
     );
   }
-  return fetchClaudeUsage(
-    token,
-    "Claude Code OAuth token expired — run `claude` briefly (it refreshes on use) and retry",
-  );
+  return lines.join("\n");
 }
 
 /** pi's own Anthropic subscription login (`/login` → Anthropic → OAuth). pi
@@ -698,7 +776,11 @@ async function fetchClaudeBridge(_ctx: ExtensionContext): Promise<UsageDisplay> 
 async function fetchClaudeSubscription(ctx: ExtensionContext): Promise<UsageDisplay> {
   const token = await providerApiKey(ctx, "anthropic");
   if (!token) throw new Error("no Anthropic OAuth login in pi — run /login");
-  return fetchClaudeUsage(token, "Anthropic OAuth token rejected — run /login again");
+  return fetchClaudeUsage(
+    token,
+    "Anthropic OAuth token rejected — run /login again",
+    claudeModelFamily(ctx.model?.id),
+  );
 }
 
 /** pi-claude-subscription-connector loads without its usage-status.ts (it
@@ -717,7 +799,7 @@ export function claudeBillingAlarm(status: number, headers: Record<string, strin
   return undefined;
 }
 
-async function fetchClaudeUsage(token: string, expiredMessage: string): Promise<UsageDisplay> {
+async function fetchClaudeUsage(token: string, expiredMessage: string, family?: string): Promise<UsageDisplay> {
   let usage: ClaudeUsageResponse;
   try {
     usage = (await fetchJson(USAGE_URL_CLAUDE, {
@@ -739,49 +821,28 @@ async function fetchClaudeUsage(token: string, expiredMessage: string): Promise<
     throw err;
   }
 
-  // Shortest first: the 5h session cap gates sooner than the weekly quota.
-  const windows = [
-    { raw: usage.five_hour, seconds: FIVE_HOURS_SECONDS },
-    { raw: usage.seven_day, seconds: SEVEN_DAYS_SECONDS },
-  ]
-    .map((entry) => claudeWindowToUsageWindow(entry.raw, entry.seconds))
-    .filter((window): window is UsageWindow => window !== undefined);
-
+  // `limits[]` is authoritative: it names each meter and its reset. Prefer it
+  // over inferring spans from the per-family windows.
   const nowMs = Date.now();
+  const everyWindow =
+    usage.limits && usage.limits.length > 0 ? claudeLimitWindows(usage.limits) : claudeLegacyWindows(usage);
+  // The chip shows the meters of the model in use; the detail shows every one.
+  const windows = claudeWindowsForFamily(everyWindow, family);
+
   const value = windows
-    .map((window) => formatCodexWindow(window, nowMs))
+    .map((entry) => formatCodexWindow(entry.window, nowMs))
     .filter((formatted): formatted is string => formatted !== undefined)
     .join(" ");
-  if (!value) throw new Error("no Claude usage window was returned");
-
-  const detail: string[] = [];
-  const detailRows: Array<[string, ClaudeUsageWindow | null | undefined]> = [
-    ["5h session", usage.five_hour],
-    ["Weekly (all models)", usage.seven_day],
-    ["Weekly Opus", usage.seven_day_opus],
-    ["Weekly Sonnet", usage.seven_day_sonnet],
-  ];
-  for (const [label, window] of detailRows) {
-    if (typeof window?.utilization !== "number") continue;
-    const resetMs = window.resets_at ? Date.parse(window.resets_at) : NaN;
-    detail.push(
-      `${label}: ${formatNumber(window.utilization)}%` +
-        (Number.isFinite(resetMs) ? ` — resets ${formatResetClock(resetMs, nowMs)}` : ""),
-    );
-  }
-  const extra = usage.extra_usage;
-  if (extra?.is_enabled) {
-    detail.push(
-      `Extra usage: ${formatDollars(toNumber(extra.used_credits))} of ` +
-        `${formatDollars(toNumber(extra.monthly_limit))} (${formatNumber(extra.utilization ?? 0)}%)`,
-    );
-  }
+  const detail = claudeDetail(usage, nowMs);
+  // Every meter idle is a normal state (nothing used yet this session), not a
+  // failed fetch: say so instead of throwing and retrying on a backoff.
+  if (!value) return { value: "idle", commandText: detail.length > 0 ? detail : "idle" };
 
   const resetSummary = windows
-    .map((window) => formatReset(window, nowMs))
+    .map((entry) => formatReset(entry.window, nowMs))
     .filter((formatted): formatted is string => formatted !== undefined)
     .join(" ");
-  const commandText = detail.length > 0 ? detail.join("\n") : value;
+  const commandText = detail.length > 0 ? detail : value;
   return { value, commandText: resetSummary ? `${commandText}\nResets: ${resetSummary}` : commandText };
 }
 
@@ -2245,19 +2306,6 @@ const DRIVERS: Driver[] = [
     fetch: fetchCodex,
   },
   {
-    id: "claude-bridge-window",
-    provider: "claude-bridge",
-    statusKey: "claude-bridge-window",
-    cacheTtlMs: CLAUDE_USAGE_CACHE_TTL_MS,
-    command: {
-      name: "claude-bridge-window",
-      description: "Refresh the compact Claude subscription usage window",
-      scopeNote: "Claude usage is only shown for claude-bridge models",
-    },
-    isActive: (ctx) => isProvider(ctx, "claude-bridge"),
-    fetch: fetchClaudeBridge,
-  },
-  {
     id: "claude-window",
     provider: "anthropic",
     statusKey: "claude-window",
@@ -2270,6 +2318,8 @@ const DRIVERS: Driver[] = [
     // Subscription OAuth only: an Anthropic API key is pay-per-token.
     isActive: (ctx) =>
       ctx.model?.provider === "anthropic" && ctx.modelRegistry.isUsingOAuth(ctx.model),
+    // Variant-keyed cache: sessions on Opus and Sonnet keep separate entries.
+    cacheVariant: (ctx) => claudeModelFamily(ctx.model?.id),
     fetch: fetchClaudeSubscription,
   },
   {
@@ -2403,14 +2453,16 @@ async function refreshDriver(
 
   const ttl = driver.cacheTtlMs ?? 0;
   const now = Date.now();
-  const cached = state.last && ttl > 0 && now - state.lastFetchMs < ttl;
+  const cacheKey = cacheKeyFor(driver, ctx);
+  const cached =
+    state.last && ttl > 0 && now - state.lastFetchMs < ttl && state.lastCacheKey === cacheKey;
 
   // Idle poll tick, or our own copy is still fresh: adopt anything newer
   // another session wrote to the shared file (a cheap read; no TTL, since
   // nobody may be fetching), and never call the API. Without this, a settle
   // inside the memory TTL kept painting the older value.
   if ((options.cacheOnly || cached) && !options.force) {
-    const entry = (await readSharedCache())[driver.id];
+    const entry = (await readSharedCache())[cacheKey];
     if (!entry || typeof entry.value !== "string" || !Number.isFinite(entry.fetchedAt)) return state.last;
     if (state.last && entry.fetchedAt <= state.lastFetchMs) return state.last;
     if (generation !== state.generation) return undefined;
@@ -2423,6 +2475,7 @@ async function refreshDriver(
       ...(entry.resetDate !== undefined ? { resetDate: entry.resetDate } : {}),
     };
     state.last = display;
+    state.lastCacheKey = cacheKey;
     state.lastFetchMs = entry.fetchedAt;
     if (driver.stashKey) writeStash(driver, display);
     if (driver.statusKey && !safeSetStatus(ctx, driver.statusKey, display.value)) return undefined;
@@ -2434,7 +2487,7 @@ async function refreshDriver(
   // fresher data. Cheap read, no API cost, keeps inactive sessions current.
   if (!options.force) {
     const shared = await readSharedCache();
-    const entry = shared[driver.id];
+    const entry = shared[cacheKey];
     if (entry && typeof entry.value === "string" && Number.isFinite(entry.fetchedAt)) {
       const fileTtl = fileTtlFor(driver);
       if (now - entry.fetchedAt < fileTtl) {
@@ -2452,6 +2505,7 @@ async function refreshDriver(
             ...(entry.resetDate !== undefined ? { resetDate: entry.resetDate } : {}),
           };
           state.last = display;
+          state.lastCacheKey = cacheKey;
           state.lastFetchMs = entry.fetchedAt;
           if (driver.stashKey) writeStash(driver, display);
           if (driver.statusKey && !safeSetStatus(ctx, driver.statusKey, display.value)) return undefined;
@@ -2479,7 +2533,7 @@ async function refreshDriver(
     if (!locked) return state.last;
     // Lost the race while awaiting the lock: re-check the file once before fetching.
     const raced = await readSharedCache();
-    const entry = raced[driver.id];
+    const entry = raced[cacheKey];
     if (entry && typeof entry.value === "string" && Number.isFinite(entry.fetchedAt)) {
       if (Date.now() - entry.fetchedAt < fileTtlFor(driver)) {
         await releaseCacheLock();
@@ -2494,6 +2548,7 @@ async function refreshDriver(
           ...(entry.resetDate !== undefined ? { resetDate: entry.resetDate } : {}),
         };
         state.last = display;
+        state.lastCacheKey = cacheKey;
         state.lastFetchMs = entry.fetchedAt;
         if (driver.stashKey) writeStash(driver, display);
         if (driver.statusKey && !safeSetStatus(ctx, driver.statusKey, display.value)) return undefined;
@@ -2532,6 +2587,7 @@ async function refreshDriver(
     }
     const fetchedAt = Date.now();
     state.last = display;
+    state.lastCacheKey = cacheKey;
     state.lastFetchMs = fetchedAt;
     state.lastFailureMs = 0;
     state.rateLimited = false;
@@ -2543,10 +2599,10 @@ async function refreshDriver(
       return undefined;
     }
     if (options.allowInactive) {
-      await writeSharedEntry(driver.id, display, fetchedAt);
+      await writeSharedEntry(cacheKey, display, fetchedAt);
       if (locked) await releaseCacheLock();
     } else {
-      void writeSharedEntry(driver.id, display, fetchedAt).finally(() => {
+      void writeSharedEntry(cacheKey, display, fetchedAt).finally(() => {
         if (locked) void releaseCacheLock();
       });
     }
@@ -2608,13 +2664,28 @@ function cachedEntry(raw: unknown): CachedEntry | undefined {
   };
 }
 
+/** A driver's cache entry: its plain key, or — when the chip varies by model —
+ *  the freshest of its variant keys (claude-window:opus, claude-window:sonnet;
+ *  the plain key is what older sessions and other tools wrote). */
+function cachedEntryFor(cache: Record<string, unknown>, driver: Driver): CachedEntry | undefined {
+  const base = cachedEntry(cache[driver.id]);
+  if (!driver.cacheVariant) return base;
+  let best = base;
+  for (const key of Object.keys(cache)) {
+    if (!key.startsWith(`${driver.id}:`)) continue;
+    const entry = cachedEntry(cache[key]);
+    if (entry && (!best || entry.fetchedAt > best.fetchedAt)) best = entry;
+  }
+  return best;
+}
+
 /** One row per driver. Missing means no usable cache entry, not zero usage. */
 export function summarizeUsageCache(
   cache: Record<string, unknown>,
   nowMs: number,
 ): UsageCacheRow[] {
   return DRIVERS.map((driver) => {
-    const entry = cachedEntry(cache[driver.id]);
+    const entry = cachedEntryFor(cache, driver);
     if (!entry) return { id: driver.id, provider: driver.provider, status: "missing" };
     const ageMs = nowMs - entry.fetchedAt;
     const fresh = ageMs >= 0 && ageMs < fileTtlFor(driver);

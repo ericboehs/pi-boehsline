@@ -667,7 +667,6 @@ test("provider-specific model aliases are pinned to exact releases", async () =>
     [{ id: "claude-sonnet-5.5", provider: "github-copilot", reasoning: true }, "sonn"],
     [{ id: "claude-sonnet-5", provider: "github-copilot", reasoning: true }, "sonnet-5"],
     [{ id: "anthropic/claude-sonnet-5.5", provider: "openrouter", reasoning: true }, "anthropic/claude-sonnet-5.5"],
-    [{ id: "claude-opus-5", provider: "claude-bridge", reasoning: true }, "opus-5"],
     [{ id: "gpt-6.1-sol", provider: "openai-codex", reasoning: true }, "sol"],
     [{ id: "gpt-6-sol", provider: "openai-codex", reasoning: true }, "sol"],
     [{ id: "gpt-5.6-sol", provider: "openai-codex", reasoning: true }, "gpt-5.6-sol"],
@@ -898,7 +897,7 @@ test("usage chips color by pace in compact and long forms", async () => {
     const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     return new RegExp(`\x1B\\[([0-9;]+)m${escaped}\x1B\\[39m`).exec(ui.raw()[0])?.[1];
   };
-  for (const key of ["codex-window", "copilot-window", "grok-window", "cerebras-window", "claude-bridge-window", "claude-window"]) {
+  for (const key of ["codex-window", "copilot-window", "grok-window", "cerebras-window", "claude-window"]) {
     for (const form of ["compact", "long"]) {
       // 2.1/7D is 30% elapsed: color follows points ahead of pace.
       assert.equal(await shade(key, "2.1/7D: 18%", form), "90", `${key} ${form} gray when behind pace`);

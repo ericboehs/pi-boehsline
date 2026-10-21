@@ -4,18 +4,24 @@
 
 ### Fixed
 
+- provider-usage: an idle Claude 5h window no longer looks like a missing one. Anthropic returns `resets_at: null` while `five_hour` has no active usage, and the chip needs a reset to show elapsed/total, so the window was dropped silently; the code now says why.
+
 - compaction: a model whose thinking map has no `off` level (Copilot Sonnet 5.5) gets low-effort adaptive thinking instead of `thinking: disabled`, which the API rejects. Opus 5.5 is unchanged. Models with `off: null` other than Opus 5.5 still fall back to pi.
 - compaction: an update may grow the summary by 4,000 characters, and the checkpoint is kept at or under 32,000. The old instruction said to preserve every earlier bullet, so a long session's summary grew until the next compaction had to re-emit it and could hit the output limit. The split-turn block and file lists are kept; the oldest Done bullets are what get dropped.
 
 ### Added
 
 - footer: pace marks name the window. When a provider has more than one usage window (Codex, Claude, OpenCode Go), the arrow carries the window's span letter — `↓6w` is 6 points ahead of the weekly, `↓6h` of the 5h, `↓6m` of the monthly — in compact, detailed and mini (the bare `↓` becomes `↓w`); single-window chips (Copilot, Grok, Cerebras) stay bare. In mini the letter is the only window name there is.
+- provider-usage: Claude's chip shows the meters of the model in use — the 5h session plus the weekly meter of the model's family (opus/sonnet), `weekly_all` when the family has none — instead of every weekly meter side by side; `/claude-window`'s detail still lists them all. The shared cache entry is keyed per family (`claude-window:opus`), so concurrent sessions on different families never adopt each other's value; canvas's usage table folds the family keys into one row, the freshest winning.
 - footer: `defaultModels` in `footer.json` names each provider's everyday model (`{ "opencode-go": "deepseek-v4.1-flash" }`); with the Model condition at `unless default` the model chip hides for that model too. Hand-edited like `dirNames`, and kept when `/footer` saves.
 - image-prune (opt-in): pi resends every image in context on every request until compaction, and base64 doesn't compress. Once the visible images pass `thresholdMB` (default 5), one batch of `context_edit` replacements at `turn_end` swaps every image older than the last `keepTurns` (2) user turns for a note with a path the read tool can open; pasted images are saved under `~/.pi/agent/tmp/image-prune/` first. One batch, not one image per turn, so the prompt cache is rewritten once. `/image-prune` shows the images in context; `/image-prune now` forces a batch. Tool result images over `shrinkMinKB` (512 KB) are also re-encoded on arrival to at most `shrinkMaxPx` (1568) and under 512 KB, with a note giving the coordinate scale: earl's 3.3 MB PNG camera photos become ~200 KB JPEGs.
 
 ### Changed
 
 - footer: OpenCode Go's provider chip reads `oc` (was `ocg`).
+- provider-usage: drop the claude-bridge driver and its chip. It read Claude Code's own Keychain/OAuth credential to show the same windows `claude-window` already shows from pi's Anthropic login (`/login` → Anthropic).
+- provider-usage: Claude reads the response's `limits[]` instead of inferring spans from `five_hour`/`seven_day`. Each meter names its own `kind`, `group`, `percent`, `severity`, and `resets_at`, so a new meter (Opus, Sonnet, cowork) needs no code, and only a meter with no reset is dropped. `is_active` flags which window is currently enforced, not whether it has usage — Anthropic reports `weekly_all` with `is_active: false` at 33% used — so it never gates rendering. A response where every meter lacks a reset reports `idle` instead of failing the fetch.
+- footer, canvas: drop the retired claude-bridge special cases (`INLINE_STATUS_KEYS`, its provider abbreviation and model-name rule, and its canvas usage label). Canvas usage rows now name `claude-window` ("Claude") instead.
 
 ## 0.2.6 — 2026-10-17
 

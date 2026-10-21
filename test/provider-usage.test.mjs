@@ -15,6 +15,9 @@ import {
   IDLE_POLL_MS,
   pollFetches,
   claudeBillingAlarm,
+  claudeLimitWindows,
+  claudeModelFamily,
+  claudeWindowsForFamily,
   copilotUsageDisplay,
   effectiveOooDays,
   workdaysBetween,
@@ -186,7 +189,8 @@ test("summarizeUsageCache marks fresh, stale, and missing without treating a hol
     "grok-window": { value: "2/7D: 4%", fetchedAt: "nope" },
   }, NOW);
 
-  assert.equal(rows.length, 10);
+  // One row per driver; a cache hole becomes a missing row, not a zero.
+  assert.equal(rows.length, 9);
   assert.equal(row("ollama-usage", {
     "ollama-usage": { value: "$1 / $60 (2%)", commandText: "Included (pro): $1 of $60", fetchedAt: NOW - 30_000 },
   }).status, "fresh");
@@ -199,12 +203,6 @@ test("summarizeUsageCache marks fresh, stale, and missing without treating a hol
   assert.equal(row("codex-window", {
     "codex-window": { value: "1/5H: 10%", fetchedAt: NOW - 130_000 },
   }).status, "stale");
-  assert.equal(row("claude-bridge-window", {
-    "claude-bridge-window": { value: "1/5H: 8%", fetchedAt: NOW - 179_000 },
-  }).status, "fresh");
-  assert.equal(row("claude-bridge-window", {
-    "claude-bridge-window": { value: "1/5H: 8%", fetchedAt: NOW - 181_000 },
-  }).status, "stale");
   // pi's Anthropic login refetches on every 2-minute poll tick, latency included.
   assert.equal(row("claude-window", {
     "claude-window": { value: "1/5H: 8%", fetchedAt: NOW - 109_000 },
@@ -212,6 +210,13 @@ test("summarizeUsageCache marks fresh, stale, and missing without treating a hol
   assert.equal(row("claude-window", {
     "claude-window": { value: "1/5H: 8%", fetchedAt: NOW - 111_000 },
   }).status, "stale");
+  // Variant-keyed entries (claude's family filter): the freshest variant is the row.
+  const claude = row("claude-window", {
+    "claude-window": { value: "1/5H: 8%", fetchedAt: NOW - 109_000 },
+    "claude-window:opus": { value: "1/5H: 8% 3.4/7D: 40%", fetchedAt: NOW - 30_000 },
+  });
+  assert.equal(claude.status, "fresh");
+  assert.equal(claude.value, "1/5H: 8% 3.4/7D: 40%", "the freshest family wins over the older plain key");
   assert.equal(row("grok-window", { "grok-window": { value: "2/7D: 4%", fetchedAt: "nope" } }).status, "missing");
   assert.equal(row("copilot-window", {}).status, "missing");
   assert.equal(row("copilot-window", {}).value, undefined);
@@ -314,7 +319,75 @@ test("Copilot caches an exact timestamp only when supplied by the API", () => {
     formatUsageCacheReport([copilot]),
     `github-copilot fresh 30s\n${display.value}\nResets: ${timestamp}`,
   );
-  assert.deepEqual(copilotUsageDisplay({ unlimited: true, reset_date: "2023-12-01" }), { value: "unlimited" });
+  assert.deepEqual(copilotUsageDisplay({ unlimited: true, reset_date: "2023-12-01" }), {
+    value: "unlimited",
+    quota: { unlimited: true, resetDate: "2023-12-01" },
+  });
+});
+
+test("claudeLimitWindows: meters with a reset, is_active ignored, span from the kind or its group", () => {
+  const reset = "2026-10-26T15:59:59.570269+00:00";
+  const windows = claudeLimitWindows([
+    // Idle window: Anthropic keeps the meter but nulls the reset.
+    { kind: "session", group: "session", percent: 0, is_active: false, resets_at: null },
+    // is_active: false does NOT mean unused: weekly_all arrives that way at 33%.
+    { kind: "weekly_all", group: "weekly", percent: 33, is_active: false, resets_at: reset },
+    { kind: "weekly_opus", group: "weekly", percent: 40, resets_at: reset },
+    // A meter we have never seen: the group still gives its span.
+    { kind: "weekly_cowork", group: "weekly", percent: 5, resets_at: reset },
+    // Nothing to pace against, so it cannot render a chip.
+    { kind: "session", group: "session", percent: 5, is_active: true, resets_at: null },
+  ]);
+  assert.deepEqual(
+    windows.map((w) => w.label),
+    ["Weekly (all models)", "Weekly Opus", "weekly cowork"],
+  );
+  assert.deepEqual(
+    windows.map((w) => w.window.limit_window_seconds),
+    [7 * 86_400, 7 * 86_400, 7 * 86_400],
+  );
+  assert.equal(windows[0]?.window.used_percent, 33);
+  assert.equal(windows[0]?.window.reset_at, Math.floor(Date.parse(reset) / 1000));
+  // An unknown group falls back to the session span; severity only rides along when abnormal.
+  assert.equal(
+    claudeLimitWindows([{ kind: "mystery", percent: 1, resets_at: reset }])[0]?.window.limit_window_seconds,
+    5 * 3_600,
+  );
+  assert.deepEqual(
+    claudeLimitWindows([{ kind: "weekly_all", percent: 99, severity: "critical", resets_at: reset }])[0]?.severity,
+    "critical",
+  );
+  assert.equal(
+    claudeLimitWindows([{ kind: "weekly_all", percent: 10, severity: "normal", resets_at: reset }])[0]?.severity,
+    undefined,
+  );
+});
+
+test("claudeWindowsForFamily: the chip shows the session plus the family's weekly; no family meter keeps them all", () => {
+  const reset = "2026-10-26T15:59:59.570269+00:00";
+  const windows = claudeLimitWindows([
+    { kind: "session", percent: 20, resets_at: reset },
+    { kind: "weekly_all", percent: 33, resets_at: reset },
+    { kind: "weekly_opus", percent: 40, resets_at: reset },
+    { kind: "weekly_sonnet", percent: 10, resets_at: reset },
+  ]);
+  // On an Opus model: the 5h session plus Opus's weekly; weekly_all and Sonnet drop.
+  assert.deepEqual(
+    claudeWindowsForFamily(windows, claudeModelFamily("claude-opus-5-5")).map((w) => w.label),
+    ["5h session", "Weekly Opus"],
+  );
+  assert.deepEqual(
+    claudeWindowsForFamily(windows, claudeModelFamily("claude-sonnet-4-5")).map((w) => w.label),
+    ["5h session", "Weekly Sonnet"],
+  );
+  // No family meter in the response (Pro's single weekly_all, or the family's
+  // window idle: no reset): every meter stays.
+  assert.deepEqual(
+    claudeWindowsForFamily(windows.filter((w) => w.label !== "Weekly Opus"), "opus").map((w) => w.label),
+    ["5h session", "Weekly (all models)", "Weekly Sonnet"],
+  );
+  assert.deepEqual(claudeWindowsForFamily(windows, claudeModelFamily("claude-3-haiku")), windows);
+  assert.deepEqual(claudeWindowsForFamily(windows, claudeModelFamily(undefined)), windows);
 });
 
 test("resolveUsageDriver accepts ids and the short names a model will pass", () => {
@@ -326,7 +399,8 @@ test("resolveUsageDriver accepts ids and the short names a model will pass", () 
   assert.equal(resolveUsageDriver("ollama-usage")?.provider, "ollama");
   assert.equal(resolveUsageDriver("claude")?.id, "claude-window");
   assert.equal(resolveUsageDriver("anthropic")?.id, "claude-window");
-  assert.equal(resolveUsageDriver("claude-bridge")?.id, "claude-bridge-window");
+  // claude-bridge was retired: its chip is gone, not just unlisted.
+  assert.equal(resolveUsageDriver("claude-bridge"), undefined);
   assert.equal(resolveUsageDriver(""), undefined);
   assert.equal(resolveUsageDriver("nope"), undefined);
 });
@@ -368,7 +442,7 @@ test("a settle adopts a newer shared-cache value even while the memory copy is f
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = dir;
   const write = (value, fetchedAt) =>
-    writeFileSync(path.join(dir, "usage-cache.json"), JSON.stringify({ "claude-window": { value, fetchedAt } }));
+    writeFileSync(path.join(dir, "usage-cache.json"), JSON.stringify({ "claude-window:opus": { value, fetchedAt } }));
   const handlers = new Map();
   const pi = {
     on: (name, handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
@@ -410,6 +484,16 @@ test("a settle adopts a newer shared-cache value even while the memory copy is f
     await fire("agent_settled");
     await settle();
     assert.equal(statuses.get("claude-window"), "2.5/5H: 12% 3.5/7D: 18%");
+
+    // A different family's entry (another session on Sonnet) is never adopted,
+    // even newer: sessions on Opus and Sonnet keep separate cache keys.
+    writeFileSync(path.join(dir, "usage-cache.json"), JSON.stringify({
+      "claude-window:opus": { value: "2.5/5H: 12% 3.5/7D: 18%", fetchedAt: now + 5_000 },
+      "claude-window:sonnet": { value: "2.5/5H: 99% 3.5/7D: 99%", fetchedAt: now + 20_000 },
+    }));
+    await fire("agent_settled");
+    await settle();
+    assert.equal(statuses.get("claude-window"), "2.5/5H: 12% 3.5/7D: 18%", "another family's newer entry is not adopted");
   } finally {
     await fire("session_shutdown");
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;

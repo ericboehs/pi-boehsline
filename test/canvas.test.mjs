@@ -1418,18 +1418,27 @@ test("usageRows: the session's provider first, stale entries dropped, text clean
   const now = Date.parse("2026-05-01T12:00:00Z");
   const cache = {
     "copilot-window": { value: "61% \x1b[31mpremium\x1b[0m", commandText: "Premium: 61%\nResets: Jun 1", resetMs: Date.parse("2026-06-01T00:00:00Z"), fetchedAt: now - 60000 },
-    "claude-bridge-window": { value: "5h 20%", fetchedAt: now - 120000, resetDate: "2026-05-03" },
+    "claude-window": { value: "5h 20%", fetchedAt: now - 120000, resetDate: "2026-05-03" },
     "codex-window": { value: "old", fetchedAt: now - 8 * 86400000 },
     "mystery": { value: "7", commandText: "7", fetchedAt: now },
     "broken": { value: 3, fetchedAt: now },
   };
-  assert.deepEqual(usageRows(cache, "claude-bridge", now), [
+  assert.deepEqual(usageRows(cache, "anthropic", now), [
     { label: "Claude", value: "5h 20%", resetDate: "2026-05-03", fetchedAt: "2026-05-01T11:58:00.000Z", current: true },
     { label: "Copilot", value: "61% premium", detail: "Premium: 61%\nResets: Jun 1", resetAt: "2026-06-01T00:00:00.000Z", fetchedAt: "2026-05-01T11:59:00.000Z" },
     { label: "mystery", value: "7", fetchedAt: "2026-05-01T12:00:00.000Z" },
   ]);
   assert.deepEqual(usageRows(null, "x"), []);
   assert.deepEqual(usageRows([], "x"), []);
+
+  // Family-variant keys (claude's model-family filter): one driver row, the
+  // freshest variant winning over the older plain key.
+  assert.deepEqual(usageRows({
+    "claude-window": { value: "5h 20% 3.4/7D: 33%", fetchedAt: now - 120000 },
+    "claude-window:opus": { value: "5h 20% 3.4/7D: 40%", fetchedAt: now - 30000 },
+  }, "anthropic", now), [
+    { label: "Claude", value: "5h 20% 3.4/7D: 40%", fetchedAt: "2026-05-01T11:59:30.000Z", current: true },
+  ]);
 });
 
 test("gitInfo and sessionInfoOf: a real repo, a plain folder, a missing one", async () => {

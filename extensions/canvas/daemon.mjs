@@ -804,7 +804,7 @@ export function readSystemTheme(dir = OMARCHY) {
  */
 export const USAGE_DRIVERS = {
   "codex-window": ["openai-codex", "Codex"],
-  "claude-bridge-window": ["claude-bridge", "Claude"],
+  "claude-window": ["anthropic", "Claude"],
   "copilot-window": ["github-copilot", "Copilot"],
   "grok-window": ["xai", "Grok"],
   "cerebras-window": ["cerebras", "Cerebras"],
@@ -823,9 +823,23 @@ const plain = (v, max) => String(v).replace(/\x1b\[[0-9;]*m/g, "").replace(/[\x0
  */
 export function usageRows(cache, provider, now = Date.now()) {
   if (!cache || typeof cache !== "object" || Array.isArray(cache)) return [];
-  const rows = [];
+  // Family-variant keys (claude-window:opus, claude-window:sonnet: the chip
+  // filters Claude's weekly meters to the model family in use) are one
+  // driver: fold them into its row, the freshest variant winning.
+  const best = new Map();
+  const unknown = [];
   for (const [key, e] of Object.entries(cache)) {
     if (!e || typeof e.value !== "string" || typeof e.fetchedAt !== "number" || now - e.fetchedAt > USAGE_MAX_AGE) continue;
+    const base = key.split(":", 1)[0];
+    if (!USAGE_DRIVERS[base]) {
+      unknown.push([key, e]);
+      continue;
+    }
+    const prev = best.get(base);
+    if (!prev || e.fetchedAt > prev.fetchedAt) best.set(base, e);
+  }
+  const rows = [];
+  for (const [key, e] of [...best, ...unknown]) {
     const [prov, label] = USAGE_DRIVERS[key] || ["", key];
     rows.push({
       label,
