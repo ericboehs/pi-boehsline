@@ -3,7 +3,11 @@
 // sections whose timestamp moved, so iframes and scroll position survive.
 
 import { readPair, readPrefs, prettyName, swatch, themeMode, themeVars } from "/assets/theme.mjs";
-import { asQuote, boardMarks, buildTree, codeLayout, dismissPipe, lineLabel, optionLetter, optionPrompt, optionsText, pipeRows, pipeStripHidden, REVIEW_VERDICTS, reviewLabel, reviewMessage, infoRows, slackText, treeText, wrapLabel, cardKey, cardPrompt, inlineTokens, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, ownerSession, placeBefore, placeTrackers, trackerTone, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions } from "/assets/nav.mjs";
+import { asQuote, boardMarks, cardKey, cardPrompt, dismissPipe, optionsText, ownerSession, pipeRows, pipeStripHidden, REVIEW_VERDICTS, reviewLabel, reviewMessage, infoRows, slackText, treeText, wrapLabel, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, placeBefore, placeTrackers, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions } from "/assets/nav.mjs";
+// The renderers themselves live in render.mjs (with render.css): the page passes
+// what only it has (its copy buttons, highlight.js loading, the kanban modal,
+// owner links, remembered folds, talk-back) through each one's opts.
+import { clock, counts, dayLabel, diffBlock, diffFileList, h, inline, langFor, noteParas, parsePatch, renderChart, renderCode, renderJson, renderKanban, renderMermaid, renderOptions, renderStats, renderSteps, renderTable, renderTerminal, renderTimeline, renderTracker, renderTree, svg, tilde, tip, toneVar } from "/assets/render.mjs";
 
 const CSS = `
 :root { color-scheme: light dark; --bg:#f7f5f0; --card:#fff; --ink:#1c1b19; --dim:#8a8578; --line:#e6e1d6; --soft:#f0ece3; --accent:#b4541f; --ok:#1f7a52; --warn:#a86a00; --bad:#c0392b; --code:#f3f0e8; --tint:#fbf3ec; --hl-kw:#285880; --hl-str:#42632a; --hl-num:#805424; --hl-com:#5b6a7f; --hl-title:#68448b; --c1:#3b7dd8; --c2:#e0703a; --c3:#2f9e72; --c4:#c4475b; --c5:#8a63c9; --c6:#b8901c; --c7:#2e9bb0; --c8:#8c8577; }
@@ -43,21 +47,6 @@ header.top .tools .back { margin-left: 8px; }
   .side { position: sticky; top: 14px; max-height: calc(100vh - 28px); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 }
 .side .card > h2 .meta button.btn { display: none; }
-.tracker { display: flex; flex-direction: column; gap: 4px; }
-.tk-line { display: flex; gap: 8px; align-items: baseline; font-size: 12px; }
-.tk-id { font-weight: 600; font-variant-numeric: tabular-nums; }
-.tk-state { font-weight: 600; }
-.tk-state.ok { color: var(--ok); }
-.tk-state.warn { color: var(--warn); }
-.tk-state.bad { color: var(--bad); }
-.tk-state.go { color: var(--c1); }
-.tk-state.approved { color: var(--c7); }
-.tk-state.draft { color: var(--c5); }
-.tk-state.dim { color: var(--dim); }
-.tk-title { font-size: 13.5px; line-height: 1.35; }
-.tk-title a { color: inherit; text-decoration: none; }
-.tk-title a:hover { color: var(--accent); }
-.tk-note { color: var(--dim); font-size: 12px; line-height: 1.35; }
 .side .card > .bd { padding: 10px 12px; }
 .side .md table { font-size: 12px; }
 .side .md th, .side .md td { padding: 3px 6px; }
@@ -140,232 +129,13 @@ dialog.modal .mbody > .empty, dialog.modal .mbody > .err { padding: 18px; }
 dialog.modal.image .mbody { background: var(--soft); display: flex; align-items: center; justify-content: center; }
 dialog.modal img.lightbox { display: block; max-width: 94vw; max-height: calc(92vh - 42px); object-fit: contain; }
 .gallery a, img.shot { cursor: zoom-in; }
-table.diff { border-collapse: collapse; width: 100%; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
-table.diff td { padding: 0 10px; vertical-align: top; }
-table.diff td.ln { width: 1%; min-width: 2.6em; text-align: right; color: var(--dim); user-select: none; white-space: nowrap; padding: 0 6px; }
-table.diff td.ln + td.ln { border-right: 1px solid var(--line); }
-table.diff td.code { white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; }
-table.diff td.code::before { display: inline-block; width: 1.2em; color: var(--dim); user-select: none; }
-table.diff tr.add td.code::before { content: "+"; color: var(--ok); }
-table.diff tr.del td.code::before { content: "−"; color: var(--bad); }
-table.diff:not(.split) tr.ctx td.code::before { content: " "; }
-table.diff tr.add td { background: color-mix(in srgb, var(--ok) 13%, transparent); }
-table.diff tr.del td { background: color-mix(in srgb, var(--bad) 12%, transparent); }
-table.diff tr.hunk td { background: color-mix(in srgb, var(--accent) 7%, var(--soft)); color: var(--dim); padding-top: 3px; padding-bottom: 3px; }
-table.diff tr.hunk:not(:first-child) td { border-top: 1px solid var(--line); }
-table.diff tr.note td { color: var(--dim); font-style: italic; }
-table.diff.split { table-layout: fixed; }
-table.diff.split col.c-ln { width: 3.4em; }
-table.diff.split td.ln { min-width: 0; }
-table.diff.split td.ln + td.code + td.ln { border-left: 1px solid var(--line); }
-table.diff.split td.ln + td.ln { border-right: 0; }
-table.diff.split td.code { border-right: 0; }
-table.diff.split td.add { background: color-mix(in srgb, var(--ok) 13%, transparent); }
-table.diff.split td.del { background: color-mix(in srgb, var(--bad) 12%, transparent); }
-table.diff.split td.code::before { content: none; }
-table.diff td.blank { background: repeating-linear-gradient(135deg, transparent 0 5px, color-mix(in srgb, var(--line) 45%, transparent) 5px 6px); }
-table.diff mark { color: inherit; border-radius: 2px; padding: 0; }
-table.diff tr.add mark, table.diff td.add mark { background: color-mix(in srgb, var(--ok) 34%, transparent); }
-table.diff tr.del mark, table.diff td.del mark { background: color-mix(in srgb, var(--bad) 30%, transparent); }
-.diffview { display: flex; flex-direction: column; gap: 10px; }
-.diffview.in-modal { padding: 10px 12px 12px; }
-.diffview.in-modal .dv-file.bare { margin: 0 -12px -12px; border-top: 1px solid var(--line); border-radius: 0; }
-.dv-bar { display: flex; align-items: center; gap: 10px; font-size: 13px; }
-.dv-sum { color: var(--dim); }
-.n-add { color: var(--ok); font-weight: 600; }
-.n-del { color: var(--bad); font-weight: 600; }
-.dv-bar .tools { margin-left: auto; display: flex; gap: 6px; align-items: center; }
 .segs { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
 .seg { font: 500 11.5px/1 -apple-system, BlinkMacSystemFont, sans-serif; padding: 5px 9px; border: 0; background: transparent; color: var(--dim); cursor: pointer; }
 .seg + .seg { border-left: 1px solid var(--line); }
 .seg.on { background: var(--soft); color: var(--ink); }
-.dv-files { list-style: none; margin: 0; padding: 5px 0; border: 1px solid var(--line); border-radius: 8px; font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.dv-files li { display: flex; gap: 10px; align-items: baseline; padding: 0 12px; }
-.dv-files a { color: var(--ink); text-decoration: none; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dv-files a:hover { text-decoration: underline; }
-.dv-file { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; scroll-margin-top: 14px; }
-.dv-file > header { display: flex; align-items: center; gap: 8px; padding: 6px 10px; background: color-mix(in srgb, var(--soft) 50%, var(--card)); border-bottom: 1px solid var(--line); cursor: pointer; font: 600 12.5px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.dv-file > header:hover .chev { color: var(--ink); }
-.dv-file.shut > header { border-bottom: 0; }
-.dv-file.shut .dv-body { display: none; }
-.dv-file.shut .chev::before { transform: translateX(-1px) rotate(-45deg); }
-.dv-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dv-n { margin-left: auto; font-weight: 500; white-space: nowrap; }
-.dv-status { font: 500 10.5px/1 -apple-system, BlinkMacSystemFont, sans-serif; padding: 3px 6px; border-radius: 4px; background: var(--soft); color: var(--dim); }
-.dv-status.added { color: var(--ok); } .dv-status.deleted { color: var(--bad); }
-.dv-body { overflow-x: auto; }
-.dv-body > .empty { padding: 10px 12px; }
-.dv-load { margin: 10px 12px; }
-.chart { margin: 0; display: flex; flex-direction: column; gap: 8px; }
-.chart-plot { width: 100%; min-height: 40px; }
-.chart svg { display: block; overflow: visible; font: 11px/1 -apple-system, BlinkMacSystemFont, sans-serif; }
-.chart .grid line { stroke: var(--line); stroke-width: 1; shape-rendering: crispEdges; }
-.chart .grid line.minor { stroke-dasharray: 2 3; }
-.chart .grid line.zero { stroke: var(--dim); stroke-opacity: 0.55; }
-.chart text { fill: var(--dim); }
-.chart text.al { font-weight: 600; }
-.chart text.total { fill: var(--ink); font-size: 18px; font-weight: 600; }
-.chart .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-.chart .area { fill-opacity: 0.2; stroke: none; }
-.chart .pt { stroke: var(--card); stroke-width: 1.5; }
-.chart .slice { stroke: var(--card); stroke-width: 2; }
-.chart .hole { fill: var(--card); }
-.chart :is(.bar, .pt, .slice):hover { filter: brightness(1.12); }
-.chart-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12.5px; color: var(--ink); }
-.chart-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
-.chart-legend em { font-style: normal; color: var(--dim); }
-.chart-cap { font-size: 12.5px; color: var(--dim); }
-.term { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--code); }
-.term-head { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--line); }
-.term-cmd { font: 12.5px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); white-space: pre-wrap; word-break: break-all; background: none; padding: 0; }
-.term-ps { color: var(--dim); user-select: none; }
-.term-meta { display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--dim); white-space: nowrap; }
-.term-meta .btn { margin: -4px -6px -4px 0; }
-.term-exit { font-weight: 600; }
-.term-exit.ok { color: var(--ok); } .term-exit.bad { color: var(--bad); }
-.fold-more { display: block; margin: 6px 0 0; }
-.gallery figure[hidden], details.agent[hidden] { display: none; }
-.term-running { display: inline-flex; gap: 6px; align-items: center; color: var(--ok); font-variant-numeric: tabular-nums; }
-.term-tools { display: flex; gap: 10px; align-items: center; padding: 6px 12px; border-bottom: 1px solid var(--line); }
-.term-tools .btn { margin-left: auto; }
-.term-filter, .tbl-filter { font: 12.5px/1.2 -apple-system, BlinkMacSystemFont, sans-serif; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; width: min(260px, 50%); }
-.term-count, .tbl-count { font-size: 12px; color: var(--dim); }
-.term-body { max-height: 640px; overflow: auto; padding: 6px 0; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.tl { display: flex; min-height: 1.5em; padding: 0 12px 0 0; }
-.tl .ln { flex: none; width: 4.2em; padding-right: 12px; text-align: right; color: var(--dim); opacity: 0.6; user-select: none; }
-.tl .tx { white-space: pre-wrap; word-break: break-word; min-width: 0; }
-.tl.bad .tx { color: var(--bad); } .tl.warn .tx { color: var(--warn); } .tl.ok .tx { color: var(--ok); }
-.tl mark { background: color-mix(in srgb, var(--warn) 35%, transparent); color: inherit; border-radius: 2px; }
-.term-fold { display: block; margin: 4px 12px 4px 4.2em; font: 500 12px/1 -apple-system, BlinkMacSystemFont, sans-serif; color: var(--accent); background: none; border: 1px dashed var(--line); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
-.term-fold:hover { background: var(--soft); }
-.term-none { padding: 6px 12px; color: var(--dim); font-style: italic; }
-.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 10px; }
-.stat { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.stat-label { font-size: 12px; color: var(--dim); }
-.stat-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-.stat-value { font-size: 24px; line-height: 1.15; font-weight: 650; font-variant-numeric: tabular-nums; }
-.stat-delta { font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.stat-delta.ok { color: var(--ok); } .stat-delta.bad { color: var(--bad); } .stat-delta.flat { color: var(--dim); }
-.stat-note { font-size: 11.5px; color: var(--dim); }
-svg.spark { display: block; overflow: visible; margin-top: 2px; max-width: 100%; height: auto; }
-svg.spark path { fill: none; stroke-width: 1.6; stroke-linejoin: round; stroke-linecap: round; }
-.tbl-tools { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
-.tbl-scroll { max-height: 70vh; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
-table.ktable { width: 100%; border-collapse: collapse; font-size: 13px; margin: 0; }
-table.ktable th, table.ktable td { padding: 5px 10px; border-bottom: 1px solid var(--soft); text-align: left; vertical-align: middle; white-space: nowrap; }
-table.ktable td { white-space: normal; }
-table.ktable thead th { position: sticky; top: 0; background: var(--card); border-bottom: 1px solid var(--line); z-index: 1; padding: 0; }
-table.ktable tbody tr:hover { background: var(--soft); }
-table.ktable .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-table.ktable th.num .tbl-sort { justify-content: flex-end; }
-table.ktable td.nil { color: var(--dim); }
-.tbl-sort { all: unset; box-sizing: border-box; display: flex; gap: 5px; align-items: center; width: 100%; padding: 7px 10px; font-weight: 600; font-size: 12.5px; cursor: pointer; }
-.tbl-sort .arrow { font-size: 9px; color: var(--dim); opacity: 0.5; }
-.tbl-sort.on .arrow { opacity: 1; color: var(--accent); }
-.tbl-sort:hover .arrow { opacity: 1; }
-.tbl-sort:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-td.barc > div { display: flex; align-items: center; gap: 8px; min-width: 140px; }
-.cbar { flex: 1; height: 8px; background: var(--soft); border-radius: 999px; overflow: hidden; min-width: 60px; }
-.cbar i { display: block; height: 100%; background: var(--accent); border-radius: inherit; }
-td.barc .num { min-width: 4em; }
-.ctag { display: inline-block; font-size: 11.5px; line-height: 1; padding: 3px 7px; border-radius: 999px; background: var(--soft); color: var(--dim); white-space: nowrap; }
-/* code: a file's lines with numbers, highlighted bands, and note callouts under their lines */
-.code-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; font-size: 12px; color: var(--dim); }
-.code-head .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); overflow-wrap: anywhere; }
-.code-body { background: var(--code); border-radius: 8px; padding: 6px 0; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.cl { display: grid; grid-template-columns: var(--gut, 3ch) 1fr; gap: 12px; padding: 0 12px 0 0; box-shadow: inset 3px 0 0 transparent; }
-.cl .ln { text-align: right; color: var(--dim); user-select: none; padding-left: 10px; opacity: 0.75; }
-.cl .lc { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; tab-size: 4; }
-.cl.hl { background: color-mix(in srgb, var(--accent) 13%, transparent); }
-.cl.hl .ln { color: var(--accent); opacity: 1; }
-.cl.toned { box-shadow: inset 3px 0 0 var(--tone); }
-.code-note { margin: 4px 12px 6px calc(var(--gut, 3ch) + 22px); padding: 7px 10px; border-left: 3px solid var(--tone, var(--accent)); background: var(--card); border-radius: 0 6px 6px 0; font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--ink); box-shadow: 0 1px 2px rgb(0 0 0 / 0.06); }
-.code-note p { margin: 0; } .code-note p + p { margin-top: 6px; }
-.code-note .at { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--tone, var(--accent)); margin-right: 6px; }
-.code-note code { font-size: 0.92em; padding: 0 3px; border-radius: 3px; background: var(--soft); }
-.code-cap, .tree-cap, .opt-cap { margin-top: 6px; font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--dim); }
-/* tree: folders fold; tags colour the name */
-.tree { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.tree ul { list-style: none; margin: 0; padding: 0 0 0 16px; border-left: 1px solid var(--line); margin-left: 7px; }
-.tree > ul { border: 0; padding: 0; margin: 0; }
-.tree li { margin: 0; }
-.tr { display: flex; align-items: baseline; gap: 6px; padding: 1px 4px; border-radius: 4px; }
-.tr.dir { cursor: pointer; user-select: none; }
-.tr.dir:hover { background: var(--soft); }
-.tr .caret { display: inline-block; width: 1ch; color: var(--dim); transition: transform 0.12s; }
-.tr.dir.open .caret { transform: rotate(90deg); }
-.tr .ico { flex: none; align-self: center; color: var(--dim); }
-.tr .nm { white-space: nowrap; }
-.tr.dir .nm { font-weight: 600; }
-.tr .note { color: var(--dim); font: 12.5px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow-wrap: anywhere; }
-.tr .note code { font-size: 0.92em; padding: 0 3px; border-radius: 3px; background: var(--soft); }
-.tr .ttag { font: 10.5px/1 -apple-system, BlinkMacSystemFont, sans-serif; padding: 2px 6px; border-radius: 999px; color: var(--tone); background: color-mix(in srgb, var(--tone) 14%, transparent); white-space: nowrap; }
-.tr.t-added .nm { color: var(--ok); } .tr.t-changed .nm { color: var(--warn); } .tr.t-deleted .nm { color: var(--bad); text-decoration: line-through; } .tr:is(.t-renamed, .t-moved) .nm { color: var(--c5); }
-.tr .sum { color: var(--dim); font-size: 11.5px; display: none; } .tr.dir:not(.open) .sum { display: inline; }
-.tree-root { font-weight: 600; padding: 1px 4px; }
-/* options: choices side by side */
-.opts-q { font-weight: 600; margin-bottom: 8px; }
-.opts { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
-.opt { display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--card); font-size: 13px; line-height: 1.45; }
-.opt.rec { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
-.opt-hd { display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap; }
-.opt-hd .letter { flex: none; display: inline-grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: var(--soft); font-size: 11.5px; font-weight: 700; color: var(--dim); align-self: center; }
-.opt.rec .letter { background: var(--accent); color: var(--card); }
-.opt-hd b { font-size: 13.5px; }
-.opt-badge { font-size: 10.5px; padding: 2px 7px; border-radius: 999px; background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); font-weight: 600; white-space: nowrap; }
-.opt-cost { font-size: 12px; color: var(--dim); }
-.opt ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
-.opt li { display: grid; grid-template-columns: 1.1em 1fr; }
-.opt li::before { font-weight: 700; } .opt .pros li::before { content: "✓"; color: var(--ok); } .opt .cons li::before { content: "✗"; color: var(--bad); }
-.opt code { font-size: 0.92em; padding: 0 3px; border-radius: 3px; background: var(--soft); }
-.opt-scores { display: grid; grid-template-columns: auto 1fr auto; gap: 3px 8px; align-items: center; font-size: 12px; color: var(--dim); }
-.opt-scores .cbar { height: 6px; min-width: 40px; } .opt-scores .cbar i { background: var(--c1); }
-.opt-ft { margin-top: auto; padding-top: 4px; display: flex; justify-content: flex-end; }
 /* pdf and video */
 iframe.pdf { width: 100%; height: 80vh; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
 video.vid { display: block; max-width: 100%; max-height: 80vh; margin: 0 auto; border-radius: 6px; background: #000; }
-/* kanban: columns side by side; stacked when the card is narrow (side panel, phone) */
-.kanban { container-type: inline-size; display: flex; flex-direction: column; gap: 8px; }
-.kb-head { font-size: 13px; }
-.kb-cols { display: grid; grid-template-columns: var(--kb-tpl, repeat(4, minmax(170px, 1fr))); gap: 10px; overflow-x: auto; }
-.kb-col { --tone: var(--line); background: var(--soft); border-radius: 8px; border-top: 3px solid var(--tone); padding: 8px; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
-.kb-col > header, .kb-fold { display: flex; align-items: baseline; gap: 6px; padding: 0 2px; font: 600 12px/1.3 -apple-system, BlinkMacSystemFont, sans-serif; color: var(--ink); }
-.kb-fold { width: 100%; background: none; border: 0; cursor: pointer; text-align: left; }
-.kb-fold:hover .kb-label { text-decoration: underline; }
-.kb-chev { display: inline-block; width: 8px; color: var(--dim); transition: transform 0.15s; transform: rotate(90deg); }
-.kb-col.folded .kb-chev { transform: none; }
-.kb-col.folded > .kb-cards, .kb-col.folded > .kb-more { display: none; }
-/* an empty column, side by side, is a thin strip with its label running down */
-.kb-col.empty { padding: 8px 6px; align-items: center; }
-.kb-col.empty > header { writing-mode: vertical-rl; flex-direction: row; color: var(--dim); }
-.kb-col.empty > header .kb-n { margin-left: 0; margin-top: 6px; }
-.kb-col.empty > .kb-empty { display: none; }
-.kb-progress { display: flex; flex-direction: column; gap: 4px; }
-.kb-bar { display: flex; gap: 2px; height: 6px; border-radius: 3px; overflow: hidden; background: var(--soft); }
-.kb-bar > i { min-width: 4px; }
-.kb-sum { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
-.kb-card code { font-size: 0.92em; padding: 0 3px; border-radius: 3px; background: var(--soft); }
-.kb-card a { color: inherit; text-decoration-color: color-mix(in srgb, var(--accent) 60%, transparent); text-underline-offset: 2px; }
-.kb-card a:hover { color: var(--accent); }
-.kb-title { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
-.kb-col.compact .kb-cards { gap: 2px; }
-.kb-col.compact .kb-card { padding: 3px 8px; border-color: transparent; background: color-mix(in srgb, var(--card) 55%, transparent); color: var(--dim); font-size: 12px; }
-.kb-col.compact .kb-title { -webkit-line-clamp: 1; overflow-wrap: normal; word-break: break-all; }
-.kb-moved { margin-left: 6px; font: 600 10.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 2px 5px; border-radius: 999px; vertical-align: 1px; white-space: nowrap; color: color-mix(in srgb, var(--accent) 75%, var(--ink)); background: color-mix(in srgb, var(--accent) 16%, transparent); }
-.kb-card.moved { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
-.kb-col.compact .kb-card.moved { border-color: transparent; }
-.kb-n { color: var(--dim); font-weight: 500; font-variant-numeric: tabular-nums; margin-left: auto; }
-.kb-col.over .kb-n { color: var(--warn); font-weight: 650; }
-.kb-cards { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.kb-card { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; font-size: 12.5px; line-height: 1.4; overflow-wrap: anywhere; }
-.kb-card.toned { box-shadow: inset 3px 0 0 var(--card-tone); padding-left: 11px; }
-.kb-id { color: var(--dim); font: 500 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; margin-right: 5px; }
-.kb-note { color: var(--dim); font-size: 12px; margin-top: 3px; }
-.kb-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 5px; }
-.kb-owner { display: inline-flex; align-items: center; gap: 4px; font: 500 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dim); text-decoration: none; }
-.kb-owner .pulse { width: 6px; height: 6px; }
-.kb-owner .pulse.blocked { box-shadow: none; }
-.kb-owner .pulse.ended { background: transparent; border: 1.5px solid var(--dim); opacity: 0.7; }
 a.kb-owner:hover { color: var(--accent); text-decoration: underline; }
 a.kb-owner.ended { opacity: 0.8; }
 /* Background jobs (auto-jobs) */
@@ -419,9 +189,6 @@ dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: h
 .w-sub.cleared { color: var(--dim); }
 .w-sub .w-ico { color: var(--warn); }
 .w-sub.cleared .w-ico { color: var(--ok); }
-.kb-card { cursor: pointer; transition: border-color 0.12s; }
-.kb-card:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
-.kb-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .kb-detail { padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 10px; border-left: 3px solid var(--tone, var(--line)); overflow-y: auto; }
 .kb-d-top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .kb-d-col { font: 600 11.5px/1 -apple-system, BlinkMacSystemFont, sans-serif; color: var(--tone, var(--dim)); text-transform: uppercase; letter-spacing: 0.04em; }
@@ -458,20 +225,6 @@ dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: h
 .pin-head .pin-ico, .toc .pin-ico { fill: currentColor; flex: none; }
 .pin-slot:not(:empty) { margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px dashed var(--line); }
 .toc a .pin-ico { width: 10px; height: 10px; margin-right: 5px; color: var(--dim); }
-.kb-owner.me { color: color-mix(in srgb, var(--accent) 75%, var(--ink)); }
-.kb-more, .kb-empty { color: var(--dim); font-size: 12px; padding: 0 2px; }
-@container (max-width: 560px) {
-  .kb-cols { grid-template-columns: 1fr; gap: 6px; overflow: visible; }
-  .kb-col { border-top: 0; border-left: 3px solid var(--tone); padding: 6px 8px; }
-  .kb-col.empty, .kb-col.folded { flex-direction: row; align-items: baseline; }
-  .kb-col.empty > header { writing-mode: horizontal-tb; flex: 1; }
-  .kb-col.empty > header .kb-n { margin: 0 0 0 auto; }
-}
-.ctag.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
-.ctag.bad { color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
-.ctag.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 16%, transparent); }
-.tbl-more { margin-top: 6px; }
-.tbl-more .term-fold { margin-left: 0; }
 .cmp-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 8px; }
 .cmp-fade { width: 200px; accent-color: var(--accent); }
 .cmp-stack { position: relative; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; line-height: 0; user-select: none; touch-action: none; }
@@ -487,29 +240,6 @@ dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: h
 .cmp-side figure { margin: 0; min-width: 0; }
 .cmp-side figcaption { font-size: 12px; font-weight: 600; color: var(--dim); margin-bottom: 4px; }
 .cmp-side img { display: block; width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; }
-.steps-head { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin-bottom: 10px; }
-.steps-count { font-size: 12.5px; color: var(--dim); }
-.steps-count .bad { color: var(--bad); } .steps-count .warn { color: var(--warn); }
-.steps-bar { flex: 1 1 160px; height: 6px; background: var(--soft); border-radius: 999px; overflow: hidden; }
-.steps-bar i { display: block; height: 100%; background: var(--ok); border-radius: inherit; transition: width 0.3s; }
-ol.steps-list { list-style: none; margin: 0; padding: 0; }
-.step { position: relative; display: flex; gap: 10px; padding: 0 0 12px; }
-.step:not(:last-child)::before { content: ""; position: absolute; left: 10px; top: 22px; bottom: 0; width: 2px; background: var(--line); }
-.step.s-done:not(:last-child)::before { background: color-mix(in srgb, var(--ok) 45%, var(--line)); }
-.smark { flex: none; width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--line); box-sizing: border-box; display: grid; place-items: center; font: 700 11px/1 -apple-system, BlinkMacSystemFont, sans-serif; color: var(--card); background: var(--card); }
-.s-done .smark { background: var(--ok); border-color: var(--ok); }
-.s-failed .smark { background: var(--bad); border-color: var(--bad); }
-.s-blocked .smark { background: var(--warn); border-color: var(--warn); }
-.s-skipped .smark { color: var(--dim); }
-.s-active .smark { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent); }
-.s-active .smark::after { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
-.sbody { min-width: 0; padding-top: 2px; }
-.slabel { font-size: 13.5px; line-height: 1.35; }
-.s-active .slabel { font-weight: 600; }
-.s-skipped .slabel { color: var(--dim); text-decoration: line-through; }
-.s-failed .slabel { color: var(--bad); }
-.snote { font-size: 12.5px; color: var(--dim); margin-top: 1px; }
-.sdetail { margin: 4px 0 0; font: 11.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dim); background: var(--code); border-radius: 6px; padding: 6px 8px; white-space: pre-wrap; }
 .pipe-head { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; margin-bottom: 6px; }
 .pipe-now { font-size: 12.5px; color: var(--dim); }
 .pipe-now.p-back { color: var(--warn); } .pipe-now.p-failed { color: var(--bad); } .pipe-now.p-active { color: var(--c1); }
@@ -558,39 +288,6 @@ ol.steps-list { list-style: none; margin: 0; padding: 0; }
 .pipe-strip .pipe-now:hover { text-decoration: underline; }
 .pipe-strip .pipe-chips { margin-top: 6px; gap: 4px; }
 .pipe-strip .pipe-chip { font-size: 11.5px; padding: 2px 8px 2px 3px; }
-.jtools { margin-left: auto; display: flex; gap: 4px; }
-.jt { font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; max-height: 70vh; overflow: auto; }
-.jc { display: none; padding-left: 18px; border-left: 1px solid var(--soft); margin-left: 6px; }
-.jn.open > .jc { display: block; }
-.jrow { cursor: pointer; border-radius: 4px; }
-.jrow:hover { background: var(--soft); }
-.jn.leaf { padding-left: 0; }
-.jtog { display: inline-block; width: 14px; color: var(--dim); font-size: 10px; user-select: none; }
-.jk { all: unset; cursor: copy; color: var(--t4); }
-.jk.idx { color: var(--dim); }
-.jk:hover { text-decoration: underline; }
-.jk.copied { color: var(--ok); }
-.jp { color: var(--dim); }
-.jprev { color: var(--dim); font-size: 11.5px; }
-.jn.open > .jrow > .jprev { opacity: 0.6; }
-.jv { white-space: pre-wrap; word-break: break-word; }
-.j-string { color: var(--t2); } .j-number { color: var(--t3); } .j-boolean { color: var(--t5); } .j-null { color: var(--dim); font-style: italic; }
-.jt mark { background: color-mix(in srgb, var(--warn) 35%, transparent); color: inherit; border-radius: 2px; }
-.jmore { margin: 2px 0; }
-ol.tline { list-style: none; margin: 0; padding: 0; }
-.tday { font-size: 12px; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; padding: 10px 0 6px 92px; }
-.tday:first-child { padding-top: 0; }
-.tev { position: relative; display: grid; grid-template-columns: 76px 16px 1fr; gap: 0 8px; padding-bottom: 12px; }
-.tev::before { content: ""; position: absolute; left: 91px; top: 14px; bottom: -2px; width: 2px; background: var(--line); }
-.tev:last-child::before, .tev:has(+ .tday)::before { display: none; }
-.twhen { text-align: right; font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--dim); padding-top: 1px; display: flex; flex-direction: column; }
-.tgap { font-size: 11px; opacity: 0.75; }
-.tdot { width: 12px; height: 12px; margin: 4px 0 0 1px; border-radius: 50%; background: var(--card); border: 2px solid var(--line); box-sizing: border-box; z-index: 1; }
-.tev.toned .tdot { background: var(--tone); border-color: var(--tone); }
-.ttitle { font-size: 13.5px; line-height: 1.4; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.tnote { font-size: 12.5px; color: var(--dim); margin-top: 2px; white-space: pre-wrap; }
-:root { --t0:#1c1b19; --t1:#c0392b; --t2:#1f7a52; --t3:#a86a00; --t4:#285880; --t5:#8a3f9e; --t6:#1f7a8a; --t7:#6b675e; --t8:#8a8578; --t9:#e0533f; --t10:#2f9e72; --t11:#b8901c; --t12:#3b7dd8; --t13:#a35bc0; --t14:#2e9bb0; --t15:#3a3834; }
-@media (prefers-color-scheme: dark) { :root { --t0:#6b675e; --t1:#ef6f5e; --t2:#5cc495; --t3:#e2b257; --t4:#6ea3ec; --t5:#c792ea; --t6:#5cc3d3; --t7:#d6d3cc; --t8:#8a8578; --t9:#ff8a7a; --t10:#7ad9ab; --t11:#f0cc70; --t12:#8fbaf2; --t13:#d8aaf2; --t14:#7ad4e2; --t15:#ffffff; } }
 .fileview { display: flex; align-items: stretch; min-height: 100%; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .fileview pre { margin: 0; padding: 8px 0; font: inherit; white-space: pre; }
 .fileview .gutter { flex: none; position: sticky; left: 0; padding: 8px 10px 8px 14px; text-align: right; color: var(--dim); user-select: none; border-right: 1px solid var(--line); background: color-mix(in srgb, var(--soft) 40%, var(--card)); }
@@ -761,8 +458,6 @@ body.rv-on .toast { bottom: 76px; }
 .md blockquote > .bq-copy .btn { background: var(--card); opacity: 0; transition: opacity .12s; }
 .md blockquote:hover > .bq-copy .btn, .md blockquote > .bq-copy .btn:focus-visible, .md blockquote > .bq-copy .btn.ok { opacity: 1; }
 @media (hover: none) { .md blockquote > .bq-copy .btn { opacity: 0.6; } }
-.mmd { overflow-x: auto; text-align: center; }
-.mmd svg { max-width: 100%; height: auto; }
 iframe { display: block; width: 100%; border: 0; background: #fff; }
 iframe.fit { background: var(--card); }
 iframe.plan { height: 82vh; }
@@ -774,6 +469,8 @@ img.shot { display: block; max-width: 100%; margin: 0 auto; border-radius: 6px; 
 .findings li time { color: var(--dim); font-size: 12px; text-align: right; padding-top: 1px; }
 .findings li .when { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
 .tag.auto { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.fold-more { display: block; margin: 6px 0 0; }
+.gallery figure[hidden], details.agent[hidden] { display: none; }
 .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
 .gallery figure { margin: 0; min-width: 0; }
 .gallery img { display: block; width: 100%; height: 150px; object-fit: cover; object-position: top left; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
@@ -872,20 +569,6 @@ const style = document.createElement("style");
 style.textContent = CSS;
 document.head.append(style);
 
-const h = (tag, attrs = {}, ...kids) => {
-  const el = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (v == null || v === false) continue;
-    if (k === "class") el.className = v;
-    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
-    else el.setAttribute(k, v === true ? "" : String(v));
-  }
-  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid instanceof Node ? kid : String(kid));
-  return el;
-};
-
-const tilde = (p) => String(p || "").replace(/^\/(?:Users|home)\/[^/]+/, "~");
-
 function ago(t) {
   const ms = Date.now() - (typeof t === "number" ? t : Date.parse(t));
   if (!(ms >= 0)) return "";
@@ -896,19 +579,10 @@ function ago(t) {
   return `${Math.round(s / 86400)}d ago`;
 }
 
-const clock = (d) => d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 const fullDate = (iso) => {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
 };
-
-function dayLabel(d) {
-  const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
-  const diff = Math.round((day(new Date()) - day(d)) / 86400000);
-  if (diff === 0) return "Today";
-  if (diff === 1) return "Yesterday";
-  return d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
-}
 
 /** A relative time that the ticker below keeps current. */
 const agoEl = (iso) => h("time", { "data-at": iso, datetime: iso, title: fullDate(iso) }, ago(iso));
@@ -1029,7 +703,6 @@ function clipButton(getHref, label = "Clippy", ico = null) {
 // ── renderers ────────────────────────────────────────────────────────────────
 
 let mermaidReady;
-let mermaidSeq = 0;
 let hljsReady;
 
 /** highlight.js, loaded on first use; null when it can't load (code stays plain). */
@@ -1078,19 +751,8 @@ function loadMermaid() {
   return mermaidReady;
 }
 
-async function renderMermaid(el, source) {
-  // Not "mermaid": mermaid's own startOnLoad scans for that class when its
-  // script loads and would empty this box before render() fills it.
-  el.classList.add("mmd");
-  el._src = source; // kept so a theme change can draw it again
-  try {
-    const mermaid = await loadMermaid();
-    const { svg } = await mermaid.render(`mmd-${++mermaidSeq}`, source);
-    el.innerHTML = svg;
-  } catch (e) {
-    el.replaceChildren(h("div", { class: "err" }, `mermaid: ${e.message || e}`), h("pre", {}, source));
-  }
-}
+/** mermaid, drawn by render.mjs with this page's lazy loader (and its theme config). */
+const drawMermaid = (el, source) => renderMermaid(el, source, { loadMermaid });
 
 function renderMarkdown(text) {
   const el = h("div", { class: "md" });
@@ -1104,7 +766,7 @@ function renderMarkdown(text) {
   for (const code of el.querySelectorAll("pre > code.language-mermaid")) {
     const box = h("div");
     code.parentElement.replaceWith(box);
-    renderMermaid(box, code.textContent);
+    drawMermaid(box, code.textContent);
   }
   // Paths in table cells may wrap at their slashes, not mid-name.
   for (const code of el.querySelectorAll("td code")) {
@@ -1165,20 +827,6 @@ window.addEventListener("message", (e) => {
   }
 });
 
-/** A compact card: number, state, title (a link when href is set), note. The header is the section title. */
-function renderTracker(spec) {
-  const title = spec.href
-    ? h("a", { href: spec.href, target: "_blank", rel: "noopener" }, spec.title)
-    : spec.title;
-  return h(
-    "div",
-    { class: "tracker" },
-    spec.id || spec.state ? h("div", { class: "tk-line" }, spec.id ? h("span", { class: "tk-id" }, `#${spec.id}`) : null, spec.state ? h("span", { class: `tk-state ${trackerTone(spec.state)}` }, spec.state) : null) : null,
-    h("div", { class: "tk-title" }, title),
-    spec.note ? h("div", { class: "tk-note" }, spec.note) : null,
-  );
-}
-
 async function sectionBody(id, sec) {
   if (sec.kind === "watch") return renderWatch(sec.data || {});
   const url = `/s/${encodeURIComponent(id)}/f/${encodeURIComponent(sec.file)}?v=${encodeURIComponent(sec.at || "")}`;
@@ -1187,7 +835,7 @@ async function sectionBody(id, sec) {
       return renderMarkdown(await (await fetch(url)).text());
     case "mermaid": {
       const box = h("div");
-      renderMermaid(box, await (await fetch(url)).text());
+      drawMermaid(box, await (await fetch(url)).text());
       return box;
     }
     case "html": {
@@ -1209,7 +857,7 @@ async function sectionBody(id, sec) {
     case "chart":
       return renderChart(JSON.parse(await (await fetch(url)).text()));
     case "terminal":
-      return renderTerminal(JSON.parse(await (await fetch(url)).text()));
+      return renderTerminal(JSON.parse(await (await fetch(url)).text()), { copyButton });
     case "stats":
       return renderStats(JSON.parse(await (await fetch(url)).text()));
     case "table":
@@ -1219,21 +867,21 @@ async function sectionBody(id, sec) {
     case "pipeline":
       return renderPipeline(JSON.parse(await (await fetch(url)).text()));
     case "kanban":
-      return renderKanban(JSON.parse(await (await fetch(url)).text()), sec.id, sec.title);
+      return sectionKanban(JSON.parse(await (await fetch(url)).text()), sec);
     case "jobs":
       return renderJobs(JSON.parse(await (await fetch(url)).text()));
     case "json":
-      return renderJson(await (await fetch(url)).text());
+      return renderJson(await (await fetch(url)).text(), { copyButton, copyText });
     case "timeline":
       return renderTimeline(JSON.parse(await (await fetch(url)).text()));
     case "compare":
       return renderCompare(JSON.parse(await (await fetch(url)).text()), (f) => `/s/${encodeURIComponent(id)}/f/${encodeURIComponent(f)}?v=${encodeURIComponent(sec.at || "")}`);
     case "code":
-      return renderCode(JSON.parse(await (await fetch(url)).text()));
+      return renderCode(JSON.parse(await (await fetch(url)).text()), { loadHighlight });
     case "tree":
-      return renderTree(JSON.parse(await (await fetch(url)).text()), sec.id);
+      return sectionTree(JSON.parse(await (await fetch(url)).text()), sec.id);
     case "options":
-      return renderOptions(JSON.parse(await (await fetch(url)).text()));
+      return renderOptions(JSON.parse(await (await fetch(url)).text()), { onSend: (prompt, e) => sendOrCopy(prompt, e) });
     case "tracker":
       return renderTracker(JSON.parse(await (await fetch(url)).text()));
     case "pdf":
@@ -2178,636 +1826,6 @@ function sectionCard(id, sec) {
   );
 }
 
-// ── charts ─────────────────────────────────────────────────────────────────────
-// A chart section is a small JSON spec drawn here as SVG. Colours are CSS
-// variables (--c1…--c8 and the status colours), so light and dark need no
-// redraw. It redraws on width changes so text stays its real size.
-// { type: bar|line|area|scatter|pie|donut, labels, series: [{ name, data, color }],
-//   stacked, horizontal, x: { label }, y: { label, unit, prefix, min, max }, height, caption }
-
-const SVG_NS = "http://www.w3.org/2000/svg";
-function svg(tag, attrs = {}, ...kids) {
-  const el = document.createElementNS(SVG_NS, tag);
-  for (const [k, v] of Object.entries(attrs)) if (v != null && v !== false) el.setAttribute(k, String(v));
-  for (const k of kids.flat()) if (k != null && k !== false) el.append(typeof k === "string" || typeof k === "number" ? String(k) : k);
-  return el;
-}
-const tip = (text) => svg("title", {}, text);
-const NAMED = new Set(["accent", "ok", "warn", "bad", "ink", "dim"]);
-const seriesColor = (s, i) => (/^c[1-8]$/.test(s?.color) || NAMED.has(s?.color) ? `var(--${s.color})` : `var(--c${(i % 8) + 1})`);
-const textW = (s) => String(s).length * 6.4;
-const clip = (s, n = 18) => (String(s).length > n ? `${String(s).slice(0, n - 1)}…` : String(s));
-
-function niceScale(lo, hi, count) {
-  if (!(hi > lo)) [lo, hi] = lo === 0 ? [0, 1] : [Math.min(lo, 0), Math.max(hi, 0) || Math.abs(lo)];
-  const raw = (hi - lo) / Math.max(count, 1);
-  const mag = 10 ** Math.floor(Math.log10(raw));
-  const f = raw / mag;
-  const step = (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * mag;
-  const a = Math.floor(lo / step + 1e-9) * step;
-  const b = Math.ceil(hi / step - 1e-9) * step;
-  const ticks = [];
-  for (let v = a; v <= b + step / 2; v += step) ticks.push(Number(v.toFixed(10)));
-  return { lo: a, hi: b, ticks };
-}
-
-function fmtValue(v, axis = {}, tick = false) {
-  const abs = Math.abs(v);
-  const opts = abs >= 1e5 ? { notation: "compact", maximumFractionDigits: 1 } : { maximumFractionDigits: abs > 0 && abs < 1 ? 3 : 2 };
-  const unit = axis.unit ? (axis.unit === "%" ? "%" : tick && axis.unit.length > 3 ? "" : `\u2009${axis.unit}`) : "";
-  return `${axis.prefix ?? ""}${new Intl.NumberFormat(undefined, opts).format(v)}${unit}`;
-}
-
-function renderChart(spec) {
-  const pie = spec.type === "pie" || spec.type === "donut";
-  const series = spec.series || [];
-  const legend = pie
-    ? (() => {
-        const data = series[0]?.data || [];
-        const total = data.reduce((a, b) => a + (b || 0), 0) || 1;
-        return (spec.labels || []).map((l, i) => [l, `var(--c${(i % 8) + 1})`, ` ${fmtValue(data[i] ?? 0, spec.y)} · ${Math.round(((data[i] || 0) / total) * 100)}%`]);
-      })()
-    : series.length > 1
-      ? series.map((s, i) => [s.name || `Series ${i + 1}`, seriesColor(s, i), ""])
-      : [];
-  const plot = h("div", { class: "chart-plot" });
-  const wrap = h(
-    "figure",
-    { class: "chart" },
-    legend.length ? h("div", { class: "chart-legend" }, legend.map(([name, color, extra]) => h("span", {}, h("i", { style: `background:${color}` }), name, extra ? h("em", {}, extra) : null))) : null,
-    plot,
-    spec.caption ? h("figcaption", { class: "chart-cap" }, spec.caption) : null,
-  );
-  let lastW = 0;
-  const draw = () => {
-    const w = Math.floor(plot.clientWidth);
-    if (!w || Math.abs(w - lastW) < 2) return;
-    lastW = w;
-    try {
-      plot.replaceChildren(pie ? drawPie(spec, w) : drawXY(spec, w));
-    } catch (e) {
-      plot.replaceChildren(h("div", { class: "err" }, `chart: ${e.message}`));
-    }
-  };
-  new ResizeObserver(draw).observe(plot);
-  return wrap;
-}
-
-function drawXY(spec, W) {
-  const type = spec.type;
-  const series = spec.series;
-  const scatter = type === "scatter";
-  const horiz = type === "bar" && !!spec.horizontal;
-  const stacked = !!spec.stacked && (type === "bar" || type === "area");
-  const labels = scatter ? [] : (spec.labels || []).map(String);
-  const n = labels.length;
-  const ya = spec.y || {};
-  const xa = spec.x || {};
-  const pts = (s) => s.data.map((p) => (Array.isArray(p) ? { x: p[0], y: p[1], label: p[2] } : p)).filter((p) => p && Number.isFinite(p.x) && Number.isFinite(p.y));
-
-  // Value domain, with stacks summed and bars and areas reaching zero.
-  let vals = [];
-  if (scatter) vals = series.flatMap((s) => pts(s).map((p) => p.y));
-  else if (stacked)
-    for (let i = 0; i < n; i++) {
-      let pos = 0;
-      let neg = 0;
-      for (const s of series) (s.data[i] ?? 0) >= 0 ? (pos += s.data[i] ?? 0) : (neg += s.data[i]);
-      vals.push(pos, neg);
-    }
-  else vals = series.flatMap((s) => s.data.filter((v) => Number.isFinite(v)));
-  let lo = Math.min(...vals);
-  let hi = Math.max(...vals);
-  if (type === "bar" || type === "area") (lo = Math.min(0, lo)), (hi = Math.max(0, hi));
-  const H = Math.min(Math.max(spec.height || (horiz ? n * (series.length > 1 && !stacked ? series.length * 13 + 12 : 28) + 44 : 280), 120), 900);
-  const vs = niceScale(ya.min ?? lo, ya.max ?? hi, horiz ? Math.max(2, Math.floor(W / 120)) : Math.max(2, Math.floor(H / 56)));
-  if (ya.min != null) (vs.lo = ya.min), (vs.ticks = vs.ticks.filter((t) => t >= ya.min));
-  if (ya.max != null) (vs.hi = ya.max), (vs.ticks = vs.ticks.filter((t) => t <= ya.max));
-
-  const tickLabels = vs.ticks.map((t) => fmtValue(t, ya, true));
-  const top = 8;
-  const right = 14;
-  let left;
-  let bottom = 22 + (horiz ? (ya.label ? 16 : 0) : xa.label ? 16 : 0);
-  if (horiz) left = Math.min(Math.max(...labels.map((l) => textW(clip(l, 24)))) + 12, W * 0.4);
-  else left = Math.max(...tickLabels.map(textW)) + 10 + (ya.label ? 16 : 0);
-  const pw = Math.max(W - left - right, 40);
-  const ph = Math.max(H - top - bottom, 40);
-  const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img" });
-  const grid = svg("g", { class: "grid" });
-  const axis = svg("g", { class: "axis" });
-  const marks = svg("g", { class: "marks" });
-  root.append(grid, marks, axis);
-  const span = vs.hi - vs.lo || 1;
-  const vpos = horiz ? (v) => left + ((v - vs.lo) / span) * pw : (v) => top + (1 - (v - vs.lo) / span) * ph;
-  const zero = vpos(Math.min(Math.max(0, vs.lo), vs.hi));
-
-  // Value gridlines and their labels.
-  vs.ticks.forEach((t, i) => {
-    const p = vpos(t);
-    const cls = t === 0 ? "zero" : null;
-    if (horiz) {
-      grid.append(svg("line", { x1: p, x2: p, y1: top, y2: top + ph, class: cls }));
-      axis.append(svg("text", { x: p, y: top + ph + 15, "text-anchor": "middle" }, tickLabels[i]));
-    } else {
-      grid.append(svg("line", { x1: left, x2: left + pw, y1: p, y2: p, class: cls }));
-      axis.append(svg("text", { x: left - 6, y: p + 3.5, "text-anchor": "end" }, tickLabels[i]));
-    }
-  });
-  const valueLabel = ya.label;
-  if (valueLabel && horiz) axis.append(svg("text", { class: "al", x: left + pw / 2, y: H - 4, "text-anchor": "middle" }, valueLabel));
-  if (valueLabel && !horiz) axis.append(svg("text", { class: "al", transform: `translate(11 ${top + ph / 2}) rotate(-90)`, "text-anchor": "middle" }, valueLabel));
-  if (xa.label && !horiz) axis.append(svg("text", { class: "al", x: left + pw / 2, y: H - 4, "text-anchor": "middle" }, xa.label));
-
-  if (scatter) {
-    const xs = series.flatMap((s) => pts(s).map((p) => p.x));
-    const xsc = niceScale(xa.min ?? Math.min(...xs), xa.max ?? Math.max(...xs), Math.max(2, Math.floor(pw / 90)));
-    const xspan = xsc.hi - xsc.lo || 1;
-    const xpos = (v) => left + ((v - xsc.lo) / xspan) * pw;
-    for (const t of xsc.ticks) {
-      grid.append(svg("line", { x1: xpos(t), x2: xpos(t), y1: top, y2: top + ph, class: "minor" }));
-      axis.append(svg("text", { x: xpos(t), y: top + ph + 15, "text-anchor": "middle" }, fmtValue(t, xa, true)));
-    }
-    series.forEach((s, si) => {
-      const color = seriesColor(s, si);
-      for (const p of pts(s)) marks.append(svg("circle", { class: "pt", cx: xpos(p.x), cy: vpos(p.y), r: 4, style: `fill:${color}` }, tip(`${p.label ? `${p.label}: ` : ""}${s.name ? `${s.name} · ` : ""}${fmtValue(p.x, xa)}, ${fmtValue(p.y, ya)}`)));
-    });
-    return root;
-  }
-
-  // Categories: one band each, labels thinned to fit.
-  const band = (horiz ? ph : pw) / Math.max(n, 1);
-  const cpos = (i) => (horiz ? top : left) + (i + 0.5) * band;
-  if (horiz) {
-    labels.forEach((l, i) => axis.append(svg("text", { x: left - 6, y: cpos(i) + 3.5, "text-anchor": "end" }, clip(l, 24), l.length > 24 ? tip(l) : null)));
-  } else {
-    const every = Math.max(1, Math.ceil((Math.max(...labels.map((l) => textW(clip(l)))) + 10) / band));
-    labels.forEach((l, i) => i % every === 0 && axis.append(svg("text", { x: cpos(i), y: top + ph + 15, "text-anchor": "middle" }, clip(l), l.length > 18 ? tip(l) : null)));
-  }
-
-  if (type === "bar") {
-    const group = band * (n > 1 ? 0.74 : 0.5);
-    const bw = stacked ? group : group / series.length;
-    const pos = new Array(n).fill(0);
-    const neg = new Array(n).fill(0);
-    series.forEach((s, si) => {
-      const color = seriesColor(s, si);
-      s.data.forEach((v, i) => {
-        if (!Number.isFinite(v)) return;
-        let a = 0;
-        if (stacked) v >= 0 ? ((a = pos[i]), (pos[i] += v)) : ((a = neg[i]), (neg[i] += v));
-        const p0 = vpos(a);
-        const p1 = vpos(a + v);
-        const off = cpos(i) - group / 2 + (stacked ? 0 : si * bw);
-        const thick = Math.max(bw - (stacked || series.length === 1 ? 0 : 1.5), 1);
-        const rect = horiz
-          ? { x: Math.min(p0, p1), y: off, width: Math.max(Math.abs(p1 - p0), 0.5), height: thick }
-          : { x: off, y: Math.min(p0, p1), width: thick, height: Math.max(Math.abs(p1 - p0), 0.5) };
-        marks.append(svg("rect", { class: "bar", ...rect, rx: Math.min(2.5, thick / 4), style: `fill:${color}` }, tip(`${labels[i]}${s.name ? ` · ${s.name}` : ""}: ${fmtValue(v, ya)}`)));
-      });
-    });
-    return root;
-  }
-
-  // Lines and areas: points at band centres, a gap for each null.
-  const base = new Array(n).fill(0);
-  series.forEach((s, si) => {
-    const color = seriesColor(s, si);
-    const tops = s.data.map((v, i) => (Number.isFinite(v) ? (stacked ? base[i] + v : v) : null));
-    const runs = [];
-    let run = [];
-    tops.forEach((v, i) => (v == null ? (run.length && runs.push(run), (run = [])) : run.push(i)));
-    if (run.length) runs.push(run);
-    for (const r of runs) {
-      const line = r.map((i, k) => `${k ? "L" : "M"}${cpos(i).toFixed(1)},${vpos(tops[i]).toFixed(1)}`).join("");
-      if (type === "area") {
-        const back = r
-          .slice()
-          .reverse()
-          .map((i) => `L${cpos(i).toFixed(1)},${(stacked ? vpos(base[i]) : zero).toFixed(1)}`)
-          .join("");
-        marks.append(svg("path", { class: "area", d: `${line}${back}Z`, style: `fill:${color}` }));
-      }
-      marks.append(svg("path", { class: "line", d: line, style: `stroke:${color}` }));
-    }
-    if (n <= 80)
-      s.data.forEach((v, i) => {
-        if (!Number.isFinite(v)) return;
-        marks.append(svg("circle", { class: "pt", cx: cpos(i), cy: vpos(tops[i]), r: n <= 24 ? 3.2 : 2.2, style: `fill:${color}` }, tip(`${labels[i]}${s.name ? ` · ${s.name}` : ""}: ${fmtValue(v, ya)}`)));
-      });
-    if (stacked) tops.forEach((v, i) => v != null && (base[i] = v));
-  });
-  return root;
-}
-
-function drawPie(spec, W) {
-  const data = (spec.series[0]?.data || []).map((v) => (Number.isFinite(v) && v > 0 ? v : 0));
-  const labels = (spec.labels || []).map(String);
-  const total = data.reduce((a, b) => a + b, 0);
-  const H = Math.min(Math.max(spec.height || 240, 120), 900);
-  const r = Math.min(H / 2 - 6, W / 2 - 6);
-  const inner = spec.type === "donut" ? r * 0.6 : 0;
-  const cx = W / 2;
-  const cy = H / 2;
-  const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img" });
-  if (!total) return root;
-  const at = (a, rad) => [cx + rad * Math.sin(a), cy - rad * Math.cos(a)];
-  let a0 = 0;
-  data.forEach((v, i) => {
-    if (!v) return;
-    const a1 = a0 + (v / total) * Math.PI * 2;
-    const color = `var(--c${(i % 8) + 1})`;
-    const label = `${labels[i] ?? ""}: ${fmtValue(v, spec.y)} (${Math.round((v / total) * 100)}%)`;
-    if (v === total) {
-      marks(svg("circle", { class: "slice", cx, cy, r, style: `fill:${color}` }, tip(label)));
-    } else {
-      const big = a1 - a0 > Math.PI ? 1 : 0;
-      const [x0, y0] = at(a0, r);
-      const [x1, y1] = at(a1, r);
-      let d = `M${cx},${cy}L${x0},${y0}A${r},${r} 0 ${big} 1 ${x1},${y1}Z`;
-      if (inner) {
-        const [ix0, iy0] = at(a0, inner);
-        const [ix1, iy1] = at(a1, inner);
-        d = `M${ix0},${iy0}L${x0},${y0}A${r},${r} 0 ${big} 1 ${x1},${y1}L${ix1},${iy1}A${inner},${inner} 0 ${big} 0 ${ix0},${iy0}Z`;
-      }
-      marks(svg("path", { class: "slice", d, style: `fill:${color}` }, tip(label)));
-    }
-    a0 = a1;
-  });
-  if (inner) {
-    if (data.filter(Boolean).length === 1) root.append(svg("circle", { cx, cy, r: inner, class: "hole" }));
-    root.append(svg("text", { class: "total", x: cx, y: cy + 2, "text-anchor": "middle" }, fmtValue(total, spec.y)), svg("text", { x: cx, y: cy + 18, "text-anchor": "middle" }, "total"));
-  }
-  return root;
-  function marks(el) {
-    root.append(el);
-  }
-}
-
-// ── terminal ─────────────────────────────────────────────────────────────────────
-// Command output with its ANSI colours (mapped to --t0…--t15 so they follow
-// the theme), a header with the command, exit code and duration, the middle of
-// long output folded, and a filter box. Output without colour gets error,
-// warning and pass lines tinted.
-
-function applySgr(style, params) {
-  const p = params === "" ? [0] : params.split(";").map(Number);
-  const c256 = (n) => {
-    if (n < 16) return n;
-    if (n >= 232) return `rgb(${[0, 0, 0].map(() => 8 + (n - 232) * 10).join(",")})`;
-    const v = (x) => (x ? x * 40 + 55 : 0);
-    n -= 16;
-    return `rgb(${v(Math.floor(n / 36))},${v(Math.floor(n / 6) % 6)},${v(n % 6)})`;
-  };
-  for (let i = 0; i < p.length; i++) {
-    const n = p[i];
-    if (n === 0) for (const k of Object.keys(style)) delete style[k];
-    else if (n === 1) style.b = 1;
-    else if (n === 2) style.dim = 1;
-    else if (n === 3) style.i = 1;
-    else if (n === 4) style.u = 1;
-    else if (n === 7) style.inv = 1;
-    else if (n === 22) delete style.b, delete style.dim;
-    else if (n === 23) delete style.i;
-    else if (n === 24) delete style.u;
-    else if (n === 27) delete style.inv;
-    else if (n >= 30 && n <= 37) style.fg = n - 30;
-    else if (n >= 90 && n <= 97) style.fg = n - 90 + 8;
-    else if (n === 39) delete style.fg;
-    else if (n >= 40 && n <= 47) style.bg = n - 40;
-    else if (n >= 100 && n <= 107) style.bg = n - 100 + 8;
-    else if (n === 49) delete style.bg;
-    else if (n === 38 || n === 48) {
-      const key = n === 38 ? "fg" : "bg";
-      if (p[i + 1] === 5) (style[key] = c256(p[i + 2] || 0)), (i += 2);
-      else if (p[i + 1] === 2) (style[key] = `rgb(${p[i + 2] || 0},${p[i + 3] || 0},${p[i + 4] || 0})`), (i += 4);
-    }
-  }
-}
-
-/** Output split into lines of [text, style] runs, with \r redraws applied and other escapes dropped. */
-function parseAnsi(text) {
-  const lines = [];
-  const style = {};
-  let segs = [];
-  let plain = "";
-  const push = (t) => {
-    t = t.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
-    if (t) segs.push([t, { ...style }]), (plain += t);
-  };
-  const end = () => {
-    lines.push({ segs, plain });
-    segs = [];
-    plain = "";
-  };
-  text = text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
-  const re = /\x1b\[([0-9;?]*)([A-Za-z])|\r\n|\n|\r/g;
-  let last = 0;
-  let m;
-  while ((m = re.exec(text))) {
-    push(text.slice(last, m.index));
-    last = re.lastIndex;
-    if (m[0] === "\n" || m[0] === "\r\n") end();
-    else if (m[0] === "\r") (segs = []), (plain = "");
-    else if (m[2] === "m") applySgr(style, m[1]);
-  }
-  push(text.slice(last));
-  if (segs.length || plain) end();
-  return lines;
-}
-
-function ansiCss(st) {
-  const color = (c) => (typeof c === "number" ? `var(--t${c})` : c);
-  let fg = st.fg != null ? color(st.fg) : null;
-  let bg = st.bg != null ? color(st.bg) : null;
-  if (st.inv) [fg, bg] = [bg || "var(--code)", fg || "var(--ink)"];
-  return [fg && `color:${fg}`, bg && `background:${bg}`, st.b && "font-weight:700", st.dim && "opacity:.65", st.i && "font-style:italic", st.u && "text-decoration:underline"].filter(Boolean).join(";");
-}
-
-const lineTint = (s) =>
-  /(?<!\b0 )\b(error|errors|failed|failure|fatal|panic|exception)\b|✖|✗|^\s*not ok\b|^\s*FAIL\b/i.test(s)
-    ? " bad"
-    : /\b(warn|warning|deprecated)\b/i.test(s)
-      ? " warn"
-      : /✔|✓|^\s*ok\b|^\s*PASS\b|(?<!\b0 )\bpassed\b/.test(s)
-        ? " ok"
-        : "";
-
-function fmtSeconds(s) {
-  if (s < 1) return `${Math.round(s * 1000)} ms`;
-  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)} s`;
-  return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
-}
-
-function renderTerminal(spec) {
-  const output = spec.output || "";
-  const lines = parseAnsi(output);
-  const colored = /\x1b\[[0-9;]*m/.test(output);
-  const running = spec.running && spec.started;
-  const count = h("span", { class: "term-count" });
-  const filter = lines.length > 15 ? h("input", { class: "term-filter", type: "search", placeholder: "Filter lines", "aria-label": "Filter lines" }) : null;
-  // A command still going: a pulse and an elapsed time that ticks between writes.
-  let clock = null;
-  if (running) {
-    const t0 = Date.parse(spec.started);
-    const label = h("span");
-    const tick = () => {
-      const s = Math.max(0, Math.floor((Date.now() - t0) / 1000));
-      label.textContent = `running ${s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`}`;
-    };
-    tick();
-    let was = false;
-    const iv = setInterval(() => {
-      if (label.isConnected) (was = true), tick();
-      else if (was) clearInterval(iv); // re-rendered or closed
-    }, 1000);
-    clock = h("span", { class: "term-running" }, h("span", { class: "pulse working" }), label);
-  }
-  const head = h(
-    "div",
-    { class: "term-head" },
-    h("code", { class: "term-cmd" }, spec.command ? [h("span", { class: "term-ps" }, "$ "), spec.command] : h("span", { class: "term-ps" }, "output")),
-    h(
-      "span",
-      { class: "term-meta" },
-      spec.cwd ? h("span", { title: spec.cwd }, tilde(spec.cwd)) : null,
-      clock,
-      !running && spec.duration != null ? h("span", {}, typeof spec.duration === "number" ? fmtSeconds(spec.duration) : spec.duration) : null,
-      spec.exit != null ? h("span", { class: `term-exit ${spec.exit === 0 ? "ok" : "bad"}` }, `exit ${spec.exit}`) : null,
-      h("span", {}, `${lines.length.toLocaleString()} line${lines.length === 1 ? "" : "s"}`),
-    ),
-  );
-  const copy = copyButton(() => lines.map((l) => l.plain).join("\n"), "Copy output", null, { slack: "code" });
-  const tools = filter ? h("div", { class: "term-tools" }, filter, count, copy) : null;
-  if (!filter) head.lastChild.append(copy);
-  const body = h("div", { class: "term-body" });
-  const lineEl = (l, i, q) => {
-    const text = h("span", { class: "tx" });
-    if (q) {
-      // Filtered lines show plain text with the matches marked.
-      const low = l.plain.toLowerCase();
-      let at = 0;
-      for (let k = low.indexOf(q); k >= 0; k = low.indexOf(q, at)) {
-        text.append(l.plain.slice(at, k), h("mark", {}, l.plain.slice(k, k + q.length)));
-        at = k + q.length;
-      }
-      text.append(l.plain.slice(at));
-    } else for (const [t, st] of l.segs) text.append(Object.keys(st).length ? h("span", { style: ansiCss(st) }, t) : t);
-    return h("div", { class: `tl${colored ? "" : lineTint(l.plain)}` }, h("span", { class: "ln" }, i + 1), text);
-  };
-  const HEAD = 30;
-  const TAIL = 40;
-  let expanded = false;
-  const draw = () => {
-    const q = filter?.value.trim().toLowerCase() || "";
-    body.replaceChildren();
-    if (q) {
-      const hits = [];
-      lines.forEach((l, i) => l.plain.toLowerCase().includes(q) && hits.push(i));
-      for (const i of hits.slice(0, 2000)) body.append(lineEl(lines[i], i, q));
-      if (!hits.length) body.append(h("div", { class: "term-none" }, "No lines match"));
-      count.textContent = `${hits.length.toLocaleString()} of ${lines.length.toLocaleString()}`;
-      return;
-    }
-    count.textContent = "";
-    if (expanded || lines.length <= HEAD + TAIL + 10) lines.forEach((l, i) => body.append(lineEl(l, i)));
-    else if (running) {
-      // Still going: the newest lines matter, so only the tail shows.
-      const hidden = lines.length - TAIL;
-      body.append(h("button", { class: "term-fold", type: "button", onclick: () => ((expanded = true), draw()) }, `Show ${hidden.toLocaleString()} earlier lines`));
-      lines.slice(-TAIL).forEach((l, k) => body.append(lineEl(l, hidden + k)));
-    } else {
-      lines.slice(0, HEAD).forEach((l, i) => body.append(lineEl(l, i)));
-      const hidden = lines.length - HEAD - TAIL;
-      body.append(h("button", { class: "term-fold", type: "button", onclick: () => ((expanded = true), draw()) }, `Show ${hidden.toLocaleString()} more lines`));
-      lines.slice(-TAIL).forEach((l, k) => body.append(lineEl(l, lines.length - TAIL + k)));
-    }
-    if (!lines.length) body.append(h("div", { class: "term-none" }, running ? "No output yet" : "No output"));
-  };
-  filter?.addEventListener("input", draw);
-  draw();
-  // Follow the newest line while it runs (once in the page).
-  if (running) requestAnimationFrame(() => (body.scrollTop = body.scrollHeight));
-  return h("div", { class: `term${running ? " running" : ""}` }, head, tools, body);
-}
-
-// ── stats ──────────────────────────────────────────────────────────────────────────
-
-/** A small line of numbers with a dot on the last one; null leaves a gap. */
-function sparkSvg(data, w = 90, hgt = 26, color = "var(--accent)") {
-  const vals = (data || []).filter(Number.isFinite);
-  if (vals.length < 2) return null;
-  const lo = Math.min(...vals);
-  const span = Math.max(...vals) - lo || 1;
-  const x = (i) => 2 + (i / (data.length - 1)) * (w - 4);
-  const y = (v) => 3 + (1 - (v - lo) / span) * (hgt - 6);
-  let d = "";
-  let pen = false;
-  data.forEach((v, i) => {
-    if (!Number.isFinite(v)) return void (pen = false);
-    d += `${pen ? "L" : "M"}${x(i).toFixed(1)},${y(v).toFixed(1)}`;
-    pen = true;
-  });
-  let li = data.length - 1;
-  while (li > 0 && !Number.isFinite(data[li])) li--;
-  return svg("svg", { class: "spark", viewBox: `0 0 ${w} ${hgt}`, width: w, height: hgt, "aria-hidden": "true" }, svg("path", { d, style: `stroke:${color}` }), svg("circle", { cx: x(li), cy: y(data[li]), r: 2.2, style: `fill:${color}` }));
-}
-
-function renderStats(spec) {
-  const items = spec.items || [];
-  return h(
-    "div",
-    { class: "stats" },
-    items.map((it) => {
-      const color = /^c[1-8]$/.test(it.color) || NAMED.has(it.color) ? `var(--${it.color})` : "var(--accent)";
-      const value = typeof it.value === "number" ? fmtValue(it.value, it) : `${it.prefix ?? ""}${it.value}${it.unit ? `\u2009${it.unit}` : ""}`;
-      let delta = null;
-      if (it.delta != null && it.delta !== "") {
-        const dir = typeof it.delta === "number" ? Math.sign(it.delta) : /^\s*-/.test(it.delta) ? -1 : /^\s*\+/.test(it.delta) ? 1 : 0;
-        const text = typeof it.delta === "number" ? fmtValue(Math.abs(it.delta), { unit: it.unit === "%" ? "%" : "" }) : String(it.delta).replace(/^\s*[+-]\s*/, "");
-        const good = it.good || "up";
-        const cls = !dir || good === "none" ? "flat" : (dir > 0) === (good === "up") ? "ok" : "bad";
-        delta = h("span", { class: `stat-delta ${cls}` }, `${dir > 0 ? "↑" : dir < 0 ? "↓" : "→"} ${text}`);
-      }
-      return h(
-        "div",
-        { class: "stat" },
-        h("div", { class: "stat-label" }, it.label),
-        h("div", { class: "stat-row" }, h("b", { class: "stat-value", style: it.color ? `color:${color}` : null }, value), delta),
-        it.spark ? sparkSvg(it.spark, 120, 28, color) : null,
-        it.note ? h("div", { class: "stat-note" }, it.note) : null,
-      );
-    }),
-  );
-}
-
-// ── table ──────────────────────────────────────────────────────────────────────────
-// Rows from JSON or CSV: click a header to sort (asc, desc, off), type to
-// filter, typed cells (number, bar, spark, tag, link, code), 500 rows at a time.
-
-const TAG_TONE = [
-  [/^(ok|pass(ed|ing)?|success(ful)?|succeeded|done|yes|up|green|healthy|merged|open|active)$/i, "ok"],
-  [/^(fail(ed|ing|ure)?|error|errored|broken|no|down|red|critical|high|blocked)$/i, "bad"],
-  [/^(warn(ing)?|pending|queued|running|medium|yellow|slow|draft|skipped|flaky)$/i, "warn"],
-];
-
-function renderTable(spec) {
-  const rows = spec.rows || [];
-  let cols = spec.columns;
-  if (!cols) cols = Array.isArray(rows[0]) ? rows[0].map((_, i) => `Column ${i + 1}`) : [...new Set(rows.slice(0, 50).flatMap((r) => Object.keys(r)))];
-  cols = cols.map((c, i) => (typeof c === "string" ? { label: c, key: c } : { ...c, label: c.label ?? c.key, key: c.key ?? c.label ?? String(i) }));
-  const data = rows.map((r) => cols.map((c, i) => (Array.isArray(r) ? r[i] : r?.[c.key])));
-  for (const [i, c] of cols.entries()) {
-    if (c.type) continue;
-    const vals = data.map((r) => r[i]).filter((v) => v != null && v !== "");
-    c.type = !vals.length ? "text" : vals.every((v) => typeof v === "number") ? "number" : vals.every((v) => Array.isArray(v) && v.every((x) => x === null || typeof x === "number")) ? "spark" : "text";
-  }
-  const max = cols.map((c, i) => (c.type === "bar" ? Math.max(0, ...data.map((r) => (Number.isFinite(r[i]) ? Math.abs(r[i]) : 0))) : 0));
-  const text = (v) => (v == null ? "" : Array.isArray(v) ? "" : typeof v === "object" ? String(v.text ?? v.href ?? "") : String(v));
-  const haystack = data.map((r) => r.map(text).join(" \u0001 ").toLowerCase());
-  const sortKey = (v, c) => (c.type === "spark" ? (Array.isArray(v) ? v.filter(Number.isFinite).at(-1) : null) : c.type === "number" || c.type === "bar" ? (Number.isFinite(v) ? v : null) : text(v) || null);
-
-  const cell = (v, c, i) => {
-    if (v == null || v === "") return h("td", { class: "nil" }, "–");
-    switch (c.type) {
-      case "number":
-        return h("td", { class: "num" }, typeof v === "number" ? fmtValue(v, c) : String(v));
-      case "bar": {
-        const pct = max[i] && Number.isFinite(v) ? (Math.abs(v) / max[i]) * 100 : 0;
-        return h("td", { class: "barc" }, h("div", {}, h("span", { class: "cbar" }, h("i", { style: `width:${pct.toFixed(1)}%` })), h("span", { class: "num" }, Number.isFinite(v) ? fmtValue(v, c) : String(v))));
-      }
-      case "spark":
-        return h("td", { class: "sparkc" }, Array.isArray(v) ? sparkSvg(v, 84, 20) || "–" : String(v));
-      case "tag": {
-        const tone = TAG_TONE.find(([re]) => re.test(String(v).trim()))?.[1];
-        return h("td", {}, h("span", { class: `ctag${tone ? ` ${tone}` : ""}` }, String(v)));
-      }
-      case "link": {
-        const href = typeof v === "object" ? v.href : v;
-        const label = typeof v === "object" ? v.text ?? v.href : v;
-        return h("td", {}, /^https?:\/\//i.test(String(href)) ? h("a", { href, target: "_blank", rel: "noopener noreferrer" }, String(label)) : String(label));
-      }
-      case "code":
-        return h("td", {}, h("code", {}, String(v)));
-      default:
-        return h("td", {}, text(v));
-    }
-  };
-
-  const startCol = spec.sort ? cols.findIndex((c, i) => c.key === spec.sort.column || c.label === spec.sort.column || i === spec.sort.column) : -1;
-  const sort = { col: startCol, desc: !!spec.sort?.desc };
-  let limit = 500;
-  const filter = rows.length > 8 ? h("input", { class: "tbl-filter", type: "search", placeholder: `Filter ${rows.length.toLocaleString()} rows`, "aria-label": "Filter rows" }) : null;
-  const count = h("span", { class: "tbl-count" });
-  const thead = h("thead");
-  const tbody = h("tbody");
-  const more = h("div", { class: "tbl-more" });
-  const draw = () => {
-    const q = filter?.value.trim().toLowerCase() || "";
-    let order = data.map((_, i) => i);
-    if (q) order = order.filter((i) => haystack[i].includes(q));
-    if (sort.col >= 0) {
-      const c = cols[sort.col];
-      const keys = data.map((r) => sortKey(r[sort.col], c));
-      order.sort((a, b) => {
-        const x = keys[a];
-        const y = keys[b];
-        if (x == null || y == null) return x == null ? (y == null ? a - b : 1) : -1; // empties last
-        const d = typeof x === "number" && typeof y === "number" ? x - y : String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: "base" });
-        return (sort.desc ? -d : d) || a - b;
-      });
-    }
-    thead.replaceChildren(
-      h(
-        "tr",
-        {},
-        cols.map((c, i) => {
-          const on = sort.col === i;
-          const right = c.type === "number" || c.align === "right";
-          return h(
-            "th",
-            { class: right ? "num" : null, "aria-sort": on ? (sort.desc ? "descending" : "ascending") : "none" },
-            h(
-              "button",
-              {
-                type: "button",
-                class: `tbl-sort${on ? " on" : ""}`,
-                title: "Sort",
-                onclick: () => {
-                  // Numbers start high-first, text A-Z; a third click turns sorting off.
-                  const firstDesc = c.type === "number" || c.type === "bar" || c.type === "spark";
-                  if (!on) Object.assign(sort, { col: i, desc: firstDesc });
-                  else if (sort.desc === firstDesc) sort.desc = !sort.desc;
-                  else sort.col = -1;
-                  draw();
-                },
-              },
-              c.label,
-              h("span", { class: "arrow" }, on ? (sort.desc ? "▼" : "▲") : "↕"),
-            ),
-          );
-        }),
-      ),
-    );
-    tbody.replaceChildren(...order.slice(0, limit).map((ri) => h("tr", {}, cols.map((c, i) => cell(data[ri][i], c, i)))));
-    if (!order.length) tbody.append(h("tr", {}, h("td", { class: "nil", colspan: cols.length }, "No rows match")));
-    count.textContent = q ? `${order.length.toLocaleString()} of ${rows.length.toLocaleString()} rows` : `${rows.length.toLocaleString()} rows`;
-    more.replaceChildren(
-      order.length > limit ? h("button", { class: "term-fold", type: "button", onclick: () => ((limit += 1000), draw()) }, `Show ${Math.min(1000, order.length - limit).toLocaleString()} more of ${(order.length - limit).toLocaleString()}`) : "",
-    );
-  };
-  filter?.addEventListener("input", () => ((limit = 500), draw()));
-  draw();
-  return h(
-    "div",
-    { class: "tbl" },
-    h("div", { class: "tbl-tools" }, filter, count),
-    h("div", { class: "tbl-scroll" }, h("table", { class: "ktable" }, thead, tbody)),
-    more,
-    spec.caption ? h("div", { class: "chart-cap" }, spec.caption) : null,
-  );
-}
-
 // ── compare ────────────────────────────────────────────────────────────────────────
 // Two images: a slider (before on the left, after on the right; drag, or the
 // arrow keys), side by side, or onion skin (after over before, faded). The
@@ -2877,42 +1895,6 @@ function renderCompare(spec, src) {
   };
   draw();
   return h("div", { class: "cmp" }, h("div", { class: "cmp-bar" }, modes, fade), stage);
-}
-
-// ── steps ───────────────────────────────────────────────────────────────────────────
-// A checklist with a progress bar; the agent replaces the section as steps move.
-
-const STEP_ICON = { done: "✓", active: "", failed: "✕", skipped: "–", blocked: "!", todo: "" };
-
-function renderSteps(spec) {
-  const steps = spec.steps || [];
-  const n = (s) => steps.filter((x) => x.status === s).length;
-  const counted = steps.length - n("skipped");
-  const pct = counted ? (n("done") / counted) * 100 : 100;
-  const extra = [n("failed") && h("span", { class: "bad" }, `${n("failed")} failed`), n("blocked") && h("span", { class: "warn" }, `${n("blocked")} blocked`), n("skipped") && h("span", {}, `${n("skipped")} skipped`)].filter(Boolean);
-  return h(
-    "div",
-    { class: "steps" },
-    h(
-      "div",
-      { class: "steps-head" },
-      spec.title ? h("b", {}, spec.title) : null,
-      h("span", { class: "steps-count" }, `${n("done")} of ${counted} done`, extra.flatMap((e) => [" · ", e])),
-      h("span", { class: `steps-bar${n("failed") ? " bad" : ""}`, role: "progressbar", "aria-valuenow": Math.round(pct), "aria-valuemin": 0, "aria-valuemax": 100 }, h("i", { style: `width:${pct.toFixed(1)}%` })),
-    ),
-    h(
-      "ol",
-      { class: "steps-list" },
-      steps.map((s) =>
-        h(
-          "li",
-          { class: `step s-${s.status}` },
-          h("span", { class: "smark", title: s.status }, STEP_ICON[s.status] ?? ""),
-          h("div", { class: "sbody" }, h("div", { class: "slabel" }, s.label), s.note ? h("div", { class: "snote" }, s.note) : null, s.detail ? h("pre", { class: "sdetail" }, s.detail) : null),
-        ),
-      ),
-    ),
-  );
 }
 
 // ── pipeline ──────────────────────────────────────────────────────────────────────────
@@ -3276,281 +2258,10 @@ function renderPipeline(spec) {
   return el;
 }
 
-// ── json ──────────────────────────────────────────────────────────────────────────────
-// A collapsible tree, built lazily as nodes open. Two levels open to start;
-// the filter keeps the paths to matching keys and values and opens them.
-// Clicking a key copies its jq-style path.
-
-function renderJson(text) {
-  let root;
-  try {
-    root = JSON.parse(text);
-  } catch (e) {
-    return h("pre", { class: "err" }, `Not JSON: ${e.message}`);
-  }
-  const isObj = (v) => v && typeof v === "object";
-  // jq-style paths: the root is ".", its children ".key" and ".[0]".
-  const childPath = (p, k) => {
-    const b = p === "." ? "" : p;
-    if (typeof k === "number") return `${b || "."}[${k}]`;
-    return /^[A-Za-z_$][\w$]*$/.test(k) ? `${b}.${k}` : `${b || "."}[${JSON.stringify(k)}]`;
-  };
-  const entriesOf = (v) => (Array.isArray(v) ? v.map((x, i) => [i, x]) : Object.entries(v));
-  const filter = h("input", { class: "tbl-filter", type: "search", placeholder: "Filter keys and values", "aria-label": "Filter keys and values" });
-  const count = h("span", { class: "tbl-count" });
-  const tree = h("div", { class: "jt" });
-  let state = { open: "auto", keep: null, q: "", budget: 0 };
-
-  const marked = (s, q) => {
-    if (!q) return s;
-    const k = s.toLowerCase().indexOf(q);
-    return k < 0 ? s : [s.slice(0, k), h("mark", {}, s.slice(k, k + q.length)), s.slice(k + q.length)];
-  };
-  const prim = (v) => {
-    const t = v === null ? "null" : typeof v;
-    return h("span", { class: `jv j-${t}` }, marked(t === "string" ? JSON.stringify(v) : String(v), state.q));
-  };
-  const keyEl = (k, path) =>
-    k == null
-      ? null
-      : h(
-          "button",
-          {
-            type: "button",
-            class: `jk${typeof k === "number" ? " idx" : ""}`,
-            title: `Copy path ${path}`,
-            onclick: async (e) => {
-              e.stopPropagation();
-              await copyText(path).catch(() => {});
-              e.target.classList.add("copied");
-              setTimeout(() => e.target.classList.remove("copied"), 900);
-            },
-          },
-          typeof k === "number" ? String(k) : marked(k, state.q),
-        );
-  const node = (k, v, path, depth, free) => {
-    if (!isObj(v)) return h("div", { class: "jn leaf" }, h("span", { class: "jtog" }), keyEl(k, path), k != null ? h("span", { class: "jp" }, ": ") : null, prim(v));
-    const entries = entriesOf(v);
-    const arr = Array.isArray(v);
-    const kids = h("div", { class: "jc" });
-    const tog = h("span", { class: "jtog" }, entries.length ? "▸" : "");
-    const preview = h("span", { class: "jprev" }, arr ? `[ ${entries.length} item${entries.length === 1 ? "" : "s"} ]` : `{ ${entries.length} key${entries.length === 1 ? "" : "s"} }`);
-    const row = h("div", { class: "jrow" }, tog, keyEl(k, path), k != null ? h("span", { class: "jp" }, ": ") : null, preview);
-    const wrap = h("div", { class: "jn" }, row, kids);
-    let built = false;
-    const build = () => {
-      built = true;
-      const keep = free ? null : state.keep;
-      let shown = entries.filter(([ck]) => !keep || keep.has(childPath(path, ck)));
-      const LIMIT = 200;
-      const add = (from) => {
-        for (const [ck, cv] of shown.slice(from, from + LIMIT)) {
-          const cp = childPath(path, ck);
-          // Below a match, everything shows; elsewhere the filter keeps only paths that lead to one.
-          kids.append(node(ck, cv, cp, depth + 1, free || (keep && state.hits.has(cp))));
-        }
-        if (shown.length > from + LIMIT) {
-          const more = h("button", { type: "button", class: "term-fold jmore", onclick: () => (more.remove(), add(from + LIMIT)) }, `Show ${Math.min(LIMIT, shown.length - from - LIMIT)} more of ${shown.length - from - LIMIT}`);
-          kids.append(more);
-        }
-      };
-      add(0);
-    };
-    const set = (open) => {
-      if (open && !built) build();
-      wrap.classList.toggle("open", open);
-      tog.textContent = entries.length ? (open ? "▾" : "▸") : "";
-    };
-    row.addEventListener("click", () => entries.length && set(!wrap.classList.contains("open")));
-    let open;
-    if (state.keep && !free) open = true;
-    else if (state.open === "all") open = state.budget-- > 0;
-    else if (state.open === "none") open = depth === 0;
-    else open = depth < 2 && entries.length <= 60;
-    if (open && entries.length) set(true);
-    return wrap;
-  };
-
-  const draw = () => {
-    const q = filter.value.trim().toLowerCase();
-    state.q = q;
-    state.keep = null;
-    state.hits = new Set();
-    if (q) {
-      const keep = new Set(["."]);
-      let seen = 0;
-      const walk = (v, path, k, trail) => {
-        if (++seen > 50000 || state.hits.size >= 500) return;
-        const hit = (k != null && typeof k === "string" && k.toLowerCase().includes(q)) || (!isObj(v) && String(v).toLowerCase().includes(q));
-        if (hit) {
-          state.hits.add(path);
-          for (const t of trail) keep.add(t);
-          keep.add(path);
-        }
-        if (isObj(v)) for (const [ck, cv] of entriesOf(v)) walk(cv, childPath(path, ck), ck, [...trail, path]);
-      };
-      walk(root, ".", null, []);
-      state.keep = keep;
-      count.textContent = `${state.hits.size >= 500 ? "500+" : state.hits.size} match${state.hits.size === 1 ? "" : "es"}`;
-    } else count.textContent = "";
-    tree.replaceChildren(node(null, root, ".", 0, false));
-    if (q && !state.hits.size) tree.replaceChildren(h("div", { class: "term-none" }, "Nothing matches"));
-  };
-  filter.addEventListener("input", () => ((state.open = "auto"), draw()));
-  const btn = (label, mode) => h("button", { type: "button", class: "btn", onclick: () => ((state.open = mode), (state.budget = 3000), (filter.value = ""), draw()) }, label);
-  draw();
-  return h("div", { class: "jsonv" }, h("div", { class: "tbl-tools" }, filter, count, h("span", { class: "jtools" }, btn("Expand all", "all"), btn("Collapse", "none"), copyButton(() => JSON.stringify(root, null, 2), "Copy JSON"))), tree);
-}
-
-// ── timeline ─────────────────────────────────────────────────────────────────────
-// Events down a line. When every event has a real time they are sorted
-// (unless order is "given"), grouped under day headings, and the gap since
-// the previous event is shown; text times are shown as written.
-
-function fmtGap(ms) {
-  const m = Math.round(ms / 60000);
-  if (m < 1) return "";
-  if (m < 60) return `${m}m`;
-  if (m < 1440) return `${Math.floor(m / 60)}h${m % 60 ? ` ${m % 60}m` : ""}`;
-  const d = Math.floor(m / 1440);
-  const hr = Math.round((m % 1440) / 60);
-  return `${d}d${hr ? ` ${hr}h` : ""}`;
-}
-
 // ── code, tree, options ──
 
 const COPY_AS = { code: (s) => s.code, tree: (s) => treeText(s), options: (s) => optionsText(s) };
 
-/** Note text: paragraphs split on blank lines, with inline `code`, **bold** and links. */
-const noteParas = (text, lead = null) => String(text).split(/\n\s*\n/).map((p, i) => h("p", {}, i ? null : lead, inline(p)));
-
-/** A highlighted element's content as one list of nodes per line; a span that crosses a line break is split, so every line stands alone. */
-function lineNodes(root) {
-  const lines = [[]];
-  const walk = (node, chain) => {
-    for (const ch of node.childNodes) {
-      if (ch.nodeType === Node.TEXT_NODE) {
-        ch.textContent.split("\n").forEach((part, i) => {
-          if (i) lines.push([]);
-          if (!part) return;
-          let el = document.createTextNode(part);
-          for (let j = chain.length - 1; j >= 0; j--) {
-            const c = chain[j].cloneNode(false);
-            c.append(el);
-            el = c;
-          }
-          lines.at(-1).push(el);
-        });
-      } else if (ch.nodeType === Node.ELEMENT_NODE) walk(ch, [...chain, ch]);
-    }
-  };
-  walk(root, []);
-  return lines;
-}
-
-function renderCode(spec) {
-  const rows = codeLayout(spec);
-  const last = rows.at(-1)?.n || 1;
-  const body = h("div", { class: "code-body", style: `--gut:${String(last).length + 0.5}ch`, "data-rv-file": spec.path || "code", "data-rv-lang": spec.lang || "" });
-  const cells = [];
-  for (const r of rows) {
-    const lc = h("span", { class: "lc" }, r.text || "\u200b");
-    cells.push(lc);
-    body.append(h("div", { class: `cl${r.hl ? " hl" : ""}${r.tone ? " toned" : ""}`, style: r.tone ? `--tone:${toneVar(r.tone)}` : null, "data-line": r.n }, h("span", { class: "ln", "data-rv": `:${r.n}` }, String(r.n)), lc));
-    for (const n of r.notes) body.append(h("div", { class: "code-note", style: n.tone ? `--tone:${toneVar(n.tone)}` : null }, ...noteParas(n.text, h("span", { class: "at" }, lineLabel(n.from, n.to)))));
-  }
-  const shown = rows.length ? `lines ${rows[0].n}–${last} of ${spec.total}` : "";
-  const head = h("div", { class: "code-head" }, h("span", { class: "path" }, spec.path || ""), h("span", {}, rows.length === spec.total ? `${spec.total} lines` : shown), spec.lang ? h("span", { class: "ctag" }, spec.lang) : null);
-  // Highlight the whole range at once (a string or comment can span lines), then split the result back into rows.
-  if (spec.lang && !PLAIN.has(spec.lang) && String(spec.code).length <= 200000)
-    loadHighlight().then((hl) => {
-      if (!hl?.getLanguage(spec.lang) || !window.DOMPurify) return;
-      try {
-        const tmp = document.createElement("code");
-        tmp.innerHTML = window.DOMPurify.sanitize(hl.highlight(String(spec.code), { language: spec.lang, ignoreIllegals: true }).value, HL_CLEAN);
-        const lines = lineNodes(tmp);
-        if (lines.length === cells.length) cells.forEach((c, i) => lines[i].length && c.replaceChildren(...lines[i]));
-      } catch {}
-    });
-  return h("div", { class: "code" }, head, body, spec.caption ? h("div", { class: "code-cap" }, inline(spec.caption)) : null);
-}
-
-const TREE_FOLD_KEY = "canvas:tree-folds"; // localStorage: { "<session>/<section>/<path>": open? }
-const TREE_TONE = { added: "ok", changed: "warn", deleted: "bad", renamed: "c5", moved: "c5" };
-const FOLDER_ICON = ["M1.8 4.2c0-.6.4-1 1-1h3.4l1.4 1.5h5.6c.6 0 1 .4 1 1v6.6c0 .6-.4 1-1 1H2.8c-.6 0-1-.4-1-1z"];
-const FILE_ICON = ["M4 1.8h5l3.2 3.2v9.2H4z", "M9 1.8V5h3.2"];
-
-function renderTree(spec, secId = "") {
-  const nodes = buildTree(spec.entries);
-  const total = spec.entries?.length || 0;
-  const store = () => readStore(localStorage, TREE_FOLD_KEY);
-  const keyOf = (p) => `${currentSession}/${secId}/${p}`;
-  const glyph = (paths) => svg("svg", { class: "ico", viewBox: "0 0 16 16", width: 13, height: 13, "aria-hidden": "true" }, ...paths.map((d) => svg("path", { d, fill: "none", stroke: "currentColor", "stroke-width": "1.3", "stroke-linejoin": "round" })));
-  const list = (kids, depth) =>
-    h(
-      "ul",
-      {},
-      kids.map((n) => {
-        const tone = TREE_TONE[n.tag];
-        const sum = n.dir ? Object.entries(n.counts || {}).map(([t, c]) => `${c} ${t}`).join(" · ") || `${n.files} file${n.files === 1 ? "" : "s"}` : "";
-        const row = h(
-          "div",
-          { class: `tr${n.dir ? " dir" : ""}${n.tag ? ` t-${n.tag}` : ""}`, title: n.path, ...(n.dir ? { role: "button", tabindex: "0" } : {}) },
-          n.dir ? h("span", { class: "caret", "aria-hidden": "true" }, "▸") : h("span", { class: "caret" }),
-          glyph(n.dir ? FOLDER_ICON : FILE_ICON),
-          h("span", { class: "nm" }, n.dir ? `${n.name}/` : n.name),
-          n.tag ? h("span", { class: "ttag", style: `--tone:${toneVar(tone)}` }, n.tag) : null,
-          n.note ? h("span", { class: "note" }, inline(n.note)) : null,
-          n.dir ? h("span", { class: "sum" }, sum) : null,
-        );
-        const li = h("li", {}, row);
-        if (n.dir) {
-          const sub = list(n.kids, depth + 1);
-          const saved = store()[keyOf(n.path)];
-          const set = (open) => ((sub.hidden = !open), row.classList.toggle("open", open), row.setAttribute("aria-expanded", String(open)));
-          set(saved ?? (total <= 150 || depth < 1));
-          const flip = () => {
-            const open = sub.hidden;
-            set(open);
-            const all = store();
-            all[keyOf(n.path)] = open;
-            writeStore(localStorage, TREE_FOLD_KEY, all);
-          };
-          row.addEventListener("click", flip);
-          row.addEventListener("keydown", (e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), flip()));
-          li.append(sub);
-        }
-        return li;
-      }),
-    );
-  return h("div", { class: "tree" }, spec.root ? h("div", { class: "tree-root" }, `${spec.root}/`) : null, list(nodes, 0), spec.caption ? h("div", { class: "tree-cap" }, inline(spec.caption)) : null);
-}
-
-function renderOptions(spec) {
-  const cards = (spec.options || []).map((o, i) =>
-    h(
-      "div",
-      { class: `opt${o.recommended ? " rec" : ""}` },
-      h("div", { class: "opt-hd" }, h("span", { class: "letter" }, optionLetter(i)), h("b", {}, inline(o.label)), o.recommended ? h("span", { class: "opt-badge" }, "Recommended") : null),
-      o.cost ? h("div", { class: "opt-cost" }, o.cost) : null,
-      o.summary ? h("div", {}, inline(o.summary)) : null,
-      o.pros ? h("ul", { class: "pros" }, o.pros.map((p) => h("li", {}, h("span", {}, inline(p))))) : null,
-      o.cons ? h("ul", { class: "cons" }, o.cons.map((p) => h("li", {}, h("span", {}, inline(p))))) : null,
-      o.scores
-        ? h(
-            "div",
-            { class: "opt-scores" },
-            Object.entries(o.scores).flatMap(([k, v]) => [h("span", {}, k), h("span", { class: "cbar", title: `${k}: ${v}/5` }, h("i", { style: `width:${(v / 5) * 100}%` })), h("span", {}, String(v))]),
-          )
-        : null,
-      h("div", { class: "opt-ft" }, sendButton(() => optionPrompt(spec, i), "Pick", "Send this choice to pi (⌥-click: copy the prompt)")),
-    ),
-  );
-  return h("div", {}, spec.question ? h("div", { class: "opts-q" }, inline(spec.question)) : null, h("div", { class: "opts" }, cards), spec.caption ? h("div", { class: "opt-cap" }, inline(spec.caption)) : null);
-}
-const withTitle = (el, title) => (el.setAttribute("title", title), el);
-
-/** A button that sends getText() to pi (sendOrCopy: undo toast; copies on ⌥-click or when the session has ended). */
 function sendButton(getText, label = "Send to pi", title = "Send this to pi (⌥-click: copy it)") {
   const b = h("button", { class: "btn", type: "button", title }, label);
   b.addEventListener("click", (e) => (e.preventDefault(), e.stopPropagation(), sendOrCopy(getText(), e)));
@@ -3558,10 +2269,9 @@ function sendButton(getText, label = "Send to pi", title = "Send this to pi (⌥
 }
 
 // ── kanban ─────────────────────────────────────────────────────────────────────────
-// Columns side by side, or stacked when the card is narrow (the side panel,
-// a phone): a container query, so the same board fits both places.
-
-const toneVar = (t) => (/^(ok|warn|bad|accent|dim|c[1-8])$/.test(t || "") ? `var(--${t})` : "");
+// The board itself is render.mjs's; what it can't know is this browser: the
+// "new" / moved marks (stored per section so they survive a reload), the folded
+// compact column, each owner's session link, and the card's details modal.
 
 const KB_SEEN_KEY = "canvas:kanban-seen"; // localStorage: { "<session>/<section>": { snap, moves, at } }
 const KB_FOLD_KEY = "canvas:kanban-fold"; // sessionStorage: { "<session>/<section>/<column>": folded }
@@ -3587,12 +2297,6 @@ function saveBoardMarks(key, entry) {
   writeStore(localStorage, KB_SEEN_KEY, all);
 }
 
-/** Inline `code`, **bold** and links as DOM; links become text inside a card that is itself a link. */
-const inline = (text, links = true) =>
-  inlineTokens(text).map((t) =>
-    t.t === "code" ? h("code", {}, t.v) : t.t === "b" ? h("b", {}, t.v) : t.t === "a" && links ? h("a", { href: t.href, target: "_blank", rel: "noopener noreferrer" }, t.v) : t.v,
-  );
-
 /** An owner chip: a session's name and state dot (linked to its canvas), "this session", or @name. */
 function ownerChip(owner) {
   const o = ownerSession(owner, sessionsCache, currentSession);
@@ -3608,16 +2312,12 @@ function refreshOwners() {
   for (const el of document.querySelectorAll(".kb-owner[data-owner]")) el.replaceWith(ownerChip(el.dataset.owner));
 }
 
-function renderKanban(spec, secId = "", secTitle = "") {
+/** This section's moved marks, updating what the browser remembers as a side effect. */
+function kanbanMoves(spec, sec) {
   const cols = spec.columns || [];
-  const flat = cols.flatMap((c) => (c.cards || []).map((k) => ({ k, c })));
-  const boardName = spec.title || secTitle || "Board";
-  const todo = secId === "auto-tasks";
-  const count = (c) => (c.cards || []).length + (c.more || 0);
-  const busy = cols.some((c) => !c.compact && count(c));
-  const key = `${currentSession}/${secId}`;
+  const key = `${currentSession}/${sec.id}`;
   const visible = document.visibilityState === "visible";
-  const marks = secId ? boardMarks(readStore(localStorage, KB_SEEN_KEY)[key], cols, { visible }) : { moves: {}, save: null };
+  const marks = sec.id ? boardMarks(readStore(localStorage, KB_SEEN_KEY)[key], cols, { visible }) : { moves: {}, save: null };
   if (marks.save) saveBoardMarks(key, marks.save);
   if (marks.save && !visible) {
     // Marks drawn in a background tab start their clock once the tab is seen.
@@ -3629,78 +2329,25 @@ function renderKanban(spec, secId = "", secTitle = "") {
     };
     document.addEventListener("visibilitychange", seen);
   }
-  const folds = readStore(sessionStorage, KB_FOLD_KEY);
+  return marks.moves;
+}
 
-  const card = (k, c) => {
-    const mv = marks.moves[cardKey(k)];
-    const li = h(
-      "li",
-      { class: `kb-card${toneVar(k.tone) ? " toned" : ""}${mv ? " moved" : ""}`, style: toneVar(k.tone) ? `--card-tone:${toneVar(k.tone)}` : null, tabindex: "0", "aria-haspopup": "dialog" },
-      h(
-        "div",
-        { class: "kb-title", title: c.compact ? k.title : null },
-        k.id ? h("span", { class: "kb-id" }, k.id) : null,
-        k.href ? h("a", { href: k.href, target: "_blank", rel: "noopener noreferrer" }, inline(k.title, false)) : inline(k.title),
-        mv ? h("span", { class: "kb-moved", title: mv === "new" ? "New since you last looked" : `Moved to ${mv} since you last looked` }, mv === "new" ? "new" : `→ ${mv}`) : null,
-      ),
-      k.note && !c.compact ? h("div", { class: "kb-note" }, inline(k.note)) : null,
-      (k.tag || k.owner) && !c.compact ? h("div", { class: "kb-meta" }, k.tag ? h("span", { class: `ctag${/^(ok|warn|bad)$/.test(k.tone) ? ` ${k.tone}` : ""}` }, k.tag) : null, k.owner ? ownerChip(k.owner) : null) : null,
-    );
-    // A click (not on a link, not a text selection) or Enter opens the card's details.
-    const open = () => cardDetail(flat, flat.findIndex((x) => x.k === k), { todo, board: boardName, moves: marks.moves });
-    li.addEventListener("click", (e) => !e.target.closest("a, button") && !String(getSelection?.() || "") && open());
-    li.addEventListener("keydown", (e) => {
-      if (e.target !== li || (e.key !== "Enter" && e.key !== " ")) return;
-      e.preventDefault();
-      e.stopPropagation();
-      open();
-    });
-    return li;
-  };
-
-  const column = (c) => {
-    const n = count(c);
-    const over = c.limit && n > c.limit;
-    const foldKey = `${key}/${c.label}`;
-    const foldable = c.compact && n > 0;
-    const label = [
-      foldable ? h("span", { class: "kb-chev", "aria-hidden": "true" }, "›") : null,
-      h("span", { class: "kb-label" }, c.label),
-      h("span", { class: "kb-n", title: c.limit ? `${n} cards, WIP limit ${c.limit}${over ? " (over)" : ""}` : `${n} cards` }, c.limit ? `${n}/${c.limit}` : String(n)),
-    ];
-    // A compact column (Done) folds when nothing else is on the board, unless opened by hand.
-    const shut = foldable && (folds[foldKey] ?? !busy);
-    const head = foldable ? h("button", { class: "kb-fold", type: "button", "aria-expanded": String(!shut) }, label) : h("header", {}, label);
-    const col = h(
-      "section",
-      { class: `kb-col${over ? " over" : ""}${n ? "" : " empty"}${c.compact ? " compact" : ""}${shut ? " folded" : ""}`, style: toneVar(c.tone) ? `--tone:${toneVar(c.tone)}` : null },
-      head,
-      n ? h("ul", { class: "kb-cards" }, (c.cards || []).map((k) => card(k, c))) : h("div", { class: "kb-empty" }, "Nothing here"),
-      c.more ? h("div", { class: "kb-more" }, `+${c.more} more`) : null,
-    );
-    if (foldable)
-      head.addEventListener("click", () => {
-        const now = !col.classList.contains("folded");
-        col.classList.toggle("folded", now);
-        head.setAttribute("aria-expanded", String(!now));
-        writeStore(sessionStorage, KB_FOLD_KEY, { ...readStore(sessionStorage, KB_FOLD_KEY), [foldKey]: now });
-      });
-    return col;
-  };
-
-  const parts = cols.map((c) => ({ c, n: count(c) })).filter((p) => p.n);
-  const progress = spec.progress
-    ? h(
-        "div",
-        { class: "kb-progress" },
-        h("div", { class: "kb-bar", "aria-hidden": "true" }, parts.map((p) => h("i", { style: `flex:${p.n};background:${toneVar(p.c.tone) || "var(--line)"}`, title: `${p.c.label}: ${p.n}` }))),
-        h("div", { class: "kb-sum" }, parts.map((p) => `${p.n} ${p.c.label.toLowerCase()}`).join(" · ") || "Nothing on the board"),
-      )
-    : null;
-  // Empty columns shrink to a thin labelled strip when the columns sit side by side.
-  const tpl = cols.map((c) => (count(c) ? "minmax(170px, 1fr)" : "36px")).join(" ");
-  const board = h("div", { class: "kb-cols", style: `--kb-tpl:${tpl}` }, cols.map(column));
-  const root = h("div", { class: "kanban" }, spec.title ? h("div", { class: "kb-head" }, h("b", {}, spec.title)) : null, progress, board, spec.caption ? h("div", { class: "chart-cap" }, spec.caption) : null);
+/** A kanban section: render.mjs's board with this page's marks, folds, owner links and modal. */
+function sectionKanban(spec, sec) {
+  const moves = kanbanMoves(spec, sec);
+  const root = renderKanban(spec, {
+    section: sec.id,
+    title: sec.title,
+    moves,
+    folds: { read: () => readStore(sessionStorage, KB_FOLD_KEY), write: (v) => writeStore(sessionStorage, KB_FOLD_KEY, v) },
+    foldKey: (label) => `${currentSession}/${sec.id}/${label}`,
+    ownerChip,
+    onSend: (prompt, e) => sendOrCopy(prompt, e),
+    onCard: (k, c) => {
+      const flat = (spec.columns || []).flatMap((col) => (col.cards || []).map((card) => ({ k: card, c: col })));
+      cardDetail(flat, flat.findIndex((x) => x.k === k), { todo: sec.id === "auto-tasks", board: spec.title || sec.title || "Board", moves });
+    },
+  });
   // Owners render before the session list has loaded on a fresh page: link them once it has.
   if (root.querySelector(".kb-owner[data-owner]") && !sessionsCache.length) {
     fetch("/api/sessions")
@@ -3714,7 +2361,17 @@ function renderKanban(spec, secId = "", secTitle = "") {
   return root;
 }
 
-/** A kanban card's details in the modal: full text, owner, link, and a prompt to paste into pi. ← / → step through the board. */
+/** A tree section: its folds are remembered per session, section and path, in this browser. */
+function sectionTree(spec, secId) {
+  const prefix = `${currentSession}/${secId}/`;
+  return renderTree(spec, {
+    foldKey: (path) => prefix + path,
+    folds: { read: () => readStore(localStorage, TREE_FOLD_KEY), write: (all) => writeStore(localStorage, TREE_FOLD_KEY, all) },
+  });
+}
+
+const TREE_FOLD_KEY = "canvas:tree-folds"; // localStorage: { "<session>/<section>/<path>": open? }
+
 function cardDetail(items, i, { todo, board, moves }) {
   showModal(items, Math.max(i, 0), ({ k, c }) => {
     const prompt = cardPrompt(k, c.label, { todo, board });
@@ -3960,283 +2617,14 @@ function watchGroup(name, label, rows) {
   return h("div", { class: "w-group" }, head, body);
 }
 
-function renderTimeline(spec) {
-  const toDate = (at) => (typeof at === "number" ? new Date(at) : typeof at === "string" && /\d{4}-\d{2}-\d{2}|^\d{1,2}:\d{2}/.test(at) ? new Date(/^\d{1,2}:\d{2}/.test(at) ? `1970-01-01T${at.padStart(5, "0")}` : at) : null);
-  let events = (spec.events || []).map((e, i) => ({ ...e, i, d: toDate(e.at) }));
-  const dated = events.every((e) => e.d && !Number.isNaN(e.d.getTime()));
-  const timeOnly = dated && events.every((e) => typeof e.at === "string" && /^\d{1,2}:\d{2}/.test(e.at));
-  if (dated && spec.order !== "given") events = [...events].sort((a, b) => a.d - b.d || a.i - b.i);
-  const list = h("ol", { class: "tline" });
-  let lastDay = "";
-  let prev = null;
-  for (const e of events) {
-    if (dated && !timeOnly) {
-      const day = e.d.toDateString();
-      if (day !== lastDay) list.append(h("li", { class: "tday" }, dayLabel(e.d)));
-      lastDay = day;
-    }
-    const gap = dated && prev ? fmtGap(e.d - prev.d) : "";
-    const tone = /^(ok|warn|bad|accent|dim|c[1-8])$/.test(e.tone) ? `var(--${e.tone})` : "var(--line)";
-    list.append(
-      h(
-        "li",
-        { class: `tev${e.tone ? " toned" : ""}`, style: `--tone:${tone}` },
-        h("div", { class: "twhen" }, h("span", { title: dated && !timeOnly ? e.d.toLocaleString() : null }, dated ? (timeOnly ? e.at : clock(e.d)) : e.at ?? ""), gap ? h("span", { class: "tgap" }, `+${gap}`) : null),
-        h("span", { class: "tdot" }),
-        h(
-          "div",
-          { class: "tbody" },
-          h("div", { class: "ttitle" }, e.title, e.tag ? h("span", { class: `ctag${/^(ok|warn|bad)$/.test(e.tone) ? ` ${e.tone}` : ""}` }, e.tag) : null),
-          e.note ? h("div", { class: "tnote" }, e.note) : null,
-        ),
-      ),
-    );
-    prev = e;
-  }
-  const span = dated && events.length > 1 ? fmtGap(events.at(-1).d - events[0].d) : "";
-  return h("div", { class: "tlw" }, list, spec.caption || span ? h("div", { class: "chart-cap" }, [spec.caption, span && `${events.length} events over ${span}`].filter(Boolean).join(" · ")) : null);
-}
-
 // ── diffs ────────────────────────────────────────────────────────────────────
-// One renderer for the diff kind, Files changed and the modal: a patch splits
-// into files, each a collapsible block with old and new line numbers, unified
-// or side by side. Lines are coloured by the file's extension, and paired -/+
-// lines mark the words that changed.
+// The blocks are render.mjs's (diffBlock, and each file's hunks from the patch).
+// What is this page's: the summary bar with the Unified / Split switch, the
+// Expand button that opens the patch in the modal, the redraw on a mode change,
+// and review comments repainted onto every redrawn body.
 
-const DIFF_LANGS = { rb: "ruby", rake: "ruby", gemspec: "ruby", js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript", ts: "typescript", tsx: "typescript", mts: "typescript", json: "json", py: "python", rs: "rust", go: "go", sh: "bash", bash: "bash", zsh: "bash", yml: "yaml", yaml: "yaml", md: "markdown", html: "xml", erb: "xml", xml: "xml", svg: "xml", css: "css", scss: "scss", less: "less", sql: "sql", java: "java", kt: "kotlin", swift: "swift", c: "c", h: "c", cpp: "cpp", cs: "csharp", ini: "ini", toml: "ini", php: "php", lua: "lua", pl: "perl", graphql: "graphql", mk: "makefile", diff: "diff", patch: "diff" };
-
-function langFor(path) {
-  const name = String(path || "").split("/").pop().toLowerCase();
-  if (["gemfile", "rakefile", "guardfile", "brewfile"].includes(name)) return "ruby";
-  if (name === "makefile") return "makefile";
-  return DIFF_LANGS[name.includes(".") ? name.split(".").pop() : ""] || "";
-}
-
-/** A patch as files: { from, to, path, status, binary, hunks: [{ head, rows: [{ t, a, b, text }] }], adds, dels }. */
-function parsePatch(text) {
-  const files = [];
-  let f = null;
-  let hunk = null;
-  let remA = 0;
-  let remB = 0;
-  const start = () => {
-    f = { from: "", to: "", path: "", status: "modified", binary: false, hunks: [], adds: 0, dels: 0, minus: false };
-    files.push(f);
-    hunk = null;
-  };
-  const strip = (p) => (p === "/dev/null" ? "" : p.replace(/\t.*$/, "").replace(/^[ab]\//, ""));
-  for (const line of text.split("\n")) {
-    // Inside a hunk the header's counts say which lines belong to it, so a
-    // removed line that reads "-- x" is never taken for a file header.
-    if (hunk && (remA > 0 || remB > 0)) {
-      const c = line[0];
-      if (c === "+") (hunk.rows.push({ t: "add", b: hunk.b++, text: line.slice(1) }), f.adds++, remB--);
-      else if (c === "-") (hunk.rows.push({ t: "del", a: hunk.a++, text: line.slice(1) }), f.dels++, remA--);
-      else if (c === " " || line === "") (hunk.rows.push({ t: "ctx", a: hunk.a++, b: hunk.b++, text: line.slice(1) }), remA--, remB--);
-      else if (c === "\\") hunk.rows.push({ t: "note", text: line.slice(2) });
-      else hunk = null;
-      if (hunk) continue;
-    }
-    if (hunk && line.startsWith("\\")) {
-      hunk.rows.push({ t: "note", text: line.slice(2) });
-      continue;
-    }
-    let m;
-    if ((m = line.match(/^diff --git a\/(.+?) b\/(.+)$/))) {
-      start();
-      f.from = m[1];
-      f.to = m[2];
-    } else if (line.startsWith("--- ")) {
-      if (!f || f.hunks.length || f.minus) start();
-      f.minus = true;
-      f.from = strip(line.slice(4));
-      if (!f.from) f.status = "added";
-    } else if (line.startsWith("+++ ") && f) {
-      f.to = strip(line.slice(4));
-      if (!f.to) f.status = "deleted";
-    } else if (f && line.startsWith("new file mode")) f.status = "added";
-    else if (f && line.startsWith("deleted file mode")) f.status = "deleted";
-    else if (f && line.startsWith("rename from ")) (f.status = "renamed"), (f.from = line.slice(12));
-    else if (f && line.startsWith("rename to ")) (f.status = "renamed"), (f.to = line.slice(10));
-    else if (line.startsWith("Binary files ")) {
-      if (!f) start();
-      f.binary = true;
-    } else if ((m = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/))) {
-      if (!f) start();
-      hunk = { head: line, a: Number(m[1]), b: Number(m[3]), rows: [] };
-      f.hunks.push(hunk);
-      remA = m[2] === undefined ? 1 : Number(m[2]);
-      remB = m[4] === undefined ? 1 : Number(m[4]);
-    }
-  }
-  for (const x of files) x.path = x.to || x.from;
-  return files.filter((x) => x.hunks.length || x.binary || x.status !== "modified");
-}
-
-const wordTokens = (s) => s.match(/\w+|\s+|[^\w\s]/g) || [];
-
-/** The changed character ranges of a and b (LCS over words), or null when too long or too different to help. */
-function wordRanges(a, b) {
-  const x = wordTokens(a);
-  const y = wordTokens(b);
-  if (!x.length || !y.length || x.length * y.length > 40000) return null;
-  const n = x.length;
-  const m = y.length;
-  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
-  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i][j] = x[i] === y[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
-  const ra = [];
-  const rb = [];
-  let i = 0;
-  let j = 0;
-  let pa = 0;
-  let pb = 0;
-  let same = 0;
-  const add = (r, s, e) => (r.length && r[r.length - 1][1] === s ? (r[r.length - 1][1] = e) : r.push([s, e]));
-  while (i < n || j < m) {
-    if (i < n && j < m && x[i] === y[j]) {
-      same += x[i].length;
-      pa += x[i++].length;
-      pb += y[j++].length;
-    } else if (j < m && (i >= n || dp[i][j + 1] >= dp[i + 1][j])) {
-      add(rb, pb, (pb += y[j++].length));
-    } else {
-      add(ra, pa, (pa += x[i++].length));
-    }
-  }
-  // Mostly rewritten lines read better whole than speckled with marks.
-  if (same < 0.4 * Math.max(a.length, b.length)) return null;
-  return [ra, rb];
-}
-
-/** Wrap character ranges of el's text in <mark>, across any highlight spans. */
-function markRanges(el, ranges) {
-  if (!ranges?.length) return;
-  const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-  const nodes = [];
-  for (let n; (n = walk.nextNode()); ) nodes.push(n);
-  let pos = 0;
-  for (const node of nodes) {
-    const start = pos;
-    const end = (pos += node.data.length);
-    const cuts = ranges.filter(([s, e]) => s < end && e > start).map(([s, e]) => [Math.max(s, start) - start, Math.min(e, end) - start]);
-    if (!cuts.length) continue;
-    const frag = document.createDocumentFragment();
-    let at = 0;
-    for (const [s, e] of cuts) {
-      if (s > at) frag.append(node.data.slice(at, s));
-      frag.append(h("mark", {}, node.data.slice(s, e)));
-      at = e;
-    }
-    if (at < node.data.length) frag.append(node.data.slice(at));
-    node.replaceWith(frag);
-  }
-}
-
-function codeCell(row, hl, lang, ranges) {
-  const td = h("td", { class: "code" });
-  if (!row) return (td.classList.add("blank"), td);
-  let html = null;
-  if (hl && lang && row.t !== "note" && row.text.length <= 2000 && window.DOMPurify) {
-    try {
-      html = window.DOMPurify.sanitize(hl.highlight(row.text, { language: lang, ignoreIllegals: true }).value, HL_CLEAN);
-    } catch {}
-  }
-  if (html != null) td.innerHTML = html;
-  else td.textContent = row.text;
-  markRanges(td, ranges);
-  return td;
-}
-
-/** Each del paired with the add at the same place in its change block: Map row -> ranges. */
-function pairWords(rows) {
-  const marks = new Map();
-  for (let i = 0; i < rows.length; ) {
-    if (rows[i].t !== "del" && rows[i].t !== "add") {
-      i++;
-      continue;
-    }
-    const dels = [];
-    const adds = [];
-    while (i < rows.length && rows[i].t === "del") dels.push(rows[i++]);
-    while (i < rows.length && rows[i].t === "add") adds.push(rows[i++]);
-    for (let k = 0; k < Math.min(dels.length, adds.length); k++) {
-      const r = wordRanges(dels[k].text, adds[k].text);
-      if (r) (marks.set(dels[k], r[0]), marks.set(adds[k], r[1]));
-    }
-  }
-  return marks;
-}
-
-function hunkRows(hunk, split, hl, lang) {
-  const marks = pairWords(hunk.rows);
-  const out = [h("tr", { class: "hunk" }, h("td", { colspan: split ? 4 : 3 }, hunk.head))];
-  // A gutter cell that takes review comments carries data-rv="side:n".
-  const ln = (n, side) => h("td", { class: "ln", ...(side && n != null ? { "data-rv": `${side}:${n}` } : {}) }, n ?? "");
-  if (!split) {
-    // Unified: one commentable cell per row, the new line's (the old one's for a deletion).
-    for (const r of hunk.rows) out.push(h("tr", { class: r.t }, ln(r.a, r.t === "del" ? "old" : null), ln(r.b, r.t === "add" || r.t === "ctx" ? "new" : null), codeCell(r, hl, lang, marks.get(r))));
-    return out;
-  }
-  const rows = hunk.rows;
-  for (let i = 0; i < rows.length; ) {
-    const r = rows[i];
-    if (r.t === "ctx" || r.t === "note") {
-      const side = r.t === "ctx";
-      out.push(h("tr", { class: r.t }, ln(r.a, side && "old"), codeCell(r, hl, lang), ln(r.b, side && "new"), codeCell(r, hl, lang)));
-      i++;
-      continue;
-    }
-    const dels = [];
-    const adds = [];
-    while (i < rows.length && rows[i].t === "del") dels.push(rows[i++]);
-    while (i < rows.length && rows[i].t === "add") adds.push(rows[i++]);
-    for (let k = 0; k < Math.max(dels.length, adds.length); k++) {
-      const d = dels[k];
-      const a = adds[k];
-      out.push(h("tr", { class: "pair" }, ln(d?.a, d && "old"), codeCell(d, hl, lang, marks.get(d)), ln(a?.b, a && "new"), codeCell(a, hl, lang, marks.get(a))));
-      const tr = out[out.length - 1];
-      if (d) (tr.children[0].classList.add("del"), tr.children[1].classList.add("del"));
-      if (a) (tr.children[2].classList.add("add"), tr.children[3].classList.add("add"));
-    }
-  }
-  return out;
-}
-
-const BIG_FILE = 1500;
 const diffViews = new Set();
 const diffMode = () => (localStorage.getItem("canvas:diff-view") === "split" ? "split" : "unified");
-const counts = (adds, dels) => [h("span", { class: "n-add" }, `+${adds}`), " ", h("span", { class: "n-del" }, `\u2212${dels}`)];
-const STATUS = { added: "new", deleted: "deleted", renamed: "renamed" };
-
-function fileBlock(f, split, hl, showHead) {
-  const lang = langFor(f.path);
-  const lines = f.hunks.reduce((n, x) => n + x.rows.length, 0);
-  const body = h("div", { class: "dv-body", "data-rv-file": f.path, "data-rv-lang": "diff" });
-  const fill = () => {
-    if (f.binary) return body.replaceChildren(h("div", { class: "empty" }, "Binary file changed."));
-    if (!f.hunks.length) return body.replaceChildren(h("div", { class: "empty" }, f.status === "renamed" ? "Renamed without changes." : "No content changes."));
-    body.replaceChildren(h("table", { class: `diff${split ? " split" : ""}` }, split ? h("colgroup", {}, h("col", { class: "c-ln" }), h("col"), h("col", { class: "c-ln" }), h("col")) : null, h("tbody", {}, f.hunks.flatMap((x) => hunkRows(x, split, hl, lang)))));
-    queueMicrotask(() => reviewPaintBox(body)); // a redraw (Split / Unified, Show this diff) brings the comments back
-  };
-  if (lines > BIG_FILE && !f.loaded) body.append(h("button", { class: "btn dv-load", type: "button", onclick: () => ((f.loaded = true), fill()) }, `Show this diff (${lines} lines)`));
-  else fill();
-  if (!showHead) return h("section", { class: "dv-file bare" }, body);
-  const block = h("section", { class: `dv-file${f.shut ? " shut" : ""}` });
-  const head = h(
-    "header",
-    { title: f.shut ? "Expand" : "Collapse" },
-    h("button", { class: "chev", type: "button", "aria-label": "Toggle file" }),
-    h("span", { class: "dv-path" }, f.status === "renamed" && f.from !== f.to ? `${f.from} \u2192 ${f.to}` : f.path),
-    STATUS[f.status] ? h("span", { class: `dv-status ${f.status}` }, STATUS[f.status]) : null,
-    h("span", { class: "dv-n" }, f.binary ? "binary" : counts(f.adds, f.dels)),
-  );
-  head.addEventListener("click", () => {
-    f.shut = !f.shut;
-    block.classList.toggle("shut", f.shut);
-  });
-  block.append(head, body);
-  return block;
-}
 
 /** The whole patch: a summary bar, a file list when there are several, then one block per file. */
 async function renderDiffView(text, { title = "Diff", href = "", inModal = false } = {}) {
@@ -4249,7 +2637,7 @@ async function renderDiffView(text, { title = "Diff", href = "", inModal = false
     const adds = files.reduce((n, f) => n + f.adds, 0);
     const dels = files.reduce((n, f) => n + f.dels, 0);
     const mode = (m, label) => h("button", { class: `seg${(m === "split") === split ? " on" : ""}`, type: "button", onclick: () => setDiffMode(m) }, label);
-    const blocks = files.map((f) => fileBlock(f, split, hl, !(inModal && files.length === 1)));
+    const blocks = files.map((f) => diffBlock(f, { split, hl, showHead: !(inModal && files.length === 1), onBody: reviewPaintBox }));
     const bar = h(
       "div",
       { class: "dv-bar" },
@@ -4261,41 +2649,13 @@ async function renderDiffView(text, { title = "Diff", href = "", inModal = false
         inModal ? null : h("button", { class: "btn", type: "button", title: "Open large", onclick: () => showModal([text], 0, () => ({ kind: "diff", title, href, body: renderDiffView(text, { title, href, inModal: true }) })) }, "Expand \u2922"),
       ),
     );
-    const list =
-      files.length > 1
-        ? h(
-            "ol",
-            { class: "dv-files" },
-            files.map((f, i) =>
-              h(
-                "li",
-                {},
-                h(
-                  "a",
-                  {
-                    href: "#",
-                    onclick: (e) => {
-                      e.preventDefault();
-                      if (f.shut) blocks[i].querySelector("header").click();
-                      blocks[i].scrollIntoView({ behavior: "smooth", block: "start" });
-                    },
-                  },
-                  f.path,
-                ),
-                STATUS[f.status] ? h("span", { class: `dv-status ${f.status}` }, STATUS[f.status]) : null,
-                h("span", { class: "dv-n" }, f.binary ? "binary" : counts(f.adds, f.dels)),
-              ),
-            ),
-          )
-        : null;
-    root.replaceChildren(bar, list ?? "", ...blocks);
+    root.replaceChildren(bar, diffFileList(files, blocks) ?? "", ...blocks);
   };
   draw();
   root.redraw = draw;
   diffViews.add(root);
   return root;
 }
-
 function setDiffMode(m) {
   localStorage.setItem("canvas:diff-view", m);
   for (const v of diffViews) v.isConnected ? v.redraw() : diffViews.delete(v);
@@ -5155,7 +3515,7 @@ function rethemeMermaid() {
   mermaidRetheme = setTimeout(() => {
     if (!window.mermaid) return;
     window.mermaid.initialize(mermaidConfig());
-    for (const el of document.querySelectorAll(".mmd")) if (el._src) renderMermaid(el, el._src);
+    for (const el of document.querySelectorAll(".mmd")) if (el._src) drawMermaid(el, el._src);
   }, 120);
 }
 
