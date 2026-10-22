@@ -197,7 +197,36 @@ async function mount(overrides = {}) {
       return bin;
     };
     process.argv[1] = path.join(root, "removed", "dist", "bundle", "cli.js");
-    if (layout === "path") {
+    // A fake mise whose pin points at `bin`.
+    const fakeMise = (bin) => {
+      const miseDir = path.join(root, "mise-bin");
+      mkdirSync(miseDir, { recursive: true });
+      writeFileSync(
+        path.join(miseDir, "mise"),
+        `#!/bin/sh\n[ "$1 $2" = "which pi" ] && echo ${JSON.stringify(bin)}\n`,
+        { mode: 0o755 },
+      );
+      return miseDir;
+    };
+    // A real running entrypoint inside `pkgDir`, whose package.json says `version`.
+    const runningFrom = (pkgDir, version) => {
+      const entry = path.join(pkgDir, "dist", "bundle", "cli.js");
+      mkdirSync(path.dirname(entry), { recursive: true });
+      writeFileSync(entry, "");
+      writeFileSync(path.join(pkgDir, "package.json"), pkgJson(version));
+      process.argv[1] = entry;
+    };
+    if (layout === "fork") {
+      // ~/.pi/agent/bin/pi runs a source checkout's dist/cli.js, rebuilt in
+      // place, while mise still pins an older pi that this process never runs.
+      runningFrom(path.join(root, "pi", "packages", "coding-agent"), to);
+      process.env.PATH = isolatedPath(fakeMise(aubeInstall("0.0.1")));
+    } else if (layout === "mise-argv") {
+      // Running from a versioned mise install: the entrypoint still names the
+      // old version, so mise has to be asked where the pin moved.
+      runningFrom(path.join(root, "mise", "installs", "pi", "0.0.1"), "0.0.1");
+      process.env.PATH = isolatedPath(fakeMise(aubeInstall(to)));
+    } else if (layout === "path") {
       process.env.PATH = isolatedPath(path.dirname(aubeInstall(to)));
     } else if (layout === "mise") {
       // The process's own PATH still names its old versioned install first;
@@ -1478,6 +1507,8 @@ for (const [layout, why] of [
   ["path", "without mise, the first pi on PATH is the active install"],
   ["node-prefix", "an npm-global install beside node, with no pi on PATH"],
   ["argv", "a pi started by path, found by walking up from dist/bundle/cli.js"],
+  ["fork", "a source checkout rebuilt in place wins over an older pi pinned in mise"],
+  ["mise-argv", "an entrypoint under mise installs still defers to mise's pin"],
 ]) {
   test(`update notice resolves the installed version: ${layout} (${why})`, async () => {
     const ui = await mount({ updateInstalled: { to: "99.0.0", layout } });

@@ -52,7 +52,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { appendFile, readFile, readlink, realpath, writeFile, access, stat, lstat, constants } from "node:fs/promises";
 import { homedir, loadavg } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
 import {
   CustomEditor,
@@ -1702,15 +1702,50 @@ async function packageJsonForBin(bin: string): Promise<string | null> {
 }
 
 /**
- * The active install's package.json, resolved fresh on every call through the
- * `pi` a new launch would run (see activePiBin). Falls back to the running
- * entrypoint (argv[1]), then an npm-global install beside node, when no pi bin
+ * True for a path inside mise's per-version install tree. mise installs each
+ * version in its own directory, so a running process's entrypoint keeps naming
+ * its old version after an upgrade and only mise knows where the pin moved.
+ */
+function underMiseInstalls(file: string): boolean {
+  const roots = [process.env.MISE_DATA_DIR, join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "mise")]
+    .filter((dir): dir is string => Boolean(dir))
+    .map((dir) => join(dir, "installs") + sep);
+  return roots.some((root) => file.startsWith(root)) || file.includes(`${sep}mise${sep}installs${sep}`);
+}
+
+/**
+ * The running install's package.json when that answers the question by
+ * itself: the entrypoint resolves to a pi package outside mise's install tree.
+ * An npm-global install is upgraded in place, and a source checkout (the pi
+ * fork run through ~/.pi/agent/bin/pi) is rebuilt in place, so its package.json
+ * is the one a new launch reads. Asking mise there would compare the running
+ * fork against a different pi that never runs.
+ */
+async function runningPackageJson(): Promise<string | null> {
+  const entry = process.argv[1];
+  if (!entry) return null;
+  try {
+    const found = await packageJsonAbove(await realpath(entry));
+    return found && !underMiseInstalls(found) ? found : null;
+  } catch {
+    // The update may have removed the running process's old entrypoint.
+    return null;
+  }
+}
+
+/**
+ * The active install's package.json, resolved fresh on every call. The running
+ * entrypoint wins unless it lives under mise installs (see runningPackageJson).
+ * Otherwise ask the `pi` a new launch would run (see activePiBin), then fall
+ * back to argv[1], then an npm-global install beside node, when no pi bin
  * resolves (e.g. a pi started by path).
  *
  * argv[1] is dist/bundle/cli.js since pi ships its own bundle, so walk up to
  * the package rather than assuming a fixed depth.
  */
 async function piPackageJsonPath(): Promise<string | null> {
+  const running = await runningPackageJson();
+  if (running) return running;
   const bin = await activePiBin();
   if (bin) {
     const found = await packageJsonForBin(bin);
