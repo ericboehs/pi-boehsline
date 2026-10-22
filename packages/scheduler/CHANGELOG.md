@@ -14,6 +14,11 @@ change behaviour; each one says what it breaks.
   Agent-set timers are marked `source: "agent"` and fire with a label saying
   so. Nothing changes with it off.
 
+### Changed
+
+- The session status is plain text (`2 timers · 1 paused`) instead of
+  `⏰ 2 ⏸1`. Boehsline's footer renders it as a `◷` Timers chip.
+
 ## [0.2.0] — 2026-08-24
 
 A correctness pass over the durable scheduler, from a multi-pass review of the

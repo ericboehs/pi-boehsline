@@ -2,7 +2,7 @@
  * Minimal footer/statusline for pi — a lean replacement for the pi-footer package.
  *
  * Renders a main line:
- *   dir [⎇ repo] branch* ⇣⇡ provider model thinking [bypass] ctx/window $cost [inline statuses] ⚡boot tk/s   session-name
+ *   dir [⎇ repo] branch* ⇣⇡ provider model thinking [bypass] ctx/window $cost [inline statuses] ⚡boot tk/s ◷timers   session-name
  * plus an optional dim row of other extension statuses (from ctx.ui.setStatus).
  * The tk/s chip is the output rate: dim and live while a reply streams, then
  * the exact figure for the last reply (usage.output over first token → end;
@@ -110,6 +110,30 @@ const AUTO_BUNDLE_LOCK_STALE_MIN = 10;
 /** Statuses rendered inline in the main line (in this order) instead of the status row. */
 const INLINE_STATUS_KEYS = ["codex-window", "copilot-window", "grok-window", "cerebras-window", "claude-window", "opencode-go-window"] as const;
 
+/** The scheduler's status key; the timers chip renders it instead of the status row. */
+const TIMERS_STATUS_KEY = "session-scheduler";
+
+/**
+ * The scheduler's status ("2 timers", "2 timers · 1 paused", "1 paused") as
+ * counts, or undefined for anything else, which then stays on the status row
+ * as is rather than being lost.
+ */
+export function parseTimerStatus(value: string | undefined): { active: number; paused: number } | undefined {
+  const match = /^(?:(\d+) timers?(?: · (\d+) paused)?|(\d+) paused)$/.exec(value?.trim() ?? "");
+  if (!match) return undefined;
+  if (match[3] !== undefined) return { active: 0, paused: Number(match[3]) };
+  return { active: Number(match[1]), paused: Number(match[2] ?? 0) };
+}
+
+/** The timers chip: count "◷ 2", detailed "◷ 2 timers · 1 paused"; only paused shows "◷ 1 paused" either way. */
+export function formatTimersChip(counts: { active: number; paused: number } | undefined, mode: string | undefined): string {
+  if (!counts || (counts.active === 0 && counts.paused === 0)) return "";
+  if (counts.active === 0) return `◷ ${counts.paused} paused`;
+  if (mode !== "detailed") return `◷ ${counts.active}`;
+  const armed = `${counts.active} timer${counts.active === 1 ? "" : "s"}`;
+  return `◷ ${counts.paused > 0 ? `${armed} · ${counts.paused} paused` : armed}`;
+}
+
 /** provider-usage listens: { days, setAt } from the /footer OOO row (same string there). */
 const FOOTER_COPILOT_OOO_EVENT = "footer:copilot-ooo";
 
@@ -132,6 +156,7 @@ export const FOOTER_CHIPS = [
   { id: "usage", label: "Rate limits", example: "57%", description: "Provider usage windows: Copilot premium-request share over workdays (W) with the %/d left per workday, Codex/Grok/Claude windows, compact, detailed, or mini (just ↑ speed up / ↓ slow down, hidden on pace; multi-window chips name the window: ↓6w). Click: cycle for this session." },
   { id: "boot", label: "Boot time", example: "⚡775ms", description: "⚡ startup time, until the first message. Click: recent boot stats." },
   { id: "rate", label: "Token rate", example: "99", description: "Tokens per second of the last reply (live while streaming), alone or with the time to first token. Click: flip for this session." },
+  { id: "timers", label: "Timers", example: "◷ 2", description: "◷ and the number of /once and /loop timers armed in this session; detailed adds \"timers\" and how many are paused." },
   { id: "name", label: "Session name", example: "session-name", description: "Session name, or the dim peer name other agents use: in the editor's top border, or at the right end of the footer. Click: prefill /auto-name, or while it shows bypass (red ⚠), turn the guardian back on." },
   { id: "statuses", label: "Extension statuses", example: "extension status", description: "Other extensions' statuses, on a dim line of their own." },
 ] as const;
@@ -160,6 +185,7 @@ export const CHIP_MODES: Partial<Record<FooterChipId, readonly string[]>> = {
   // compact stays first (the default); a click cycles compact → detailed → mini.
   usage: ["compact", "detailed", "mini"],
   rate: ["number", "with TTFT"],
+  timers: ["count", "detailed"],
   name: ["border", "footer"],
   bypass: ["name", "chip", "both"],
 };
@@ -635,7 +661,7 @@ export function viewConfig(config: FooterConfig, view: FooterView): FooterConfig
   return {
     ...rest,
     hidden: new Set(),
-    modes: { ...config.modes, git: "full", cost: "detailed", usage: "detailed", rate: "with TTFT" },
+    modes: { ...config.modes, git: "full", cost: "detailed", usage: "detailed", rate: "with TTFT", timers: "detailed" },
     usagePace: "on",
   };
 }
@@ -2172,7 +2198,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
     | "gitPull";
   /** Clickable zones: chip ids, plus the git chip's three segments. */
   type FooterZoneKey =
-    | Exclude<FooterChipId, "git" | "worktree" | "statuses">
+    | Exclude<FooterChipId, "git" | "worktree" | "timers" | "statuses">
     | "gitBranch"
     | "gitBehind"
     | "gitAhead";
@@ -2617,6 +2643,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
             { provider: ctx.model?.provider, model: ctx.model?.id, thinking: pi.getThinkingLevel() },
             defaults,
           );
+        const timersText = formatTimersChip(parseTimerStatus(statuses.get(TIMERS_STATUS_KEY)), chipMode(shown(), "timers"));
         const chips: Array<readonly [Exclude<FooterChipId, "name" | "statuses">, string]> = [
           ["dir", dirChipShown ? color(BLUE, dirLabel(ctx.cwd, showFullPath, shown().dirNames)) : ""],
           ["worktree", repoOfWorktree ? color(BLUE, `⎇ ${repoOfWorktree}`) : ""],
@@ -2698,6 +2725,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
                     : color(rateColor(lastRate, lightTheme), formatRateChip(lastRate, lastTtftMs, detailedRate))
                   : "",
           ],
+          ["timers", timersText ? theme.fg("dim", timersText) : ""],
         ];
         // /footer's order: a stable sort, so the rate-limit slots stay together.
         const rank = (id: FooterLineChipId) => shown().order.indexOf(id);
@@ -2776,8 +2804,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
             if (usageValue) zones.cost = span;
           } else if (id === "usage") {
             zones.usage = span;
-          } else if (id !== "worktree") {
-            // The worktree chip is glance-only; every other chip is its own zone.
+          } else if (id !== "worktree" && id !== "timers") {
+            // The worktree and timers chips are glance-only; every other chip is its own zone.
             zones[id] = span;
           }
           parts.push({ id, text: part, width: partWidth, zones });
@@ -2906,6 +2934,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
           const extra: string[] = [];
           for (const [key, value] of statuses) {
             if (!value || (INLINE_STATUS_KEYS as readonly string[]).includes(key)) continue;
+            // The timers chip owns the scheduler's status when it can read it.
+            if (key === TIMERS_STATUS_KEY && parseTimerStatus(value)) continue;
             extra.push(value);
           }
           if (extra.length > 0) {

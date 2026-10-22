@@ -58,6 +58,18 @@ interface SchedulerSnapshot {
   tasks: ScheduledTask[];
 }
 
+/**
+ * The footer status: "2 timers", "2 timers · 1 paused", or "1 paused" when
+ * nothing is armed. Plain text on purpose; Boehsline's footer parses this
+ * exact shape into its timers chip, so change both together.
+ */
+export function timerStatusText(active: number, paused: number): string | undefined {
+  if (active === 0 && paused === 0) return undefined;
+  if (active === 0) return `${paused} paused`;
+  const armed = `${active} timer${active === 1 ? "" : "s"}`;
+  return paused > 0 ? `${armed} · ${paused} paused` : armed;
+}
+
 interface ToolParams {
   action: string;
   prompt?: string;
@@ -266,10 +278,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
       ...pending.keys(),
     ]).size;
     const paused = tasks.filter((task) => task.paused).length;
-    const label = active > 0 || paused > 0
-      ? `⏰ ${active}${paused > 0 ? ` ⏸${paused}` : ""}`
-      : undefined;
-    ctx.ui.setStatus("session-scheduler", label);
+    ctx.ui.setStatus("session-scheduler", timerStatusText(active, paused));
   };
 
   const persist = () => {

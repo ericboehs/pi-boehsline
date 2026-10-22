@@ -39,6 +39,8 @@ import footer, {
   DEFAULT_CHIP_ORDER,
   FOOTER_CHIPS,
   LAYOUT_ROWS,
+  formatTimersChip,
+  parseTimerStatus,
   nameTopBorder,
   readFooterConfig,
   topBorderLayout,
@@ -2773,7 +2775,7 @@ test("/footer reorders with J/K or Shift+arrows, j/k navigate, and the name row 
     selectRow(list, /^→ Token rate/, "k"); // up past its Rate condition row
     list.handleInput("K"); // above Boot time
     list.handleInput("\x1bs");
-    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).order.slice(-2), ["rate", "boot"], "Alt+S saves the order");
+    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).order.slice(-3), ["rate", "boot", "timers"], "Alt+S saves the order");
     list.handleInput("\x1b");
   });
 });
@@ -2883,4 +2885,62 @@ test("/footer on and off switch the whole footer; anything else shows usage", as
   await ui.run("footer", "sideways");
   assert.equal(ui.notices.at(-1).level, "warning");
   assert.match(ui.notices.at(-1).message, /^Usage: \/footer/);
+});
+
+// ---- timers chip (session scheduler) --------------------------------------
+
+test("parseTimerStatus reads the scheduler's plain-text status and nothing else", () => {
+  assert.deepEqual(parseTimerStatus("1 timer"), { active: 1, paused: 0 });
+  assert.deepEqual(parseTimerStatus("2 timers · 1 paused"), { active: 2, paused: 1 });
+  assert.deepEqual(parseTimerStatus("3 paused"), { active: 0, paused: 3 });
+  assert.equal(parseTimerStatus("⏰ 2 ⏸1"), undefined, "the old emoji form is not ours to guess at");
+  assert.equal(parseTimerStatus(undefined), undefined);
+});
+
+test("formatTimersChip: count, detailed, and paused-only", () => {
+  const counts = { active: 2, paused: 1 };
+  assert.equal(formatTimersChip(counts, "count"), "◷ 2");
+  assert.equal(formatTimersChip(counts, "detailed"), "◷ 2 timers · 1 paused");
+  assert.equal(formatTimersChip({ active: 1, paused: 0 }, "detailed"), "◷ 1 timer");
+  assert.equal(formatTimersChip({ active: 0, paused: 2 }, "count"), "◷ 2 paused", "a bare 0 would hide that anything exists");
+  assert.equal(formatTimersChip({ active: 0, paused: 0 }, "count"), "");
+  assert.equal(formatTimersChip(undefined, "count"), "");
+});
+
+test("the timers chip is listed in /footer with count and detailed modes", () => {
+  assert.ok(FOOTER_CHIPS.some((chip) => chip.id === "timers"));
+  assert.deepEqual(CHIP_MODES.timers, ["count", "detailed"]);
+  assert.ok(DEFAULT_CHIP_ORDER.includes("timers"));
+});
+
+test("the timers chip takes the scheduler status off the status row", async () => {
+  const ui = await mount({
+    statuses: new Map([
+      ["session-scheduler", "2 timers · 1 paused"],
+      ["turn-timer", "3s"],
+    ]),
+  });
+  const [main, statusRow] = await ui.settled(120);
+  assert.match(main, /◷ 2(?! timers)/, "count mode by default");
+  assert.equal(statusRow, "3s", "the scheduler status is not repeated below");
+});
+
+test("the timers chip follows footer.json: detailed, or hidden everywhere", async () => {
+  await withAgentDir(async (dir) => {
+    writeFileSync(path.join(dir, "footer.json"), JSON.stringify({ modes: { name: "footer", timers: "detailed" } }));
+    let ui = await mount({ statuses: new Map([["session-scheduler", "1 timer"]]) });
+    assert.match((await ui.settled(120))[0], /◷ 1 timer\b/);
+
+    writeFileSync(path.join(dir, "footer.json"), JSON.stringify({ hidden: ["timers"], modes: { name: "footer" } }));
+    ui = await mount({ statuses: new Map([["session-scheduler", "1 timer"]]) });
+    const lines = await ui.settled(120);
+    assert.ok(!lines.some((line) => /◷|timer/.test(line)), lines.join("\n"));
+  });
+});
+
+test("a scheduler status the chip cannot read stays on the status row", async () => {
+  const ui = await mount({ statuses: new Map([["session-scheduler", "something new"]]) });
+  const lines = await ui.settled(120);
+  assert.equal(lines.at(-1), "something new");
+  assert.doesNotMatch(lines[0], /◷/);
 });

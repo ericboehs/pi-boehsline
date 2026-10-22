@@ -103,6 +103,13 @@ In a non-interactive run (`pi -p`, including durable `/schedule` runs) the
 tool refuses to set timers, since the process exits before any would fire;
 use `pi-scheduler add` for that.
 
+### Footer status
+
+While timers exist the session status reads `2 timers`, `2 timers · 1
+paused`, or `1 paused`, in plain text. Boehsline's footer turns it into a
+`◷` Timers chip you can set to count, detailed or hidden in `/footer`; other
+footers show the text as is.
+
 ## Durable tasks: `/schedule`
 
 `extensions/durable-scheduler.ts` plus `bin/pi-scheduler`. These run whether or

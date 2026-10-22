@@ -15,6 +15,7 @@ import sessionScheduler, {
   TOOL_OPT_IN,
   advanceRecurringTask,
   deliveryText,
+  timerStatusText,
   normalizeTasksForResume,
 } from "../extensions/session-scheduler.ts";
 
@@ -708,4 +709,18 @@ test("an agent's timer fires labelled as its own; a user's fires verbatim", asyn
 
   const user = { id: "u", kind: "once", prompt: "verbatim", createdAt: 0, nextRunAt: 0 };
   assert.equal(deliveryText(user), "verbatim");
+});
+
+test("the footer status is plain text: no emoji", async (t) => {
+  assert.equal(timerStatusText(0, 0), undefined);
+  assert.equal(timerStatusText(1, 0), "1 timer");
+  assert.equal(timerStatusText(2, 1), "2 timers · 1 paused");
+  assert.equal(timerStatusText(0, 3), "3 paused");
+
+  const ui = await mount();
+  t.after(ui.shutdown);
+  await ui.run("loop", "5m a");
+  await ui.run("loop", "5m b");
+  await ui.run("loop", `pause ${latestTasks(ui)[0].id}`);
+  assert.deepEqual(ui.statuses.at(-1), { key: "session-scheduler", value: "1 timer · 1 paused" });
 });

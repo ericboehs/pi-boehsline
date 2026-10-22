@@ -13,8 +13,8 @@ value; the selected row's description says what it shows and what a click
 does. Enter or Space cycles the row's value: `shown`/`hidden`, or for chips
 with display modes, each mode then `hidden` (Directory name/full path, Git
 full/branch, Context tokens/percent, Cost and
-Rate limits compact/detailed, Token rate number/with TTFT, Session name
-border/footer). A Git condition
+Rate limits compact/detailed, Token rate number/with TTFT, Timers
+count/detailed, Session name border/footer). A Git condition
 row under Git can hide the branch on a clean default branch (origin/HEAD's,
 else main or master) with nothing to push or pull. Git status is cached for
 5s; after a `!` command it's re-checked every 0.5s for 10s, so `!git switch`
@@ -125,6 +125,12 @@ The Token rate chip's Rate condition (`after 2s`, `5s`, `10s`, `30s`) shows it
 only for slow turns: nothing until a request has run that long, then the
 waiting counter, the live rate and its final rate. A faster turn hides it
 again rather than leaving the slow turn's rate up.
+
+The Timers chip shows the scheduler's `/once` and `/loop` timers for this
+session: `◷ 2` (count), `◷ 2 timers · 1 paused` (detailed), or `◷ 1 paused`
+when nothing is armed. It reads the scheduler's plain-text status and takes
+it off the statuses row; hide the chip to hide timers altogether. A status
+in any other shape stays on the row.
 
 Reopening `/footer` keeps the session's unsaved changes; a new session starts
 from the saved file. A saved mode is where each session starts; clicking a chip
