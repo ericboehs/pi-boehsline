@@ -95,6 +95,17 @@ test("thoughtless: Opus 5.5 compacts with low-effort adaptive thinking", async (
   assert.deepEqual(result.compaction.details, { readFiles: ["a.ts"], modifiedFiles: ["b.ts"] });
 });
 
+test("thoughtless: max tokens are clamped to the model's output limit", async () => {
+  // Copilot Sonnet 4.6 allows 32k output; complete() sends maxTokens as max_tokens unchanged.
+  const fixture = thoughtlessFixture({ ...OPUS, id: "claude-sonnet-4.6", maxTokens: 32_000, thinkingLevelMap: { max: "max", minimal: "low" } });
+  await summarizeWithoutThinking(fixture.event, fixture.ctx);
+  assert.equal(fixture.calls[0][2].maxTokens, 32_000);
+
+  const big = thoughtlessFixture({ ...OPUS, maxTokens: 128_000 });
+  await summarizeWithoutThinking(big.event, big.ctx);
+  assert.equal(big.calls[0][2].maxTokens, 64_000);
+});
+
 test("thoughtless: Sonnet 5.5, whose map has no off level, uses low-effort adaptive thinking", async () => {
   const fixture = thoughtlessFixture({
     id: "claude-sonnet-5.5",

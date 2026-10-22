@@ -16,7 +16,7 @@ import {
 
 // Compaction without the high-effort thinking tax.
 //
-// pi budgets the summary call at `Math.min(0.8 * reserveTokens, model.maxTokens)`
+// Before pi 1.4.0, pi budgeted the summary call at `Math.min(0.8 * reserveTokens, model.maxTokens)`
 // -- 13,107 tokens with the default 16,384 reserve. It then passes the *session*
 // thinking level into that call, and GitHub Copilot's Claude Opus 5.x models
 // use `compat.forceAdaptiveThinking`, so at xhigh the model can spend the whole
@@ -29,16 +29,26 @@ import {
 //
 // retryAssistantCall() only retries `stopReason: "error"`, so "length" is never
 // retried. Compaction throws, context stays above the threshold, the next turn
-// tries again, and the session wedges. Re-checked against pi 0.99.1: the budget,
-// the thinking pass-through, and the "length" refusal are all unchanged.
+// tries again, and the session wedges. Measured over 229 saved compactions in
+// ~/.pi/agent/sessions, summary *text* alone hit p90 11,821 / p99 15,263 /
+// max 17,690 tokens -- 10 of them already exceeded 13,107 with no reasoning.
 //
-// Measured over 229 saved compactions in ~/.pi/agent/sessions, summary *text*
-// alone hit p90 11,821 / p99 15,263 / max 17,690 tokens -- 10 of them already
-// exceeded 13,107 with no reasoning at all. So this handler does two things:
+// pi 1.4.0 fixed the budget: summary calls now send no maxTokens, so they get
+// the model's full output limit (64k-128k on Copilot Claude). The thinking
+// pass-through and the "length" refusal are unchanged, so at xhigh the summary
+// call still spends a session-level reasoning budget on a checkpoint. What
+// this handler still does:
 //
 //   1. Summarizes on the same model with thinking disabled where supported.
 //      Opus 5.5 requires adaptive thinking, so it gets low effort instead.
-//   2. Gives thinking + summary a 64k ceiling instead of 0.8 * reserveTokens.
+//      This is the main reason the handler exists now: it is faster and
+//      cheaper than pi's call, not just less likely to fail.
+//   2. Caps thinking + summary at MAX_SUMMARY_TOKENS. pi's own call no longer
+//      needs this, but with thinking off a summary under the 32k-character
+//      budget is about 8k tokens, so 64k only stops a runaway response from
+//      billing up to 128k. It is clamped to model.maxTokens because
+//      modelRegistry.complete() sends it as max_tokens unchanged, and Copilot
+//      Sonnet 4.6 allows only 32k.
 //
 // It also strips assistant reasoning out of the text being summarized. In the
 // worst session measured, `[Assistant thinking]` blocks were 60.6% of the
@@ -48,6 +58,12 @@ import {
 
 /** Shared ceiling for adaptive thinking plus summary text. Only emitted tokens are billed. */
 const MAX_SUMMARY_TOKENS = 64_000;
+
+/** MAX_SUMMARY_TOKENS, but never above what the model accepts. */
+export function summaryMaxTokens(model: { maxTokens?: number }): number {
+	const limit = model.maxTokens;
+	return typeof limit === "number" && limit > 0 ? Math.min(MAX_SUMMARY_TOKENS, limit) : MAX_SUMMARY_TOKENS;
+}
 
 /** Keep a little reasoning for signal; discard the other 99%. */
 const THINKING_CHARS = 400;
@@ -113,6 +129,7 @@ export async function summarizeWithoutThinking(event: SessionBeforeCompactEvent,
 	if (!conversation.trim()) return;
 
 	const budget = summaryBudget(previousSummary?.length ?? 0);
+	const maxTokens = summaryMaxTokens(model);
 	const shownSummary = promptSummary(previousSummary, budget);
 	const prompt = [
 		`<conversation>\n${conversation}\n</conversation>`,
@@ -138,7 +155,7 @@ export async function summarizeWithoutThinking(event: SessionBeforeCompactEvent,
 				...(thinking === "low-adaptive"
 					? { thinkingEnabled: true, effort: "low" }
 					: { thinkingEnabled: false }),
-				maxTokens: MAX_SUMMARY_TOKENS,
+				maxTokens,
 				// One-off prompt, never reused: do not pay for a cache write.
 				cacheRetention: "none",
 				sessionId: uuidv7(),
@@ -149,10 +166,10 @@ export async function summarizeWithoutThinking(event: SessionBeforeCompactEvent,
 		if (signal.aborted) return;
 
 		if (response.stopReason === "length" || response.stopReason === "error") {
-			// Falling through to pi's default compaction here would just fail the
-			// same way with a smaller budget, so say so loudly instead.
+			// Falling through to pi's default compaction would retry with session
+			// thinking on, which is slower and no more likely to fit, so say so instead.
 			ctx.ui.notify(
-				`compaction: summary ${response.stopReason} at ${MAX_SUMMARY_TOKENS.toLocaleString()} tokens`,
+				`compaction: summary ${response.stopReason} at ${maxTokens.toLocaleString()} tokens`,
 				"error",
 			);
 			return;
