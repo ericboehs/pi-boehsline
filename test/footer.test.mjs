@@ -2944,3 +2944,31 @@ test("a scheduler status the chip cannot read stays on the status row", async ()
   assert.equal(lines.at(-1), "something new");
   assert.doesNotMatch(lines[0], /◷/);
 });
+
+test("clicking the timers chip flips count/detailed for this session only", async () => {
+  await withAgentDir(async (dir) => {
+    writeFileSync(path.join(dir, "footer.json"), JSON.stringify({ modes: { name: "footer" } }));
+    const ui = await mount({ statuses: new Map([["session-scheduler", "2 timers · 1 paused"]]) });
+    const line = (await ui.settled(120))[0];
+    assert.match(line, /◷ 2(?! timers)/);
+
+    assert.deepEqual(ui.click(line.indexOf("◷"), 0), { handled: true });
+    const detailed = ui.plain()[0];
+    assert.match(detailed, /◷ 2 timers · 1 paused/);
+
+    assert.deepEqual(ui.click(detailed.indexOf("◷"), 0), { handled: true });
+    assert.match(ui.plain()[0], /◷ 2(?! timers)/, "a second click flips back");
+    assert.deepEqual(JSON.parse(readFileSync(path.join(dir, "footer.json"), "utf8")).modes, { name: "footer" }, "nothing saved");
+  });
+});
+
+test("a saved detailed timers mode is where the click starts from", async () => {
+  await withAgentDir(async (dir) => {
+    writeFileSync(path.join(dir, "footer.json"), JSON.stringify({ modes: { name: "footer", timers: "detailed" } }));
+    const ui = await mount({ statuses: new Map([["session-scheduler", "1 timer"]]) });
+    const line = (await ui.settled(120))[0];
+    assert.match(line, /◷ 1 timer\b/);
+    ui.click(line.indexOf("◷"), 0);
+    assert.match(ui.plain()[0], /◷ 1(?! timer)/);
+  });
+});

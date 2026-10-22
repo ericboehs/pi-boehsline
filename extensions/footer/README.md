@@ -128,7 +128,7 @@ again rather than leaving the slow turn's rate up.
 
 The Timers chip shows the scheduler's `/once` and `/loop` timers for this
 session: `◷ 2` (count), `◷ 2 timers · 1 paused` (detailed), or `◷ 1 paused`
-when nothing is armed. It reads the scheduler's plain-text status and takes
+when nothing is armed. Clicking it flips count/detailed for the session. It reads the scheduler's plain-text status and takes
 it off the statuses row; hide the chip to hide timers altogether. A status
 in any other shape stays on the row.
 

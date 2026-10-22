@@ -156,7 +156,7 @@ export const FOOTER_CHIPS = [
   { id: "usage", label: "Rate limits", example: "57%", description: "Provider usage windows: Copilot premium-request share over workdays (W) with the %/d left per workday, Codex/Grok/Claude windows, compact, detailed, or mini (just ↑ speed up / ↓ slow down, hidden on pace; multi-window chips name the window: ↓6w). Click: cycle for this session." },
   { id: "boot", label: "Boot time", example: "⚡775ms", description: "⚡ startup time, until the first message. Click: recent boot stats." },
   { id: "rate", label: "Token rate", example: "99", description: "Tokens per second of the last reply (live while streaming), alone or with the time to first token. Click: flip for this session." },
-  { id: "timers", label: "Timers", example: "◷ 2", description: "◷ and the number of /once and /loop timers armed in this session; detailed adds \"timers\" and how many are paused." },
+  { id: "timers", label: "Timers", example: "◷ 2", description: "◷ and the number of /once and /loop timers armed in this session; detailed adds \"timers\" and how many are paused. Click: flip for this session." },
   { id: "name", label: "Session name", example: "session-name", description: "Session name, or the dim peer name other agents use: in the editor's top border, or at the right end of the footer. Click: prefill /auto-name, or while it shows bypass (red ⚠), turn the guardian back on." },
   { id: "statuses", label: "Extension statuses", example: "extension status", description: "Other extensions' statuses, on a dim line of their own." },
 ] as const;
@@ -2181,6 +2181,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
   let lastTtftMs: number | undefined;
   /** The rate chip shows "3.1s 99tk/s" instead of the bare "99" when true. */
   let detailedRate = false;
+  /** The timers chip shows "◷ 2 timers · 1 paused" instead of "◷ 2" when true. */
+  let detailedTimers = false;
   /** Clickable chip actions. The session-cost chip stays glance-only. */
   type FooterClickAction =
     | "model"
@@ -2192,13 +2194,14 @@ export default function footerExtension(pi: ExtensionAPI): void {
     | "providerUsage"
     | "cost"
     | "rate"
+    | "timers"
     | "name"
     | "gitStatus"
     | "gitPush"
     | "gitPull";
   /** Clickable zones: chip ids, plus the git chip's three segments. */
   type FooterZoneKey =
-    | Exclude<FooterChipId, "git" | "worktree" | "timers" | "statuses">
+    | Exclude<FooterChipId, "git" | "worktree" | "statuses">
     | "gitBranch"
     | "gitBehind"
     | "gitAhead";
@@ -2219,6 +2222,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
     ["cost", "cost"],
     ["usage", "providerUsage"],
     ["rate", "rate"],
+    ["timers", "timers"],
     ["name", "name"],
   ];
   /** /footer's saved choices (hidden chips, start modes, order), from footer.json. */
@@ -2245,6 +2249,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
     compactCostUsage = chipMode(shown(), "cost") !== "detailed";
     usageMode = chipMode(shown(), "usage") ?? "compact";
     detailedRate = chipMode(shown(), "rate") === "with TTFT";
+    detailedTimers = chipMode(shown(), "timers") === "detailed";
   }
   /** Each chip's text at the last render, hidden ones too, for /footer's samples. */
   let chipSamples = new Map<FooterChipId, string>();
@@ -2325,6 +2330,9 @@ export default function footerExtension(pi: ExtensionAPI): void {
       repaint?.();
     } else if (action === "rate") {
       detailedRate = !detailedRate;
+      repaint?.();
+    } else if (action === "timers") {
+      detailedTimers = !detailedTimers;
       repaint?.();
     } else if (action === "cost") {
       compactCostUsage = !compactCostUsage;
@@ -2643,7 +2651,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
             { provider: ctx.model?.provider, model: ctx.model?.id, thinking: pi.getThinkingLevel() },
             defaults,
           );
-        const timersText = formatTimersChip(parseTimerStatus(statuses.get(TIMERS_STATUS_KEY)), chipMode(shown(), "timers"));
+        const timersText = formatTimersChip(parseTimerStatus(statuses.get(TIMERS_STATUS_KEY)), detailedTimers ? "detailed" : "count");
         const chips: Array<readonly [Exclude<FooterChipId, "name" | "statuses">, string]> = [
           ["dir", dirChipShown ? color(BLUE, dirLabel(ctx.cwd, showFullPath, shown().dirNames)) : ""],
           ["worktree", repoOfWorktree ? color(BLUE, `⎇ ${repoOfWorktree}`) : ""],
@@ -2804,8 +2812,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
             if (usageValue) zones.cost = span;
           } else if (id === "usage") {
             zones.usage = span;
-          } else if (id !== "worktree" && id !== "timers") {
-            // The worktree and timers chips are glance-only; every other chip is its own zone.
+          } else if (id !== "worktree") {
+            // The worktree chip is glance-only; every other chip is its own zone.
             zones[id] = span;
           }
           parts.push({ id, text: part, width: partWidth, zones });
