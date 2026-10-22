@@ -1,11 +1,14 @@
 /**
  * Iterative compaction used to say "PRESERVE all existing information".
  * One session grew 7,791 → 52,556 characters over six compacts, and the next
- * update has to re-emit all of it. Cap the growth, and the size, so the
- * checkpoint cannot walk into the model's output limit.
+ * update has to re-emit all of it. Cap the growth, and the size.
  *
- * 32,000 characters is about 8,000 tokens. With a couple thousand tokens of
- * reasoning that still fits under a 16k output cap. Under the ceiling, one
+ * pi 1.4.0 dropped the fixed summary output cap (about 13k tokens) and gives
+ * summaries the model's output limit, so size no longer makes a summary fail.
+ * The cap still pays: every update re-emits the whole checkpoint, so a larger
+ * one costs output tokens and latency on each compact, and it then sits in
+ * context for the rest of the session. 32,000 characters is about 8,000
+ * tokens, which also keeps models with small output limits safe. Under the ceiling, one
  * update may add 4,000 characters. At the ceiling, new facts replace older
  * Done items. The split-turn block and the file lists are kept; the oldest
  * Done bullets are what get dropped.
