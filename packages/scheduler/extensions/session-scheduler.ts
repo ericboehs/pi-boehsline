@@ -3,6 +3,13 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { randomBytes } from "node:crypto";
+import { Type } from "typebox";
+
+// Boehsline's shared config and tool_search helper. The tool is an opt-in on
+// top of the commands, so it reads the same boehsline.json `enable` list (and
+// shows up in /boehsline) as every other opt-in.
+import { enabled, loadConfig, optIns, settingsFor } from "../../../lib/config.ts";
+import { activateToolSearch } from "../../../lib/tool-search.ts";
 
 import {
   MIN_INTERVAL_MS,
@@ -15,12 +22,19 @@ import {
   parseCron,
   parseDuration,
   parseOnceCommand,
+  parseOnceTime,
   stripPromptDelimiter,
 } from "./lib/schedule-core.ts";
 
 const SNAPSHOT_TYPE = "session-scheduler:snapshot";
 const SNAPSHOT_VERSION = 1;
 const MAX_TASKS = 50;
+
+/** The opt-in name in boehsline.json's `enable` list, and its settings key. */
+export const TOOL_OPT_IN = "scheduler-tool";
+export const TOOL_NAME = "schedule";
+const TOOL_ACTIONS = ["once", "loop", "list", "cancel", "pause", "resume"] as const;
+type ToolAction = (typeof TOOL_ACTIONS)[number];
 
 // setTimeout silently fires immediately past this, so long waits are re-armed
 // in chunks instead of being trusted to a single timer.
@@ -34,12 +48,22 @@ export interface ScheduledTask extends Schedule {
   createdAt: number;
   nextRunAt: number;
   paused?: boolean;
+  /** "agent" when the schedule tool created it; its fire is labelled as the agent's own reminder. */
+  source?: "agent";
 }
 
 interface SchedulerSnapshot {
   version: number;
   sessionId: string;
   tasks: ScheduledTask[];
+}
+
+interface ToolParams {
+  action: string;
+  prompt?: string;
+  when?: string;
+  every?: string;
+  id?: string;
 }
 
 interface ResumeResult {
@@ -180,6 +204,29 @@ function formatTask(task: ScheduledTask): string {
   return `${task.id} · ${describeSchedule(task)} · ${next} · ${task.prompt}`;
 }
 
+/** What the agent sees: relative times, since it may not know the clock. */
+export function formatTaskForAgent(task: ScheduledTask, now = Date.now()): string {
+  const at = new Date(task.nextRunAt).toLocaleString();
+  const when = task.paused
+    ? `paused (was due ${at})`
+    // Rounded up to the second, so 15m reads as 15m and not 14m59s.
+    : `next in ${formatDuration(Math.ceil((task.nextRunAt - now) / 1000) * 1000)} (${at})`;
+  const kind = task.kind === "once" ? "once" : describeSchedule(task);
+  const by = task.source === "agent" ? "agent" : "user";
+  return `${task.id} · ${kind} · ${when} · set by ${by} · ${task.prompt}`;
+}
+
+/**
+ * The text a fire sends. A timer the agent set itself comes back as a user
+ * message, so say whose it is; otherwise the model reads its own reminder as
+ * a fresh request from the user.
+ */
+export function deliveryText(task: ScheduledTask): string {
+  if (task.source !== "agent") return task.prompt;
+  const kind = task.kind === "once" ? "one-shot" : `recurring, ${describeSchedule(task)}`;
+  return `[Scheduled task ${task.id} (${kind}) that you set with the ${TOOL_NAME} tool fired]\n${task.prompt}`;
+}
+
 function makeTaskId(existing: ScheduledTask[]): string {
   const used = new Set(existing.map((task) => task.id));
   let id: string;
@@ -254,7 +301,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     updateStatus(ctx);
     if (ctx.hasUI) ctx.ui.notify(`Scheduled task ${task.id} fired`, "info");
     try {
-      pi.sendUserMessage(task.prompt);
+      pi.sendUserMessage(deliveryText(task));
     } catch (error) {
       // Put it back before persisting anything: a one-shot removed from the
       // snapshot and then failing to deliver would be gone from both the
@@ -350,7 +397,12 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     return complete;
   };
 
-  const addInterval = (ctx: ExtensionContext, durationText: string, promptText: string) => {
+  const addInterval = (
+    ctx: ExtensionContext,
+    durationText: string,
+    promptText: string,
+    source?: ScheduledTask["source"],
+  ) => {
     const intervalMs = parseDuration(durationText);
     if (intervalMs === undefined || intervalMs < MIN_INTERVAL_MS) {
       throw new Error("Recurring intervals must be at least 1m (examples: 5m, 1h, 1h30m)");
@@ -362,11 +414,17 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
       prompt,
       intervalMs,
       nextRunAt: Date.now() + intervalMs,
+      ...(source ? { source } : {}),
     });
   };
 
-  const addOnce = (ctx: ExtensionContext, nextRunAt: number, prompt: string) => {
-    const task = addTask(ctx, { kind: "once", prompt, nextRunAt });
+  const addOnce = (
+    ctx: ExtensionContext,
+    nextRunAt: number,
+    prompt: string,
+    source?: ScheduledTask["source"],
+  ) => {
+    const task = addTask(ctx, { kind: "once", prompt, nextRunAt, ...(source ? { source } : {}) });
     notice(
       ctx,
       `Scheduled ${task.id} once at ${new Date(task.nextRunAt).toLocaleString()}`
@@ -628,6 +686,98 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
       }
     },
   });
+
+  // ── schedule tool (opt-in) ──
+  //
+  // Off by default: the commands above stay out of model context, which is
+  // the package's whole stance. Turning on "scheduler-tool" in boehsline.json
+  // lets the agent set and manage the same timers. It is deferred unless the
+  // settings say otherwise, so it costs nothing until tool_search loads it.
+  const config = loadConfig();
+  const toolOn = enabled(TOOL_OPT_IN, config);
+  optIns().set(TOOL_OPT_IN, {
+    name: TOOL_OPT_IN,
+    description: "Let the agent set /once and /loop timers with a schedule tool",
+    on: toolOn,
+  });
+  if (toolOn) {
+    const { exposure } = settingsFor(TOOL_OPT_IN, { exposure: "deferred" }, config);
+    const direct = exposure === "direct";
+    if (!direct) activateToolSearch(pi);
+
+    const runTool = (action: ToolAction, params: ToolParams, ctx: ExtensionContext) => {
+      const need = (value: string | undefined, name: string) => {
+        const trimmed = value?.trim();
+        if (!trimmed) throw new Error(`${action} needs ${name}`);
+        return trimmed;
+      };
+      switch (action) {
+        case "once": {
+          const when = need(params.when, "`when` (a duration like 15m, a clock time like 15:30 or 8p, or an ISO timestamp)");
+          const prompt = need(params.prompt, "a `prompt`");
+          const nextRunAt = parseOnceTime(when);
+          if (nextRunAt === undefined) throw new Error(`Could not read "${when}" as a time; use 15m, 2h, 15:30, 8p or an ISO timestamp`);
+          const task = addOnce(ctx, nextRunAt, prompt, "agent");
+          return { text: `Scheduled ${formatTaskForAgent(task)}. It fires into this conversation only while this session stays open.`, tasks: [task] };
+        }
+        case "loop": {
+          const every = need(params.every, "`every` (a duration of 1m or more, like 15m)");
+          const prompt = need(params.prompt, "a `prompt`");
+          const task = addInterval(ctx, every, prompt, "agent");
+          notice(ctx, `Agent set loop ${task.id} every ${formatDuration(task.intervalMs ?? 0)}: ${task.prompt}`);
+          return { text: `Looping ${formatTaskForAgent(task)}. Cancel it with action "cancel" once it is no longer needed.`, tasks: [task] };
+        }
+        case "list":
+          return {
+            text: tasks.length > 0 ? tasks.map((task) => formatTaskForAgent(task)).join("\n") : "No timers in this session",
+            tasks: tasks.map((task) => ({ ...task })),
+          };
+        case "cancel": {
+          const task = removeTask(ctx, need(params.id, "an `id`"));
+          notice(ctx, `Agent cancelled session task ${task.id}`);
+          return { text: `Cancelled ${task.id}`, tasks: [task] };
+        }
+        case "pause":
+        case "resume": {
+          const paused = action === "pause";
+          const { changed, expired } = setPaused(ctx, need(params.id, "an `id` (or \"all\")"), paused);
+          const lines = changed.map((task) => `${paused ? "Paused" : "Resumed"} ${formatTaskForAgent(task)}`);
+          for (const task of expired) lines.push(`Dropped ${task.id}: its one-shot time passed while paused`);
+          if (lines.length === 0) lines.push(paused ? "Nothing to pause" : "Nothing to resume");
+          if (changed.length > 0 || expired.length > 0) notice(ctx, `Agent: ${lines.join("; ")}`);
+          return { text: lines.join("\n"), tasks: [...changed, ...expired] };
+        }
+      }
+    };
+
+    pi.registerTool({
+      name: TOOL_NAME,
+      label: "Schedule",
+      exposure: direct ? "direct" : "deferred",
+      executionMode: "sequential",
+      description:
+        "Set timers that send a prompt back into this conversation later, the same timers as the user's /once and /loop. " +
+        "Use it to check back on something slow (a deploy, CI, a long build) instead of polling, or when the user asks to be reminded. " +
+        "Actions: once (needs when + prompt), loop (needs every + prompt, 1m minimum), list, cancel (id), pause/resume (id or \"all\"). " +
+        "Timers live in this session only: they fire while pi is open and are lost when it exits. " +
+        "When one fires, its prompt arrives as a message labelled as your scheduled task. Cancel loops you no longer need.",
+      parameters: Type.Object({
+        action: Type.Union(TOOL_ACTIONS.map((name) => Type.Literal(name))),
+        prompt: Type.Optional(Type.String({ description: "once/loop: what to send into the conversation when it fires; write it as an instruction to yourself" })),
+        when: Type.Optional(Type.String({ description: "once: 30s, 15m, 2h, 1d; or a clock time 15:30, 9a, 8p; or an ISO timestamp" })),
+        every: Type.Optional(Type.String({ description: "loop: interval such as 5m, 1h, 1h30m (at least 1m)" })),
+        id: Type.Optional(Type.String({ description: "cancel/pause/resume: task id or a unique prefix; pause/resume also take \"all\"" })),
+      }),
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        if (!ctx.hasUI && params.action !== "list") {
+          throw new Error("Session timers need an interactive session; this one ends when the run does, so a timer would never fire.");
+        }
+        const action = params.action as ToolAction;
+        const result = runTool(action, params, ctx);
+        return { content: [{ type: "text", text: result.text }], details: { action, tasks: result.tasks } };
+      },
+    });
+  }
 
   pi.on("session_start", (_event, ctx) => restoreRuntime(ctx));
   pi.on("session_tree", (_event, ctx) => restoreRuntime(ctx));

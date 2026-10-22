@@ -13,8 +13,10 @@ implementation.
 | Stored in | a custom session entry | `~/.pi/agent/scheduler/tasks.json` |
 | Missed fires | dropped | caught up once, within a grace window |
 
-**Neither extension registers an LLM tool or adds anything to model context.**
-The durable half stays out of pi entirely between runs: a launchd/systemd tick
+**By default neither extension registers an LLM tool or adds anything to model
+context.** The one exception is opt-in: enable `scheduler-tool` in Boehsline
+and the agent gets a deferred `schedule` tool for session timers (see
+[below](#letting-the-agent-set-timers-schedule-tool)). The durable half stays out of pi entirely between runs: a launchd/systemd tick
 owns the schedule, so nothing is resident and pi's startup path is untouched.
 Session timers (`/once`, `/loop`) are necessarily in-process — they hold
 `setTimeout`s for the life of the session and read their snapshot back at
@@ -63,6 +65,43 @@ without firing or drifting. `resume` recomputes the next occurrence rather than
 replaying what was missed: a recurring task advances to its next future slot,
 and a one-shot whose time passed while paused is dropped with a warning instead
 of firing late.
+
+### Letting the agent set timers: `schedule` tool
+
+Off by default. Turn it on with `/boehsline enable scheduler-tool` (or add
+`"scheduler-tool"` to `enable` in `~/.pi/agent/boehsline.json`), then
+`/reload`. The agent gets one tool, `schedule`, that drives the same timers
+as `/once` and `/loop`:
+
+| action | needs | does |
+|---|---|---|
+| `once` | `when`, `prompt` | one-shot; `when` is `15m`, `2h`, `15:30`, `8p` or an ISO timestamp |
+| `loop` | `every`, `prompt` | recurring, 1m minimum |
+| `list` | | every timer in the session, yours included, with who set it |
+| `cancel` | `id` | an id or unique prefix |
+| `pause` / `resume` | `id` | an id, a prefix, or `all` |
+
+It is the agent's version of the commands, not a separate scheduler: `/loop
+list` shows what the agent set, the agent can cancel yours, and the same
+limits apply (50 timers, 1m loop floor, nothing survives quitting pi). You
+see a notice whenever the agent adds, cancels, pauses or resumes a timer.
+
+When an agent-set timer fires, its prompt arrives labelled
+`[Scheduled task <id> (...) that you set with the schedule tool fired]`, so
+the model reads it as its own reminder rather than a new request from you.
+Timers you set fire verbatim, as before.
+
+The tool is `deferred`: it is not in the prompt until the agent finds it with
+`tool_search`, so enabling it costs nothing in sessions that never schedule.
+To put it in every prompt instead:
+
+```jsonc
+{ "scheduler-tool": { "exposure": "direct" } }
+```
+
+In a non-interactive run (`pi -p`, including durable `/schedule` runs) the
+tool refuses to set timers, since the process exits before any would fire;
+use `pi-scheduler add` for that.
 
 ## Durable tasks: `/schedule`
 

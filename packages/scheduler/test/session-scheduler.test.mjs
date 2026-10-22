@@ -1,8 +1,20 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
+// The schedule tool is a Boehsline opt-in. Point the config at a scratch file
+// so the developer's own boehsline.json cannot turn it on under the tests.
+const configDir = mkdtempSync(join(tmpdir(), "session-scheduler-"));
+const configPath = join(configDir, "boehsline.json");
+process.env.BOEHSLINE_CONFIG = configPath;
+delete process.env.BOEHSLINE_ENABLE;
+
 import sessionScheduler, {
+  TOOL_OPT_IN,
   advanceRecurringTask,
+  deliveryText,
   normalizeTasksForResume,
 } from "../extensions/session-scheduler.ts";
 
@@ -14,7 +26,16 @@ function snapshot(sessionId, tasks) {
   };
 }
 
-async function mount({ branch = [], idle = true, sessionId = "session-a", persisted = true } = {}) {
+async function mount({
+  branch = [],
+  idle = true,
+  sessionId = "session-a",
+  persisted = true,
+  hasUI = true,
+  config = {},
+} = {}) {
+  writeFileSync(configPath, JSON.stringify(config));
+  const tools = [];
   const handlers = {};
   const commands = {};
   const entries = persisted
@@ -27,7 +48,7 @@ async function mount({ branch = [], idle = true, sessionId = "session-a", persis
   let registeredTools = 0;
 
   const ctx = {
-    hasUI: true,
+    hasUI,
     isIdle: () => isIdle,
     sessionManager: {
       getSessionId: () => sessionId,
@@ -43,7 +64,10 @@ async function mount({ branch = [], idle = true, sessionId = "session-a", persis
   const pi = {
     on: (name, handler) => { handlers[name] = handler; },
     registerCommand: (name, options) => { commands[name] = options; },
-    registerTool: () => { registeredTools += 1; },
+    registerTool: (tool) => { registeredTools += 1; tools.push(tool); },
+    getActiveTools: () => [],
+    getAllTools: () => [],
+    setActiveTools: () => {},
     appendEntry: (customType, data) => {
       entries.push({ type: "custom", customType, data });
     },
@@ -65,6 +89,8 @@ async function mount({ branch = [], idle = true, sessionId = "session-a", persis
     sent,
     statuses,
     registeredTools,
+    tools,
+    tool: (params) => tools[0].execute("call-1", params, undefined, undefined, ctx),
     setIdle: (value) => { isIdle = value; },
     run: (name, args = "") => commands[name].handler(args, ctx),
     shutdown: () => handlers.session_shutdown({ reason: "quit" }, ctx),
@@ -577,4 +603,109 @@ test("a one-shot that fails to deliver is kept, not silently dropped", async (t)
   assert.deepEqual(afterDelivery, [], "and it retires only once it has actually landed");
 
   await handlers.session_shutdown({ reason: "quit" }, ctx);
+});
+
+// ── schedule tool (opt-in) ──
+
+const withTool = { config: { enable: [TOOL_OPT_IN] } };
+const textOf = (result) => result.content.map((part) => part.text).join("");
+
+test("the schedule tool stays off unless scheduler-tool is enabled", async (t) => {
+  const ui = await mount({ config: { enable: ["something-else"] } });
+  t.after(ui.shutdown);
+  assert.equal(ui.registeredTools, 0);
+});
+
+test("enabled, it registers one deferred, sequential schedule tool", async (t) => {
+  const ui = await mount(withTool);
+  t.after(ui.shutdown);
+  assert.equal(ui.tools.length, 1);
+  assert.equal(ui.tools[0].name, "schedule");
+  assert.equal(ui.tools[0].exposure, "deferred", "costs no context until tool_search loads it");
+  assert.equal(ui.tools[0].executionMode, "sequential", "it mutates the shared timer list");
+  assert.deepEqual(Object.keys(ui.commands).sort(), ["loop", "once"], "the commands are unchanged");
+});
+
+test("settings can expose the tool directly", async (t) => {
+  const ui = await mount({ config: { enable: [TOOL_OPT_IN], [TOOL_OPT_IN]: { exposure: "direct" } } });
+  t.after(ui.shutdown);
+  assert.equal(ui.tools[0].exposure, "direct");
+});
+
+test("the tool sets a one-shot the user can see and /once list shows", async (t) => {
+  const ui = await mount(withTool);
+  t.after(ui.shutdown);
+
+  const result = await ui.tool({ action: "once", when: "15m", prompt: "check the deploy" });
+  assert.match(textOf(result), /next in 15m/);
+  const [task] = latestTasks(ui);
+  assert.equal(task.kind, "once");
+  assert.equal(task.prompt, "check the deploy");
+  assert.equal(task.source, "agent");
+  assert.ok(Math.abs(task.nextRunAt - (Date.now() + 900_000)) < 5_000);
+  assert.match(ui.notices.at(-1).message, /Scheduled .* once at/, "the user is told");
+
+  await ui.run("once", "list");
+  assert.match(ui.notices.at(-1).message, /check the deploy/);
+});
+
+test("the tool sets loops and lists every timer, the user's included", async (t) => {
+  const ui = await mount(withTool);
+  t.after(ui.shutdown);
+
+  await ui.run("loop", "1h user loop");
+  await ui.tool({ action: "loop", every: "5m", prompt: "poll CI" });
+  const listed = textOf(await ui.tool({ action: "list" }));
+  assert.match(listed, /every 1h .* set by user · user loop/);
+  assert.match(listed, /every 5m .* set by agent · poll CI/);
+});
+
+test("the tool cancels, pauses and resumes by id prefix or all", async (t) => {
+  const ui = await mount(withTool);
+  t.after(ui.shutdown);
+
+  await ui.tool({ action: "loop", every: "5m", prompt: "a" });
+  await ui.tool({ action: "loop", every: "10m", prompt: "b" });
+  const [a, b] = latestTasks(ui);
+
+  assert.match(textOf(await ui.tool({ action: "pause", id: "all" })), /Paused .*\n.*Paused/);
+  assert.ok(latestTasks(ui).every((task) => task.paused));
+
+  assert.match(textOf(await ui.tool({ action: "resume", id: a.id.slice(0, 6) })), new RegExp(`Resumed ${a.id}`));
+  assert.equal(latestTasks(ui).find((task) => task.id === a.id).paused, false);
+
+  assert.equal(textOf(await ui.tool({ action: "cancel", id: b.id })), `Cancelled ${b.id}`);
+  assert.deepEqual(latestTasks(ui).map((task) => task.id), [a.id]);
+});
+
+test("bad tool input fails the call instead of scheduling anything", async (t) => {
+  const ui = await mount(withTool);
+  t.after(ui.shutdown);
+
+  await assert.rejects(ui.tool({ action: "once", prompt: "x" }), /once needs `when`/);
+  await assert.rejects(ui.tool({ action: "once", when: "someday", prompt: "x" }), /Could not read "someday"/);
+  await assert.rejects(ui.tool({ action: "loop", every: "10s", prompt: "x" }), /at least 1m/);
+  await assert.rejects(ui.tool({ action: "loop", every: "5m" }), /loop needs a `prompt`/);
+  await assert.rejects(ui.tool({ action: "cancel", id: "nope" }), /No session task matches nope/);
+  assert.deepEqual(latestTasks(ui), []);
+});
+
+test("without an interactive session the tool refuses to set timers that could never fire", async (t) => {
+  const ui = await mount({ ...withTool, hasUI: false });
+  t.after(ui.shutdown);
+  await assert.rejects(ui.tool({ action: "once", when: "5m", prompt: "x" }), /interactive session/);
+  assert.match(textOf(await ui.tool({ action: "list" })), /No timers/);
+});
+
+test("an agent's timer fires labelled as its own; a user's fires verbatim", async (t) => {
+  const ui = await mount(withTool);
+  t.after(ui.shutdown);
+
+  await ui.tool({ action: "once", when: new Date(Date.now() + 30).toISOString(), prompt: "look at CI" });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(ui.sent.length, 1);
+  assert.match(ui.sent[0], /^\[Scheduled task [0-9a-f]{8} \(one-shot\) that you set with the schedule tool fired\]\nlook at CI$/);
+
+  const user = { id: "u", kind: "once", prompt: "verbatim", createdAt: 0, nextRunAt: 0 };
+  assert.equal(deliveryText(user), "verbatim");
 });

@@ -20,6 +20,9 @@ const home = mkdtempSync(join(tmpdir(), "deferred-tools-"));
 process.env.HOME = home;
 process.env.XDG_CACHE_HOME = join(home, ".cache");
 process.env.BOEHSLINE_CONFIG = join(home, "boehsline.json");
+// Opt-in deferred tools are only registered when enabled; turn them on so
+// they are checked too.
+process.env.BOEHSLINE_ENABLE = "scheduler-tool";
 delete process.env.PI_SUBAGENT_CHILD;
 
 const root = new URL("..", import.meta.url).pathname;

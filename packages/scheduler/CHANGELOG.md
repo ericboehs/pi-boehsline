@@ -3,6 +3,17 @@
 Notable changes to pi-scheduler. While the major version is 0, a minor bump may
 change behaviour; each one says what it breaks.
 
+## [Unreleased]
+
+### Added
+
+- Opt-in `schedule` tool so the agent can set and manage session timers:
+  `once`, `loop`, `list`, `cancel`, `pause`, `resume`. Off unless
+  `scheduler-tool` is in Boehsline's `enable` list; deferred by default
+  (`"scheduler-tool": { "exposure": "direct" }` to always declare it).
+  Agent-set timers are marked `source: "agent"` and fire with a label saying
+  so. Nothing changes with it off.
+
 ## [0.2.0] — 2026-08-24
 
 A correctness pass over the durable scheduler, from a multi-pass review of the

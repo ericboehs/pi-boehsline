@@ -55,6 +55,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [watch](extensions/opt-in/watch/README.md) | Slack, bot feed and notification watcher with digests and drafts | `/watch`, `watch_items` tool |
 | [meeting](extensions/opt-in/meeting/README.md) | Live meeting copilot: questions worth asking, from the transcript | `/meeting`, `/q<N>` |
 | [omlx](extensions/opt-in/omlx/README.md) | Adds models loaded in a local oMLX server to `/model` |  |
+| [scheduler-tool](packages/scheduler/README.md#letting-the-agent-set-timers-schedule-tool) | Lets the agent set and manage `/once` and `/loop` timers | `schedule` tool (deferred) |
 | [sc](extensions/opt-in/sc/README.md) | Attach the newest screenshot from iCloud Downloads | `/sc` |
 | [skill-modes](extensions/opt-in/skill-modes/README.md) | Sticky skill modes: a `mode: true` skill stays on until `/mode off` | `/mode` |
 | [tmux-attention](extensions/opt-in/tmux-attention/README.md) | Highlights the tmux window when pi needs you |  |
@@ -112,6 +113,7 @@ Everything below goes in `~/.pi/agent/boehsline.json`, or comes from a package t
 
   "meeting": { "qmdCollections": ["notes"], "dailyDir": "~/Notes/daily", "codeDir": "~/src" },
   "image-prune": { "thresholdMB": 5, "keepTurns": 2, "shrinkMaxPx": 1568, "shrinkMinKB": 512 },  // "enabled": false pauses it; /image-prune now still works
+  "scheduler-tool": { "exposure": "deferred" },  // "direct" puts the schedule tool in every prompt
   "update": { "dir": "~/dotfiles", "task": "update:pi" },  // no dir: the checkout that holds ~/.config/mise/config.toml
   "wiki-session-log": { "command": ["~/bin/pi-session-sync"] }
 }
