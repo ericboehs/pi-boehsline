@@ -1802,9 +1802,8 @@ async function bundleIsStale(): Promise<boolean> {
   try {
     const pkgJson = await piPackageJsonPath();
     if (!pkgJson) return false;
-    // Since pi 0.85 upstream ships dist/bundle/cli.js and pi-bundle builds
-    // nothing when it exists, so a missing dist/bundle.mjs is expected, not stale.
-    if (await stat(join(dirname(pkgJson), "dist", "bundle", "cli.js")).then(() => true, () => false)) return false;
+    // A missing dist/bundle.mjs is expected, not stale, when pi ships its own.
+    if (await shipsOwnBundle(pkgJson)) return false;
     const bundle = join(dirname(pkgJson), "dist", "bundle.mjs");
     const [pkgStat, bundleStat] = await Promise.all([
       stat(pkgJson),
@@ -1814,6 +1813,15 @@ async function bundleIsStale(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Since pi 0.85 upstream ships dist/bundle/cli.js, and pi-bundle builds
+ * nothing when it exists. A source checkout (the pi fork) has it after
+ * `npm run build` too.
+ */
+export async function shipsOwnBundle(pkgJson: string): Promise<boolean> {
+  return stat(join(dirname(pkgJson), "dist", "bundle", "cli.js")).then(() => true, () => false);
 }
 
 /**
@@ -1833,6 +1841,12 @@ async function rebuildBundle(version: string): Promise<void> {
   if (stash.__piFooterAutoBundleFor === version) return;
   stash.__piFooterAutoBundleFor = version;
   if (process.env.PI_NO_AUTO_BUNDLE) return;
+
+  // Nothing to build when pi ships its own bundle. Spawning pi-bundle anyway
+  // only logs a failure: run through ~/.pi/agent/bin/pi, the fork has no
+  // install beside its bin for pi-bundle to find.
+  const pkgJson = await piPackageJsonPath();
+  if (pkgJson && (await shipsOwnBundle(pkgJson))) return;
 
   const script = await piBundleScript();
   if (!script) return;

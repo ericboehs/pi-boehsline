@@ -24,6 +24,7 @@ afterEach(async () => {
 import { VERSION as RUNNING_PI_VERSION } from "@earendil-works/pi-coding-agent";
 import footer, {
   CHIP_MODES,
+  shipsOwnBundle,
   viewConfig,
   alarmStatuses,
   contextAboveThreshold,
@@ -1517,6 +1518,18 @@ for (const [layout, why] of [
     assert.match(strip(widget.render(80)[0]), new RegExp(`→ v99\\.0\\.0 · Restart to update$`));
   });
 }
+
+test("auto-bundle skips a pi that ships dist/bundle/cli.js, such as a built fork", async () => {
+  // Spawning pi-bundle for these only logged "no pi install found next to
+  // ~/.pi/agent/bin" on every version change.
+  const root = mkdtempSync(path.join(tmpdir(), "footer-own-bundle-"));
+  const pkg = path.join(root, "package.json");
+  writeFileSync(pkg, JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "1.4.0" }));
+  assert.equal(await shipsOwnBundle(pkg), false);
+  mkdirSync(path.join(root, "dist", "bundle"), { recursive: true });
+  writeFileSync(path.join(root, "dist", "bundle", "cli.js"), "");
+  assert.equal(await shipsOwnBundle(pkg), true);
+});
 
 test("update notice shows both versions in a right-aligned widget above the prompt", async () => {
   // The running process's entrypoint may be gone; the active pi on PATH still answers.
