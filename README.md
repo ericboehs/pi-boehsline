@@ -64,7 +64,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 
 ### Bundled packages
 
-Git subtrees under [`packages/`](packages), kept verbatim (see [below](#bundled-packages-git-subtrees)). The approval guardian is one too, loaded through its opt-in wrapper.
+Git subtrees under [`packages/`](packages), kept verbatim except the scheduler, which is now developed here (see [below](#bundled-packages-git-subtrees)). The approval guardian is one too, loaded through its opt-in wrapper.
 
 | Package | What it does | From |
 |---|---|---|
@@ -155,12 +155,12 @@ Only your own file can turn opt-in extensions on. A package can supply settings 
 
 ## Bundled packages (git subtrees)
 
-`packages/` holds the repos that used to ship on their own. Each is a git subtree with its full history, and stays verbatim so pulls apply cleanly. The root `package.json` lists their entry files.
+`packages/` holds the repos that used to ship on their own. Each is a git subtree with its full history, and stays verbatim so pulls apply cleanly. The exception is `packages/scheduler`: ericboehs/pi-scheduler is archived, so the scheduler is developed in Boehsline directly, there's nothing to pull, and it can import Boehsline's `lib/` (its opt-in `schedule` tool and the footer's timers chip do). The root `package.json` lists their entry files.
 
 | Folder | From | Upstream (forks) |
 |---|---|---|
 | `packages/context` | ericboehs/pi-context | |
-| `packages/scheduler` | ericboehs/pi-scheduler | |
+| `packages/scheduler` | ericboehs/pi-scheduler (archived; developed here now) | |
 | `packages/agent-link` | ericboehs/pi-agent-link | alonw0/pi-claude-link |
 | `packages/approval-guardian` | ericboehs/pi-approval-guardian | mics8128/pi-approval-guardian |
 | `packages/goal` | ericboehs/pi-goal | |

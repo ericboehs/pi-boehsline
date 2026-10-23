@@ -39,7 +39,7 @@
     }
   },
   "pi": {
-    "//": "Explicit globs: each extension is a folder with index.ts and a README.md; lib/ holds imported modules, not extensions. Opt-in extensions are declared like the rest and gate themselves (lib/opt-in.ts), because pi settings filters can only narrow what a manifest declares. packages/* are git subtrees kept verbatim (so `git subtree pull` stays clean); list their entry files here instead of restructuring them.",
+    "//": "Explicit globs: each extension is a folder with index.ts and a README.md; lib/ holds imported modules, not extensions. Opt-in extensions are declared like the rest and gate themselves (lib/opt-in.ts), because pi settings filters can only narrow what a manifest declares. packages/* are git subtrees kept verbatim (so `git subtree pull` stays clean), except packages/scheduler, developed here since pi-scheduler was archived; list their entry files here instead of restructuring them.",
     "extensions": [
       "extensions/*/index.ts",
       "extensions/opt-in/*/index.ts",
