@@ -657,8 +657,8 @@ test("the tool sets loops and lists every timer, the user's included", async (t)
   await ui.run("loop", "1h user loop");
   await ui.tool({ action: "loop", every: "5m", prompt: "poll CI" });
   const listed = textOf(await ui.tool({ action: "list" }));
-  assert.match(listed, /every 1h .* set by user · user loop/);
-  assert.match(listed, /every 5m .* set by agent · poll CI/);
+  assert.match(listed, /every 1h .* set by user · "user loop"/);
+  assert.match(listed, /every 5m .* set by agent · "poll CI"/);
 });
 
 test("the tool cancels, pauses and resumes by id prefix or all", async (t) => {
@@ -709,6 +709,14 @@ test("an agent's timer fires labelled as its own; a user's fires verbatim", asyn
 
   const user = { id: "u", kind: "once", prompt: "verbatim", createdAt: 0, nextRunAt: 0 };
   assert.equal(deliveryText(user), "verbatim");
+});
+
+test("the tool quotes prompts, so trailing punctuation never doubles up", async (t) => {
+  const ui = await mount(withTool);
+  t.after(ui.shutdown);
+  const text = textOf(await ui.tool({ action: "once", when: "5m", prompt: 'Say "done".' }));
+  assert.ok(text.includes('· "Say \\"done\\".". It fires'), text);
+  assert.doesNotMatch(text, /\.\. /);
 });
 
 test("the footer status is plain text: no emoji", async (t) => {

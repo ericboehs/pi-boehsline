@@ -225,7 +225,9 @@ export function formatTaskForAgent(task: ScheduledTask, now = Date.now()): strin
     : `next in ${formatDuration(Math.ceil((task.nextRunAt - now) / 1000) * 1000)} (${at})`;
   const kind = task.kind === "once" ? "once" : describeSchedule(task);
   const by = task.source === "agent" ? "agent" : "user";
-  return `${task.id} · ${kind} · ${when} · set by ${by} · ${task.prompt}`;
+  // Quoted (JSON-escaped), so the tool's own sentence after it never runs
+  // into the prompt's punctuation ("…done.. It fires…").
+  return `${task.id} · ${kind} · ${when} · set by ${by} · ${JSON.stringify(task.prompt)}`;
 }
 
 /**
