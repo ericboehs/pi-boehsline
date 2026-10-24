@@ -3,7 +3,7 @@
 // sections whose timestamp moved, so iframes and scroll position survive.
 
 import { readPair, readPrefs, prettyName, swatch, themeMode, themeVars } from "/assets/theme.mjs";
-import { asQuote, boardMarks, cardKey, cardPrompt, dismissPipe, optionsText, ownerSession, pipeRows, pipeStripHidden, REVIEW_VERDICTS, reviewLabel, reviewMessage, infoRows, slackText, treeText, wrapLabel, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, placeBefore, placeTrackers, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions } from "/assets/nav.mjs";
+import { asQuote, boardMarks, cardKey, cardPrompt, dismissPipe, optionsText, ownerSession, pipeRows, pipeStripHidden, REVIEW_VERDICTS, reviewLabel, reviewMessage, infoRows, plainText, treeText, wrapLabel, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, placeBefore, placeTrackers, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions } from "/assets/nav.mjs";
 // The renderers themselves live in render.mjs (with render.css): the page passes
 // what only it has (its copy buttons, highlight.js loading, the kanban modal,
 // owner links, remembered folds, talk-back) through each one's opts.
@@ -618,14 +618,14 @@ async function copyText(text) {
 
 /**
  * A copy button. A plain click copies getText(); ⌥ copies it as a > quote,
- * ⇧ as Slack markup (slackText; code and output, slack: "code", go in a
- * ``` block instead), ⇧⌥ as Slack markup quoted.
+ * ⇧ as plain text (plainText; code and output, plain: "code", go in a
+ * ``` block instead), ⇧⌥ as plain text quoted.
  */
-function copyButton(getText, label = "Copy", ico = null, { slack = "markdown" } = {}) {
+function copyButton(getText, label = "Copy", ico = null, { plain = "markdown" } = {}) {
   const base = ico ? "btn ico" : "btn";
   const face = (state) => (ico ? (state === "ok" ? icon("check") : state === "bad" ? "✗" : icon(ico)) : state === "ok" ? "Copied" : state === "bad" ? "Failed" : label);
-  const tip = `${ico ? label : "Copy to clipboard"} · ⌥-click: as a > quote · ⇧-click: for Slack · ⇧⌥-click: for Slack, quoted`;
-  const forSlack = (text) => (slack === "code" ? `\`\`\`\n${String(text).replace(/\n+$/, "")}\n\`\`\`` : slackText(text));
+  const tip = `${ico ? label : "Copy to clipboard"} · ⌥-click: as a > quote · ⇧-click: as plain text · ⇧⌥-click: as plain text, quoted`;
+  const asPlain = (text) => (plain === "code" ? `\`\`\`\n${String(text).replace(/\n+$/, "")}\n\`\`\`` : plainText(text));
   const b = h("button", { class: base, type: "button", title: tip, "aria-label": ico ? label : null }, face());
   let timer;
   b.addEventListener("click", async (e) => {
@@ -635,7 +635,7 @@ function copyButton(getText, label = "Copy", ico = null, { slack = "markdown" } 
     const quote = e.altKey;
     try {
       const raw = await getText();
-      const text = e.shiftKey ? forSlack(raw) : raw;
+      const text = e.shiftKey ? asPlain(raw) : raw;
       await copyText(quote ? asQuote(text) : text);
       b.replaceChildren(face("ok"));
       b.className = `${base} ok`;
@@ -778,7 +778,7 @@ function renderMarkdown(text) {
     const lang = [...code.classList].find((c) => c.startsWith("language-"))?.slice(9);
     const wrap = h("div", { class: "codeblock" });
     pre.replaceWith(wrap);
-    wrap.append(lang ? h("span", { class: "lang" }, lang) : "", pre, copyButton(() => code.textContent.replace(/\n$/, ""), "Copy", null, { slack: "code" }));
+    wrap.append(lang ? h("span", { class: "lang" }, lang) : "", pre, copyButton(() => code.textContent.replace(/\n$/, ""), "Copy", null, { plain: "code" }));
     if (lang) highlightInto(code, lang);
   }
   // Top-level quotes (drafts, mostly) copy their markdown without the > markers; ⌥-click keeps them.
@@ -1799,7 +1799,7 @@ function sectionCard(id, sec) {
     const src = copyButton(async () => {
       const text = await (await fetch(rawUrl(id, sec))).text();
       return as ? as(JSON.parse(text)) : text;
-    }, `Copy ${as ? (sec.kind === "code" ? "the code" : sec.kind === "tree" ? "the tree" : "the options") : "source"} (yc, yC for Slack)`, "copy", { slack: sec.kind === "code" || sec.kind === "tree" ? "code" : "markdown" });
+    }, `Copy ${as ? (sec.kind === "code" ? "the code" : sec.kind === "tree" ? "the tree" : "the options") : "source"} (yc, yC as plain text)`, "copy", { plain: sec.kind === "code" || sec.kind === "tree" ? "code" : "markdown" });
     src.dataset.yank = "source"; // yc presses it, yC ⇧-presses it
     meta.append(src);
   }
@@ -3954,18 +3954,18 @@ function hopChanged(dir) {
 const cardTitle = (card) => card?.querySelector(":scope > h2 .title")?.textContent || "this section";
 
 /** Press a header button of the current section (Copy source, Clippy) and echo its result. */
-async function yankWith(card, selector, what, slack = false) {
+async function yankWith(card, selector, what, plain = false) {
   const b = card?.querySelector(`:scope > h2 ${selector}`);
   if (!b) return toast(`“${cardTitle(card)}” has no ${what} to copy`);
   setCurrent(card, false);
-  // As a ⇧-click for Slack markup (yC).
-  b.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, shiftKey: slack }));
+  // As a ⇧-click for plain text (yC).
+  b.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, shiftKey: plain }));
   const ok = await new Promise((resolve) => {
     const mo = new MutationObserver(() => /\b(ok|bad)\b/.test(b.className) && (clearTimeout(t), mo.disconnect(), resolve(b.className.includes("ok"))));
     const t = setTimeout(() => (mo.disconnect(), resolve(null)), 5000);
     mo.observe(b, { attributes: true, attributeFilter: ["class"] });
   });
-  if (ok === true) toast(what === "file" ? b.title || "File copied" : `Copied the source of “${cardTitle(card)}”${slack ? " for Slack" : ""}`);
+  if (ok === true) toast(what === "file" ? b.title || "File copied" : `Copied the source of “${cardTitle(card)}”${plain ? " as plain text" : ""}`);
   else if (ok === false) toast(`Couldn't copy the ${what}${b.title && what === "file" ? `: ${b.title}` : ""}`);
 }
 
@@ -4033,7 +4033,7 @@ function vimAction(action, e) {
       return pageHooks.setAll?.(true);
     case "yankSource":
       return yankWith(currentOrTop(), "[data-yank=source]", "source");
-    case "yankSlack":
+    case "yankPlain":
       return yankWith(currentOrTop(), "[data-yank=source]", "source", true);
     case "yankFile":
       return yankWith(currentOrTop(), ".clip", "file");

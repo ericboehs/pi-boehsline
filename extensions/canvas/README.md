@@ -188,7 +188,7 @@ the review prompt — so a renderer never reaches for a page global.
   the path and "lines 40–80 of 312" head it; highlight.js colours the whole
   range at once and the result is split back into rows, so a comment that
   spans lines stays coloured. Its copy button copies the code itself (⇧ for a
-  Slack ``` block). A `tree` is a file tree from flat paths
+  ``` block). A `tree` is a file tree from flat paths
   (`{"src/a.ts": "added"}`, a note, or `{tag, note}`; a trailing `/` names a
   folder): folders first, natural order, a chain of lone folders merged
   (`src/lib/util/`), tags colouring the name (added green, changed amber,
@@ -327,9 +327,10 @@ the review prompt — so a renderer never reaches for a page global.
   hover otherwise), then the age and three quiet icons: copy source, Clippy
   and open in a new tab. ⌥-click on any copy button (the source, a code
   block, a finding, a prompt) copies the text as a markdown blockquote, `> `
-  on every line. ⇧-click copies it as Slack markup for the composer
-  (`**b**` → `*b*`, `*i*` → `_i_`, `~~s~~` → `~s~`, a heading → a bold
-  line, `-` items → `•`, a table → an aligned code block; links, code and
+  on every line. ⇧-click copies it as plain text for a chat composer or
+  anywhere markdown doesn't render (`**b**`, `*i*`, `_i_`, `~~s~~` lose their
+  marks, a heading becomes its text, `-` items → `•`, `[t](u)` → `t (u)`, a
+  table → an aligned code block; `` `code` `` spans keep their backticks and
   quotes stay), and a code block or command output in a ``` block; ⇧⌥-click
   does the same, quoted. Drafts (a Slack post, an email, a PR comment) are written
   as blockquotes, not code fences, so they wrap and read in full colour; the
@@ -413,7 +414,7 @@ the review prompt — so a renderer never reaches for a page global.
   last-turn mark. Enter, `o`
   or `za` folds or opens the current section, `zo` / `zc` open or fold it, `zR` /
   `zM` open or fold every section. `yy` copies the section's file through
-  Clippy and `yc` its source as text (`yC` as Slack markup, like ⇧-click; the page link is in Cmd-K), `p` pins or
+  Clippy and `yc` its source as text (`yC` as plain text, like ⇧-click; the page link is in Cmd-K), `p` pins or
   unpins it. `?` lists them all; the
   list and the handler share one table (`VIM_KEYS` in `canvas/nav.mjs`).
 - **Themes.** All of Omarchy's first-party themes are bundled

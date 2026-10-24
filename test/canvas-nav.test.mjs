@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { asQuote, boardMarks, boardMoves, boardSnapshot, cardPrompt, dismissPipe, pipeStripHidden, slackText, fuzzyScore, inlineTokens, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, ownerSession, pipeRows, placeBefore, placeTrackers, trackerTone, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions, wrapLabel, buildTree, codeFromText, codeLayout, lineLabel, optionPrompt, optionsText, treeText, fenceFor, reviewLabel, reviewMessage, fmtBytes, fmtCount, gitSummary, infoRows, uniichatSummary } from "../extensions/canvas/nav.mjs";
+import { asQuote, boardMarks, boardMoves, boardSnapshot, cardPrompt, dismissPipe, pipeStripHidden, plainText, fuzzyScore, inlineTokens, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, ownerSession, pipeRows, placeBefore, placeTrackers, trackerTone, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions, wrapLabel, buildTree, codeFromText, codeLayout, lineLabel, optionPrompt, optionsText, treeText, fenceFor, reviewLabel, reviewMessage, fmtBytes, fmtCount, gitSummary, infoRows, uniichatSummary } from "../extensions/canvas/nav.mjs";
 import { mix, prettyName, readPair, readPrefs, swatch, systemTheme, themeDefault, themeMode, themeVars } from "../extensions/canvas/theme.mjs";
 import { parseColors } from "../extensions/canvas/build-themes.mjs";
 
@@ -147,7 +147,7 @@ test("vim key table: unique, prefix-free, every action documented", () => {
   for (const a of seqs) for (const b of seqs) if (a !== b) assert.ok(!b.startsWith(a), `${a} would shadow ${b}`);
   for (const action of new Set(VIM_KEYS.map((k) => k.action))) assert.ok(VIM_KEYS.some((k) => k.action === action && k.help), `${action} shows in the ? list`);
   assert.ok(seqs.includes("yy") && seqs.includes("yc") && !seqs.includes("yf"), "yy is Clippy now; yf is gone");
-  assert.deepEqual(matchKeys("yC"), { action: "yankSlack" }, "yC copies for Slack");
+  assert.deepEqual(matchKeys("yC"), { action: "yankPlain" }, "yC copies as plain text");
   assert.deepEqual(matchKeys("gr"), { action: "lastReply" });
   assert.ok(seqs.includes("h") && seqs.includes("l"));
 });
@@ -332,24 +332,26 @@ test("pipeStripHidden: dismissed at this version, or stale after 30 minutes; dis
   assert.deepEqual(Object.keys(dismissPipe(h, "b", "x", 3)), ["c", "d", "b"], "re-dismissed moves to newest");
 });
 
-test("slackText: markdown as Slack markup; links, code and quotes kept; tables as code blocks", () => {
-  assert.equal(slackText("## Status: **done**"), "*Status: done*");
-  assert.equal(slackText("**b**, *i*, _i_, ~~s~~"), "*b*, _i_, _i_, ~s~");
-  assert.equal(slackText("`co**de**` and [a **b**](https://x.y/a_b*c) and https://z.q/**x**"), "`co**de**` and [a **b**](https://x.y/a_b*c) and https://z.q/**x**");
-  assert.equal(slackText("<https://a.b> ![shot](https://i.png) ![](https://j.png)"), "https://a.b [shot](https://i.png) https://j.png");
-  assert.equal(slackText("- one\n  * two **b**\n- [ ] todo\n- [x] done\n1. first"), "• one\n  • two *b*\n☐ todo\n☑ done\n1. first");
-  assert.equal(slackText("a\n\n---\n\nb"), "a\n\n———\n\nb");
-  assert.equal(slackText("> quoted **b**\n> - item"), "> quoted *b*\n> • item");
-  assert.equal(slackText("2*3*4 and x * y, a<br>b"), "2*3*4 and x * y, a\nb", "a bare * is not emphasis");
+test("plainText: markdown without its marks; code spans, fences and quotes kept; links as text (url); tables as code blocks", () => {
+  assert.equal(plainText("## Status: **done**"), "Status: done");
+  assert.equal(plainText("**b**, __b__, *i*, _i_, ~~s~~"), "b, b, i, i, s");
+  assert.equal(plainText("snake_case_name stays, file_a and file_b too"), "snake_case_name stays, file_a and file_b too");
+  assert.equal(plainText("`co**de**` and [a **b**](https://x.y/a_b*c) and https://z.q/**x**"), "`co**de**` and a b (https://x.y/a_b*c) and https://z.q/**x**");
+  assert.equal(plainText("[`cmd`](https://c.d) and [https://e.f](https://e.f)"), "`cmd` (https://c.d) and https://e.f");
+  assert.equal(plainText("<https://a.b> ![shot](https://i.png) ![](https://j.png)"), "https://a.b shot (https://i.png) https://j.png");
+  assert.equal(plainText("- one\n  * two **b**\n- [ ] todo\n- [x] done\n1. first"), "• one\n  • two b\n☐ todo\n☑ done\n1. first");
+  assert.equal(plainText("a\n\n---\n\nb"), "a\n\n———\n\nb");
+  assert.equal(plainText("> quoted **b**\n> - item"), "> quoted b\n> • item");
+  assert.equal(plainText("2*3*4 and x * y, a<br>b"), "2*3*4 and x * y, a\nb", "a bare * is not emphasis");
   // Fenced code: untouched but its language; a ~~~ fence becomes ```.
-  assert.equal(slackText('```ruby\nputs "**raw**"\n- not a bullet\n```\n~~~\nx\n~~~'), '```\nputs "**raw**"\n- not a bullet\n```\n```\nx\n```');
+  assert.equal(plainText('```ruby\nputs "**raw**"\n- not a bullet\n```\n~~~\nx\n~~~'), '```\nputs "**raw**"\n- not a bullet\n```\n```\nx\n```');
   // A table: aligned in a code block, cells as plain text, a link as "text (url)", an escaped pipe kept.
   assert.equal(
-    slackText("| Name | Count | Link |\n|---|---:|---|\n| **Alpha** | 3 | [docs](https://d.e) |\n| Beta \\| two | 12 | |\n\nafter"),
+    plainText("| Name | Count | Link |\n|---|---:|---|\n| **Alpha** | 3 | [docs](https://d.e) |\n| Beta \\| two | 12 | |\n\nafter"),
     ["```", "Name        Count  Link", "----------  -----  ------------------", "Alpha       3      docs (https://d.e)", "Beta | two  12", "```", "", "after"].join("\n"),
   );
-  assert.equal(slackText("| not | a table |"), "| not | a table |", "pipes without a separator row stay");
-  assert.equal(asQuote(slackText("# Hi\n\n**x**\n")), "> *Hi*\n>\n> *x*");
+  assert.equal(plainText("| not | a table |"), "| not | a table |", "pipes without a separator row stay");
+  assert.equal(asQuote(plainText("# Hi\n\n**x** `y`\n")), "> Hi\n>\n> x `y`");
 });
 
 test("codeLayout numbers lines and places bands and callouts", () => {

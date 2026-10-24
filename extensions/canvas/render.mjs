@@ -602,7 +602,7 @@ export function renderTable(spec) {
 }
 
 // ── hosts ──────────────────────────────────────────────────────────────────────
-// The page passes its own copy button (⌥-click quotes, ⇧-click Slack markup) and
+// The page passes its own copy button (⌥-click quotes, ⇧-click plain text) and
 // its own clipboard (with an execCommand fallback); a bubble host gets ours.
 
 /** The copy button a host wants, or this module's own. */
@@ -855,7 +855,7 @@ export function renderTerminal(spec, opts = {}) {
       h("span", {}, `${lines.length.toLocaleString()} line${lines.length === 1 ? "" : "s"}`),
     ),
   );
-  const copy = copyButtonFor(opts)(() => lines.map((l) => l.plain).join("\n"), "Copy output", null, { slack: "code" });
+  const copy = copyButtonFor(opts)(() => lines.map((l) => l.plain).join("\n"), "Copy output", null, { plain: "code" });
   const tools = filter ? h("div", { class: "term-tools" }, filter, count, copy) : null;
   if (!filter) head.lastChild.append(copy);
   const body = h("div", { class: "term-body" });

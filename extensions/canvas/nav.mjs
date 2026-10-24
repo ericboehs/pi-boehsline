@@ -97,7 +97,7 @@ export const VIM_KEYS = [
   { group: "Fold", keys: "zM", action: "foldAll", help: "fold every section" },
   { group: "Yank", keys: "yy", action: "yankFile", help: "copy this section's file (Clippy), to paste as a file" },
   { group: "Yank", keys: "yc", action: "yankSource", help: "copy this section's source as text" },
-  { group: "Yank", keys: "yC", action: "yankSlack", help: "copy this section's source as Slack markup (⇧-click on copy)" },
+  { group: "Yank", keys: "yC", action: "yankPlain", help: "copy this section's source as plain text (⇧-click on copy)" },
   { group: "Other", keys: "i", action: "compose", help: "write to pi: the message box in Status (Esc leaves it)" },
   { group: "Other", keys: "I", action: "info", help: "session info: model, context, usage, repo, UniiChat (or click the session name)" },
   { group: "Other", keys: "p", action: "pin", help: "pin this section to the top of the page, or unpin it" },
@@ -288,14 +288,15 @@ export function asQuote(text) {
 }
 
 /**
- * Markdown as Slack markup (⇧-click on a copy button), for pasting into the
- * composer: **b** → *b*, *i* or _i_ → _i_, ~~s~~ → ~s~, a heading → a *bold*
- * line, - / * / + items → • (task boxes → ☐ / ☑), --- → a rule, a
- * table → an aligned code block, <br> → a newline, an image → its link.
- * Links ([t](u), which Slack takes), code spans, fenced code (its language
- * dropped), quotes and numbered items stay as they are.
+ * Markdown as plain text (⇧-click on a copy button), for chat composers and
+ * other places that don't render it: **b**, __b__, *i*, _i_ and ~~s~~ lose
+ * their marks, a heading becomes its text, - / * / + items → • (task boxes →
+ * ☐ / ☑), --- → a rule, a table → an aligned code block, <br> → a newline,
+ * [t](u) → "t (u)", an image → its link. Code spans keep their backticks and
+ * fenced code its fence (chat apps render both; the language is dropped);
+ * quotes and numbered items stay as they are.
  */
-export function slackText(md) {
+export function plainText(md) {
   const lines = String(md ?? "").replace(/\r\n?/g, "\n").replace(/\n+$/, "").split("\n");
   const out = [];
   const isRow = (l) => /^\s*\|.*\|\s*$/.test(l);
@@ -312,12 +313,12 @@ export function slackText(md) {
     }
     if (isRow(l) && i + 1 < lines.length && isSep(lines[i + 1])) {
       const rows = [];
-      for (; i < lines.length && isRow(lines[i]); i++) if (!isSep(lines[i])) rows.push(tableCells(lines[i]).map(plainInline));
+      for (; i < lines.length && isRow(lines[i]); i++) if (!isSep(lines[i])) rows.push(tableCells(lines[i]).map((c) => plainInline(c, false)));
       i--;
       out.push("```", ...alignRows(rows), "```");
       continue;
     }
-    out.push(slackLine(l));
+    out.push(plainLine(l));
   }
   return out.join("\n");
 }
@@ -332,44 +333,44 @@ function alignRows(rows) {
   const [head, ...body] = rows;
   return [line(head), w.map((x) => "-".repeat(x)).join("  "), ...body.map((r) => line(Array.from({ length: n }, (_, k) => r[k] ?? "")))];
 }
-/** A table cell as plain text (it goes in a code block): no emphasis marks, a link as "text (url)". */
-function plainInline(s) {
-  return s
-    .replace(/!?\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g, (_, t, u) => (t && t !== u ? `${t} (${u})` : u))
-    .replace(/(\*\*|__)(.+?)\1/g, "$2")
-    .replace(/(^|[^\w*])\*(?!\s)(.+?)\*(?!\w)/g, "$1$2")
-    .replace(/~~(.+?)~~/g, "$1")
-    .replace(/`([^`]+)`/g, "$1");
-}
-
-function slackLine(l) {
+function plainLine(l) {
   if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(l)) return "———";
   const head = l.match(/^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/);
-  if (head) return `*${slackInline(head[1]).replace(/\*/g, "")}*`;
+  if (head) return plainInline(head[1]);
   const item = l.match(/^(\s*)[-*+]\s+(?:\[([ xX])\]\s+)?(.*)$/);
-  if (item) return `${item[1]}${item[2] == null ? "•" : item[2] === " " ? "☐" : "☑"} ${slackInline(item[3])}`;
+  if (item) return `${item[1]}${item[2] == null ? "•" : item[2] === " " ? "☐" : "☑"} ${plainInline(item[3])}`;
   const quote = l.match(/^(\s*(?:>\s?)+)(.*)$/);
-  if (quote) return quote[1] + slackLine(quote[2]);
-  return slackInline(l);
+  if (quote) return quote[1] + plainLine(quote[2]);
+  return plainInline(l);
 }
 
-function slackInline(s) {
-  // Code spans and links are kept whole: set aside, then put back.
+/**
+ * A line's inline markdown as plain text. Code spans and bare URLs are set
+ * aside first so their * and _ survive; code keeps its backticks unless
+ * `ticks` is false (a table cell, already in a code block). A link becomes
+ * "text (url)". _ only counts around a whole word, so snake_case stays.
+ */
+function plainInline(s, ticks = true) {
   const kept = [];
   const keep = (x) => `\u0000${kept.push(x) - 1}\u0000`;
+  const put = (x) => x.replace(/\u0000(\d+)\u0000/g, (_, k) => kept[Number(k)]);
   let t = s
-    .replace(/`[^`]+`/g, keep)
-    .replace(/!\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g, (_, a, u) => keep(a ? `[${a}](${u})` : u))
-    .replace(/\[[^\]]+\]\([^)\s]+[^)]*\)/g, keep)
+    .replace(/`([^`]+)`/g, (m, c) => keep(ticks ? m : c))
     .replace(/<(https?:\/\/[^>\s]+)>/g, (_, u) => keep(u))
+    .replace(/!?\[([^\]]*)\]\(([^)\s]+)[^)]*\)/g, (_, a, u) => {
+      const txt = put(stripMarks(a));
+      return keep(txt && txt !== u ? `${txt} (${u})` : u);
+    })
     .replace(/https?:\/\/[^\s\u0000]+/g, keep)
     .replace(/<br\s*\/?>/gi, "\n");
-  t = t
-    .replace(/(\*\*|__)(?!\s)(.+?)(?<!\s)\1/g, "\u0001$2\u0001")
-    .replace(/(^|[^\w*\u0001])\*(?![\s*])(.+?)(?<![\s*])\*(?![\w*])/g, "$1_$2_")
-    .replace(/~~(.+?)~~/g, "~$1~")
-    .replace(/\u0001/g, "*");
-  return t.replace(/\u0000(\d+)\u0000/g, (_, k) => kept[Number(k)]);
+  return put(stripMarks(t));
+}
+function stripMarks(t) {
+  return t
+    .replace(/(\*\*|__)(?!\s)(.+?)(?<!\s)\1/g, "$2")
+    .replace(/(^|[^\w*])\*(?![\s*])(.+?)(?<![\s*])\*(?![\w*])/g, "$1$2")
+    .replace(/(^|[^\w])_(?![\s_])(.+?)(?<![\s_])_(?!\w)/g, "$1$2")
+    .replace(/~~(.+?)~~/g, "$1");
 }
 
 /** A blockquote's markdown without its markers: `> ` (or `>`) off each line, up to 3 spaces of indent before it. */
