@@ -1799,8 +1799,8 @@ function sectionCard(id, sec) {
     const src = copyButton(async () => {
       const text = await (await fetch(rawUrl(id, sec))).text();
       return as ? as(JSON.parse(text)) : text;
-    }, `Copy ${as ? (sec.kind === "code" ? "the code" : sec.kind === "tree" ? "the tree" : "the options") : "source"} (yc, yC as plain text)`, "copy", { plain: sec.kind === "code" || sec.kind === "tree" ? "code" : "markdown" });
-    src.dataset.yank = "source"; // yc presses it, yC ⇧-presses it
+    }, `Copy ${as ? (sec.kind === "code" ? "the code" : sec.kind === "tree" ? "the tree" : "the options") : "source"} (yc, yp as plain text)`, "copy", { plain: sec.kind === "code" || sec.kind === "tree" ? "code" : "markdown" });
+    src.dataset.yank = "source"; // yc presses it, yp ⇧-presses it
     meta.append(src);
   }
   if (sec.file && sec.kind !== "jobs" && sec.kind !== "tracker") meta.append(clipButton(() => rawUrl(id, sec, false), "Copy the file (yy)", "clip"));
@@ -3958,7 +3958,7 @@ async function yankWith(card, selector, what, plain = false) {
   const b = card?.querySelector(`:scope > h2 ${selector}`);
   if (!b) return toast(`“${cardTitle(card)}” has no ${what} to copy`);
   setCurrent(card, false);
-  // As a ⇧-click for plain text (yC).
+  // As a ⇧-click for plain text (yp).
   b.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, shiftKey: plain }));
   const ok = await new Promise((resolve) => {
     const mo = new MutationObserver(() => /\b(ok|bad)\b/.test(b.className) && (clearTimeout(t), mo.disconnect(), resolve(b.className.includes("ok"))));

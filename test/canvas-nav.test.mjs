@@ -147,7 +147,7 @@ test("vim key table: unique, prefix-free, every action documented", () => {
   for (const a of seqs) for (const b of seqs) if (a !== b) assert.ok(!b.startsWith(a), `${a} would shadow ${b}`);
   for (const action of new Set(VIM_KEYS.map((k) => k.action))) assert.ok(VIM_KEYS.some((k) => k.action === action && k.help), `${action} shows in the ? list`);
   assert.ok(seqs.includes("yy") && seqs.includes("yc") && !seqs.includes("yf"), "yy is Clippy now; yf is gone");
-  assert.deepEqual(matchKeys("yC"), { action: "yankPlain" }, "yC copies as plain text");
+  assert.deepEqual(matchKeys("yp"), { action: "yankPlain" }, "yp copies as plain text");
   assert.deepEqual(matchKeys("gr"), { action: "lastReply" });
   assert.ok(seqs.includes("h") && seqs.includes("l"));
 });

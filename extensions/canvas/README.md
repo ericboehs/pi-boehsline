@@ -414,7 +414,7 @@ the review prompt — so a renderer never reaches for a page global.
   last-turn mark. Enter, `o`
   or `za` folds or opens the current section, `zo` / `zc` open or fold it, `zR` /
   `zM` open or fold every section. `yy` copies the section's file through
-  Clippy and `yc` its source as text (`yC` as plain text, like ⇧-click; the page link is in Cmd-K), `p` pins or
+  Clippy and `yc` its source as markdown (`yp` as plain text, like ⇧-click; the page link is in Cmd-K), `p` pins or
   unpins it. `?` lists them all; the
   list and the handler share one table (`VIM_KEYS` in `canvas/nav.mjs`).
 - **Themes.** All of Omarchy's first-party themes are bundled
