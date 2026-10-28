@@ -292,6 +292,35 @@ the review prompt — so a renderer never reaches for a page global.
   state while that pi lives; a change refreshes every open page. The card
   flashes only when a new item arrives. Haiku neither trims nor sees it.
   `PI_CANVAS_AUTO=0` turns all of this off.
+- **Meeting.** While [meeting-capture](https://github.com/ericboehs/meeting-capture)
+  is following a meeting, a **Meeting** card (`auto-meeting`) sits at the top of every
+  session's side panel: a green **Live** dot and ticking elapsed time, the title and
+  app, people and slide counts, the newest slide's thumbnail and the last
+  four captions or chat lines. It stays for 15 minutes after the meeting
+  ends. **Open the live view** goes to `/meeting`. That page shows the shared screen's
+  current slide large, with a thumbnail strip, and the transcript beside it.
+  The transcript has speaker colours, chat, people and slide markers, and
+  the in-progress lines greyed at the bottom with a cursor. It follows the
+  bottom until you scroll up (then **Jump to live**). A thumbnail or a slide
+  marker pins that slide and scrolls the transcript to it; `f` follows the
+  newest again, ← / → step through slides, `/` filters the transcript and a
+  click on the slide opens it full size. After the meeting `/meeting` keeps
+  the last one until the next starts.
+  The daemon reads meeting-capture's files directly (the contract is
+  meeting-capture's `docs/canvas-contract.md`): `state.json` in
+  `MEETING_CAPTURE_STATE_DIR` (default `~/.local/state/meeting-capture`),
+  `live.json`, the transcript `.jsonl` (tailed by byte offset; a partial line
+  waits) and the slides folder's `index.jsonl`
+  ([`meeting-feed.mjs`](meeting-feed.mjs)). It polls with a few `stat`s
+  every 250 ms during a meeting and every 2 s otherwise, and sends a
+  `meeting` event on each change. `/meeting`
+  ([`meeting-page.mjs`](meeting-page.mjs)) then fetches only the entries
+  after its cursor from `/api/meeting`. Session pages refresh the card only
+  on a new caption, slide or state, at most every 2 s. A live meeting whose
+  meeting-capture pid is gone reads as stopped unexpectedly. Nothing is
+  copied into `~/.pi/canvas` and no absolute path reaches the page. Slides
+  are served from `/meeting/<meeting id>/slide/<n>[.thumb].jpg`, and only
+  names `index.jsonl` lists that resolve inside the slides folder.
 - **Diffs and lightbox.** Before the agent's first `edit` or `write` to a file,
   the extension copies what the file held (`base-<id>`, never served). After
   each turn, `git diff --no-index` writes `diff-<id>.patch`, the change since
@@ -480,5 +509,5 @@ status runs, `PI_CANVAS_TMUX=0` turns off tmux follow mode,
 Subagent children skip the canvas.
 
 ```sh
-node --test test/canvas.test.mjs test/canvas-nav.test.mjs
+node --test test/canvas.test.mjs test/canvas-nav.test.mjs test/canvas-meeting.test.mjs
 ```

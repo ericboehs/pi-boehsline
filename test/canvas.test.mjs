@@ -1414,7 +1414,7 @@ test("daemonVersion includes PI_CANVAS_THEME, so changing it restarts a running 
 
 test("daemonVersion hashes every page module, so editing one restarts a running daemon", () => {
   const h = createHash("sha1");
-  for (const f of ["daemon.mjs", "page.mjs", "render.mjs", "nav.mjs", "theme.mjs"]) h.update(readFileSync(fileURLToPath(new URL(`../extensions/canvas/${f}`, import.meta.url))));
+  for (const f of ["daemon.mjs", "page.mjs", "render.mjs", "nav.mjs", "theme.mjs", "meeting-feed.mjs", "meeting-page.mjs"]) h.update(readFileSync(fileURLToPath(new URL(`../extensions/canvas/${f}`, import.meta.url))));
   assert.equal(daemonVersion({}), h.digest("hex").slice(0, 12));
 });
 

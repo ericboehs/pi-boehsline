@@ -158,6 +158,25 @@ dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: h
 .job-m-logbox { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .job-m-log { flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 12px 16px; background: var(--soft); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }
 .job-m-none { margin: 0; padding: 18px 16px; color: var(--dim); font-size: 13px; }
+/* Meeting (auto-meeting): meeting-capture's live meeting, on every session's page */
+.meet { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.m-status { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.m-status b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.m-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+.m-dot.rec { background: var(--ok); animation: m-rec 1.6s infinite; }
+@keyframes m-rec { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); } 70%, 100% { box-shadow: 0 0 0 6px transparent; } }
+.m-title { font-weight: 600; line-height: 1.35; }
+.m-title span { color: var(--dim); font-weight: 400; font-size: 12px; margin-left: 6px; }
+.m-slide { display: block; position: relative; }
+.m-slide img { display: block; width: 100%; max-height: 160px; object-fit: contain; background: var(--soft); border-radius: 6px; }
+.m-slide span { position: absolute; left: 6px; bottom: 5px; font: 600 10.5px/1 ui-monospace, Menlo, monospace; color: #fff; background: rgb(0 0 0 / .55); padding: 2px 5px; border-radius: 3px; }
+.m-lines { display: flex; flex-direction: column; gap: 3px; }
+.m-line { line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.m-line b { font-weight: 600; margin-right: 5px; }
+.m-line.chat { color: var(--dim); }
+.m-wait { color: var(--dim); font-style: italic; }
+.m-open { align-self: flex-start; color: var(--accent); text-decoration: none; font-size: 12.5px; }
+.m-open:hover { text-decoration: underline; }
 /* Watching (auto-watch): the /watch watcher's items, on every session's page */
 .watch { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
 .w-status { color: var(--dim); font-size: 12.5px; line-height: 1.45; padding-bottom: 6px; }
@@ -829,6 +848,7 @@ window.addEventListener("message", (e) => {
 
 async function sectionBody(id, sec) {
   if (sec.kind === "watch") return renderWatch(sec.data || {});
+  if (sec.kind === "meeting") return renderMeeting(sec.data || {});
   const url = `/s/${encodeURIComponent(id)}/f/${encodeURIComponent(sec.file)}?v=${encodeURIComponent(sec.at || "")}`;
   switch (sec.kind) {
     case "markdown":
@@ -1043,7 +1063,7 @@ function collapsible(card, key, onOpen, at) {
 }
 
 /** Automatic widgets: the sidebar on wide screens, in time order otherwise. */
-const WIDGETS = ["auto-watch", "auto-jobs", "auto-tasks", "auto-agents", "auto-files", "auto-screenshots"];
+const WIDGETS = ["auto-meeting", "auto-watch", "auto-jobs", "auto-tasks", "auto-agents", "auto-files", "auto-screenshots"];
 const WIDE = "(min-width: 1200px)";
 
 // ── side panel order: one for every session, per browser (drag a header, J / K) ──
@@ -1108,6 +1128,11 @@ function sortSections(list) {
 function withWatch(sections, watch) {
   if (!watch || typeof watch !== "object") return sections;
   return [...sections.filter((s) => s.id !== "auto-watch"), { id: "auto-watch", title: "Watching", kind: "watch", by: "auto", at: watch.at, data: watch }];
+}
+/** meeting-capture's live meeting as the auto-meeting widget, on every session's page (the daemon's meeting-feed.mjs). */
+function withMeeting(sections, meeting) {
+  if (!meeting || typeof meeting !== "object") return sections;
+  return [...sections.filter((s) => s.id !== "auto-meeting"), { id: "auto-meeting", title: "Meeting", kind: "meeting", by: "auto", at: meeting.at, data: meeting }];
 }
 /** A new needs-you item since the last snapshot: worth the flash the other rewrites skip. */
 function watchGrew(prev, next) {
@@ -2500,6 +2525,47 @@ function renderJobs(spec) {
   );
 }
 
+// ── Meeting (auto-meeting): meeting-capture's live meeting, from the daemon's meeting feed ──
+// The card is a glance (state, newest slide, last lines); /meeting is the full live view.
+const meetPad = (n) => String(n).padStart(2, "0");
+function meetingElapsed(m) {
+  if (m.ended && m.duration) return m.duration;
+  const ms = (m.ended ? Date.parse(m.endedAt) : Date.now()) - Date.parse(m.startedAt);
+  if (!(ms >= 0)) return "";
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 3600)}:${meetPad(Math.floor(s / 60) % 60)}:${meetPad(s % 60)}`;
+}
+const meetColor = (name) => {
+  let x = 0;
+  for (const ch of String(name)) x = (x * 31 + ch.codePointAt(0)) >>> 0;
+  return `var(--c${(x % 7) + 1})`;
+};
+function renderMeeting(m) {
+  const elapsed = h("b", { class: "m-elapsed", "data-start": m.recording ? m.startedAt : null }, meetingElapsed(m));
+  const status = h(
+    "div",
+    { class: "m-status" },
+    h("span", { class: `m-dot${m.recording ? " rec" : ""}` }),
+    h("span", {}, m.recording ? "Live" : m.crashed ? "Stopped unexpectedly" : "Ended"),
+    elapsed,
+    m.people != null ? h("span", {}, plural(m.people, "person", "people")) : null,
+    m.slides ? h("span", {}, plural(m.slides, "slide")) : null,
+  );
+  const out = [status, h("div", { class: "m-title" }, m.title || "Meeting", m.app ? h("span", {}, m.app) : null)];
+  if (m.slide && m.id) {
+    out.push(h("a", { class: "m-slide", href: "/meeting", target: "_blank", title: "Open the live view" }, h("img", { src: `/meeting/${encodeURIComponent(m.id)}/slide/${m.slide.n}${m.slide.thumb ? ".thumb" : ""}.jpg`, alt: `Slide ${m.slide.n}`, loading: "lazy" }), h("span", {}, `slide ${m.slide.n}`)));
+  }
+  const recent = Array.isArray(m.recent) ? m.recent : [];
+  if (recent.length) out.push(h("div", { class: "m-lines" }, recent.map((e) => h("div", { class: `m-line${e.type === "chat" ? " chat" : ""}` }, e.speaker ? h("b", { style: `color:${meetColor(e.speaker)}` }, `${e.type === "chat" ? "(chat) " : ""}${e.speaker}`) : null, e.text))));
+  else if (m.recording) out.push(h("div", { class: "m-wait" }, "Waiting for captions…"));
+  out.push(h("a", { class: "m-open", href: "/meeting", target: "_blank" }, m.recording ? "Open the live view ↗" : "Open the transcript ↗"));
+  return h("div", { class: "meet" }, out);
+}
+// The card's elapsed time ticks without a rebuild.
+setInterval(() => {
+  for (const el of document.querySelectorAll(".m-elapsed[data-start]")) el.textContent = meetingElapsed({ startedAt: el.dataset.start });
+}, 1000);
+
 // ── Watching (auto-watch): the /watch watcher, from <root>/.watch.json via the session state ──
 // Not a section file: the daemon puts the one watcher's snapshot (watch.ts
 // watchSnapshot) in every page's state, and refresh() shows it as a widget.
@@ -3236,7 +3302,7 @@ async function sessionView(id) {
       if (by && state.status) by.textContent = statusBy(state.status);
     }
 
-    const sections = sortSections(withWatch(state.sections, state.watch));
+    const sections = sortSections(withMeeting(withWatch(state.sections, state.watch), state.meeting));
     const keep = new Set(sections.map((s) => s.id));
     for (const [sid, c] of cards) if (!keep.has(sid)) (c.el.remove(), cards.delete(sid));
     for (const sec of sections) {
@@ -3244,7 +3310,7 @@ async function sessionView(id) {
       if (!c || c.at !== sec.at) {
         const el = sectionCard(id, sec);
         if (c) {
-          if (sec.id === "auto-jobs" || (sec.id === "auto-watch" && !watchGrew(c.sec, sec))) {
+          if (sec.id === "auto-jobs" || sec.id === "auto-meeting" || (sec.id === "auto-watch" && !watchGrew(c.sec, sec))) {
             // Rewritten every few seconds while a job runs (the watcher: every read): no flash, and the old
             // rows stay up until the new ones load, so nothing jumps.
             const old = c.el.querySelector(":scope > .bd");
@@ -3329,6 +3395,16 @@ async function sessionView(id) {
   const es = new EventSource("/api/events");
   es.addEventListener("system-theme", onSystemTheme);
   es.addEventListener("follow", onFollow);
+  // The Meeting card: a new caption, slide or state (not each live.json rewrite), at most every 2 s.
+  let meetingTimer = 0;
+  es.addEventListener("meeting", (e) => {
+    let d = {};
+    try {
+      d = JSON.parse(e.data);
+    } catch {}
+    if (!d.final || meetingTimer) return;
+    meetingTimer = setTimeout(() => ((meetingTimer = 0), refresh()), 2000);
+  });
   es.addEventListener("changed", (e) => {
     let d = {};
     try {

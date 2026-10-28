@@ -22,6 +22,7 @@ import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { systemTheme, themeDefault } from "./theme.mjs";
 
+import { MEETING_STATE_DIR, MeetingFeed } from "./meeting-feed.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 function arg(name, fallback) {
@@ -40,6 +41,8 @@ export const PEERS = resolve(arg("peers", process.env.PI_CANVAS_PEERS || join(ho
 /** provider-usage.ts's shared cache: one entry per usage driver, for the info panel. */
 export const USAGE_CACHE = resolve(arg("usage", process.env.PI_CANVAS_USAGE || join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "usage-cache.json")));
 const VERSION = arg("version", "dev");
+// meeting-capture's state folder (MEETING_CAPTURE_STATE_DIR): the Meeting card and /meeting.
+export const meeting = new MeetingFeed(resolve(arg("meeting", MEETING_STATE_DIR)));
 const RETAIN_DAYS = Number(process.env.PI_CANVAS_RETAIN_DAYS || 30);
 
 // Browser libraries, fetched once from jsdelivr and checked against these
@@ -417,6 +420,7 @@ const ASSETS = {
   "/assets/render.mjs": ["render.mjs", JS],
   "/assets/render.css": ["render.css", "text/css; charset=utf-8"],
   "/assets/theme-boot.js": ["theme-boot.js", JS],
+  "/assets/meeting-page.mjs": ["meeting-page.mjs", JS],
   "/assets/themes.json": ["themes.json", "application/json; charset=utf-8"],
 };
 
@@ -431,6 +435,18 @@ ${THEME_DEFAULT ? `<meta name="canvas-theme-default" content="${THEME_DEFAULT}">
 <script src="/assets/vendor/marked.js" defer></script>
 <script src="/assets/vendor/purify.js" defer></script>
 <script src="/assets/page.mjs" type="module"></script>
+<body><div id="app"></div></body>
+</html>`;
+
+// The live meeting page: its own small module, no vendor scripts.
+const MEETING_SHELL = `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meeting</title>
+<link rel="icon" href="data:,">
+<script src="/assets/theme-boot.js"></script>
+<script src="/assets/meeting-page.mjs" type="module"></script>
 <body><div id="app"></div></body>
 </html>`;
 
@@ -756,13 +772,23 @@ function handler(req, res) {
     );
     return;
   }
+  if (url.pathname === "/meeting") return send(res, 200, MEETING_SHELL, { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": PAGE_CSP });
+  if (url.pathname === "/api/meeting") return json(res, meeting.snapshot(Number(url.searchParams.get("since") || 0), url.searchParams.get("id") || ""));
+  // Slides: /meeting/<meeting id>/slide/<n>.jpg or <n>.thumb.jpg, only files index.jsonl lists.
+  if (parts[0] === "meeting" && parts.length === 4 && parts[2] === "slide") {
+    const m = /^(\d{1,6})(\.thumb)?\.jpg$/.exec(parts[3]);
+    const path = m && meeting.slideFile(parts[1], Number(m[1]), Boolean(m[2]));
+    if (!path) return send(res, 404, "not found");
+    // A meeting's slide n never changes, and the id is in the URL: let the browser keep it.
+    return send(res, 200, readFileSync(path), { "Content-Type": "image/jpeg", "Content-Security-Policy": SECTION_CSP, "Cache-Control": "private, max-age=86400, immutable" });
+  }
   if (url.pathname === "/api/sessions") return json(res, listSessions(ROOT));
   if (url.pathname === "/api/system-theme") return json(res, { theme: readSystemTheme() });
   if (url.pathname === "/api/peers") return json(res, { peers: readPeers() });
   if (url.pathname === "/api/events") return subscribe("*", req, res);
   if (parts[0] === "api" && parts[1] === "s" && SESSION_ID.test(parts[2] || "")) {
     const id = parts[2];
-    if (parts.length === 3) return json(res, sessionState(ROOT, id));
+    if (parts.length === 3) return json(res, { ...sessionState(ROOT, id), meeting: meeting.summary() });
     if (parts.length === 4 && parts[3] === "events") return subscribe(id, req, res);
     if (parts.length === 4 && parts[3] === "info") return void sessionInfoOf(ROOT, id).then((d) => json(res, d), () => send(res, 500, "info failed"));
   }
@@ -985,6 +1011,24 @@ function onChange(relPath) {
   );
 }
 
+/**
+ * meeting-capture's files, polled: four stats every 250 ms while recording
+ * (live.json is rewritten that often), every 2 s otherwise. Polling, not
+ * fs.watch: the files are replaced by rename and the folders come and go.
+ * Every change is a "meeting" event; final: true (a new caption, slide or
+ * state) is what session pages refresh their Meeting card on.
+ */
+function pollMeeting() {
+  let ch = { final: false, live: false };
+  try {
+    ch = meeting.poll();
+  } catch (e) {
+    console.error(`${new Date().toISOString()} canvas daemon: meeting poll failed: ${e.message}`);
+  }
+  if (ch.final || ch.live) broadcast("meeting", { id: meeting.id, final: ch.final });
+  setTimeout(pollMeeting, meeting.state?.recording ? 250 : 2000).unref();
+}
+
 export function start() {
   mkdirSync(ROOT, { recursive: true });
   prune(ROOT);
@@ -994,6 +1038,7 @@ export function start() {
   setInterval(() => publish("*", { tick: true }), 60_000).unref();
   watch(ROOT, { recursive: true }, (_event, file) => onChange(file ? String(file) : ""));
   watchSystemTheme();
+  pollMeeting();
   const server = createServer(handler);
   server.on("error", (e) => {
     // Another daemon won the race for the port: that one serves, this one goes.
