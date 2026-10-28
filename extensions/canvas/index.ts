@@ -71,7 +71,7 @@ export type Turn = {
   tools: { name: string; arg: string; error: boolean }[];
   files: string[];
   /** Every successful edit or write, in order, for the Files changed widget. */
-  ops?: { tool: "edit" | "write"; path: string }[];
+  ops?: FileOp[];
   /** Image files the agent read this turn (screenshots it looked at). */
   images?: string[];
   /** Sections the main agent added or replaced with the canvas tool this turn. */
@@ -79,8 +79,15 @@ export type Turn = {
   reply: string;
 };
 
+/** An edit or write; `id` is the tool call's, to merge calls seen live with those in the transcript. */
+export type FileOp = { tool: "edit" | "write"; path: string; id?: string };
+
 type Part = { type?: string; text?: string; name?: string; arguments?: Record<string, unknown> };
-type Entry = { type?: string; message?: { role?: string; content?: unknown; toolName?: string; isError?: boolean; toolCallId?: string } };
+type NestedCall = { id?: string; name?: string; arguments?: Record<string, unknown>; status?: string };
+type Entry = {
+  type?: string;
+  message?: { role?: string; content?: unknown; toolName?: string; isError?: boolean; toolCallId?: string; nestedCalls?: { calls?: NestedCall[] } };
+};
 
 function textOf(content: unknown): string {
   if (typeof content === "string") return content;
@@ -116,10 +123,20 @@ export function lastTurn(branch: unknown[]): Turn {
   turn.user = textOf(entries[start]?.message?.content);
   const files = new Set<string>();
   const errored = new Set<string>();
+  // Edits a codemode script made: not toolCall parts, only a record on the script's result
+  // (arguments omitted when large; the live tool_result hook catches those).
+  const nested: FileOp[] = [];
   for (const e of entries.slice(start + 1)) {
     const m = e?.message;
     if (e?.type !== "message" || !m) continue;
     if (m.role === "toolResult" && m.isError && m.toolCallId) errored.add(m.toolCallId);
+    if (m.role !== "toolResult") continue;
+    for (const c of m.nestedCalls?.calls ?? []) {
+      const path = c?.arguments?.path;
+      if ((c?.name === "edit" || c?.name === "write") && c.status === "ok" && typeof path === "string" && path) {
+        nested.push({ tool: c.name, path, ...(c.id ? { id: c.id } : {}) });
+      }
+    }
   }
   for (const e of entries.slice(start + 1)) {
     const m = e?.message;
@@ -137,14 +154,24 @@ export function lastTurn(branch: unknown[]): Turn {
       turn.tools.push({ name: p.name, arg: oneLine(arg, 160), error: failed });
       if ((p.name === "edit" || p.name === "write") && typeof a.path === "string") {
         files.add(a.path);
-        if (!failed) turn.ops!.push({ tool: p.name, path: a.path });
+        if (!failed) turn.ops!.push({ tool: p.name, path: a.path, ...(p.id ? { id: p.id } : {}) });
       }
       if (p.name === "read" && !failed && typeof a.path === "string" && IMAGE_EXT.has(extname(a.path).toLowerCase()) && !turn.images!.includes(a.path)) turn.images!.push(a.path);
       if (p.name === "canvas" && !failed && a.kind !== "finding" && !a.remove) turn.canvasSections = (turn.canvasSections ?? 0) + 1;
     }
   }
+  for (const op of nested) {
+    files.add(op.path);
+    turn.ops!.push(op);
+  }
   turn.files = [...files];
   return turn;
+}
+
+/** The turn's ops plus edits seen live that the transcript missed (a nested call's omitted arguments). */
+export function mergeOps(ops: FileOp[], live: FileOp[]): FileOp[] {
+  const seen = new Set(ops.map((o) => o.id).filter(Boolean));
+  return [...ops, ...live.filter((o) => !o.id || !seen.has(o.id))];
 }
 
 export const REPLY_MAX = 100_000;
@@ -1689,6 +1716,8 @@ export default function canvas(pi: ExtensionAPI) {
   // The current or last turn (one prompt's run, start to settle): the page
   // marks sections and findings written since it started.
   let turn: { n: number; started: string; ended?: string } | null = null;
+  /** Edits and writes codemode scripts made this run, from tool_result (the transcript can drop their paths). */
+  let liveNested: FileOp[] = [];
   function writeTurn() {
     if (!turn || !sessionId || !existsSync(dir())) return;
     try {
@@ -2226,6 +2255,7 @@ export default function canvas(pi: ExtensionAPI) {
   pi.on("agent_start", (event) => {
     track(event);
     turn = { n: (turn?.n ?? 0) + 1, started: new Date().toISOString() };
+    liveNested = [];
     writeTurn();
   });
   pi.on("message_end", (event, ctx) => {
@@ -2257,6 +2287,14 @@ export default function canvas(pi: ExtensionAPI) {
     } catch {}
   });
 
+  pi.on("tool_result", (event) => {
+    try {
+      if (!event.parentToolCallId || event.isError || (event.toolName !== "edit" && event.toolName !== "write")) return;
+      const p = (event.input as { path?: unknown }).path;
+      if (typeof p === "string" && p) liveNested.push({ tool: event.toolName, path: p, id: event.toolCallId });
+    } catch {}
+  });
+
   pi.on("agent_settled", (event, ctx) => {
     track(event);
     if (turn && !turn.ended) {
@@ -2268,6 +2306,8 @@ export default function canvas(pi: ExtensionAPI) {
     writeInfo(ctx);
     if (autoOn) {
       const turn = lastTurn(ctx.sessionManager.getBranch() || []);
+      turn.ops = mergeOps(turn.ops ?? [], liveNested);
+      liveNested = [];
       void serial(() => updateWidgets(ctx, turn)).catch(() => {});
       void serial(() => updateAgents(ctx)).catch(() => {});
       void serial(() => updateTasks(ctx)).catch(() => {});

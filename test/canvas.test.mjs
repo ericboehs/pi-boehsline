@@ -15,7 +15,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import canvasExtension, { ActivityTracker, daemonVersion, STATUS_PROMPT, checkChart, compareOptions, normalizeSpec, parseDelimited, diffSkipReason, fileId, filesMarkdown, syncCopies, gitDiff, isSensitivePath, jobsSpec, logTail, looksLikeDiff, makePatch, findingLine, findingTexts, isSectionId, newFindings, parseExtras, shotsMarkdown, agentTraffic, agentsMarkdown, bashExit, runSpec, streamable, tailLines, readPeers, resolvePeerName, tallyFiles, lastReply, sessionInfo, uniichatInfo, lastTurn, normalizeCode, normalizeOptions, normalizeTracker, normalizeTree, parseLineRange, nextSteps, claimInbox, ackInbox, withoutNextSteps, leftHalfBounds, openTodos, parseStatus, tmuxMeta, todoBoard, turnDigest, upsertSection, worthStatus } from "../extensions/canvas/index.ts";
+import canvasExtension, { ActivityTracker, daemonVersion, STATUS_PROMPT, checkChart, compareOptions, normalizeSpec, parseDelimited, diffSkipReason, fileId, filesMarkdown, syncCopies, gitDiff, isSensitivePath, jobsSpec, logTail, looksLikeDiff, makePatch, findingLine, findingTexts, isSectionId, newFindings, parseExtras, shotsMarkdown, agentTraffic, agentsMarkdown, bashExit, runSpec, streamable, tailLines, readPeers, resolvePeerName, tallyFiles, lastReply, sessionInfo, uniichatInfo, lastTurn, mergeOps, normalizeCode, normalizeOptions, normalizeTracker, normalizeTree, parseLineRange, nextSteps, claimInbox, ackInbox, withoutNextSteps, leftHalfBounds, openTodos, parseStatus, tmuxMeta, todoBoard, turnDigest, upsertSection, worthStatus } from "../extensions/canvas/index.ts";
 import { allowedHost, byteRange, clipTarget, latestClient, listSessions, parseFindings, prune, queueMessage, readAcks, readReply, readWatch, replyPreview, sessionForPane, sessionState, tmuxOf, withKit, PLAN_JS, SANDBOXED_SECTION_CSP, scriptableType, parseGitStatus, usageRows, gitInfo, sessionInfoOf } from "../extensions/canvas/daemon.mjs";
 
 const msg = (role, content, extra = {}) => ({ type: "message", message: { role, content, ...extra } });
@@ -153,9 +153,9 @@ test("lastTurn collects successful edits and writes, and images the agent read",
     msg("toolResult", [{ type: "text", text: "ENOENT" }], { toolCallId: "r4", isError: true }),
   ]);
   assert.deepEqual(t.ops, [
-    { tool: "edit", path: "a.ts" },
-    { tool: "edit", path: "a.ts" },
-    { tool: "write", path: "b.md" },
+    { tool: "edit", path: "a.ts", id: "e1" },
+    { tool: "edit", path: "a.ts", id: "e2" },
+    { tool: "write", path: "b.md", id: "w1" },
   ]);
   assert.deepEqual(t.images, ["/tmp/shot.PNG"]);
   assert.equal(t.canvasSections, 1);
@@ -441,6 +441,39 @@ test("lastTurn names a canvas post by kind and id, not by its file path", () => 
     { type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "/tmp/a.txt" } }] } },
   ]);
   assert.deepEqual(t.tools.map((x) => x.arg), ["table commits-table", "finding", "remove old", "/tmp/a.txt"]);
+});
+
+test("lastTurn counts edits a codemode script made, from the result's nestedCalls", () => {
+  const t = lastTurn([
+    { type: "message", message: { role: "user", content: "fix it" } },
+    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "codemode", arguments: { code: "..." } }] } },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: "c1",
+        toolName: "codemode",
+        isError: false,
+        nestedCalls: {
+          complete: false,
+          calls: [
+            { id: "c1/1", name: "edit", arguments: { path: "a.md" }, status: "ok" },
+            { id: "c1/2", name: "write", argumentsBytes: 900000, status: "ok" },
+            { id: "c1/3", name: "edit", arguments: { path: "bad.md" }, status: "error" },
+            { id: "c1/4", name: "read", arguments: { path: "r.md" }, status: "ok" },
+          ],
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(t.ops, [{ tool: "edit", path: "a.md", id: "c1/1" }]);
+  assert.deepEqual(t.files, ["a.md"]);
+  // Live tool_result ops fill in the call whose arguments were omitted, without doubling c1/1.
+  const merged = mergeOps(t.ops, [
+    { tool: "edit", path: "a.md", id: "c1/1" },
+    { tool: "write", path: "big.md", id: "c1/2" },
+  ]);
+  assert.deepEqual(merged.map((o) => o.path), ["a.md", "big.md"]);
 });
 
 test("prompt copy points at the newer kinds and keeps bodies out of context", async () => {
