@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { browserHeaders, userAgentString } from "./ua.ts";
 import { navigateAndGet, sameOriginFetch, shutdownBrowser } from "./browser.ts";
 import { secretSourceLabel } from "../../../lib/secrets.ts";
+import { policyBlockTitle } from "../block-page.ts";
 
 export { shutdownBrowser };
 
@@ -267,11 +268,32 @@ async function tier3(
  */
 export class TierHttpError extends Error {
 	readonly status: number;
+	/** A firewall's block page answered, not the vendor. */
+	readonly blocked: boolean;
 
-	constructor(message: string, status: number) {
+	constructor(message: string, status: number, blocked = false) {
 		super(message);
 		this.name = "TierHttpError";
 		this.status = status;
+		this.blocked = blocked;
+	}
+}
+
+/**
+ * Read a paid tier's JSON reply, or throw. The body is read as text first: a
+ * firewall's block page is HTML, and `res.json()` would swallow it into `{}`
+ * and leave the error looking like the vendor's own.
+ */
+async function tierJson(tier: string, res: Response): Promise<any> {
+	const text = await res.text().catch(() => "");
+	const blocked = policyBlockTitle(text);
+	if (blocked) {
+		throw new TierHttpError(`${tier} ${res.status}: blocked by network policy (${blocked.slice(0, 120)})`, res.status, true);
+	}
+	try {
+		return JSON.parse(text);
+	} catch {
+		return {};
 	}
 }
 
@@ -289,7 +311,7 @@ async function tier5(url: string, key?: string, signal?: AbortSignal): Promise<R
 		body: JSON.stringify({ url, formats: ["markdown"], onlyMainContent: true }),
 		signal: AbortSignal.any(signals),
 	});
-	const json = (await res.json().catch(() => ({}))) as any;
+	const json = await tierJson("firecrawl", res);
 	if (!res.ok || json?.success === false) {
 		const detail = JSON.stringify(json?.error ?? json ?? {}).slice(0, 200);
 		throw new TierHttpError(`firecrawl ${res.status}: ${detail}`, res.status);
@@ -324,7 +346,7 @@ async function tier6(url: string, key?: string, signal?: AbortSignal): Promise<R
 		body: JSON.stringify({ urls: [url] }),
 		signal: AbortSignal.any(signals),
 	});
-	const json = (await res.json().catch(() => ({}))) as any;
+	const json = await tierJson("tinyfish", res);
 	if (!res.ok) {
 		const detail = JSON.stringify(json?.error ?? json ?? {}).slice(0, 200);
 		throw new TierHttpError(`tinyfish ${res.status}: ${detail}`, res.status);

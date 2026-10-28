@@ -23,7 +23,7 @@ import {
   type SearchBackend,
   type WebConfig,
 } from "./providers/config.ts";
-import { cooloffForStatus, costLabel, probeBackends, runSearchChain, SEARCH_INDEX } from "./providers/search.ts";
+import { cooloffForStatus, costLabel, POLICY_BLOCK_COOLOFF_MS, probeBackends, runSearchChain, SEARCH_INDEX } from "./providers/search.ts";
 
 const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses";
 // Plain OpenAI API keys speak the same Responses API shape, just at the
@@ -354,12 +354,17 @@ function truncate(body: string, maxChars: number, url: string): string {
 
 /* --------------------------------------------------------------- /web ui */
 
-function chainLine(order: string[], off: string[], skipUntil: Record<string, number>): string {
+/** What a benched backend is called in /web: why, when we know, else just "skipped". */
+function skipLabel(cfg: Pick<WebConfig, "skipReason">, name: string): string {
+  return cfg.skipReason[name] === "blocked" ? "blocked by network" : "skipped";
+}
+
+function chainLine(order: string[], off: string[], cfg: Pick<WebConfig, "skipUntil" | "skipReason">): string {
   const now = Date.now();
   return order
     .map((name) => {
       if (off.includes(name)) return `${name} (off)`;
-      if ((skipUntil[name] ?? 0) > now) return `${name} (skipped)`;
+      if ((cfg.skipUntil[name] ?? 0) > now) return `${name} (${skipLabel(cfg, name)})`;
       return name;
     })
     .join(" \u203a ");
@@ -376,8 +381,8 @@ async function statusText(cfg: WebConfig): Promise<string> {
   const problem = configProblem();
   const lines = [
     ...(problem ? [`\u26a0 ${problem}: defaults in use until it's fixed`, ""] : []),
-    `search    ${chainLine(cfg.search.order, cfg.search.off, cfg.skipUntil)}`,
-    `fetch     ${chainLine(cfg.fetch.order, cfg.fetch.off, cfg.skipUntil)}`,
+    `search    ${chainLine(cfg.search.order, cfg.search.off, cfg)}`,
+    `fetch     ${chainLine(cfg.fetch.order, cfg.fetch.off, cfg)}`,
     `format    ${cfg.format}    excerpts ${cfg.excerpts}`,
     "",
   ];
@@ -412,7 +417,14 @@ async function statusText(cfg: WebConfig): Promise<string> {
 
   const skipped = Object.entries(cfg.skipUntil).filter(([, until]) => until > Date.now());
   if (skipped.length) {
-    lines.push("", ...skipped.map(([name, until]) => `skipped   ${name} for ${relative(until)}`));
+    lines.push(
+      "",
+      ...skipped.map(([name, until]) =>
+        cfg.skipReason[name] === "blocked"
+          ? `blocked   ${name} by network policy, retry in ${relative(until)} (/web reset to retry now)`
+          : `skipped   ${name} for ${relative(until)}`,
+      ),
+    );
   }
   return lines.join("\n");
 }
@@ -498,7 +510,9 @@ async function runTest(args: string[], ctx: ExtensionContext): Promise<string> {
     const state = cfg.fetch.off.includes(r.tier)
       ? "off"
       : (cfg.skipUntil[r.tier] ?? 0) > now
-        ? "cooling"
+        ? cfg.skipReason[r.tier] === "blocked"
+          ? "blocked"
+          : "cooling"
         : "ready";
     lines.push(
       `${pad(r.tier, 11)}${pad(state, 9)}${pad(r.ok ? "ok" : "FAIL", 10)}${pad(String(r.ms), 7)}${pad(r.ok ? String(r.chars) : "\u2013", 8)}${FETCH_COST_PER_CALL[r.tier]}`,
@@ -634,7 +648,7 @@ async function handleWebCommand(args: string, ctx: ExtensionContext): Promise<vo
           const remainder = (c[which].order as string[]).filter((n) => !parsed.includes(n));
           c[which].order = [...parsed, ...remainder] as any;
         });
-        notify(`${which} order \u2192 ${chainLine(cfg[which].order, cfg[which].off, cfg.skipUntil)}`);
+        notify(`${which} order \u2192 ${chainLine(cfg[which].order, cfg[which].off, cfg)}`);
         return;
       }
 
@@ -649,7 +663,7 @@ async function handleWebCommand(args: string, ctx: ExtensionContext): Promise<vo
           for (const name of parsed) (turningOff ? off.add(name) : off.delete(name));
           c[which].off = [...off] as any;
         });
-        notify(`${which} \u2192 ${chainLine(cfg[which].order, cfg[which].off, cfg.skipUntil)}`);
+        notify(`${which} \u2192 ${chainLine(cfg[which].order, cfg[which].off, cfg)}`);
         return;
       }
 
@@ -864,6 +878,13 @@ export default function web(pi: ExtensionAPI): void {
         onTierError: (tier, err) => {
           const status = (err as { status?: number }).status;
           if (typeof status !== "number") return;
+          // A firewall refused the host: same day-long bench as search, and
+          // /web says why. Firecrawl shares its pool with search, so this
+          // benches it there too.
+          if ((err as { blocked?: boolean }).blocked) {
+            void markSkip(tier, POLICY_BLOCK_COOLOFF_MS, "blocked");
+            return;
+          }
           // Firecrawl bills search and fetch from one pool, so a quota rejection
           // here has to bench it for the search chain too — even when a cheaper
           // tier went on to answer this particular fetch.

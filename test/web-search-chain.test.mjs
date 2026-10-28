@@ -128,3 +128,31 @@ test("a network failure still benches the backend", async () => {
 	const { loadConfig } = await import("../extensions/web/providers/config.ts");
 	assert.ok((await loadConfig()).skipUntil.brave > Date.now(), "benched");
 });
+
+const BLOCK_PAGE = `<html><head><title>Corp Security Policy Violation - Web Application Blocked (Restricted App-ID)</title></head>
+<body>Access to the web application you were trying to visit has been blocked.</body></html>`;
+
+test("a firewall block page benches the backend for a day and records why", async () => {
+	stubFetch();
+	const ok = globalThis.fetch;
+	globalThis.fetch = async (url) =>
+		new URL(String(url)).host === "api.search.brave.com"
+			? new Response(BLOCK_PAGE, { status: 503, headers: { "content-type": "text/html" } })
+			: ok(url);
+	const { backend, tried } = await runSearchChain("curl follow redirects", {}, deps);
+	assert.equal(backend, "tavily");
+	assert.match(tried[0], /^brave: blocked by network policy \(503: Corp Security Policy Violation/);
+	const { loadConfig } = await import("../extensions/web/providers/config.ts");
+	const cfg = await loadConfig();
+	assert.ok(cfg.skipUntil.brave > Date.now() + 23 * 60 * 60 * 1000, "benched about a day");
+	assert.equal(cfg.skipReason.brave, "blocked");
+});
+
+test("an ordinary 5xx benches without a reason, so /web just says skipped", async () => {
+	stubFetch({ "api.search.brave.com": 503 });
+	await runSearchChain("curl follow redirects", {}, deps);
+	const { loadConfig } = await import("../extensions/web/providers/config.ts");
+	const cfg = await loadConfig();
+	assert.ok(cfg.skipUntil.brave > Date.now());
+	assert.equal(cfg.skipReason.brave, undefined);
+});

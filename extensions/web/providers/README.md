@@ -35,6 +35,15 @@ Cool-offs: 24h for auth/quota, 10min for 5xx and timeouts, **none** for other
 4xx — those are our bug, and surfacing them every call is how they get fixed.
 State lives in `skipUntil` and self-heals: expired entries are dropped on read.
 
+A firewall's block page (an HTML "Security Policy Violation" / "Restricted
+App-ID" page from a corporate VPN, whatever the status) is not a 5xx: it lasts
+as long as the machine stays on that network. It benches the backend for 24h,
+the same as a spent quota, and records `skipReason: "blocked"` so `/web` shows
+`tavily (blocked by network)` rather than `(skipped)`. A blocked re-probe is
+free (the firewall answers, the vendor never bills), and `/web reset` brings
+the backend back as soon as you're off the network. The Firecrawl and TinyFish
+fetch tiers detect the same pages (`block-page.ts`).
+
 ### Why this order
 
 Failover fires only on exhaustion, so whatever sits at the head serves nearly

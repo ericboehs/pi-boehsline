@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { agentCost, cooloffForStatus, costLabel, formatUsd, parseBraveMonthly, quotaLeft } from "../extensions/web/providers/search.ts";
+import { agentCost, cooloffForStatus, costLabel, formatUsd, parseBraveMonthly, policyBlockTitle, quotaLeft } from "../extensions/web/providers/search.ts";
 
 test("reads the monthly half of Brave's paired remaining and limit headers", () => {
 	assert.equal(parseBraveMonthly("0, 1985"), 1985);
@@ -88,4 +88,34 @@ test("every other 429 keeps the day-long bench", () => {
 test("the pace match is 429-only: the same body on another status means that status", () => {
 	assert.equal(cooloffForStatus(402, PERPLEXITY_PACE_429), DAY);
 	assert.equal(cooloffForStatus(403, PERPLEXITY_PACE_429), DAY);
+});
+
+// A Palo Alto App-ID filter's block page, trimmed: a 503 with HTML, not JSON.
+const FIREWALL_BLOCK_503 = `<html>
+<head>
+<title>Corp Security Policy Violation - Web Application Blocked (Restricted App-ID)</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+</head><body><div id="content">Access to the web application you were trying to visit has been blocked.</div></body></html>`;
+
+test("a firewall block page is recognised and named by its title", () => {
+	assert.equal(
+		policyBlockTitle(FIREWALL_BLOCK_503),
+		"Corp Security Policy Violation - Web Application Blocked (Restricted App-ID)",
+	);
+});
+
+test("a firewall block page benches for a day, not the ten minutes of a 5xx", () => {
+	assert.equal(cooloffForStatus(503, FIREWALL_BLOCK_503), DAY);
+	assert.ok(cooloffForStatus(503, "upstream unavailable") < DAY);
+});
+
+test("an API's own JSON error that says blocked is not a firewall page", () => {
+	const json = '{"error":"Web application blocked by security policy violation"}';
+	assert.equal(policyBlockTitle(json), undefined);
+	assert.equal(cooloffForStatus(400, json), 0);
+});
+
+test("an ordinary HTML error page is not a firewall page", () => {
+	const html = "<html><head><title>502 Bad Gateway</title></head><body>nginx</body></html>";
+	assert.equal(policyBlockTitle(html), undefined);
 });

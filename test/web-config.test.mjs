@@ -50,3 +50,29 @@ test("a web.json that exists but can't be read is never overwritten", async () =
 	await assert.rejects(fresh.mutateConfig((c) => (c.format = "serp")), /not overwritten/);
 	await assert.doesNotReject(fresh.markSkip("exa", 60_000));
 });
+
+test("a skip reason is stored with its skip, kept by a longer window, and dropped with it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "web-config-reason-"));
+  process.env.PI_CODING_AGENT_DIR = dir;
+  const fresh = await import(`../extensions/web/providers/config.ts?reason=${Date.now()}`);
+  await fresh.markSkip("tavily", 24 * 60 * 60 * 1000, "blocked");
+  // A shorter transient skip doesn't overwrite the longer blocked one or its reason.
+  await fresh.markSkip("tavily", 60_000);
+  let cfg = await fresh.loadConfig();
+  assert.equal(cfg.skipReason.tavily, "blocked");
+  const onDisk = JSON.parse(readFileSync(join(dir, "web.json"), "utf8"));
+  assert.equal(onDisk.skipReason.tavily, "blocked");
+
+  // A reason whose skip has expired (or never existed) is dropped on read.
+  writeFileSync(
+    join(dir, "web.json"),
+    JSON.stringify({ skipUntil: { tavily: Date.now() - 1 }, skipReason: { tavily: "blocked", exa: "blocked", brave: "bogus" } }),
+  );
+  const reread = await import(`../extensions/web/providers/config.ts?reread=${Date.now()}`);
+  cfg = await reread.loadConfig();
+  assert.deepEqual(cfg.skipReason, {});
+
+  await reread.markSkip("exa", 60_000, "blocked");
+  await reread.clearSkips();
+  assert.deepEqual((await reread.loadConfig()).skipReason, {});
+});

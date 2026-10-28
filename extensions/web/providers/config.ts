@@ -21,6 +21,14 @@ export type Excerpts = "auto" | "short" | "long";
 export const FORMATS: Format[] = ["native", "serp", "answer"];
 export const EXCERPT_MODES: Excerpts[] = ["auto", "short", "long"];
 
+/**
+ * Why a backend is benched, when it's worth more than "skipped". Only a
+ * network block for now: a firewall refusing the host is the user's network,
+ * not the vendor, and /web should say so.
+ */
+export type SkipReason = "blocked";
+export const SKIP_REASONS: SkipReason[] = ["blocked"];
+
 export interface WebConfig {
   search: { order: SearchBackend[]; off: SearchBackend[] };
   fetch: { order: FetchTierName[]; off: FetchTierName[] };
@@ -28,6 +36,8 @@ export interface WebConfig {
   excerpts: Excerpts;
   /** backend/tier name -> epoch ms before which it must not be tried again. */
   skipUntil: Record<string, number>;
+  /** backend/tier name -> why it's benched; only set alongside a live skipUntil. */
+  skipReason: Record<string, SkipReason>;
 }
 
 /**
@@ -79,6 +89,7 @@ export const DEFAULT_CONFIG: WebConfig = {
   format: "native",
   excerpts: "auto",
   skipUntil: {},
+  skipReason: {},
 };
 
 export function agentDir(): string {
@@ -108,6 +119,11 @@ function coerce(raw: unknown): WebConfig {
     // Expired entries are dropped on read, so a stale file self-heals.
     if (typeof v === "number" && Number.isFinite(v) && v > now) skipUntil[k] = v;
   }
+  const skipReason: Record<string, SkipReason> = {};
+  for (const [k, v] of Object.entries(obj.skipReason ?? {})) {
+    // A reason outlives nothing: it goes when its skip expires.
+    if (k in skipUntil && SKIP_REASONS.includes(v as SkipReason)) skipReason[k] = v as SkipReason;
+  }
   return {
     search: {
       order: uniqueNames(obj.search?.order, SEARCH_BACKENDS) ?? [...DEFAULT_CONFIG.search.order],
@@ -120,6 +136,7 @@ function coerce(raw: unknown): WebConfig {
     format: FORMATS.includes(obj.format) ? obj.format : DEFAULT_CONFIG.format,
     excerpts: EXCERPT_MODES.includes(obj.excerpts) ? obj.excerpts : DEFAULT_CONFIG.excerpts,
     skipUntil,
+    skipReason,
   };
 }
 
@@ -190,18 +207,23 @@ export function activeChain<T extends string>(order: T[], off: T[], skipUntil: R
  * where a failed write must neither crash pi nor stop the chain. The cool-off
  * holds in memory even when web.json can't be written.
  */
-export async function markSkip(name: string, ms: number): Promise<void> {
+export async function markSkip(name: string, ms: number, reason?: SkipReason): Promise<void> {
   const until = Date.now() + ms;
   await mutateConfig((cfg) => {
     // Never shorten an existing cool-off: two failures in one turn would
     // otherwise reset the longer quota window to the shorter transient one.
-    if (!((cfg.skipUntil[name] ?? 0) > until)) cfg.skipUntil[name] = until;
+    // The reason travels with whichever window wins.
+    if ((cfg.skipUntil[name] ?? 0) > until) return;
+    cfg.skipUntil[name] = until;
+    if (reason) cfg.skipReason[name] = reason;
+    else delete cfg.skipReason[name];
   }).catch(() => {});
 }
 
 export async function clearSkips(): Promise<void> {
   await mutateConfig((cfg) => {
     cfg.skipUntil = {};
+    cfg.skipReason = {};
   });
 }
 

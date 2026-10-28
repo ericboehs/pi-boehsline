@@ -14,8 +14,12 @@ import {
   type Format,
   type ResolvedKey,
   type SearchBackend,
+  type SkipReason,
   type WebConfig,
 } from "./config.ts";
+import { policyBlockTitle } from "../block-page.ts";
+
+export { policyBlockTitle };
 
 export interface SearchHit {
   title: string;
@@ -72,15 +76,27 @@ class BackendError extends Error {
   // strip-only TypeScript loaders (node --experimental-strip-types) reject
   // parameter properties, and this module has to load under both jiti and node.
   readonly cooloffMs: number;
+  /** Why it's benched, when /web should say more than "skipped". */
+  readonly reason?: SkipReason;
 
-  constructor(message: string, cooloffMs: number) {
+  constructor(message: string, cooloffMs: number, reason?: SkipReason) {
     super(message);
     this.cooloffMs = cooloffMs;
+    this.reason = reason;
   }
 }
 
 const QUOTA_COOLOFF_MS = 24 * 60 * 60 * 1000; // monthly allowances: re-probe daily
 const TRANSIENT_COOLOFF_MS = 10 * 60 * 1000;
+/**
+ * A network filter (corporate VPN, firewall) refused the host. It won't clear
+ * in ten minutes the way a real 5xx does: it lasts as long as the machine stays
+ * on that network, which may be indefinitely. A blocked probe is free (the
+ * filter answers; the API never bills), so re-probe once a day like a spent
+ * quota. `/web reset` brings it back immediately after leaving the network.
+ */
+export const POLICY_BLOCK_COOLOFF_MS = QUOTA_COOLOFF_MS;
+
 
 /**
  * A failure that says the backend is unreachable: undici's "fetch failed", or
@@ -149,6 +165,7 @@ function isPaceLimit(status: number, body: string): boolean {
 }
 
 export function cooloffForStatus(status: number, body = ""): number {
+  if (policyBlockTitle(body)) return POLICY_BLOCK_COOLOFF_MS;
   const authShaped =
     /SUBSCRIPTION_TOKEN_INVALID|"component"\s*:\s*"authentication"|invalid api key|unauthorized/i.test(body);
   if (status === 401 || status === 403 || (status === 422 && authShaped)) return QUOTA_COOLOFF_MS;
@@ -164,6 +181,10 @@ export function cooloffForStatus(status: number, body = ""): number {
 function httpError(status: number, body: string): BackendError {
   const detail = body.slice(0, 200).replace(/\s+/g, " ").trim();
   const cooloff = cooloffForStatus(status, body);
+  const blocked = policyBlockTitle(body);
+  if (blocked) {
+    return new BackendError(`blocked by network policy (${status}: ${blocked.slice(0, 120)}); skipping 24h, /web reset to retry`, cooloff, "blocked");
+  }
   if (cooloff === 0) return new BackendError(`HTTP ${status} ${detail}`, 0);
   if (status >= 500) return new BackendError(`upstream ${status} ${detail}`, cooloff);
   if (status === 401 || status === 403 || status === 422) {
@@ -737,7 +758,8 @@ export async function runSearchChain(
       if (signal?.aborted) throw err; // user cancelled: stop the whole chain
       if (e instanceof BackendError || isNetworkFailure(e)) {
         const cooloff = e instanceof BackendError ? e.cooloffMs : TRANSIENT_COOLOFF_MS;
-        if (cooloff > 0) await markSkip(backend, cooloff); // never rejects
+        const reason = e instanceof BackendError ? e.reason : undefined;
+        if (cooloff > 0) await markSkip(backend, cooloff, reason); // never rejects
         tried.push(`${backend}: ${err.message}`);
       } else {
         // A bug, not an outage: say where, don't bench, try the next one.
@@ -829,7 +851,7 @@ export const SEARCH_INDEX: Partial<Record<SearchBackend, string>> = {
 
 export interface ProbeResult {
   backend: SearchBackend;
-  state: "ready" | "off" | "cooling" | "no key";
+  state: "ready" | "off" | "cooling" | "blocked" | "no key";
   ok: boolean;
   ms: number;
   chars: number;
@@ -862,7 +884,9 @@ export async function probeBackends(
     const state: ProbeResult["state"] = cfg.search.off.includes(backend)
       ? "off"
       : (cfg.skipUntil[backend] ?? 0) > now
-        ? "cooling"
+        ? cfg.skipReason[backend] === "blocked"
+          ? "blocked"
+          : "cooling"
         : "ready";
 
     let cred: ResolvedKey | undefined;
