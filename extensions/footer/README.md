@@ -88,7 +88,9 @@ In a linked git worktree, the Worktree chip after it names the main repository
 file and `commondir` rather than running git, so a submodule doesn't count.
 When the worktree's directory has the branch's name, the directory chip drops
 out so the name shows once: `⎇ eert feature` rather than
-`feature ⎇ eert feature`.
+`feature ⎇ eert feature`. The same goes for a session named for its
+directory: the session name says it, so the directory chip drops out (unless
+the name chip is hidden, or the chip shows the full path).
 
 Settings that belong to a chip sit indented under it: Git condition, Context
 threshold, Copilot OOO days, and a condition each for Provider, Model and

@@ -2681,13 +2681,13 @@ export default function footerExtension(pi: ExtensionAPI): void {
         // A worktree is usually named for its branch: "wt-invoice ⎇ acme-api wt-invoice"
         // says it twice. Drop the directory then; ⎇ still marks the worktree and
         // the git chip (with its dirty and ahead marks) names it once.
+        // Likewise a session named for its directory: the name already says it.
         const repoOfWorktree = worktreeRepo(ctx.cwd);
-        const dirChipShown = !(
-          repoOfWorktree &&
-          !showFullPath &&
-          gitChip.text &&
-          branch &&
-          dirLabel(ctx.cwd, false, shown().dirNames) === branch
+        const dirName = dirLabel(ctx.cwd, false, shown().dirNames);
+        const sessionName = pi.getSessionName();
+        const dirChipShown = showFullPath || !(
+          (repoOfWorktree && gitChip.text && branch && dirName === branch) ||
+          (sessionName && enabled && !shown().hidden.has("name") && dirName === sessionName)
         );
         // footer.json's defaultModels names each provider's everyday model; the
         // Model condition treats those pairs as defaults too.

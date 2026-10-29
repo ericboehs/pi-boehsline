@@ -1013,6 +1013,21 @@ test("a worktree named for its branch says the name once", async () => {
   assert.match((await mainCheckout.settled())[0], /^eert eert /, "only in a linked worktree");
 });
 
+test("a session named for its directory says the name once", async () => {
+  const cwd = "/Users/someone/Code/aosmith-water-heater";
+  const same = await mount({ cwd, sessionName: "aosmith-water-heater" });
+  const line = (await same.settled())[0];
+  assert.doesNotMatch(line, /^aosmith-water-heater /, "directory dropped: the name says it");
+  assert.match(line, / aosmith-water-heater$/, "the name still shows");
+  const differs = await mount({ cwd, sessionName: "heater-fix" });
+  assert.match((await differs.settled())[0], /^aosmith-water-heater .* heater-fix$/, "a different name keeps the directory");
+  await withAgentDir(async (dir) => {
+    writeFileSync(path.join(dir, "footer.json"), JSON.stringify({ hidden: ["name"] }));
+    const hidden = await mount({ cwd, sessionName: "aosmith-water-heater" });
+    assert.match((await hidden.settled())[0], /^aosmith-water-heater /, "a hidden name keeps the directory");
+  });
+});
+
 test("a chip added since footer.json was saved lands after its default predecessor", () => {
   withAgentDir((dir) => {
     // An order saved before the worktree chip existed, with dir moved last.
