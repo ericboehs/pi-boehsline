@@ -4,9 +4,15 @@
 // "meeting" event and appends it. Nothing here loads from the network.
 //
 // Beside the transcript sits the copilot's Notes panel (alerts, your action
-// items, decisions, topics, questions, a suggested reply), from the notes file
-// the daemon merges into /api/meeting. From 1400 px it is a third column; below
-// that a Transcript / Notes switch at the top of the column swaps them.
+// items, decisions, topics, slides, questions, a suggested reply), from the notes file
+// the daemon merges into /api/meeting. Under the shown slide a summary panel (title,
+// what it shows, why it matters to you, key points, numbers) comes from the same
+// notes (/api/meeting's `summaries`, by slide number); a past meeting shows its archived ones. From 1400 px it is a third column; below
+// that a Transcript / Chat / Notes switch at the top of the column swaps them.
+//
+// Meeting chat messages (entries of type "chat") are kept out of the spoken transcript and shown
+// in a Chat box: on top of the third column (about 40 % of its height, its own scroll) from 1400 px,
+// a tab of its own (with an unread count) below that. Links in chat text are real links (http/https only).
 //
 // /meeting follows the live meeting. /meeting?id=<id> shows one from the history
 // (/meetings), whole and ended; #e<n> scrolls to transcript entry n and flashes it.
@@ -42,6 +48,16 @@ body:not(.has-slides) .stage { display: none; }
 .slide .cap b { color: var(--ink); }
 .slide .cap button, .jump, .strip-h button { font: 500 12px/1 -apple-system, BlinkMacSystemFont, sans-serif; padding: 5px 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--ink); cursor: pointer; }
 .slide .cap .grow { flex: 1; }
+.sum { flex: none; max-height: 30vh; overflow-y: auto; padding: 2px 18px 6px; font-size: 13px; line-height: 1.45; }
+.sum .st { font-weight: 600; font-size: 14px; }
+.sum p { margin: 3px 0; }
+.sum .why { color: var(--ink); }
+.sum .why b { color: var(--accent); font-weight: 600; }
+.sum ul { margin: 3px 0; padding-left: 18px; }
+.sum li { margin: 1px 0; }
+.sum .nums { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.sum .nums span { font-size: 11.5px; padding: 1px 8px; border-radius: 10px; background: var(--soft); color: var(--dim); }
+.sum .pending { color: var(--dim); font-style: italic; }
 .strip { flex: none; display: flex; gap: 8px; overflow-x: auto; padding: 8px 16px 14px; scroll-behavior: smooth; }
 .strip button { flex: none; padding: 0; border: 2px solid transparent; border-radius: 6px; background: none; cursor: pointer; position: relative; }
 .strip button.on { border-color: var(--accent); }
@@ -56,8 +72,8 @@ body:not(.has-slides) .tx { max-width: 920px; margin: 0 auto; width: 100%; }
 .row .sp { font-weight: 600; margin-right: 6px; }
 .row.cont time { visibility: hidden; }
 .row.first { margin-top: 8px; }
-.row.chat .body { background: var(--soft); border-radius: 6px; padding: 2px 8px; }
-.row.chat .tag { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); margin-right: 6px; }
+.row.chat .body { overflow-wrap: anywhere; }
+.row.chat .body a { color: var(--accent); }
 .row.note .body { color: var(--dim); font-size: 12.5px; }
 .row.slide-mark { margin: 8px 0; cursor: pointer; }
 .row.slide-mark .body { display: flex; align-items: center; gap: 10px; color: var(--dim); font-size: 12.5px; }
@@ -78,9 +94,18 @@ body:not(.has-slides) .tx { max-width: 920px; margin: 0 auto; width: 100%; }
 .tabs button { font: 500 12.5px/1 -apple-system, BlinkMacSystemFont, sans-serif; padding: 6px 11px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--dim); cursor: pointer; }
 .tabs button.on { color: var(--ink); border-color: var(--accent); }
 .tabs i { font-style: normal; font-weight: 600; margin-left: 5px; color: var(--warn); }
-.notes { flex: none; width: 340px; min-height: 0; display: none; flex-direction: column; border-left: 1px solid var(--line); background: var(--card); }
+.side { flex: none; width: 340px; min-height: 0; display: none; flex-direction: column; border-left: 1px solid var(--line); background: var(--card); }
+body.has-side .side { display: flex; }
+body.has-side:not(.has-slides) .tx { max-width: none; margin: 0; }
+.chat { flex: 0 0 40%; min-height: 0; display: flex; flex-direction: column; }
+body:not(.has-notes) .chat { flex: 1 1 0; }
+body:not(.has-chat) .chat { flex: none; }
+.chat-h { flex: none; display: flex; align-items: baseline; gap: 8px; padding: 8px 16px 2px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+.chat-h small { font: 12px/1.3 -apple-system, BlinkMacSystemFont, sans-serif; text-transform: none; letter-spacing: 0; font-style: italic; font-weight: 400; }
+.cscroll { flex: 1; min-height: 0; overflow-y: auto; padding: 2px 10px 8px; font-size: 13.5px; line-height: 1.4; }
+.cscroll .row.first { margin-top: 4px; }
+.notes { flex: 1 1 0; min-height: 0; display: none; flex-direction: column; border-top: 1px solid var(--line); }
 body.has-notes .notes { display: flex; }
-body.has-notes:not(.has-slides) .tx { max-width: none; margin: 0; }
 .nbody { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 16px 18px; }
 .nbody h3 { margin: 16px 0 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
 .nbody ul { margin: 0; padding-left: 18px; }
@@ -91,6 +116,9 @@ body.has-notes:not(.has-slides) .tx { max-width: none; margin: 0; }
 .nbody .alert { line-height: 1.4; }
 .nbody .alert time { color: var(--dim); font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; margin-right: 6px; }
 .nbody .topic b { font-weight: 600; }
+.nbody .slidelist { list-style: none; padding-left: 0; }
+.nbody .slidelist button { all: unset; cursor: pointer; line-height: 1.4; }
+.nbody .slidelist button:hover { color: var(--accent); text-decoration: underline; }
 .nbody .reply { padding: 8px 10px; border-radius: 6px; background: var(--soft); border-left: 3px solid var(--ok); line-height: 1.45; }
 .nbody .reply small { display: block; color: var(--dim); margin-bottom: 2px; }
 .nbody .foot { margin-top: 18px; color: var(--dim); font-size: 12px; }
@@ -98,15 +126,20 @@ dialog { border: 0; padding: 0; background: transparent; max-width: 96vw; max-he
 dialog::backdrop { background: rgb(0 0 0 / .8); }
 dialog img { display: block; max-width: 96vw; max-height: 96vh; }
 @media (max-width: 1399px) {
-  .notes { width: auto; flex: 2 1 0; border-left: 0; }
-  body.has-notes .notes { display: none; }
-  body.has-notes.view-notes .notes { display: flex; }
-  body.has-notes.view-notes .tx { display: none; }
-  body.has-notes .tabs { display: flex; }
+  .side { width: auto; flex: 2 1 0; border-left: 0; }
+  body.has-side .side { display: none; }
+  body.has-side.view-chat .side, body.has-side.view-notes .side { display: flex; }
+  body.has-side.view-chat .tx, body.has-side.view-notes .tx { display: none; }
+  body.has-side .tabs { display: flex; }
+  .chat, body:not(.has-notes) .chat, body:not(.has-chat) .chat { flex: 1 1 0; }
+  .chat-h { display: none; }
+  .notes { border-top: 0; }
+  body.view-notes .chat, body.view-chat .notes { display: none; }
 }
 @media (max-width: 900px) {
   main { flex-direction: column; }
   .stage { flex: none; max-height: 48vh; border-right: 0; border-bottom: 1px solid var(--line); }
+  .sum { max-height: 16vh; }
   .tx { min-width: 0; flex: 1; min-height: 0; }
   header input { width: 130px; }
 }
@@ -154,30 +187,55 @@ let onScreen = null; // the newest slide or revisit event's n
 const shownAgain = new Map(); // slide n → times it came back (revisits)
 let stick = true; // the transcript follows the bottom until you scroll up
 let lastSpeaker = null;
+let cstick = true; // the chat follows its bottom until you scroll up
+let chatCount = 0;
 let filter = "";
 let notes = null; // the copilot's notes, when it has some for this meeting
+let summaries = {}; // the copilot's slide summaries by slide number: { title, what, why, points, numbers }
 const wanted = new URLSearchParams(location.search).get("id") || ""; // a past meeting's id; empty follows the live one
 let jumpTo = /^#e(\d{1,7})$/.exec(location.hash)?.[1] ?? null; // the entry to scroll to once it is loaded
 let notFound = false;
 
-// ── transcript / notes switch (below 1400 px; the CSS hides it above) ──
+// ── transcript / chat / notes switch (below 1400 px; the CSS hides it above) ──
 const bars = [];
+let view = "tx";
+let unread = 0; // chat messages that came in while the Chat tab was not shown
 function tabsBar() {
   const mk = (v, label) => h("button", { type: "button", "data-v": v, onclick: () => showView(v) }, label, h("i", { hidden: true }));
-  const bar = h("div", { class: "tabs" }, mk("tx", "Transcript"), mk("notes", "Notes"));
+  const bar = h("div", { class: "tabs" }, mk("tx", "Transcript"), mk("chat", "Chat"), mk("notes", "Notes"));
   bars.push(bar);
   return bar;
 }
 function showView(v) {
-  document.body.classList.toggle("view-notes", v === "notes");
+  view = v;
+  if (v === "chat") unread = 0;
+  for (const x of ["tx", "chat", "notes"]) document.body.classList.toggle(`view-${x}`, x === v);
   for (const bar of bars) for (const b of bar.children) b.classList.toggle("on", b.dataset.v === v);
+  if (v === "chat") followChat();
+  badge();
 }
+/** Is the Chat box on screen? Always from 1400 px; below that only on its tab. */
+function chatShown() {
+  return view === "chat" || Boolean(window.matchMedia?.("(min-width: 1400px)").matches);
+}
+// Widening the window shows the Chat box, so whatever piled up while narrow has been seen.
+window.matchMedia?.("(min-width: 1400px)").addEventListener?.("change", (ev) => {
+  if (!ev.matches) return;
+  unread = 0;
+  badge();
+});
 function badge() {
   const n = notes?.alerts?.length || 0;
+  const hasChat = chatCount > 0;
   for (const bar of bars) {
     const i = bar.querySelector('[data-v="notes"] i');
     i.hidden = !n;
     i.textContent = n;
+    const c = bar.querySelector('[data-v="chat"] i');
+    c.hidden = !unread;
+    c.textContent = unread;
+    bar.querySelector('[data-v="chat"]').hidden = !hasChat;
+    bar.querySelector('[data-v="notes"]').hidden = !notes;
   }
 }
 
@@ -191,27 +249,32 @@ const ui = {
   dot: h("span", { class: "dot" }),
   title: h("h1", {}, "Meeting"),
   meta: h("div", { class: "meta" }),
-  search: h("input", { type: "search", placeholder: "Filter transcript  /", "aria-label": "Filter transcript" }),
+  search: h("input", { type: "search", placeholder: "Filter transcript and chat  /", "aria-label": "Filter transcript and chat" }),
   img: h("img", { alt: "" }),
   cap: h("div", { class: "cap" }),
   strip: h("div", { class: "strip" }),
+  sum: h("div", { class: "sum", hidden: true }),
   scroll: h("div", { class: "scroll" }),
   rows: h("div", { class: "rows" }),
   live: h("div", { class: "live" }),
   jump: h("button", { class: "jump", type: "button", hidden: true }, "↓ Jump to live"),
+  cscroll: h("div", { class: "cscroll" }),
+  chatRows: h("div", { class: "rows" }),
+  chatNone: h("small", {}, "No chat yet"),
   nbody: h("div", { class: "nbody" }),
   empty: h("div", { class: "empty", hidden: true }),
   dialog: h("dialog", {}, h("img", { alt: "" })),
 };
 ui.scroll.append(ui.rows, ui.live);
+ui.cscroll.append(ui.chatRows);
 $app.append(
   h("header", {}, ui.dot, h("div", { class: "who" }, ui.title, ui.meta), ui.search, h("div", { class: "links" }, h("a", { class: "back", href: "/meetings" }, "All meetings"), h("a", { class: "back", href: "/" }, "Canvas"))),
   h(
     "main",
     {},
-    h("section", { class: "stage" }, h("div", { class: "slide" }, h("div", { class: "frame" }, ui.img), ui.cap), ui.strip),
+    h("section", { class: "stage" }, h("div", { class: "slide" }, h("div", { class: "frame" }, ui.img), ui.cap), ui.sum, ui.strip),
     h("section", { class: "tx" }, tabsBar(), ui.scroll, ui.jump),
-    h("section", { class: "notes" }, tabsBar(), ui.nbody),
+    h("div", { class: "side" }, h("section", { class: "chat" }, tabsBar(), h("div", { class: "chat-h" }, "Chat", ui.chatNone), ui.cscroll), h("section", { class: "notes" }, tabsBar(), ui.nbody)),
     ui.empty,
   ),
   ui.dialog,
@@ -261,7 +324,10 @@ function renderEmpty() {
   const none = !state;
   ui.empty.hidden = !none;
   document.querySelector("main .tx").hidden = none;
-  if (none) document.body.classList.remove("has-notes", "view-notes");
+  if (none) {
+    document.body.classList.remove("has-notes", "has-chat", "has-side");
+    if (view !== "tx") showView("tx");
+  }
   document.body.classList.toggle("has-slides", !none && slides.length > 0);
   if (none) {
     ui.empty.replaceChildren(
@@ -294,13 +360,42 @@ function markRevisits() {
     if (!i) continue;
     i.hidden = !k;
     i.textContent = k > 1 ? `↺${k}` : "↺";
-    b.title = `Slide ${b.dataset.n}${k ? ` · shown again ${k === 1 ? "once" : `${k} times`}` : ""}`;
+    const t = summaries[b.dataset.n]?.title || "";
+    b.title = `Slide ${b.dataset.n}${t ? ` · ${t}` : ""}${k ? ` · shown again ${k === 1 ? "once" : `${k} times`}` : ""}`;
+    const img = b.querySelector("img");
+    if (img) img.alt = t ? `Slide ${b.dataset.n}: ${t}` : `Slide ${b.dataset.n}`;
   }
+}
+/** The slide rows in the transcript say "▣ Slide 3 · <title>" once the slide has a summary (they are built before it arrives). */
+function labelSlideRows() {
+  for (const row of ui.rows.querySelectorAll(".row.slide-mark.slide")) {
+    const lbl = row.querySelector(".lbl");
+    const t = summaries[row.dataset.slide]?.title || "";
+    if (lbl) lbl.textContent = `▣ Slide ${row.dataset.slide}${t ? ` · ${t}` : ""}`;
+  }
+}
+/** The summary panel under the stage image: for the shown slide, or "Summarizing…" while the live meeting's newest slide has none yet. */
+function renderSummary(n) {
+  const sum = n != null ? summaries[n] : null;
+  // Only while the copilot is summarizing slides for this meeting (slidesOn) and has not given up on this one (or hit its cap).
+  const pending = !sum && n != null && Boolean(state?.recording && notes?.slidesOn) && !(notes.slidesFailed || []).includes(n) && n === slides[slides.length - 1]?.n;
+  ui.sum.hidden = !sum && !pending;
+  if (!sum) return void ui.sum.replaceChildren(...(pending ? [h("div", { class: "pending" }, "Summarizing…")] : []));
+  ui.sum.replaceChildren(
+    ...[
+      sum.title ? h("div", { class: "st" }, sum.title) : null,
+      sum.what ? h("p", {}, sum.what) : null,
+      sum.why ? h("p", { class: "why" }, h("b", {}, "Why it matters: "), sum.why) : null,
+      sum.points?.length ? h("ul", {}, sum.points.map((x) => h("li", {}, x))) : null,
+      sum.numbers?.length ? h("div", { class: "nums" }, sum.numbers.map((x) => h("span", {}, x))) : null,
+    ].filter(Boolean),
+  );
 }
 function showSlide() {
   const n = pinned ?? (slideOf(onScreen) ? onScreen : slides[slides.length - 1]?.n);
   const s = slideOf(n);
-  if (!s) return;
+  if (!s) return void renderSummary(null);
+  renderSummary(s.n);
   const src = slideUrl(s.n, false);
   if (ui.img.getAttribute("src") !== src) (ui.img.src = src), (ui.img.alt = `Slide ${s.n}`);
   for (const b of ui.strip.children) b.classList.toggle("on", Number(b.dataset.n) === s.n);
@@ -363,15 +458,74 @@ function saysMyName(speaker, text) {
 // Rows are marked once per name key: a new row when it arrives, every row only when who "me" is changes.
 function markMentions() {
   const all = setNames();
-  for (const row of ui.rows.children) {
+  for (const row of [...ui.rows.children, ...ui.chatRows.children]) {
     if (row.dataset.sp == null || (!all && row.dataset.mk === "1")) continue;
     row.dataset.mk = "1";
     row.classList.toggle("me", saysMyName(row.dataset.sp, row.dataset.tx || ""));
   }
 }
 
+// ── chat ──
+/** text as nodes, with each http(s) URL in it a link; no markup is ever built from the text. */
+function linkify(text) {
+  const s = String(text);
+  const out = [];
+  // Not mid-word, and never across invisible format characters (bidi controls, zero-width): what you see is where it goes.
+  const re = /(?<![\p{L}\p{N}])https?:\/\/[^\s<>"'\p{Cf}]+/giu;
+  const pairs = { ")": "(", "]": "[", "}": "{" };
+  const count = (str, ch) => str.split(ch).length - 1;
+  let at = 0;
+  for (let m; (m = re.exec(s)); ) {
+    let url = m[0];
+    const joined = url.search(/,(?=https?:\/\/)/i); // "https://a.com,https://b.com" is two URLs
+    if (joined > 0) {
+      url = url.slice(0, joined);
+      re.lastIndex = m.index + joined; // scan on from the comma, so the second URL is found too
+    }
+    for (;;) {
+      const last = url.at(-1);
+      if (last && ".,;:!?".includes(last)) url = url.slice(0, -1);
+      else if (last && pairs[last] && count(url, last) > count(url, pairs[last])) url = url.slice(0, -1); // a closer only if it has no opener in the URL
+      else break;
+    }
+    let ok = false;
+    try {
+      ok = /^https?:$/.test(new URL(url).protocol);
+    } catch {}
+    if (!ok) continue;
+    if (m.index > at) out.push(s.slice(at, m.index));
+    out.push(h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, url));
+    at = m.index + url.length;
+  }
+  if (at < s.length) out.push(s.slice(at));
+  return out;
+}
+function chatRow(e) {
+  return h("div", { class: "row chat first" }, h("time", { datetime: e.ts }, clock(e.ts)), h("div", { class: "body" }, e.speaker ? h("span", { class: "sp", style: `color:${colorOf(e.speaker)}` }, e.speaker) : null, linkify(String(e.text ?? ""))));
+}
+function followChat() {
+  if (cstick) ui.cscroll.scrollTop = ui.cscroll.scrollHeight;
+}
+ui.cscroll.addEventListener("scroll", () => {
+  cstick = ui.cscroll.scrollHeight - ui.cscroll.scrollTop - ui.cscroll.clientHeight < 40;
+});
+/** The third column, the Chat tab and the "No chat yet" line follow what exists. */
+function renderSide() {
+  const has = Boolean(state);
+  const chat = has && chatCount > 0;
+  const notesOn = has && Boolean(notes);
+  document.body.classList.toggle("has-chat", chat);
+  document.body.classList.toggle("has-notes", notesOn);
+  document.body.classList.toggle("has-side", chat || notesOn);
+  ui.chatNone.hidden = chat;
+  ui.cscroll.hidden = !chat;
+  if ((view === "chat" && !chat) || (view === "notes" && !notesOn)) showView("tx");
+  badge();
+}
+
 // ── transcript ──
 function rowFor(e) {
+  if (e.type === "chat") return chatRow(e);
   const t = h("time", { datetime: e.ts }, clock(e.ts));
   if (e.type === "caption") {
     const cont = e.speaker && e.speaker === lastSpeaker;
@@ -379,14 +533,13 @@ function rowFor(e) {
     return h("div", { class: `row caption ${cont ? "cont" : "first"}` }, t, h("div", { class: "body" }, !cont && e.speaker ? h("span", { class: "sp", style: `color:${colorOf(e.speaker)}` }, e.speaker) : null, e.text));
   }
   lastSpeaker = null;
-  if (e.type === "chat") return h("div", { class: "row chat first" }, t, h("div", { class: "body" }, h("span", { class: "tag" }, "chat"), e.speaker ? h("span", { class: "sp", style: `color:${colorOf(e.speaker)}` }, e.speaker) : null, e.text));
   if (e.type === "slide" || e.type === "revisit") {
     const s = slideOf(e.n);
     return h(
       "div",
       { class: `row slide-mark ${e.type}`, "data-slide": e.n, title: "Show this slide", onclick: () => pickSlide(e.n) },
       t,
-      h("div", { class: "body" }, s ? h("img", { src: slideUrl(e.n, s.thumb), alt: "", loading: "lazy" }) : null, h("span", {}, e.type === "revisit" ? `↺ Back to slide ${e.n}` : `▣ Slide ${e.n}`)),
+      h("div", { class: "body" }, s ? h("img", { src: slideUrl(e.n, s.thumb), alt: "", loading: "lazy" }) : null, h("span", { class: "lbl" }, e.type === "revisit" ? `↺ Back to slide ${e.n}` : `▣ Slide ${e.n}${summaries[e.n]?.title ? ` · ${summaries[e.n].title}` : ""}`)),
     );
   }
   if (e.type === "people") return h("div", { class: "row note" }, t, h("div", { class: "body", title: e.people.join("\n") }, `👥 ${e.count} in the meeting`));
@@ -397,6 +550,7 @@ const rowText = (e) => `${e.speaker || ""} ${e.text || ""} ${e.type === "slide" 
 
 function appendEntries(list, base = 0) {
   const frag = document.createDocumentFragment();
+  const cfrag = document.createDocumentFragment();
   for (const [k, e] of list.entries()) {
     if (e.type === "slide" || e.type === "revisit") onScreen = e.n;
     if (e.type === "revisit") shownAgain.set(e.n, (shownAgain.get(e.n) || 0) + 1);
@@ -410,10 +564,15 @@ function appendEntries(list, base = 0) {
       if (saysMyName(e.speaker || "", e.text || "")) row.classList.add("me");
     }
     if (filter && !row.dataset.q.includes(filter)) row.hidden = true;
-    frag.append(row);
+    if (e.type === "chat") {
+      cfrag.append(row);
+      chatCount++;
+      if (base > 0 && !chatShown() && !row.hidden) unread++;
+    } else frag.append(row);
   }
   ui.rows.querySelector(".waiting")?.remove();
   ui.rows.append(frag);
+  ui.chatRows.append(cfrag);
 }
 function renderLive() {
   ui.live.replaceChildren(
@@ -428,6 +587,10 @@ function resetTranscript() {
   onScreen = null;
   shownAgain.clear();
   ui.rows.replaceChildren();
+  ui.chatRows.replaceChildren();
+  chatCount = 0;
+  unread = 0;
+  cstick = true;
   ui.strip.replaceChildren();
   ui.img.removeAttribute("src");
   pinned = null;
@@ -448,7 +611,7 @@ ui.jump.addEventListener("click", () => {
 
 ui.search.addEventListener("input", () => {
   filter = ui.search.value.trim().toLowerCase();
-  for (const row of ui.rows.children) if (row.dataset.q != null) row.hidden = Boolean(filter) && !row.dataset.q.includes(filter);
+  for (const row of [...ui.rows.children, ...ui.chatRows.children]) if (row.dataset.q != null) row.hidden = Boolean(filter) && !row.dataset.q.includes(filter);
   ui.live.hidden = Boolean(filter);
   if (!filter) followBottom();
 });
@@ -458,11 +621,9 @@ const fmtAt = (iso) => (iso ? clock(iso).slice(0, 5) : "");
 const section = (title, ...kids) => [h("h3", {}, title), ...kids];
 function renderNotes() {
   const n = notes;
-  // The panel (third column, or the Transcript / Notes switch) is there only when a copilot is writing notes.
+  // The panel (below the Chat box in the third column, or a tab) is there only when a copilot is writing notes.
   const has = Boolean(state && n);
-  document.body.classList.toggle("has-notes", has);
-  if (!has) document.body.classList.remove("view-notes");
-  badge();
+  renderSide();
   if (!has) return void ui.nbody.replaceChildren();
   const alerts = [...n.alerts].reverse();
   const mine = n.actions.filter((a) => a.mine);
@@ -471,6 +632,8 @@ function renderNotes() {
   out.push(...section("Your action items", mine.length ? h("ul", {}, mine.map((a) => h("li", {}, a.what, a.at ? h("small", {}, ` · ${fmtAt(a.at)}`) : null))) : h("div", { class: "none" }, "None")));
   out.push(...section("Decisions", n.decisions.length ? h("ul", {}, n.decisions.map((d) => h("li", {}, d.text, d.at ? h("small", {}, ` · ${fmtAt(d.at)}`) : null))) : h("div", { class: "none" }, "None yet")));
   out.push(...section("Topics", n.topics.length ? h("ul", {}, n.topics.map((t) => h("li", { class: "topic" }, h("b", {}, t.title), t.summary ? ` ${t.summary}` : ""))) : h("div", { class: "none" }, "None yet")));
+  const sums = Object.keys(summaries).map(Number).sort((a, b) => a - b);
+  if (sums.length) out.push(...section("Slides", h("ul", { class: "slidelist" }, sums.map((k) => h("li", {}, h("button", { type: "button", title: "Show this slide", onclick: () => pickSlide(k) }, `${k}. ${summaries[k].title || summaries[k].what}`))))));
   if (n.questions.length) out.push(...section("Questions worth asking", h("ul", {}, n.questions.map((q) => h("li", {}, q.q, q.why ? h("small", {}, ` — ${q.why}`) : null)))));
   out.push(...section("Suggested reply", n.reply ? h("div", { class: "reply" }, h("small", {}, `${n.reply.to ? `${n.reply.to} is waiting on you` : "Someone is waiting on you"}${n.reply.at ? ` · ${fmtAt(n.reply.at)}` : ""}`), n.reply.text) : h("div", { class: "none" }, "Nobody is waiting on you.")));
   out.push(h("div", { class: "foot" }, `${n.ended ? "Final notes" : "Updated"} ${fmtAt(n.at)}${n.session ? ` · from the “${n.session}” session` : ""}`));
@@ -483,7 +646,7 @@ function apply(d) {
   if (d.id !== id || d.from !== entries.length) {
     resetTranscript();
     id = d.id;
-    if (wanted && d.state && !d.state.recording) stick = false; // a past meeting opens at the top
+    if (wanted && d.state && !d.state.recording) stick = cstick = false; // a past meeting opens at the top
     if (d.from !== 0) return void (id = ""), pull(); // out of step: start over
   }
   notFound = Boolean(d.notFound);
@@ -491,6 +654,7 @@ function apply(d) {
   slides = d.slides || [];
   people = d.people;
   notes = d.notes || null;
+  summaries = d.summaries && typeof d.summaries === "object" ? d.summaries : {};
   live = state?.recording ? d.live || [] : [];
   renderEmpty();
   renderSlides();
@@ -502,22 +666,30 @@ function apply(d) {
     showSlide();
   }
   if (state && !entries.length && !ui.rows.querySelector(".waiting")) ui.rows.append(h("div", { class: "waiting" }, state.recording ? "Waiting for the first caption…" : "No transcript was written."));
+  labelSlideRows();
   renderLive();
   renderHeader();
   renderNotes();
   markMentions();
   if (!jumpToEntry()) followBottom();
+  followChat();
 }
 
-/** #e<n>: scroll that transcript entry into view and flash it, once, as soon as it is loaded. */
+/** #e<n>: scroll that transcript or chat entry into view and flash it, once, as soon as it is loaded. */
 function jumpToEntry() {
   if (jumpTo == null) return false;
-  const row = ui.rows.querySelector(`.row[data-i="${jumpTo}"]`);
+  const q = `.row[data-i="${jumpTo}"]`;
+  const row = ui.rows.querySelector(q) || ui.chatRows.querySelector(q);
   if (!row) return false;
   jumpTo = null;
   if (row.hidden) return false;
-  stick = false;
-  ui.jump.hidden = false;
+  if (row.classList.contains("chat")) {
+    cstick = false;
+    showView("chat"); // below 1400 px the Chat tab comes up
+  } else {
+    stick = false;
+    ui.jump.hidden = false;
+  }
   row.scrollIntoView({ block: "center" });
   row.classList.remove("flash");
   void row.offsetWidth;

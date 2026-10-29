@@ -43,6 +43,7 @@ main { flex: 1; min-height: 0; overflow-y: auto; }
 .hit:hover { background: var(--soft); }
 .hit time { color: var(--dim); font: 11.5px/1.9 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .hit .sp { font-weight: 600; margin-right: 6px; }
+.hit .tag { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; margin-right: 6px; }
 .hits .more { color: var(--dim); font-size: 12px; padding: 2px 0 0 62px; }
 mark { background: color-mix(in srgb, var(--warn) 32%, transparent); color: inherit; border-radius: 2px; padding: 0 1px; }
 .fields { color: var(--dim); font-size: 11.5px; }
@@ -194,13 +195,13 @@ function resultFor(r, terms) {
     "div",
     { class: "item" },
     rowFor(r),
-    lines.length || r.fields?.some((f) => f !== "transcript")
+    lines.length || r.fields?.some((f) => f !== "transcript" && f !== "chat")
       ? h(
           "div",
           { class: "hits" },
-          r.fields?.some((f) => f !== "transcript") ? h("div", { class: "fields" }, `Matches ${r.fields.filter((f) => f !== "transcript").join(", ")}`) : null,
+          r.fields?.some((f) => f !== "transcript" && f !== "chat") ? h("div", { class: "fields" }, `Matches ${r.fields.filter((f) => f !== "transcript" && f !== "chat").join(", ")}`) : null,
           lines.map((l) =>
-            h("a", { class: "hit", href: href(r.id, `#e${l.i}`) }, h("time", {}, hms(l.ts)), h("div", {}, l.speaker ? h("span", { class: "sp" }, l.speaker) : null, highlight(l.text, terms))),
+            h("a", { class: "hit", href: href(r.id, `#e${l.i}`) }, h("time", {}, hms(l.ts)), h("div", {}, l.type === "chat" ? h("span", { class: "tag" }, "chat") : null, l.speaker ? h("span", { class: "sp" }, l.speaker) : null, highlight(l.text, terms))),
           ),
           r.hits > lines.length ? h("div", { class: "more" }, `+${r.hits - lines.length} more`) : null,
         )

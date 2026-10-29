@@ -103,7 +103,32 @@ import {
 	widgetLines,
 	writeLock,
 	writeNotesFile,
+	buildSlidePrompt,
+	buildSlideSystem,
+	cleanOcr,
+	formatSlideSummary,
+	markSlideDone,
+	nearbyLines,
+	newSlideWork,
+	noteSlideCall,
+	normSlides,
+	parseSlideReply,
+	queueSlide,
+	readArchivedSlides,
+	slideDone,
+	slideFailed,
+	slideGap,
+	summaryMatches,
+	takeSlide,
+	waitForOcr,
+	withSummary,
+	SLIDE_CAP,
+	MAX_SLIDE_SUMMARIES,
+	OCR_WAIT_MS,
+	normFailed,
+	ocrTimeout,
 } from "../extensions/opt-in/meeting/index.ts";
+import { MEETING_DEFAULTS, meetingSettings } from "../extensions/opt-in/watch/settings.ts";
 
 import { estTokens, PROMPT_MAX_TOKENS } from "../extensions/opt-in/watch/models.ts";
 
@@ -462,7 +487,7 @@ test("slide text: newest first, empty ones skipped, capped in all", () => {
 		{ n: 3, at: "14:14:00", text: "Cert rotation plan\nOwner: Amy", onScreen: true },
 	];
 	const t = formatSlides(slides);
-	assert.match(t, /^<slides>\nText on the slides shown so far:\nSlide 3 \(14:14:00\), on screen now:\nCert rotation plan\nOwner: Amy\nSlide 1 \(14:01:00\):\nAgenda\n<\/slides>$/);
+	assert.match(t, /^<slides>\nWhat the slides shown so far say:\nSlide 3 \(14:14:00\), on screen now:\nCert rotation plan\nOwner: Amy\nSlide 1 \(14:01:00\):\nAgenda\n<\/slides>$/);
 	assert.doesNotMatch(t, /Slide 2/);
 	assert.equal(formatSlides([]), "");
 	const big = formatSlides([{ n: 1, at: "", text: "old ".repeat(2000), onScreen: false }, { n: 2, at: "", text: "x".repeat(3000), onScreen: false }, { n: 3, at: "", text: "y".repeat(3000), onScreen: false }]);
@@ -579,7 +604,7 @@ test("the notes file has the shape the canvas reads", () => {
 		reply: { to: "Katherine", text: "Friday.", at: "2026-10-28T14:12:30.000Z" },
 		alerts: Array.from({ length: 22 }, (_, i) => ({ id: `a${i}`, kind: i % 2 ? "action" : "name", who: "Ada", text: "t", at: "T" })),
 	});
-	assert.deepEqual(Object.keys(file), ["v", "pid", "session", "meeting", "at", "ended", "me", "topics", "decisions", "actions", "questions", "reply", "alerts", "alertSeq"]);
+	assert.deepEqual(Object.keys(file), ["v", "pid", "session", "meeting", "at", "ended", "me", "topics", "decisions", "actions", "questions", "reply", "alerts", "alertSeq", "slides", "slidesOn", "slidesFailed"]);
 	assert.deepEqual([file.v, file.pid, file.session, file.meeting], [1, 7, { id: "s-1", name: "earl" }, { started_at: "2026-10-28T14:00:00-05:00", app_id: "teams", title: "Weekly Sync" }]);
 	assert.deepEqual(file.actions[0], { who: "Eric", what: "own moving the legacy services onto canary", mine: true, at: "2026-10-28T14:12:00.000Z" });
 	assert.deepEqual(file.decisions, [{ text: "Rotate Thursday", at: "2026-10-28T14:12:00.000Z" }]);
@@ -587,6 +612,7 @@ test("the notes file has the shape the canvas reads", () => {
 	assert.equal(file.alerts.at(-1).id, "a21");
 	assert.deepEqual(file.reply, { to: "Katherine", text: "Friday.", at: "2026-10-28T14:12:30.000Z" });
 	assert.equal(buildNotesFile({ ...{ pid: 1, sessionId: "", sessionName: "", startedAt: "", appId: "", title: "", at: "", ended: true, me: [], notes: emptyNotes(), alerts: [], alertSeq: 0 }, reply: null }).reply, null);
+	assert.deepEqual(file.slides, [], "no summaries yet: an empty list");
 });
 
 test("the notes file is written atomically at mode 600, and only its writer removes it", () => {
@@ -1237,6 +1263,332 @@ test("the archive: <meeting id>.json, atomic, mode 600 in a 700 folder, rewritte
 		assert.equal(archiveDir(), "/tmp/canvas-x/meetings");
 	} finally {
 		for (const [i, k] of ["PI_MEETING_NOTES_DIR", "PI_MEETING_NOTES_FILE", "PI_CANVAS_ROOT"].entries()) saved[i] === undefined ? delete process.env[k] : (process.env[k] = saved[i]);
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+
+// ── slide summaries ──
+
+const SUM = (n, over = {}) => ({ n, title: `Slide ${n} title`, what: `What ${n} shows.`, why: "", points: [], numbers: [], at: "2026-10-28T14:05:00-05:00", ...over });
+
+test("the setting defaults on, and PI_MEETING_SLIDES=0 (or false/off/no) turns it off", () => {
+	assert.equal(MEETING_DEFAULTS.slideSummaries, true);
+	assert.equal(meetingSettings({}).slideSummaries, true);
+	for (const v of ["0", "false", "off", "NO", " 0 "]) assert.equal(meetingSettings({ PI_MEETING_SLIDES: v }).slideSummaries, false, v);
+	assert.equal(meetingSettings({ PI_MEETING_SLIDES: "1" }).slideSummaries, true);
+});
+
+test("the slide JSON is read leniently: fences, prose, loose types; bounded; null when there is nothing", () => {
+	const ok = parseSlideReply('Sure!\n```json\n{"title":"Q3 Roadmap","what":"A table of epics.","why":"","points":["a","b","c","d","e"],"numbers":["$4M budget",12,"x"," "],"extra":1}\n```');
+	assert.deepEqual(ok, { title: "Q3 Roadmap", what: "A table of epics.", why: "", points: ["a", "b", "c", "d"], numbers: ["$4M budget", "12", "x"] });
+	// A lone string where a list belongs, no title: derived from what; long strings are clipped.
+	const loose = parseSlideReply(JSON.stringify({ what: `Rollout plan. ${"w".repeat(900)}`, why: "y".repeat(500), points: "just one", numbers: null }));
+	assert.equal(loose.title.length, 60);
+	assert.equal(loose.what.length, 500);
+	assert.equal(loose.why.length, 300);
+	assert.deepEqual([loose.points, loose.numbers], [["just one"], []]);
+	assert.equal(parseSlideReply(JSON.stringify({ title: "x".repeat(200), what: "w" })).title.length, 80);
+	assert.equal(parseSlideReply("no json here"), null);
+	assert.equal(parseSlideReply("{broken"), null);
+	assert.equal(parseSlideReply("[1,2]"), null);
+	assert.equal(parseSlideReply('{"why":"x"}'), null, "no title or description at all");
+});
+
+test("summaries read back from a file are bounded: n is an integer of 1 or more, one per n, sorted, at most 120", () => {
+	const raw = [
+		{ n: 3, title: "Three", what: "w", points: ["a", "b", "c", "d", "e"], numbers: ["1", "2", "3", "4", "5"], at: "t" },
+		{ n: 1, title: "One" },
+		{ n: 1.5, title: "no" },
+		{ n: 0, title: "no" },
+		{ n: "2", title: "no" },
+		{ n: 4, title: "", what: "" },
+		{ n: 3, title: "Three again", what: "w2" },
+		"junk",
+		null,
+	];
+	assert.deepEqual(normSlides(raw).map((s) => [s.n, s.title]), [[1, "One"], [3, "Three again"]]);
+	assert.deepEqual(normSlides(raw)[0], { n: 1, title: "One", what: "", why: "", points: [], numbers: [], at: "" });
+	assert.deepEqual(normSlides("nope"), []);
+	const many = normSlides(Array.from({ length: 150 }, (_, i) => ({ n: i + 1, title: `t${i + 1}` })));
+	assert.equal(many.length, MAX_SLIDE_SUMMARIES);
+	assert.deepEqual([many[0].n, many.at(-1).n], [31, 150], "the newest 120 are kept");
+	assert.deepEqual(withSummary([SUM(1), SUM(3)], SUM(2)).map((s) => s.n), [1, 2, 3]);
+	assert.equal(withSummary([SUM(1)], SUM(1, { title: "New" }))[0].title, "New");
+	assert.equal(withSummary(many, SUM(200)).length, MAX_SLIDE_SUMMARIES);
+});
+
+test("OCR: a leading 'Shared content |' title line is dropped, the rest trimmed and capped at 3k", () => {
+	assert.equal(cleanOcr("Shared content | Roadmap.pptx - PowerPoint\nQ3 plan\n7\nOwner: Amy\n"), "Q3 plan\n7\nOwner: Amy", "stray page numbers stay");
+	assert.equal(cleanOcr("\n  Shared content | x\n"), "");
+	assert.equal(cleanOcr("Q3 plan\nShared content | later line stays"), "Q3 plan\nShared content | later line stays");
+	assert.equal(cleanOcr("   "), "");
+	const big = cleanOcr("a".repeat(5000));
+	assert.ok(big.startsWith("a".repeat(3000)) && big.endsWith("[… cut]") && big.length < 3020);
+});
+
+test("waiting for the OCR: missing waits, 0 bytes is no text, a timeout goes on with the image alone", async () => {
+	let t = 0;
+	const sleeps = [];
+	const sleep = async (ms) => {
+		sleeps.push(ms);
+		t += ms;
+	};
+	const now = () => t;
+	// Missing twice, then there.
+	let calls = 0;
+	const late = await waitForOcr(async () => (++calls < 3 ? null : "Shared content | Teams\nHello"), { sleep, now });
+	assert.deepEqual(late, { text: "Hello", state: "ready" });
+	assert.deepEqual(sleeps, [1000, 1000]);
+	// 0 bytes: complete, no text, no waiting.
+	sleeps.length = 0;
+	assert.deepEqual(await waitForOcr(async () => "", { sleep, now }), { text: "", state: "empty" });
+	assert.deepEqual(await waitForOcr(async () => "Shared content | Window title only\n", { sleep, now }), { text: "", state: "empty" });
+	assert.deepEqual(sleeps, []);
+	// Never written: 90 s, then the image alone.
+	t = 0;
+	let reads = 0;
+	const gone = await waitForOcr(async () => (reads++, null), { sleep, now });
+	assert.deepEqual(gone, { text: "", state: "timeout" });
+	assert.equal(t, 90_000);
+	assert.ok(reads >= 90);
+	// A shorter timeout, no waiting at all (the meeting ended), an abort.
+	t = 0;
+	assert.equal((await waitForOcr(async () => null, { sleep, now, timeoutMs: 2500 })).state, "timeout");
+	assert.equal(t, 2500);
+	t = 0;
+	assert.equal((await waitForOcr(async () => null, { sleep, now, noWait: () => true })).state, "timeout");
+	assert.equal(t, 0);
+	const ac = new AbortController();
+	ac.abort();
+	assert.equal((await waitForOcr(async () => "x", { sleep, now, signal: ac.signal })).state, "aborted");
+});
+
+test("the queue: newest slide first, one at a time, one call per 10 s, 80 slides, revisits never queue", () => {
+	const w = newSlideWork();
+	for (const n of [1, 2, 3, 4]) assert.equal(queueSlide(w, n, `t${n}`, n * 1000), true);
+	assert.equal(queueSlide(w, 3, "again", 0), false, "known already");
+	assert.equal(queueSlide(w, 0, "x", 0), false);
+	const a = takeSlide(w, 100_000);
+	assert.equal(a.n, 4, "the newest first");
+	assert.equal(takeSlide(w, 100_000), undefined, "one call at a time");
+	noteSlideCall(w, 100_000);
+	slideDone(w, a);
+	assert.equal(takeSlide(w, 105_000), undefined, "not within 10 s of the last call");
+	const b = takeSlide(w, 110_000);
+	assert.equal(b.n, 3, "then backwards");
+	noteSlideCall(w, 110_000);
+	slideDone(w, b);
+	// A new slide in the meantime jumps the line.
+	queueSlide(w, 5, "t5", 5000);
+	assert.equal(takeSlide(w, 120_000).n, 5);
+	slideDone(w, { n: 5 });
+	assert.equal(queueSlide(w, 5, "t5", 5000), false, "a summarized slide is not queued again");
+	assert.deepEqual([...w.done].sort(), [3, 4, 5]);
+	// A replay at 10x: 1 s between calls.
+	assert.equal(slideGap(1), 10_000);
+	assert.equal(slideGap(10), 1000);
+	assert.equal(slideGap(100_000), 20);
+	// The cap.
+	const c = newSlideWork();
+	let queued = 0;
+	for (let n = 1; n <= 100; n++) if (queueSlide(c, n, "", 0)) queued++;
+	assert.equal(queued, SLIDE_CAP);
+	assert.equal(SLIDE_CAP, 80);
+	// Restored summaries count against the cap, and are never queued.
+	const r = newSlideWork();
+	markSlideDone(r, 2);
+	assert.equal(queueSlide(r, 2, "", 0), false);
+	assert.equal(r.seen, 1);
+	queueSlide(r, 1, "", 0);
+	markSlideDone(r, 1);
+	assert.equal(takeSlide(r, 100_000), undefined, "a restored slide leaves the queue");
+});
+
+test("failures: back off, retry later, give up after three, no retry storm", () => {
+	const w = newSlideWork();
+	queueSlide(w, 1, "", 0);
+	queueSlide(w, 2, "", 0);
+	let job = takeSlide(w, 100_000);
+	assert.equal(job.n, 2);
+	noteSlideCall(w, 100_000);
+	assert.equal(slideFailed(w, job, 100_000, 60_000), "retry");
+	assert.equal(takeSlide(w, 130_000), undefined, "on hold: not even the other slide goes");
+	job = takeSlide(w, 160_000);
+	assert.equal(job.n, 2, "after the backoff the newest due slide goes again");
+	noteSlideCall(w, 160_000);
+	assert.equal(slideFailed(w, job, 160_000, 120_000), "retry");
+	assert.equal(w.streak, 2);
+	job = takeSlide(w, 280_000);
+	assert.equal(job.n, 2);
+	noteSlideCall(w, 280_000);
+	assert.equal(slideFailed(w, job, 280_000, 240_000), "gave-up");
+	assert.deepEqual([...w.failed], [2]);
+	assert.equal(queueSlide(w, 2, "", 0), false, "a given-up slide never comes back");
+	assert.equal(takeSlide(w, 300_000), undefined, "still on hold for the other slide");
+	job = takeSlide(w, 520_000);
+	assert.equal(job.n, 1);
+	noteSlideCall(w, 520_000);
+	slideDone(w, job);
+	assert.deepEqual([w.streak, w.holdUntil], [0, 0], "a success clears the backoff");
+});
+
+test("the talk around a slide: 90 s before and after, whatever exists, capped", () => {
+	const lines = ["[a] 10:00", "[b] 10:01", "[c] 10:03", "[d] 10:04:10", "[e] 10:05", "[f] 10:06:10", "[g] 10:08", "[h] unknown"];
+	const ms = ["10:00:00", "10:01:00", "10:03:00", "10:04:10", "10:05:00", "10:06:10", "10:08:00"].map((t) => Date.parse(`2026-10-28T${t}-05:00`)).concat(0);
+	const shown = Date.parse("2026-10-28T10:05:00-05:00");
+	const near = nearbyLines(lines, ms, shown);
+	assert.deepEqual(near.before, ["[d] 10:04:10", "[e] 10:05"], "90 s back, the moment itself included; lines of unknown time are skipped");
+	assert.deepEqual(near.after, ["[f] 10:06:10"], "90 s ahead: later lines don't exist yet or are too far");
+	assert.deepEqual(nearbyLines(lines, ms, 0), { before: [], after: [] });
+	// A talkative minute: the newest 30 before, the first 30 after.
+	const talk = Array.from({ length: 80 }, (_, i) => `[l${i}]`);
+	const when = talk.map((_, i) => shown - 80_000 + i * 2000);
+	const crowd = nearbyLines(talk, when, shown);
+	assert.equal(crowd.before.length, 30);
+	assert.equal(crowd.before.at(-1), "[l40]");
+	assert.equal(crowd.after.length, 30);
+	assert.equal(crowd.after[0], "[l41]");
+});
+
+test("the slide prompt: the meeting, who you are, what you work on, the OCR, the talk around it, previous titles", () => {
+	const system = buildSlideSystem("Eric Boehs", ["eric", "boehs"], "Engineer on the platform team.");
+	assert.match(system, /^You describe one slide from a meeting Eric Boehs is sitting in/);
+	assert.match(system, /Eric Boehs may be called eric or boehs/);
+	assert.match(system, /<about>\nEngineer on the platform team\.\n<\/about>/);
+	assert.match(system, /"why": ONE sentence.*"" \(empty\) is the normal answer.*Do not invent relevance/s);
+	assert.match(system, /at most 4 key takeaways/);
+	assert.match(system, /no speculation/);
+	assert.match(system, /JSON only/);
+
+	const digest = formatDigest(sessionDigest([{ type: "message", message: { role: "user", content: "fix the canary config" } }], "earl"));
+	const user = buildSlidePrompt({
+		title: "Platform Weekly",
+		app: "Teams",
+		focus: "learn the rollout date",
+		me: "Eric Boehs",
+		digest,
+		n: 3,
+		shownAt: "14:12:10",
+		ocr: { text: "Q3 rollout\nCanary 10/28", state: "ready" },
+		before: ["[14:11:30] Ada: next slide please"],
+		after: ["[14:12:30] Ada: so canary goes Thursday"],
+		previous: [{ n: 1, title: "Agenda" }, { n: 2, title: "Status" }],
+	});
+	assert.match(user, /^Meeting: Platform Weekly \(Teams\)\nEric Boehs's goals for this meeting: learn the rollout date\n\n<session>\nWhat the user is working on right now, from their pi session "earl":\nTheir last messages:\n- fix the canary config\n<\/session>\n/);
+	assert.match(user, /<previous_slides>\nTitles of the slides before this one, for continuity:\n1\. Agenda\n2\. Status\n<\/previous_slides>/);
+	assert.match(user, /This is slide 3, which came up at 14:12:10\. Its image is attached\.\n<ocr>\nQ3 rollout\nCanary 10\/28\n<\/ocr>/);
+	assert.match(user, /<said_before>\n\[14:11:30\] Ada: next slide please\n<\/said_before>\n<said_after>\n\[14:12:30\] Ada: so canary goes Thursday\n<\/said_after>\n\nDescribe the slide\.$/);
+	// No OCR text, and no OCR at all.
+	assert.match(buildSlidePrompt({ ...base(), ocr: { text: "", state: "empty" } }), /<ocr>\n\(the OCR found no text on this slide\)\n<\/ocr>/);
+	const none = buildSlidePrompt({ ...base(), ocr: { text: "", state: "timeout" } });
+	assert.match(none, /<ocr>\n\(the OCR text was not ready: go by the image\)\n<\/ocr>/);
+	assert.doesNotMatch(none, /<said_before>|<said_after>|<previous_slides>|<session>|goals for this meeting/);
+	function base() {
+		return { title: "T", app: "", focus: "", me: "", digest: "", n: 1, shownAt: "", before: [], after: [], previous: [] };
+	}
+});
+
+test("summary text for the tool and the scout; searching a summary matches every word", () => {
+	const s = SUM(3, { title: "Q3 Roadmap", what: "Epics by quarter.", why: "Your canary move is on it.", points: ["Canary first"], numbers: ["Oct 28 cutover"] });
+	assert.deepEqual(formatSlideSummary(s), ["Summary: Q3 Roadmap", "What it shows: Epics by quarter.", "Why it matters to you: Your canary move is on it.", "Key points:", "- Canary first", "Numbers:", "- Oct 28 cutover"]);
+	assert.deepEqual(formatSlideSummary(SUM(1, { title: "T", what: "" })), ["Summary: T"], "empty parts are left out");
+	assert.equal(summaryMatches(s, "ROADMAP canary"), true);
+	assert.equal(summaryMatches(s, "oct cutover"), true, "numbers too");
+	assert.equal(summaryMatches(s, "roadmap kubernetes"), false);
+});
+
+test("the scout is told the summary (title, what, why) for slides that have one, raw OCR for the rest", () => {
+	const t = formatSlides([
+		{ n: 1, at: "14:01:00", text: "raw agenda text", onScreen: false },
+		{ n: 2, at: "14:10:00", text: "", onScreen: false, summary: { title: "Status", what: "Red/green table.", why: "" } },
+		{ n: 3, at: "14:14:00", text: "", onScreen: true, summary: { title: "Q3 plan", what: "Epics.", why: "Your canary move is on it." } },
+	]);
+	assert.equal(t, ["<slides>", "What the slides shown so far say:", "Slide 3 (14:14:00), on screen now (summary):", "Q3 plan: Epics. Why it matters: Your canary move is on it.", "Slide 2 (14:10:00) (summary):", "Status: Red/green table.", "Slide 1 (14:01:00):", "raw agenda text", "</slides>"].join("\n"));
+});
+
+test("the notes file and the archive carry slides: sorted, bounded; restore and readArchivedSlides read them back", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-slides-"));
+	const saved = [process.env.PI_MEETING_NOTES_DIR, process.env.PI_MEETING_NOTES_FILE];
+	process.env.PI_MEETING_NOTES_DIR = path.join(dir, "meetings");
+	process.env.PI_MEETING_NOTES_FILE = path.join(dir, ".meeting-notes.json");
+	try {
+		const startedAt = "2026-10-28T14:00:00-05:00";
+		const slides = [SUM(5, { why: "relevant", points: ["p"], numbers: ["n"] }), SUM(2), ...Array.from({ length: 150 }, (_, i) => SUM(i + 10))];
+		const f = buildNotesFile({ pid: 5, sessionId: "s", sessionName: "", startedAt, appId: "teams", title: "T", at: "A", ended: false, me: [], notes: emptyNotes(), reply: null, alerts: [], alertSeq: 0, slides });
+		assert.equal(f.slides.length, 120);
+		assert.deepEqual(f.slides.slice(0, 1).map((s) => s.n), [40], "the newest 120 by number");
+		const small = buildNotesFile({ ...{ pid: 5, sessionId: "s", sessionName: "", startedAt, appId: "teams", title: "T", at: "A", ended: false, me: [], notes: emptyNotes(), reply: null, alerts: [], alertSeq: 0 }, slides: slides.slice(0, 2) });
+		assert.deepEqual(small.slides.map((s) => s.n), [2, 5], "sorted by n");
+		assert.deepEqual(Object.keys(small.slides[0]), ["n", "title", "what", "why", "points", "numbers", "at"]);
+		writeNotesFile(small);
+		writeNotesArchive(small);
+		assert.deepEqual(JSON.parse(fs.readFileSync(path.join(process.env.PI_MEETING_NOTES_DIR, `${meetingId("teams", startedAt)}.json`), "utf8")).slides, small.slides, "the archive has them too");
+		assert.deepEqual(restoreNotes(startedAt).slides, small.slides, "a reload gets them back");
+		assert.deepEqual(readArchivedSlides("teams", startedAt), small.slides);
+		assert.deepEqual(readArchivedSlides("zoom", startedAt), [], "another meeting has none");
+		assert.deepEqual(readArchivedSlides("teams", ""), []);
+		// An older file without slides restores with none.
+		const old = JSON.parse(fs.readFileSync(process.env.PI_MEETING_NOTES_FILE, "utf8"));
+		delete old.slides;
+		fs.writeFileSync(process.env.PI_MEETING_NOTES_FILE, JSON.stringify(old));
+		assert.deepEqual(restoreNotes(startedAt).slides, []);
+	} finally {
+		for (const [i, k] of ["PI_MEETING_NOTES_DIR", "PI_MEETING_NOTES_FILE"].entries()) saved[i] === undefined ? delete process.env[k] : (process.env[k] = saved[i]);
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("the recap lists slides that matter to you (n. title — why), at most 8; none when no slide has a reason", () => {
+	const slides = [SUM(1), SUM(2, { why: "Your canary move is on it." }), SUM(3, { title: "", what: "A chart.", why: "Amy owns it." }), ...Array.from({ length: 10 }, (_, i) => SUM(i + 4, { why: `reason ${i + 4}` }))];
+	const body = recapBody(meetingNotes, null, slides);
+	const at = body.indexOf("Slides:");
+	assert.ok(at > body.indexOf("Open questions:"));
+	assert.deepEqual(body.slice(at), ["Slides:", "2. Slide 2 title — Your canary move is on it.", "3. A chart. — Amy owns it.", "4. Slide 4 title — reason 4", "5. Slide 5 title — reason 5", "6. Slide 6 title — reason 6", "7. Slide 7 title — reason 7", "8. Slide 8 title — reason 8", "9. Slide 9 title — reason 9"]);
+	assert.equal(recapBody(meetingNotes, null, [SUM(1), SUM(2)]).includes("Slides:"), false, "no why, no Slides section");
+	assert.deepEqual(recapBody(emptyNotes(), null, [SUM(2, { why: "x" })]), ["Slides:", "2. Slide 2 title — x"]);
+	assert.equal(recapBlock({ title: "T", file, from: "", to: "", updates: 1, notes: meetingNotes, slides }).includes("\nSlides:\n2. Slide 2 title"), true);
+});
+
+test("the OCR wait counts from when the slide appeared (live), and is scaled and pickup-based for a replay", () => {
+	const now = 1_000_000_000;
+	assert.equal(ocrTimeout(now - 1000, now), OCR_WAIT_MS - 1000, "a slide 1 s old has 89 s left");
+	assert.equal(ocrTimeout(now - 2 * 60_000, now), 0, "shown minutes ago (a reload's catch-up): no wait at all");
+	assert.equal(ocrTimeout(now - OCR_WAIT_MS, now), 0);
+	assert.equal(ocrTimeout(now + 60_000, now), OCR_WAIT_MS, "a clock ahead never waits longer than 90 s");
+	assert.equal(ocrTimeout(0, now), OCR_WAIT_MS, "no time known: the full wait");
+	assert.equal(ocrTimeout(now - 2 * 60_000, now, 10, true), 9000, "a replay: its own times mean nothing here; 90 s scaled by the speed");
+	assert.equal(ocrTimeout(now, now, 1_000_000, true), 500, "with a floor");
+});
+
+test("slides that will get no summary (given up on, or past the cap) are listed for the canvas, bounded and sorted", () => {
+	const w = newSlideWork();
+	for (let n = 1; n <= SLIDE_CAP + 3; n++) queueSlide(w, n, "", 0);
+	assert.deepEqual([...w.failed].sort((a, b) => a - b), [SLIDE_CAP + 1, SLIDE_CAP + 2, SLIDE_CAP + 3], "the ones past the cap");
+	assert.equal(queueSlide(w, SLIDE_CAP + 1, "", 0), false);
+	assert.deepEqual(normFailed(new Set([5, 2, 2, 0, -1, 1.5, "3", null, 9])), [2, 5, 9]);
+	assert.deepEqual(normFailed("nope"), []);
+	assert.equal(normFailed(Array.from({ length: 300 }, (_, i) => i + 1)).length, MAX_SLIDE_SUMMARIES);
+	assert.equal(normFailed(Array.from({ length: 300 }, (_, i) => i + 1)).at(-1), 300, "the highest are kept");
+});
+
+test("the notes file and the archive say whether summaries run and which slides were given up on; a reload gets the list back", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-slides-on-"));
+	const saved = process.env.PI_MEETING_NOTES_FILE;
+	process.env.PI_MEETING_NOTES_FILE = path.join(dir, ".meeting-notes.json");
+	try {
+		const startedAt = "2026-10-28T14:00:00-05:00";
+		const base = { pid: 5, sessionId: "s", sessionName: "", startedAt, appId: "teams", title: "T", at: "A", ended: false, me: [], notes: emptyNotes(), reply: null, alerts: [], alertSeq: 0 };
+		const off = buildNotesFile(base);
+		assert.equal(off.slidesOn, false);
+		assert.deepEqual(off.slidesFailed, []);
+		const on = buildNotesFile({ ...base, slidesOn: true, slidesFailed: new Set([7, 3, 3, 0]) });
+		assert.equal(on.slidesOn, true);
+		assert.deepEqual(on.slidesFailed, [3, 7]);
+		writeNotesFile(on);
+		assert.deepEqual(restoreNotes(startedAt).failed, [3, 7]);
+	} finally {
+		saved === undefined ? delete process.env.PI_MEETING_NOTES_FILE : (process.env.PI_MEETING_NOTES_FILE = saved);
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
 });

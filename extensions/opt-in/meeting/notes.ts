@@ -21,6 +21,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { estTokens, PROMPT_MAX_TOKENS } from "../watch/models.ts";
 import { meetingId, writeAtomic } from "./capture.ts";
+import { normFailed, normSlides, type SlideSummary } from "./slides.ts";
 
 // ── the notes ────────────────────────────────────────────────────────────────
 
@@ -320,22 +321,28 @@ export function formatDigest(d: SessionDigest | undefined): string {
 	].join("\n");
 }
 
-export type SlideText = { n: number; at: string; text: string; onScreen: boolean };
+export type SlideText = { n: number; at: string; text: string; onScreen: boolean; summary?: { title: string; what: string; why: string } };
 export const SLIDE_OCR_CHARS = 4000;
 
-/** OCR text of the slides shown so far, newest first, under `cap` characters in all. */
+/** A slide's summary as the scout reads it: title, what it shows, and why it matters to you when there is a reason. */
+const summaryText = (s: { title: string; what: string; why: string }) => [s.title, s.what].filter(Boolean).join(": ") + (s.why ? ` Why it matters: ${s.why}` : "");
+
+/**
+ * The slides shown so far, newest first, under `cap` characters in all: a
+ * slide's summary (title, what, why) where it has one, else its raw OCR text.
+ */
 export function formatSlides(slides: readonly SlideText[], cap = SLIDE_OCR_CHARS): string {
 	const out: string[] = [];
 	let left = cap;
 	for (const s of [...slides].reverse()) {
-		const text = s.text.trim();
+		const text = (s.summary ? summaryText(s.summary) : s.text).trim();
 		if (!text || left <= 0) continue;
-		const head = `Slide ${s.n}${s.at ? ` (${s.at})` : ""}${s.onScreen ? ", on screen now" : ""}:`;
+		const head = `Slide ${s.n}${s.at ? ` (${s.at})` : ""}${s.onScreen ? ", on screen now" : ""}${s.summary ? " (summary)" : ""}:`;
 		const body = text.length > left ? `${text.slice(0, left)}\n[… cut]` : text;
 		out.push(`${head}\n${body}`);
 		left -= text.length;
 	}
-	return out.length ? ["<slides>", "Text on the slides shown so far:", ...out, "</slides>"].join("\n") : "";
+	return out.length ? ["<slides>", "What the slides shown so far say:", ...out, "</slides>"].join("\n") : "";
 }
 
 export type NotesInput = {
@@ -529,6 +536,9 @@ export type NotesFile = {
 	reply: { to: string; text: string; at: string } | null;
 	alerts: Alert[];
 	alertSeq: number; // the last alert id's number: ids keep counting after a reload
+	slides: SlideSummary[]; // slide summaries, sorted by n (see slides.ts)
+	slidesOn: boolean; // slide summaries are running for this meeting (setting on, a model that reads images)
+	slidesFailed: number[]; // slides that will not get one: given up on, or past the cap
 };
 
 export function buildNotesFile(i: {
@@ -545,6 +555,9 @@ export function buildNotesFile(i: {
 	reply: { to: string; text: string; at: string } | null;
 	alerts: readonly Alert[];
 	alertSeq: number;
+	slides?: readonly SlideSummary[];
+	slidesOn?: boolean;
+	slidesFailed?: Iterable<number>;
 }): NotesFile {
 	return {
 		v: 1,
@@ -561,6 +574,9 @@ export function buildNotesFile(i: {
 		reply: i.reply,
 		alerts: i.alerts.slice(-ALERTS_KEPT),
 		alertSeq: i.alertSeq,
+		slides: normSlides(i.slides ?? []),
+		slidesOn: i.slidesOn === true,
+		slidesFailed: normFailed(i.slidesFailed ? [...i.slidesFailed] : []),
 	};
 }
 
@@ -595,17 +611,24 @@ export function writeNotesArchive(f: NotesFile): void {
 }
 
 /** What a new instance takes back from the notes file of the meeting it is joining. */
-export type Restored = { notes: Notes; reply: { to: string; text: string; at: string } | null; alerts: Alert[]; alertSeq: number; alerted: Set<string> };
+export type Restored = { notes: Notes; reply: { to: string; text: string; at: string } | null; alerts: Alert[]; alertSeq: number; alerted: Set<string>; slides: SlideSummary[]; failed: number[] };
 
 const isoAt = (v: unknown) => clip(v, 40);
 
 /**
  * The notes a previous instance wrote for this same meeting (started_at matches),
- * or null. After a /reload, /resume or /fork the scout would otherwise start from
+ * or null (then the archived notes for this meeting, when appId is given). After a /reload, /resume or /fork the scout would otherwise start from
  * nothing and alert again for every action already on you. The file is ours to
  * trust only as far as its shape: every field is clipped and bounded.
  */
-export function restoreNotes(startedAt: string, file = notesPath()): Restored | null {
+export function restoreNotes(startedAt: string, file = notesPath(), appId?: string): Restored | null {
+	const live = restoreFrom(startedAt, file);
+	if (live || appId === undefined || !startedAt) return live;
+	// The live file is gone (`/meeting watch off`, a restart): the archive still has this meeting's notes, so the next archive write doesn't replace them with empty ones.
+	return restoreFrom(startedAt, path.join(archiveDir(), `${meetingId(appId, startedAt)}.json`));
+}
+
+function restoreFrom(startedAt: string, file: string): Restored | null {
 	let raw: Record<string, unknown>;
 	try {
 		raw = rec(JSON.parse(fs.readFileSync(file, "utf8")));
@@ -642,7 +665,17 @@ export function restoreNotes(startedAt: string, file = notesPath()): Restored | 
 	const alertSeq = Math.max(Number.isInteger(raw.alertSeq) ? (raw.alertSeq as number) : 0, ...alerts.map((a) => seqOf(a.id)));
 	// Already told about: every action on you in the notes, and every action alert still in the file.
 	const alerted = new Set([...notes.actions.filter((a) => a.mine).map((a) => normText(a.what)), ...alerts.filter((a) => a.kind === "action").map((a) => normText(a.text))]);
-	return { notes, reply, alerts, alertSeq, alerted };
+	return { notes, reply, alerts, alertSeq, alerted, slides: normSlides(raw.slides), failed: normFailed(raw.slidesFailed) };
+}
+
+/** The slide summaries archived for a meeting (<archive>/<id>.json); [] when there is no archive or it can't be read. */
+export function readArchivedSlides(appId: string, startedAt: string): SlideSummary[] {
+	if (!startedAt) return [];
+	try {
+		return normSlides(rec(JSON.parse(fs.readFileSync(path.join(archiveDir(), `${meetingId(appId, startedAt)}.json`), "utf8"))).slides);
+	} catch {
+		return [];
+	}
 }
 
 /** Delete the file if this session wrote it (another session's notes stay). */
@@ -705,14 +738,17 @@ export function widgetLines(v: WidgetView, theme: Pick<Theme, "fg">, width: numb
 
 // ── the recap ────────────────────────────────────────────────────────────────
 
+export const RECAP_SLIDES = 8; // slides listed in the recap: only those with a reason they matter
+
 const paren = (bits: (string | undefined)[]) => {
 	const s = bits.filter(Boolean).join("; ");
 	return s ? ` (${s})` : "";
 };
 
 /** The notes as plain markdown that reads the same in a terminal and in Obsidian: Topics, Decisions, Action items (yours first, starred), Open questions. */
-export function recapBody(n: Notes, reply?: Reply | null): string[] {
-	if (!hasNotes(n) && !reply) return ["No notes were taken."];
+export function recapBody(n: Notes, reply?: Reply | null, slides: readonly SlideSummary[] = []): string[] {
+	const slideLines = slides.filter((s) => s.why).slice(0, RECAP_SLIDES).map((s) => `${s.n}. ${s.title || s.what} — ${s.why}`);
+	if (!hasNotes(n) && !reply && !slideLines.length) return ["No notes were taken."];
 	const section = (label: string, items: string[]) => (items.length ? [label, ...items, ""] : []);
 	const who = (a: Action) => `${a.who ? `${a.who}: ` : ""}${a.what}${a.by ? ` (from ${a.by})` : ""}`;
 	const out = [
@@ -720,6 +756,7 @@ export function recapBody(n: Notes, reply?: Reply | null): string[] {
 		...section("Decisions:", n.decisions.map((d) => `- ${d.text}`)),
 		...section("Action items:", [...n.actions.filter((a) => a.mine), ...n.actions.filter((a) => !a.mine)].map((a) => `- ${a.mine ? "★ " : ""}${who(a)}`)),
 		...section("Open questions:", n.questions.map((q) => `- ${q.q}${paren([q.why])}`)),
+		...section("Slides:", slideLines),
 		...(reply ? [`Suggested reply${reply.to ? ` to ${reply.to}` : ""}: ${reply.text}`, ""] : []),
 	];
 	while (out.at(-1) === "") out.pop();
@@ -729,7 +766,7 @@ export function recapBody(n: Notes, reply?: Reply | null): string[] {
 /** Hidden marker that ties a daily-note block to its capture, so a rewrite replaces it. */
 export const recapMarker = (file: string) => `<!-- meeting-copilot:${path.basename(file).replace(/\.(jsonl|txt)$/, "")} -->`;
 
-export type RecapInput = { title: string; file: string; from: string; to: string; updates: number; notes: Notes };
+export type RecapInput = { title: string; file: string; from: string; to: string; updates: number; notes: Notes; slides?: readonly SlideSummary[] };
 
 export function recapBlock(r: RecapInput): string {
 	const span = [r.from, r.to].filter(Boolean).join("–");
@@ -738,6 +775,6 @@ export function recapBlock(r: RecapInput): string {
 		recapMarker(r.file),
 		`Transcript: \`${r.file.replace(/\.jsonl$/, ".txt").replace(os.homedir(), "~")}\` · ${plural(r.updates, "notes update")}`,
 		"",
-		...recapBody(r.notes),
+		...recapBody(r.notes, null, r.slides),
 	].join("\n");
 }

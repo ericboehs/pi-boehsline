@@ -172,6 +172,8 @@ dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: h
 .m-slide { display: block; position: relative; }
 .m-slide img { display: block; width: 100%; max-height: 160px; object-fit: contain; background: var(--soft); border-radius: 6px; }
 .m-slide span { position: absolute; left: 6px; bottom: 5px; font: 600 10.5px/1 ui-monospace, Menlo, monospace; color: #fff; background: rgb(0 0 0 / .55); padding: 2px 5px; border-radius: 3px; }
+.m-sum { line-height: 1.4; font-size: 12.5px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.m-sum b { font-weight: 600; margin-right: 4px; }
 .m-lines { display: flex; flex-direction: column; gap: 3px; }
 .m-line { line-height: 1.4; display: block; }
 .m-line b { font-weight: 600; margin-right: 5px; }
@@ -2630,6 +2632,10 @@ function renderMeeting(m) {
   }
   if (m.slide && m.id) {
     out.push(h("a", { class: "m-slide", href: "/meeting", target: "_blank", title: "Open the live view" }, h("img", { src: `/meeting/${encodeURIComponent(m.id)}/slide/${m.slide.n}${m.slide.thumb ? ".thumb" : ""}.jpg`, alt: `Slide ${m.slide.n}`, loading: "lazy" }), h("span", {}, `slide ${m.slide.n}`)));
+    // The copilot's summary of this slide: its title, then why it matters to you (or what it shows), two lines at most. Nothing until there is one.
+    const sum = m.slide.summary && typeof m.slide.summary === "object" ? m.slide.summary : null;
+    const sumText = sum ? sum.why || sum.what || "" : "";
+    if (sum && (sum.title || sumText)) out.push(h("div", { class: "m-sum", title: [sum.title, sum.what, sum.why].filter(Boolean).join("\n") }, sum.title ? h("b", {}, sum.title) : null, sumText));
   }
   out.push(meetLines(seedMeetTail(m)));
   out.push(h("div", { class: "m-links" }, h("a", { class: "m-open", href: "/meeting", target: "_blank" }, "Open the live view ↗"), h("a", { class: "m-open", href: "/meetings", target: "_blank" }, "Previous meetings ↗")));
@@ -2696,7 +2702,7 @@ async function pumpMeetTail() {
   const t = meetTail;
   const since = t.total;
   try {
-    // ?tail=1: only {id, from, total, entries, live}, not the slide list or notes.
+    // ?tail=1: only {id, from, total, entries, live}, not the slide list, notes and summaries.
     const r = await fetch(`/api/meeting?tail=1&since=${since}&id=${encodeURIComponent(t.id)}`, { cache: "no-store" });
     const d = await r.json();
     // A render re-seeded the tail while this was in flight: the answer is for an older cursor.

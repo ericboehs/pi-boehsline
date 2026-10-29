@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
@@ -464,7 +464,10 @@ function writeMeeting(dir, base, { title = "Weekly Sync", app = "Microsoft Teams
     recs.push({ type: "slide", slide: n, file: join(sdir, `${f}.jpg`), ts: at("14:05:00") });
   }
   if (stopped) recs.push({ type: "metadata", event: "stopped", stopped_at: stopped.at, duration: stopped.duration });
-  writeFileSync(join(dir, `${base}.jsonl`), recs.map((r) => JSON.stringify(r)).join("\n") + "\n");
+  let body = recs.map((r) => JSON.stringify(r)).join("\n") + "\n";
+  // Under 300 bytes is a stub the history hides: a real meeting is longer, so pad the small fixtures with a record the feed ignores.
+  if (body.length < 300) body += line({ type: "pad", text: "x".repeat(300) });
+  writeFileSync(join(dir, `${base}.jsonl`), body);
 }
 
 /** A meeting file over 20 MB: header, ~21 MB of captions saying "pipeline", then people and stopped (so the head and the tail say what the list needs). */
@@ -538,7 +541,7 @@ test("history: newest first, ended / crashed / filename-only, app_id from the me
   const h = history();
   try {
     const list = h.feed.history();
-    assert.deepEqual(list.map((m) => m.title), ["Weekly Sync", "Standup", "design review", "Retro"], "only <date>_<time>-… .jsonl files, newest first");
+    assert.deepEqual(list.map((m) => m.title), ["Weekly Sync", "Standup", "Design review", "Retro"], "only <date>_<time>-… .jsonl files, newest first; a title made from the slug starts with a capital");
     const [sync, standup, design, retro] = list;
     assert.deepEqual([sync.app, sync.started_at, sync.ended_at, sync.duration, sync.live], ["Microsoft Teams", at("14:00:00"), at("14:32:10"), "0:32:10", false]);
     assert.deepEqual([sync.people, sync.names.length, sync.slides, sync.captions, sync.thumb, sync.notes], [10, 8, 2, 3, true, null], "three captions; names capped at 8");
@@ -552,7 +555,7 @@ test("history: newest first, ended / crashed / filename-only, app_id from the me
     assert.equal(retro.duration, "0:45:00");
     assert.equal(JSON.stringify(list).includes(h.root), false, "no paths");
     // Paging.
-    assert.deepEqual(h.feed.history({ limit: 2, offset: 1 }).map((m) => m.title), ["Standup", "design review"]);
+    assert.deepEqual(h.feed.history({ limit: 2, offset: 1 }).map((m) => m.title), ["Standup", "Design review"]);
     assert.equal(h.feed.total(), 4);
     // Metadata app_id wins over the file name.
     writeMeeting(h.dir, "20261029_090000-teams-odd", { appId: "webex", title: "Odd", start: at("09:00:00", "2026-10-29") });
@@ -708,6 +711,37 @@ test("search: every term must match (one line, or the title, people and notes), 
   }
 });
 
+test("search: chat lines are searched too: the line says type chat, fields says chat (and transcript when a caption matched as well)", () => {
+  const f = fixture();
+  const dir = join(f.root, "hist-chat");
+  // writeMeeting makes every fifth line (the fifth, tenth…) a chat message.
+  writeMeeting(dir, "20261028_140000-teams-weekly-sync", {
+    appId: "teams",
+    stopped: { at: at("14:32:10"), duration: "0:32:10" },
+    lines: [
+      ["Ada Lovelace", "Morning everyone"],
+      ["Alan Turing", "Let us start with the runbook"],
+      ["Ada Lovelace", "Fine by me"],
+      ["Alan Turing", "Okay"],
+      ["Grace Hopper", "Paste the https://example.com/wiki/runbook link here"],
+    ],
+  });
+  try {
+    const feed = new MeetingFeed(f.state, { alive: () => true, dataDir: dir, now: () => Date.parse(at("15:00:00")) });
+    const both = feed.search("runbook")[0];
+    assert.deepEqual(both.lines.map((l) => [l.type, l.speaker, l.i]), [["caption", "Alan Turing", 1], ["chat", "Grace Hopper", 4]]);
+    assert.deepEqual([both.hits, both.fields], [2, ["transcript", "chat"]], "a caption and a chat line both matched");
+    const chatOnly = feed.search("wiki")[0];
+    assert.deepEqual(chatOnly.lines.map((l) => [l.type, l.speaker, l.i]), [["chat", "Grace Hopper", 4]]);
+    assert.deepEqual(chatOnly.fields, ["chat"], "only a chat line matched");
+    assert.deepEqual(feed.search("morning")[0].fields, ["transcript"]);
+    assert.equal(feed.search("morning")[0].lines[0].type, "caption");
+    assert.equal(feed.snapshot(0, chatOnly.id).entries[4].type, "chat", "i is the chat entry's index, so #e4 jumps to it");
+  } finally {
+    f.done();
+  }
+});
+
 test("search: three lines per meeting at most, hits counts them all; long lines are cut around the match; big files are skipped", () => {
   const f = fixture();
   try {
@@ -820,10 +854,10 @@ test("the first scan is spread over calls: newest first, partial until done, and
     assert.equal(cold.find("0123456789ab"), undefined);
     assert.equal(parsed().length <= before + 1, true, "an unknown id parses nothing itself (the scan's own one-file step aside)");
     // The file named by the filename stamp alone (no metadata) is found by the same derived id.
-    const noMeta = full.find((m) => m.title === "design review");
+    const noMeta = full.find((m) => m.title === "Design review");
     const cold2 = new MeetingFeed(h.state, { alive: () => true, dataDir: h.dir, now: () => Date.parse(at("15:00:00")), scanBudgetMs: 0 });
     cold2.listing();
-    assert.equal(cold2.find(noMeta.id)?.title, "design review");
+    assert.equal(cold2.find(noMeta.id)?.title, "Design review");
 
     // A file that changed keeps its old row while the scan catches up.
     const warm = new MeetingFeed(h.state, { alive: () => true, dataDir: h.dir, now: () => Date.parse(at("15:00:00")), scanBudgetMs: 1e9 });
@@ -1029,7 +1063,7 @@ test("card summary: recent is the newest four; live, just ended, or just the lis
     assert.equal(h.feed.state, null);
     let s = h.feed.summary();
     assert.deepEqual([s.kind, s.recording, s.id, s.recent.length], ["list", false, "", 4]);
-    assert.deepEqual(s.recent.map((m) => m.title), ["Weekly Sync", "Standup", "design review", "Old 2"]);
+    assert.deepEqual(s.recent.map((m) => m.title), ["Weekly Sync", "Standup", "Design review", "Old 2"]);
     assert.equal(JSON.stringify(s).includes(h.root), false);
     // Live: today's card plus the list.
     h.writeState({ app_id: "teams", started_at: at("15:00:00"), meeting: "Now", jsonl: join(h.dir, "20261028_150000-teams-now.jsonl") });
@@ -1094,7 +1128,7 @@ test("daemon: /meetings, /api/meetings, /api/meetings/search, past /api/meeting?
     const sync = d.meetings[0];
     writeFileSync(join(notesDir, `${sync.id}.json`), JSON.stringify(rawNotes({ pid: 1, ended: true })));
     const paged = await get("/api/meetings?limit=2&offset=1").then((r) => r.json());
-    assert.deepEqual([paged.meetings.map((m) => m.title), paged.more], [["Standup", "design review"], true]);
+    assert.deepEqual([paged.meetings.map((m) => m.title), paged.more], [["Standup", "Design review"], true]);
     assert.equal((await get("/api/meetings?limit=1000").then((r) => r.json())).meetings.length, 4, "limit is capped, not an error");
     assert.equal((await get("/api/meetings?limit=-5&offset=abc").then((r) => r.json())).meetings.length, 4);
 
@@ -1137,7 +1171,7 @@ after(() => windows.forEach((w) => w.close())); // the pages' timers would hold 
 const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
 /** Run one of the page modules (plain scripts apart from comments) in a fresh jsdom with canned API answers. */
-async function runPage(name, { url, api }) {
+async function runPage(name, { url, api, before }) {
   const dom = new JSDOM('<!doctype html><body><div id="app"></div></body>', { url, runScripts: "outside-only", pretendToBeVisual: true });
   const w = dom.window;
   windows.push(w);
@@ -1147,15 +1181,19 @@ async function runPage(name, { url, api }) {
     const body = await api(String(u));
     return { ok: true, json: async () => body };
   };
+  const es = {};
   w.EventSource = class {
-    addEventListener() {}
+    addEventListener(name, fn) {
+      es[name] = fn;
+    }
   };
   w.Element.prototype.scrollIntoView = function () {
     this.dataset.scrolled = "1";
   };
+  before?.(w);
   w.eval(pageSource(name));
   await tick();
-  return { w, doc: w.document, calls };
+  return { w, doc: w.document, calls, es };
 }
 
 const entry = (over = {}) => ({ id: "aaaaaaaaaaaa", title: "Weekly Sync", app: "Microsoft Teams", started_at: new Date().toISOString(), ended_at: new Date().toISOString(), duration: "0:32:10", live: false, people: 3, names: [], slides: 2, captions: 5, thumb: true, notes: { actions: 3, mine: 2, topics: ["Cert rotation", "Canary", "A", "B"] }, ...over });
@@ -1249,6 +1287,182 @@ test("meeting page: an unknown id says Meeting not found, with a way back", asyn
   assert.equal(empty.querySelector("a").getAttribute("href"), "/meetings");
 });
 
+test("meeting page: chat has its own box, out of the transcript; links, filter, names, unread badge on the Chat tab, #e jumps", async () => {
+  const state = { title: "Weekly Sync", app: "Teams", startedAt: "2026-10-28T14:00:00Z", recording: true, ended: false, crashed: false, endedAt: "", duration: "", hasTranscript: true, hasSlides: false };
+  const notes = { session: "earl", at: "2026-10-28T14:03:00Z", ended: false, me: ["eric"], topics: [], decisions: [], actions: [], questions: [], reply: null, alerts: [], slidesOn: false, slidesFailed: [] };
+  const cap = (speaker, text, m) => ({ type: "caption", speaker, text, ts: `2026-10-28T14:0${m}:00Z` });
+  const chat = (speaker, text, m) => ({ type: "chat", speaker, text, ts: `2026-10-28T14:0${m}:30Z` });
+  const first = [cap("Ada", "Hello team", 1), chat("Grace", "Runbook: https://example.com/wiki/runbook. Also javascript:alert(1) and <b>bold</b> http://a.test/x?y=1, and ftp://nope.test", 1), cap("Ada", "Welcome back", 2), chat("Alan", "Eric can you look?", 2)];
+  const snap = (over = {}) => ({ id: "aaaaaaaaaaaa", state, entries: first, total: first.length, from: 0, slides: [], live: [], people: null, notes, summaries: {}, ...over });
+  const { doc, es, w } = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting", api: (u) => (u.includes("since=0") ? snap() : snap({ entries: [chat("Grace", "later one", 3)], from: 4, total: 5 })) });
+
+  // Chat messages are in the Chat box, not in the transcript; the transcript's speaker continuation skips them.
+  const rows = [...doc.querySelectorAll(".scroll .rows .row")];
+  assert.deepEqual(rows.map((r) => r.className.replace(/ me| flash/g, "")), ["row caption first", "row caption cont"], "no chat rows in the transcript; Ada continues across the removed chat line");
+  const crows = [...doc.querySelectorAll(".cscroll .row.chat")];
+  assert.deepEqual(crows.map((r) => [r.dataset.i, r.querySelector(".sp").textContent]), [["1", "Grace"], ["3", "Alan"]], "entry indexes kept for #e jumps");
+  assert.match(crows[0].querySelector("time").textContent, /^\d\d:\d\d:\d\d$/);
+  assert.notEqual(crows[0].querySelector(".sp").getAttribute("style"), null, "speaker coloured");
+  // Links: http(s) only, trailing punctuation out, everything else (including markup) stays text.
+  const links = [...crows[0].querySelectorAll("a")];
+  assert.deepEqual(links.map((a) => [a.getAttribute("href"), a.textContent, a.getAttribute("target"), a.getAttribute("rel")]), [["https://example.com/wiki/runbook", "https://example.com/wiki/runbook", "_blank", "noopener noreferrer"], ["http://a.test/x?y=1", "http://a.test/x?y=1", "_blank", "noopener noreferrer"]]);
+  assert.match(crows[0].textContent, /Also javascript:alert\(1\) and <b>bold<\/b> http:\/\/a\.test\/x\?y=1, and ftp:\/\/nope\.test/);
+  assert.equal(crows[0].querySelector("b"), null, "text nodes only");
+  // Name highlighting applies to chat rows (someone else says Eric).
+  assert.equal(crows[1].classList.contains("me"), true);
+  assert.equal(crows[0].classList.contains("me"), false);
+  // Layout hooks: a third column with chat, the Chat tab shown with no badge yet.
+  assert.deepEqual(["has-chat", "has-notes", "has-side"].map((c) => doc.body.classList.contains(c)), [true, true, true]);
+  const tab = doc.querySelector('.tabs [data-v="chat"]');
+  assert.equal(tab.hidden, false);
+  assert.equal(tab.querySelector("i").hidden, true, "the first load isn't unread");
+  assert.equal(doc.querySelector(".chat-h small").hidden, true, "no 'No chat yet' line when there is chat");
+
+  // The filter box filters transcript and chat.
+  const filter = doc.querySelector("header input");
+  filter.value = "runbook";
+  filter.dispatchEvent(new w.Event("input"));
+  assert.deepEqual([...doc.querySelectorAll(".scroll .rows .row")].map((r) => r.hidden), [true, true]);
+  assert.deepEqual(crows.map((r) => r.hidden), [false, true]);
+  filter.value = "welcome";
+  filter.dispatchEvent(new w.Event("input"));
+  assert.deepEqual([...doc.querySelectorAll(".scroll .rows .row")].map((r) => r.hidden), [true, false]);
+  assert.deepEqual(crows.map((r) => r.hidden), [true, true]);
+  filter.value = "";
+  filter.dispatchEvent(new w.Event("input"));
+
+  // A message that arrives while Chat isn't the shown view counts on the tab; showing the tab clears it.
+  es.meeting();
+  await tick();
+  assert.equal(doc.querySelectorAll(".cscroll .row.chat").length, 3);
+  assert.equal(tab.querySelector("i").hidden, false);
+  assert.equal(tab.querySelector("i").textContent, "1");
+  tab.click();
+  assert.equal(doc.body.classList.contains("view-chat"), true);
+  assert.equal(tab.querySelector("i").hidden, true);
+  doc.querySelector('.tabs [data-v="tx"]').click();
+  assert.equal(doc.body.classList.contains("view-chat"), false);
+  assert.equal(doc.body.innerHTML.includes("recording"), false);
+});
+
+test("meeting page: chat links keep balanced parens, stop at invisible characters, split comma-joined URLs, and don't start mid-word", async () => {
+  const state = { title: "Weekly Sync", app: "Teams", startedAt: "2026-10-28T14:00:00Z", recording: true, ended: false, crashed: false, endedAt: "", duration: "", hasTranscript: true, hasSlides: false };
+  const texts = [
+    "(https://en.wikipedia.org/wiki/Foo_(bar)) ok", // 0: inside parens
+    "see https://en.wikipedia.org/wiki/Foo_(bar). then", // 1: outside parens, sentence end
+    "(see https://example.com/x)", // 2: closer with no opener
+    "https://x.com/\u202Egpj.exe", // 3: bidi override
+    "https://x.com\u200Bevil", // 4: zero width space
+    "https://a.com,https://b.com", // 5: comma-joined
+    "ahttps://x.com and 1https://y.com and (https://z.com)", // 6: mid-word
+  ];
+  const entries = texts.map((text, i) => ({ type: "chat", speaker: "Grace", text, ts: `2026-10-28T14:0${i}:30Z` }));
+  const { doc } = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting", api: () => ({ id: "aaaaaaaaaaaa", state, entries, total: entries.length, from: 0, slides: [], live: [], people: null, notes: null, summaries: {} }) });
+  const hrefs = [...doc.querySelectorAll(".cscroll .row.chat")].map((r) => [...r.querySelectorAll("a")].map((a) => [a.getAttribute("href"), a.textContent]));
+  assert.deepEqual(hrefs[0], [["https://en.wikipedia.org/wiki/Foo_(bar)", "https://en.wikipedia.org/wiki/Foo_(bar)"]]);
+  assert.deepEqual(hrefs[1], [["https://en.wikipedia.org/wiki/Foo_(bar)", "https://en.wikipedia.org/wiki/Foo_(bar)"]]);
+  assert.deepEqual(hrefs[2], [["https://example.com/x", "https://example.com/x"]]);
+  assert.deepEqual(hrefs[3], [["https://x.com/", "https://x.com/"]]);
+  assert.deepEqual(hrefs[4], [["https://x.com", "https://x.com"]]);
+  assert.deepEqual(hrefs[5], [["https://a.com", "https://a.com"], ["https://b.com", "https://b.com"]]);
+  assert.deepEqual(hrefs[6], [["https://z.com", "https://z.com"]]);
+  const rows = [...doc.querySelectorAll(".cscroll .row.chat")];
+  assert.match(rows[0].textContent, /\(https:\/\/en\.wikipedia\.org\/wiki\/Foo_\(bar\)\) ok$/, "outer paren stays text");
+  assert.match(rows[3].textContent, /gpj\.exe$/, "the rest stays plain text");
+  assert.equal([...rows[3].querySelectorAll("a")].every((a) => !/[\u202E\u200B]/.test(a.textContent + a.getAttribute("href"))), true);
+  assert.match(rows[6].textContent, /ahttps:\/\/x\.com and 1https:\/\/y\.com and \(https:\/\/z\.com\)/);
+});
+
+test("meeting page: unread badge skips filtered-out chat rows and clears when the window widens", async () => {
+  const state = { title: "Weekly Sync", app: "Teams", startedAt: "2026-10-28T14:00:00Z", recording: true, ended: false, crashed: false, endedAt: "", duration: "", hasTranscript: true, hasSlides: false };
+  const chat = (text, m) => ({ type: "chat", speaker: "Grace", text, ts: `2026-10-28T14:0${m}:30Z` });
+  let more = [];
+  let mq;
+  const before = (w) => {
+    const listeners = [];
+    mq = { matches: false, addEventListener: (_n, fn) => listeners.push(fn), fire: (matches) => { mq.matches = matches; for (const fn of listeners) fn({ matches }); } };
+    w.matchMedia = () => mq;
+  };
+  const first = [chat("hello", 1)];
+  const { doc, es, w } = await runPage("meeting-page.mjs", {
+    url: "http://127.0.0.1:8790/meeting",
+    before,
+    api: (u) => ({ id: "aaaaaaaaaaaa", state, entries: u.includes("since=0") ? first : more, total: 1 + more.length, from: u.includes("since=0") ? 0 : 1, slides: [], live: [], people: null, notes: null, summaries: {} }),
+  });
+  const badge = doc.querySelector('.tabs [data-v="chat"] i');
+  assert.equal(badge.hidden, true);
+  // Filter on "keep": a chat row it hides doesn't count.
+  const filter = doc.querySelector("header input");
+  filter.value = "keep";
+  filter.dispatchEvent(new w.Event("input"));
+  more = [chat("drop this", 2), chat("keep this", 3)];
+  es.meeting();
+  await tick();
+  assert.equal(badge.hidden, false);
+  assert.equal(badge.textContent, "1", "only the visible new message counts");
+  // Widening the window shows the Chat box: the stale count goes, and stays gone when narrow again.
+  mq.fire(true);
+  assert.equal(badge.hidden, true);
+  mq.fire(false);
+  assert.equal(badge.hidden, true);
+});
+
+test("meeting page: no chat yet is one small line; #e<i> on a chat entry scrolls the Chat box and shows its tab", async () => {
+  const state = { title: "Weekly Sync", app: "Teams", startedAt: "2026-10-28T14:00:00Z", recording: false, ended: true, crashed: false, endedAt: "2026-10-28T14:32:10Z", duration: "0:32:10", hasTranscript: true, hasSlides: false };
+  const notes = { session: "earl", at: "2026-10-28T14:03:00Z", ended: true, me: [], topics: [], decisions: [], actions: [], questions: [], reply: null, alerts: [], slidesOn: false, slidesFailed: [] };
+  const caps = [0, 1, 2].map((i) => ({ type: "caption", speaker: "Ada", text: `line ${i}`, ts: `2026-10-28T14:0${i}:00Z` }));
+  const base = { id: "aaaaaaaaaaaa", state, total: 3, from: 0, slides: [], live: [], people: null, notes, summaries: {} };
+  let { doc } = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting?id=aaaaaaaaaaaa", api: () => ({ ...base, entries: caps }) });
+  assert.equal(doc.querySelector(".chat-h small").hidden, false);
+  assert.equal(doc.querySelector(".chat-h small").textContent, "No chat yet");
+  assert.equal(doc.querySelector(".cscroll").hidden, true);
+  assert.equal(doc.body.classList.contains("has-chat"), false);
+  assert.equal(doc.body.classList.contains("has-side"), true, "notes keep the column");
+  assert.equal(doc.querySelector('.tabs [data-v="chat"]').hidden, true, "no Chat tab without chat");
+  // No chat and no notes: no third column at all.
+  ({ doc } = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting?id=aaaaaaaaaaaa", api: () => ({ ...base, notes: null, entries: caps }) }));
+  assert.equal(doc.body.classList.contains("has-side"), false);
+
+  // A chat entry in the hash: the Chat tab comes up and the row is scrolled to and flashed (not the transcript).
+  const withChat = [...caps, { type: "chat", speaker: "Grace", text: "see https://example.com", ts: "2026-10-28T14:03:00Z" }];
+  ({ doc } = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting?id=aaaaaaaaaaaa#e3", api: () => ({ ...base, entries: withChat, total: 4 }) }));
+  const row = doc.querySelector('.cscroll .row[data-i="3"]');
+  assert.equal(row.dataset.scrolled, "1");
+  assert.equal(row.classList.contains("flash"), true);
+  assert.equal(doc.body.classList.contains("view-chat"), true);
+  assert.equal(doc.querySelector('.tabs [data-v="chat"]').classList.contains("on"), true);
+  assert.equal(doc.querySelector('.scroll .row[data-scrolled]'), null);
+  // Chat without any notes: the column is the chat alone.
+  ({ doc } = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting?id=aaaaaaaaaaaa", api: () => ({ ...base, notes: null, entries: withChat, total: 4 }) }));
+  assert.deepEqual(["has-chat", "has-notes", "has-side"].map((c) => doc.body.classList.contains(c)), [true, false, true]);
+  assert.equal(doc.querySelector('.tabs [data-v="notes"]').hidden, true);
+});
+
+test("meeting page: the chat box css: third column from 1400 px with chat at about 40%, a tab switch below", () => {
+  const css = pageSource("meeting-page.mjs");
+  assert.match(css, /\.chat \{ flex: 0 0 40%;/);
+  assert.match(css, /@media \(max-width: 1399px\) \{[^@]*view-chat/);
+  assert.doesNotMatch(css, /innerHTML/);
+});
+
+test("meetings page: a chat hit carries a small chat tag before the speaker; fields chat is not repeated as a 'Matches' line", async () => {
+  const list = [entry({ id: "a00000000000" })];
+  const { doc } = await runPage("meetings-page.mjs", {
+    url: "http://127.0.0.1:8790/meetings",
+    api: (u) => {
+      if (u.startsWith("/api/meetings/search")) return { q: "runbook", results: [{ ...list[0], hits: 2, fields: ["transcript", "chat"], lines: [{ type: "caption", ts: "2026-10-28T14:12:05Z", speaker: "Ada", text: "the runbook", i: 1 }, { type: "chat", ts: "2026-10-28T14:13:05Z", speaker: "Grace", text: "runbook link", i: 4 }] }] };
+      return { meetings: list, live: null, more: false };
+    },
+  });
+  const input = doc.querySelector("header input");
+  input.value = "runbook";
+  input.dispatchEvent(new doc.defaultView.Event("input"));
+  await tick(300);
+  const hits = [...doc.querySelectorAll("a.hit")];
+  assert.deepEqual(hits.map((a) => [a.querySelector(".tag")?.textContent ?? null, a.querySelector(".sp").textContent, a.getAttribute("href")]), [[null, "Ada", "/meeting?id=a00000000000#e1"], ["chat", "Grace", "/meeting?id=a00000000000#e4"]]);
+  assert.equal(doc.querySelector(".fields"), null);
+});
+
 // ── the card (page.mjs renderMeeting), pulled out of the module and run in jsdom ──
 
 test("meeting card: live links, just-ended expanded plus list, plain recent list", async () => {
@@ -1285,6 +1499,8 @@ test("meeting card: live links, just-ended expanded plus list, plain recent list
   assert.equal(list.querySelector(".m-open").textContent, "View all ↗");
 });
 
+// ── slide summaries (the copilot's vision notes) ──
+
 test("meeting card: short names, one block per speaker run, the in-progress line in italics", async () => {
   const { h } = await import("../extensions/canvas/render.mjs");
   const dom = new JSDOM("<!doctype html><body></body>");
@@ -1318,6 +1534,368 @@ test("meeting card: short names, one block per speaker run, the in-progress line
   assert.match(txt, /^Ada…w\d+ .* w199$/, "a long turn keeps its end, not its start");
 });
 
+const sumRaw = (n, over = {}) => ({ n, title: `Title ${n}`, what: `What ${n} shows.`, why: "", points: [`point ${n}`], numbers: [`${n}0 ms`], at: "2026-10-28T14:05:00Z", ...over });
+
+test("normalizeNotes: slides are bounded, n an integer of 1 or more, one per n, sorted, strings clipped", () => {
+  const n = normalizeNotes(
+    rawNotes({
+      slides: [
+        sumRaw(3, { title: "t".repeat(300), what: "w".repeat(900), why: "y".repeat(900), points: ["a", "b", "c", "d", "e", 7, ""].concat(["p".repeat(400)]), numbers: ["1", "2", "3", "4", "5"] }),
+        sumRaw(1),
+        sumRaw(0),
+        sumRaw(-2),
+        sumRaw(1.5),
+        { n: "2", title: "no" },
+        { n: 5, title: "", what: "  " },
+        sumRaw(3, { title: "Three again" }),
+        "junk",
+        null,
+      ],
+    }),
+  ).notes;
+  assert.deepEqual(n.slides.map((s) => [s.n, s.title]), [[1, "Title 1"], [3, "Three again"]]);
+  const big = normalizeNotes(rawNotes({ slides: [sumRaw(3, { title: "t".repeat(300), what: "w".repeat(900), why: "y".repeat(900), points: ["a", "b", "c", "d", "e", 7, "p".repeat(400)], numbers: ["1", "2", "3", "4", "5"] })] })).notes.slides[0];
+  assert.deepEqual([big.title.length, big.what.length, big.why.length], [120, 500, 400]);
+  assert.deepEqual([big.points.length, big.numbers.length], [4, 4]);
+  assert.equal(normalizeNotes(rawNotes({ slides: Array.from({ length: 150 }, (_, i) => sumRaw(i + 1)) })).notes.slides.length, 120);
+  assert.deepEqual(normalizeNotes(rawNotes({ slides: "nope" })).notes.slides, []);
+  assert.deepEqual(normalizeNotes(rawNotes()).notes.slides, [], "an older file without slides");
+});
+
+test("MeetingFeed: summaries ride in snapshot() by slide number (not inside notes) and summary() has the current slide's only", () => {
+  const f = fixture();
+  try {
+    const notesFile = join(f.root, "notes.json");
+    const feed = new MeetingFeed(f.state, { alive: () => true, notesFile });
+    f.writeState({});
+    for (const n of [1, 2]) {
+      writeFileSync(join(f.slides, `000${n}-14010${n}.jpg`), "jpg");
+      appendFileSync(join(f.slides, "index.jsonl"), line({ n, file: `000${n}-14010${n}.jpg` }));
+    }
+    writeFileSync(f.jsonl, line({ type: "slide", slide: 1, ts: "t1" }) + line({ type: "slide", slide: 2, ts: "t2" }));
+    feed.poll();
+    assert.deepEqual(feed.snapshot().summaries, {}, "no notes, no summaries");
+    assert.equal("summary" in feed.summary().slide, false, "the card shows nothing until there is one");
+
+    writeFileSync(notesFile, JSON.stringify(rawNotes({ pid: 4242, slides: [sumRaw(1, { why: "Your canary move." }), sumRaw(2), sumRaw(9, { title: "No such frame yet" })] })));
+    assert.equal(feed.poll().final, true, "a summary arriving is a final change");
+    const snap = feed.snapshot();
+    assert.deepEqual(Object.keys(snap.summaries), ["1", "2", "9"]);
+    assert.deepEqual(snap.summaries[1], { title: "Title 1", what: "What 1 shows.", why: "Your canary move.", points: ["point 1"], numbers: ["10 ms"] }, "no n or at inside");
+    assert.equal("slides" in snap.notes, false, "the list isn't sent twice");
+    assert.equal(snap.notes.topics.length, 1);
+    assert.deepEqual(snap.slides.map((s) => s.n), [1, 2], "slides is still the frames");
+    const sum = feed.summary();
+    assert.equal(sum.slide.n, 2, "slide 2 is the newest");
+    assert.deepEqual(sum.slide.summary, { title: "Title 2", what: "What 2 shows.", why: "" }, "title, what and why only");
+    assert.equal(JSON.stringify(sum).includes("Title 1"), false, "only the current slide's");
+    assert.equal(JSON.stringify(sum.notes).includes("Title"), false);
+    // A revisit makes slide 1 current: its summary, why and all.
+    appendFileSync(f.jsonl, line({ type: "revisit", slide: 1, ts: "t3" }));
+    feed.poll();
+    assert.deepEqual(feed.summary().slide.summary, { title: "Title 1", what: "What 1 shows.", why: "Your canary move." });
+    assert.equal(JSON.stringify(snap).includes(f.root), false);
+  } finally {
+    f.done();
+  }
+});
+
+test("search also matches slide summaries (title, what, why, points), live notes or archived, like notes", () => {
+  const h = history();
+  try {
+    const notesDir = join(h.root, "archive");
+    mkdirSync(notesDir);
+    h.feed.notesDir = notesDir;
+    const id = h.feed.history().find((m) => m.title === "Weekly Sync").id;
+    writeFileSync(join(notesDir, `${id}.json`), JSON.stringify(rawNotes({ pid: 1, ended: true, topics: [], decisions: [], actions: [], questions: [], slides: [sumRaw(1, { title: "Kubernetes upgrade", what: "Cluster versions.", why: "Your runners are on it.", points: ["Drain nodes first"] })] })));
+    for (const q of ["kubernetes", "cluster versions", "runners", "drain nodes"]) {
+      const r = h.feed.search(q);
+      assert.deepEqual(r.map((x) => x.id), [id], q);
+      assert.deepEqual(r[0].fields, ["slides"], `${q}: matched in the slides, not elsewhere`);
+    }
+    assert.deepEqual(h.feed.search("kubernetes budget"), [], "every term still has to match somewhere in the meeting's fields");
+    assert.equal(h.feed.search("weekly kubernetes")[0].id, id, "terms may come from different fields");
+    // The past view carries the archived summaries.
+    const snap = h.feed.snapshot(0, id);
+    assert.equal(snap.summaries[1].title, "Kubernetes upgrade");
+    assert.equal("slides" in snap.notes, false);
+  } finally {
+    h.done();
+  }
+});
+
+test("meeting card: the current slide's title and why (or what) under the thumbnail, two lines, nothing before there is one", async () => {
+  const { h } = await import("../extensions/canvas/render.mjs");
+  const dom = new JSDOM("<!doctype html><body></body>");
+  windows.push(dom.window);
+  globalThis.document = dom.window.document;
+  globalThis.Node = dom.window.Node;
+  const src = pageSource("page.mjs");
+  const code = src.slice(src.indexOf("const meetPad"), src.indexOf("// The card's elapsed time ticks"));
+  const { renderMeeting } = new Function("h", "plural", `${code}; return { renderMeeting };`)(h, (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`);
+  const base = { kind: "live", id: "a00000000000", title: "Weekly Sync", app: "Teams", startedAt: new Date().toISOString(), recording: true, ended: false, people: 3, slides: 1, lines: [], recent: [], notes: null };
+  const none = renderMeeting({ ...base, slide: { n: 1, thumb: true } });
+  assert.equal(none.querySelector(".m-sum"), null);
+  const why = renderMeeting({ ...base, slide: { n: 1, thumb: true, summary: { title: "Q3 <b>roadmap</b>", what: "Epics by quarter.", why: "Your canary move is on it." } } });
+  const sum = why.querySelector(".m-slide + .m-sum");
+  assert.ok(sum, "right under the thumbnail");
+  assert.equal(sum.querySelector("b").textContent, "Q3 <b>roadmap</b>", "bold title, as text");
+  assert.equal(sum.querySelectorAll("b").length, 1, "nothing built from the data");
+  assert.equal(sum.textContent, "Q3 <b>roadmap</b>Your canary move is on it.");
+  const what = renderMeeting({ ...base, slide: { n: 1, thumb: true, summary: { title: "Status", what: "Red and green table.", why: "" } } });
+  assert.equal(what.querySelector(".m-sum").textContent, "StatusRed and green table.", "what when why is empty");
+  assert.match(pageSource("page.mjs"), /\.m-sum \{[^}]*-webkit-line-clamp: 2/, "clamped to two lines");
+  assert.equal(what.textContent.includes("recording"), false);
+});
+
+test("meeting page: the summary panel, tooltips, transcript rows and the Notes column's Slides section; Summarizing… while the newest live slide has none", async () => {
+  const slidesList = [1, 2, 3].map((n) => ({ n, at: `2026-10-28T14:0${n}:00Z`, reason: "change", width: 100, height: 50, thumb: true }));
+  const sums = {
+    1: { title: "Agenda <i>today</i>", what: "The agenda.", why: "", points: [], numbers: [] },
+    2: { title: "Q3 roadmap", what: "Epics by quarter.", why: "Your canary move is on it.", points: ["Canary first", "Then runners"], numbers: ["Oct 28 cutover", "12 services"] },
+  };
+  const snap = (over = {}) => ({
+    id: "aaaaaaaaaaaa",
+    state: { title: "Weekly Sync", app: "Teams", startedAt: "2026-10-28T14:00:00Z", recording: true, ended: false, crashed: false, endedAt: "", duration: "", hasTranscript: true, hasSlides: true },
+    entries: [
+      { type: "slide", n: 1, reason: "change", ts: "2026-10-28T14:01:00Z" },
+      { type: "slide", n: 2, reason: "change", ts: "2026-10-28T14:02:00Z" },
+      { type: "revisit", n: 1, reason: "revisit", ts: "2026-10-28T14:02:30Z" },
+      { type: "slide", n: 3, reason: "change", ts: "2026-10-28T14:03:00Z" },
+    ],
+    total: 4,
+    from: 0,
+    slides: slidesList,
+    live: [],
+    people: null,
+    notes: { session: "earl", at: "2026-10-28T14:03:00Z", ended: false, me: [], topics: [], decisions: [], actions: [], questions: [], reply: null, alerts: [], slidesOn: true, slidesFailed: [] },
+    summaries: sums,
+    ...over,
+  });
+  // Live, slide 3 is newest and has no summary yet: Summarizing…
+  let { doc } = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting", api: () => snap() });
+  assert.equal(doc.querySelector(".sum").hidden, false);
+  assert.equal(doc.querySelector(".sum").textContent, "Summarizing…");
+  // Not when the copilot isn't summarizing slides (off, no vision model, an older notes file), or gave up on this slide (or hit its cap).
+  const pending = async (notes) => {
+    const r = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting", api: () => snap({ notes: { ...snap().notes, ...notes } }) });
+    return [r.doc.querySelector(".sum").hidden, r.doc.querySelector(".sum").textContent];
+  };
+  assert.deepEqual(await pending({ slidesOn: false }), [true, ""], "slide summaries are off for this meeting");
+  assert.deepEqual(await pending({ slidesOn: undefined }), [true, ""], "an older notes file says nothing");
+  assert.deepEqual(await pending({ slidesFailed: [3] }), [true, ""], "given up on slide 3");
+  assert.deepEqual(await pending({ slidesFailed: [1, 2] }), [false, "Summarizing…"], "other slides' failures don't matter");
+  // Rows: "▣ Slide 2 · title" as text; slide 3 has none yet.
+  const label = (n) => [...doc.querySelectorAll(`.row.slide-mark.slide[data-slide="${n}"] .lbl`)].map((e) => e.textContent);
+  assert.deepEqual([label(1), label(2), label(3)], [["▣ Slide 1 · Agenda <i>today</i>"], ["▣ Slide 2 · Q3 roadmap"], ["▣ Slide 3"]]);
+  assert.equal(doc.querySelector(".row.slide-mark.revisit .lbl").textContent, "↺ Back to slide 1");
+  // Thumbnails: the title is the tooltip and the label.
+  const thumb = (n) => doc.querySelector(`.strip button[data-n="${n}"]`);
+  assert.equal(thumb(2).title, "Slide 2 · Q3 roadmap");
+  assert.equal(thumb(2).querySelector("img").alt, "Slide 2: Q3 roadmap");
+  assert.equal(thumb(3).title, "Slide 3");
+  assert.equal(thumb(1).title, "Slide 1 · Agenda <i>today</i> · shown again once");
+  // Notes column: a Slides section, click shows that slide in the panel.
+  const items = [...doc.querySelectorAll(".nbody .slidelist button")];
+  assert.deepEqual(items.map((b) => b.textContent), ["1. Agenda <i>today</i>", "2. Q3 roadmap"]);
+  assert.equal(doc.querySelector(".nbody .slidelist i"), null, "text, not markup");
+  items[1].click();
+  await tick();
+  const panel = doc.querySelector(".sum");
+  assert.equal(panel.hidden, false);
+  assert.equal(panel.querySelector(".st").textContent, "Q3 roadmap");
+  assert.match(panel.textContent, /Epics by quarter\./);
+  assert.equal(panel.querySelector(".why").textContent, "Why it matters: Your canary move is on it.");
+  assert.deepEqual([...panel.querySelectorAll("li")].map((e) => e.textContent), ["Canary first", "Then runners"]);
+  assert.deepEqual([...panel.querySelectorAll(".nums span")].map((e) => e.textContent), ["Oct 28 cutover", "12 services"]);
+  assert.equal(doc.querySelector("img").getAttribute("src") !== null, true);
+  assert.equal(doc.querySelector(".cap b").textContent, "Slide 2");
+  // A slide with an empty why shows no "Why it matters".
+  items[0].click();
+  await tick();
+  assert.equal(doc.querySelector(".sum .why"), null);
+  assert.equal(doc.querySelector(".sum .st").textContent, "Agenda <i>today</i>");
+  assert.equal(doc.querySelector(".sum i"), null);
+  assert.equal(doc.body.innerHTML.includes("recording"), false);
+
+  // Not live (a past meeting), or no copilot notes: no "Summarizing…" for a slide without one.
+  ({ doc } = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting?id=aaaaaaaaaaaa", api: () => snap({ state: { ...snap().state, recording: false, ended: true, endedAt: "2026-10-28T14:30:00Z", duration: "0:30:00" } }) }));
+  assert.equal(doc.querySelector(".sum").hidden, true);
+  ({ doc } = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting", api: () => snap({ notes: null, summaries: {} }) }));
+  assert.equal(doc.querySelector(".sum").hidden, true, "no copilot notes: nothing is being summarized");
+  // A past meeting shows its archived summary for the shown slide the same way.
+  ({ doc } = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting?id=aaaaaaaaaaaa#e1", api: () => snap({ state: { ...snap().state, recording: false, ended: true, endedAt: "2026-10-28T14:30:00Z", duration: "0:30:00" }, entries: snap().entries.slice(0, 2), total: 2 }) }));
+  assert.equal(doc.querySelector(".sum").hidden, false);
+  assert.equal(doc.querySelector(".sum .st").textContent, "Q3 roadmap");
+});
+
+// ── history fixes for real meeting-capture data ──
+
+/** A transcript file as meeting-capture writes it, padded over the 300 byte stub limit unless `small`. */
+function rawMeeting(dir, name, records, { small = false } = {}) {
+  mkdirSync(dir, { recursive: true });
+  let body = records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+  if (!small && body.length < 300) body += line({ type: "pad", text: "x".repeat(300) });
+  writeFileSync(join(dir, name), body);
+}
+const cap = (ts, text = "Hello there everyone, welcome to the call today.") => ({ type: "caption", speaker: "Ada", text, ts });
+
+function dataFeed() {
+  const f = fixture();
+  const dir = join(f.root, "hist");
+  mkdirSync(dir);
+  return { ...f, dir, feed: new MeetingFeed(f.state, { alive: () => true, dataDir: dir, now: () => Date.parse("2026-11-01T00:00:00Z") }) };
+}
+
+test("history app_id: the metadata's app_id, else its source without -ax, else the file name's token (older names have none)", () => {
+  const d = dataFeed();
+  try {
+    const t = (hms) => `2026-10-29T${hms}Z`;
+    const meta = (extra, hms) => ({ type: "metadata", app: "App", meeting: "Real title", recorded_at: t(hms), ...extra });
+    rawMeeting(d.dir, "20261029_090000-teams-first.jsonl", [meta({ app_id: "webex", source: "zoom-ax" }, "09:00:00"), cap(t("09:00:10"))]);
+    rawMeeting(d.dir, "20261029_100000-teams-second.jsonl", [meta({ source: "zoom-ax" }, "10:00:00"), cap(t("10:00:10"))]);
+    rawMeeting(d.dir, "20261029_110000-meet-third.jsonl", [meta({}, "11:00:00"), cap(t("11:00:10"))]);
+    rawMeeting(d.dir, "20261029_120000-standup.jsonl", [meta({}, "12:00:00"), cap(t("12:00:10"))]);
+    rawMeeting(d.dir, "20261029_130000-slack-fifth.jsonl", [meta({ source: "slack" }, "13:00:00"), cap(t("13:00:10"))]);
+    rawMeeting(d.dir, "20261029_140000-zoom-weekly-planning.jsonl", [{ type: "metadata", meeting: "No time or app", app: "Zoom" }, cap(t("14:00:10"))]);
+    const ids = Object.fromEntries(d.feed.history().map((m) => [m.started_at, m.id]));
+    assert.equal(ids[t("09:00:00")], meetingId({ appId: "webex", startedAt: t("09:00:00") }), "app_id wins over source and the name");
+    assert.equal(ids[t("10:00:00")], meetingId({ appId: "zoom", startedAt: t("10:00:00") }), "source, -ax removed (the name says teams)");
+    assert.equal(ids[t("11:00:00")], meetingId({ appId: "meet", startedAt: t("11:00:00") }), "the name's token");
+    assert.equal(ids[t("12:00:00")], meetingId({ appId: "", startedAt: t("12:00:00") }), "an older name has no token: standup is the slug, not an app");
+    assert.equal(ids[t("13:00:00")], meetingId({ appId: "slack", startedAt: t("13:00:00") }), "a source without -ax as it is");
+    const old = d.feed.history().find((m) => m.started_at === t("12:00:00"));
+    assert.equal(old.title, "Real title");
+    // The past view finds each by that id.
+    for (const id of Object.values(ids)) assert.equal(d.feed.snapshot(0, id).notFound, undefined, id);
+    // The live state keeps its own app_id.
+    d.writeState({ app_id: "teams", started_at: t("15:00:00"), jsonl: join(d.dir, "20261029_150000-teams-live.jsonl") });
+    writeFileSync(join(d.dir, "20261029_150000-teams-live.jsonl"), line(meta({ source: "zoom-ax" }, "15:00:00")));
+    d.feed.poll();
+    assert.equal(d.feed.id, meetingId({ appId: "teams", startedAt: t("15:00:00") }));
+  } finally {
+    d.done();
+  }
+});
+
+test("history: a merged file hides its fragments, takes their slides numbered in fragment order, and keeps no path from the file", () => {
+  const d = dataFeed();
+  try {
+    const t = (hms) => `2026-10-30T${hms}Z`;
+    const f1 = "20261030_090000-teams-weekly-sync";
+    const f2 = "20261030_091500-teams-weekly-sync";
+    const frag = (base, start, frames) => {
+      const sdir = join(d.dir, `${base}.slides`);
+      mkdirSync(sdir, { recursive: true });
+      const evs = [];
+      frames.forEach((file, i) => {
+        writeFileSync(join(sdir, file), `jpg ${file}`);
+        writeFileSync(join(sdir, file.replace(".jpg", ".thumb.jpg")), `thumb ${file}`);
+        appendFileSync(join(sdir, "index.jsonl"), line({ n: i + 1, at: t("09:01:00"), file, thumb: file.replace(".jpg", ".thumb.jpg"), reason: "change", width: 10, height: 5 }));
+        evs.push({ type: "slide", slide: i + 1, file: join(sdir, file), ts: t("09:01:00") });
+      });
+      rawMeeting(d.dir, `${base}.jsonl`, [{ type: "metadata", app: "Teams", app_id: "teams", meeting: "Weekly Sync", recorded_at: start }, cap(start), ...evs]);
+    };
+    frag(f1, t("09:00:00"), ["0001-090100.jpg", "0002-090200.jpg"]);
+    frag(f2, t("09:15:00"), ["0001-091600.jpg"]);
+    const s1 = join(d.dir, `${f1}.slides`);
+    const s2 = join(d.dir, `${f2}.slides`);
+    rawMeeting(d.dir, "20261030_090000-teams-weekly-sync-merged.jsonl", [
+      { type: "metadata", app: "Teams", app_id: "teams", meeting: "Meeting join now", recorded_at: t("09:00:00"), merged_from: [f1, `${f2}.jsonl`, "20261030_235959-teams-gone", "../../etc/passwd", 7] },
+      cap(t("09:00:10"), "First part."),
+      { type: "slide", slide: 1, file: join(s1, "0001-090100.jpg"), ts: t("09:01:00") },
+      { type: "slide", slide: 2, file: join(s1, "0002-090200.jpg"), ts: t("09:02:00") },
+      cap(t("09:15:10"), "Second part."),
+      { type: "slide", slide: 1, file: join(s2, "0001-091600.jpg"), ts: t("09:16:00") },
+      { type: "revisit", slide: 2, file: join(s1, "0002-090200.jpg"), reason: "revisit", ts: t("09:17:00") },
+      { type: "slide", slide: 9, file: join(d.dir, "elsewhere.slides", "0009-091700.jpg"), ts: t("09:18:00") },
+      { type: "metadata", event: "stopped", stopped_at: t("09:30:00"), duration: "0:30:00" },
+    ]);
+    rawMeeting(d.dir, "20261030_100000-zoom-other.jsonl", [{ type: "metadata", app: "Zoom", app_id: "zoom", meeting: "Other", recorded_at: t("10:00:00") }, cap(t("10:00:10"))]);
+
+    const list = d.feed.history();
+    assert.deepEqual(list.map((m) => m.title), ["Other", "Weekly sync"], "the fragments are hidden; the merged file's junk title is the slug, humanized");
+    const merged = list[1];
+    assert.equal(merged.id, meetingId({ appId: "teams", startedAt: t("09:00:00") }), "its id from its own metadata");
+    assert.deepEqual([merged.slides, merged.thumb, merged.captions, merged.duration], [3, true, 2, "0:30:00"]);
+
+    const snap = d.feed.snapshot(0, merged.id);
+    assert.deepEqual(snap.slides.map((s) => s.n), [1, 2, 3], "consecutive, in fragment order");
+    assert.deepEqual(snap.entries.filter((e) => e.type === "slide" || e.type === "revisit").map((e) => `${e.type}${e.n}`), ["slide1", "slide2", "slide3", "revisit2"], "events follow; the slide from a folder that isn't a fragment is dropped");
+    assert.equal(JSON.stringify(snap).includes(d.root), false, "no paths");
+    assert.equal(JSON.stringify(snap).includes('"dir"'), false);
+    // Each slide is served from its own fragment's folder; the folder is the data folder's, not the file's.
+    const realS1 = realpathSync(s1);
+    const realS2 = realpathSync(s2);
+    assert.equal(d.feed.slideFile(merged.id, 1), join(realS1, "0001-090100.jpg"));
+    assert.equal(d.feed.slideFile(merged.id, 2, true), join(realS1, "0002-090200.thumb.jpg"));
+    assert.equal(d.feed.slideFile(merged.id, 3), join(realS2, "0001-091600.jpg"), "fragment 2's first frame is slide 3");
+    assert.equal(d.feed.slideFile(merged.id, 4), null);
+    // Searching it reads the merged file only, and finds the line once.
+    const found = d.feed.search("second part");
+    assert.deepEqual(found.map((r) => r.id), [merged.id]);
+    assert.equal(found[0].hits, 1);
+    // Without the merged file the fragments are meetings again.
+    rmSync(join(d.dir, "20261030_090000-teams-weekly-sync-merged.jsonl"));
+    d.feed.rescan();
+    assert.deepEqual(d.feed.history().map((m) => m.title), ["Other", "Weekly Sync", "Weekly Sync"]);
+  } finally {
+    d.done();
+  }
+});
+
+test("history: a title like 'Meeting join…' or an empty one becomes the slug, humanized; a real one stays", () => {
+  const d = dataFeed();
+  try {
+    const t = (hms) => `2026-10-31T${hms}Z`;
+    const put = (name, meeting, hms) => rawMeeting(d.dir, name, [{ type: "metadata", app: "Teams", app_id: "teams", ...(meeting === undefined ? {} : { meeting }), recorded_at: t(hms) }, cap(t(hms))]);
+    put("20261031_090000-teams-platform-weekly-sync.jsonl", "Meeting join - 1234", "09:00:00");
+    put("20261031_100000-teams-design-review-merged.jsonl", "meeting joined", "10:00:00");
+    put("20261031_110000-teams-standup-notes.jsonl", "", "11:00:00");
+    put("20261031_120000-teams-budget.jsonl", undefined, "12:00:00");
+    put("20261031_130000-teams-real-slug.jsonl", "A Real Title", "13:00:00");
+    assert.deepEqual(d.feed.history().map((m) => m.title), ["A Real Title", "Budget", "Standup notes", "Design review", "Platform weekly sync"]);
+  } finally {
+    d.done();
+  }
+});
+
+test("history noise: files under 300 bytes and the Slack notification captures are not meetings", () => {
+  const d = dataFeed();
+  try {
+    const t = (hms) => `2026-10-31T${hms}Z`;
+    const real = (name, hms, title) => rawMeeting(d.dir, name, [{ type: "metadata", app: "Teams", app_id: "teams", meeting: title, recorded_at: t(hms) }, cap(t(hms))]);
+    real("20261031_090000-teams-kept.jsonl", "09:00:00", "Kept");
+    real("20261031_100000-slack-notifications-all.jsonl", "10:00:00", "Slack notifications");
+    real("20261031_110000-slack-notifications.jsonl", "11:00:00", "Slack notifications 2");
+    rawMeeting(d.dir, "20261031_120000-teams-stub.jsonl", [{ type: "metadata", meeting: "Stub", recorded_at: t("12:00:00") }], { small: true });
+    assert.ok(statSync(join(d.dir, "20261031_120000-teams-stub.jsonl")).size < 300);
+    assert.deepEqual(d.feed.history().map((m) => m.title), ["Kept"]);
+    assert.equal(d.feed.total(), 1);
+    // A stub that grows past 300 bytes is a meeting.
+    appendFileSync(join(d.dir, "20261031_120000-teams-stub.jsonl"), line(cap(t("12:00:05"), "x".repeat(300))));
+    d.feed.rescan();
+    assert.deepEqual(d.feed.history().map((m) => m.title), ["Stub", "Kept"]);
+    // A fragment without a stopped line that isn't live is Ended (as before).
+    assert.equal(d.feed.snapshot(0, d.feed.history()[0].id).state.ended, true);
+  } finally {
+    d.done();
+  }
+});
+
+// ── review fixes: the card's tail pump, names, blocks, light poll, merged lookups ──
+
+test("normalizeNotes: slidesOn is a boolean and slidesFailed a bounded, sorted list of slide numbers", () => {
+  assert.equal(normalizeNotes(rawNotes()).notes.slidesOn, false, "an older file");
+  assert.deepEqual(normalizeNotes(rawNotes()).notes.slidesFailed, []);
+  const n = normalizeNotes(rawNotes({ slidesOn: true, slidesFailed: [9, 3, 3, 0, -1, 1.5, "4", null, 2] })).notes;
+  assert.equal(n.slidesOn, true);
+  assert.deepEqual(n.slidesFailed, [2, 3, 9]);
+  assert.equal(normalizeNotes(rawNotes({ slidesOn: "yes", slidesFailed: "x" })).notes.slidesOn, false);
+  assert.deepEqual(normalizeNotes(rawNotes({ slidesOn: "yes", slidesFailed: "x" })).notes.slidesFailed, []);
+  assert.equal(normalizeNotes(rawNotes({ slidesFailed: Array.from({ length: 500 }, (_, i) => i + 1) })).notes.slidesFailed.length, 120);
+});
+
 test("feed.tailSnapshot() and /api/meeting?tail=1: only id, from, total, entries and live", async () => {
   const f = fixture();
   const port = 23790 + Math.floor(Math.random() * 1000);
@@ -1335,7 +1913,7 @@ test("feed.tailSnapshot() and /api/meeting?tail=1: only id, from, total, entries
       if (full?.total === 2) break;
       await new Promise((r) => setTimeout(r, 100));
     }
-    assert.ok(full.slides.length && full.state, "the full snapshot is as before");
+    assert.ok(full.slides.length && full.state && "summaries" in full, "the full snapshot is as before");
     const tail = await get(`/api/meeting?tail=1&since=1&id=${full.id}`);
     assert.deepEqual(Object.keys(tail).sort(), ["entries", "from", "id", "live", "total"]);
     assert.deepEqual([tail.id, tail.from, tail.total, tail.entries.map((e) => e.text)], [full.id, 1, 2, ["Two"]]);
@@ -1466,20 +2044,39 @@ test("card css: .m-line has one rule (the old line-clamp rule was dead)", () => 
   assert.doesNotMatch(css, /\.m-line \{[^}]*line-clamp/);
 });
 
-test("feed.summary(): the newest 12 lines, the in-progress ones and the total; `at` stays put while nothing changes", () => {
-  const f = fixture();
+test("history: in a half-done scan a merged file is read before the fragments, and find() answers with it, not a fragment under the same id", () => {
+  const d = dataFeed();
   try {
-    f.writeState({ pid: process.pid });
-    writeFileSync(f.jsonl, Array.from({ length: 15 }, (_, i) => line({ type: "caption", speaker: "Ada", text: `c${i}`, ts: `t${i}` })).join(""));
-    const feed = new MeetingFeed(f.state, { alive: () => true });
-    feed.poll();
-    const s = feed.summary();
-    assert.deepEqual(s.lines.map((e) => e.text), Array.from({ length: 12 }, (_, i) => `c${i + 3}`));
-    assert.deepEqual([s.total, s.live], [15, []]);
-    assert.equal(feed.summary().at, s.at, "asking again does not move `at`");
-    feed.poll();
-    assert.equal(feed.summary().at, s.at, "a quiet poll does not either");
+    const t = (hms) => `2026-11-02T${hms}Z`;
+    const frag = "20261102_090000-teams-weekly-sync";
+    const meta = (extra = {}, hms = "09:00:00") => ({ type: "metadata", app: "Teams", app_id: "teams", meeting: "Weekly Sync", recorded_at: t(hms), ...extra });
+    rawMeeting(d.dir, `${frag}.jsonl`, [meta(), cap(t("09:00:10"))]);
+    // A first, complete look: the fragment is a meeting.
+    assert.deepEqual(d.feed.history().map((m) => m.title), ["Weekly Sync"]);
+    const id = meetingId({ appId: "teams", startedAt: t("09:00:00") });
+    // Then the merged file appears, with an unrelated newer merged file ahead of it; the next scan has time for one file only.
+    rawMeeting(d.dir, "20261102_090000-teams-weekly-sync-merged.jsonl", [meta({ merged_from: [frag] }), cap(t("09:00:10")), cap(t("09:15:10"), "More.")]);
+    rawMeeting(d.dir, "20261102_100000-zoom-other-merged.jsonl", [meta({ app_id: "zoom", merged_from: [], meeting: "Other" }, "10:00:00"), cap(t("10:00:10"))]);
+    d.feed.scanBudgetMs = 0;
+    d.feed.rescan();
+    const found = d.feed.find(id); // one scan() call: it reads one file, so the fragment's cached row is still listed under this id
+    assert.equal(d.feed.scanned.partial, true);
+    assert.ok(found?.merged, "the merged file, not the stale fragment");
+    assert.deepEqual(found.fragments, [frag]);
+    assert.equal(found.path.endsWith("-merged.jsonl"), true);
+    // The past view opens the merged meeting too.
+    assert.equal(d.feed.snapshot(0, id).notFound, undefined);
+    assert.equal(d.feed.snapshot(0, id).entries.length, 2);
+    // Finished, the fragment is hidden.
+    d.feed.scanBudgetMs = 1e9;
+    d.feed.rescan();
+    const done = d.feed.history();
+    assert.deepEqual(done.map((m) => [m.title, m.captions]), [["Other", 1], ["Weekly Sync", 2]], "the fragment is hidden, the merged file is the meeting");
+    // Order itself: merged files are parsed first even though they sort after their fragment's name.
+    rmSync(join(d.dir, "20261102_100000-zoom-other-merged.jsonl"));
+    const cold = new MeetingFeed(d.state, { alive: () => true, dataDir: d.dir, now: () => Date.parse("2026-11-03T00:00:00Z"), scanBudgetMs: 0 });
+    assert.deepEqual(cold.scan().list.map((i) => i.path.endsWith("-merged.jsonl")), [true], "the first file read is a merged one, so no fragment is listed ahead of it");
   } finally {
-    f.done();
+    d.done();
   }
 });

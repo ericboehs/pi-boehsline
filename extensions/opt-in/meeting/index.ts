@@ -42,13 +42,27 @@
  * him. It is told who Eric is (meeting-context.md, his name), the meeting
  * (title, app, /meeting focus, people), a digest of THIS pi session (its name,
  * the last ~5 user messages, the last assistant message: what he is working on
- * right now), the OCR text of the slides shown so far, the previous notes and
- * the transcript. No model is polled on a timer: code decides when to call
+ * right now), the slides shown so far (a slide's summary where it has one, else
+ * its OCR text), the previous notes and the transcript. No model is polled on a timer: code decides when to call
  * (notes.ts shouldCall): about 3 min of new caption talk, or sooner (at most
  * once a minute) on a new slide or a name alert, never while a call is in
  * flight, and once at the end before the recap. /meeting ask forces one. Each
  * call stays under PROMPT_MAX_TOKENS by trimming the oldest transcript first.
  * With no usable model, name alerts (code rules) still work; no notes appear.
+ *
+ * Slide summaries (slides.ts): when that model can read images, each NEW slide
+ * (never a revisit) is sent to it with its jpg, the OCR text (waited for up to
+ * 90 s, a leading "Shared content | …" line dropped), who Eric is, the session
+ * digest, the focus, the title, the talk 90 s either side of the slide and the
+ * titles of earlier summaries; it answers {title, what, why, points, numbers},
+ * "why" being "" unless the slide matters to Eric. One call at a time, newest
+ * slide first, at most one per 10 s, 80 slides a meeting, 3 tries a slide with
+ * the scout's backoff. Cached by slide number in the notes file and archive
+ * (`slides`), restored on reload, no chat message, no status-line part; the
+ * scout reads them instead of raw OCR, and the recap lists those with a why.
+ * meeting.slideSummaries (default true) or PI_MEETING_SLIDES=0 turns it off;
+ * without a vision model it is skipped with one hint. A replay summarizes in
+ * memory only.
  *
  * Alerts, the only two kinds:
  *   name     someone other than Eric says his name (code rule, immediate, no
@@ -87,9 +101,10 @@
  * Chat Q&A: the `meeting` tool answers "what did I miss in the last 10 min",
  * "what did Amy say about the cert", "what's this slide about" from the session
  * model, read-only, in any session (no lock needed):
- *   action status | transcript | slide
+ *   action status | transcript | slide | slides
  *   minutes, since, until (HH:MM[:SS] in the meeting's own offset, or ISO), speaker, query, limit
- *   slide (default: the one on screen; its OCR text and the jpg come back)
+ *   slide (default: the one on screen; its summary, OCR text and the jpg come back)
+ *   slides (every summary; query filters; status lists them too)
  * It reads the live meeting, else the last one in state.json, and says which.
  * While this session runs a live meeting, one line is added to the system
  * prompt per turn ("A meeting is live: Weekly Sync (Microsoft Teams), 16 min
@@ -106,10 +121,11 @@
  * transcript trails the room by a couple of utterances.
  *
  * Settings: Boehsline config block "meeting" (watch/settings.ts), e.g.
- *      "meeting": { "model": "github-copilot/claude-haiku-5.5", "qmdCollections": ["notes", "team-docs"], "dailyDir": "~/Notes/daily", "owner": "earl" }
+ *      "meeting": { "model": "github-copilot/claude-haiku-5.5", "qmdCollections": ["notes", "team-docs"], "dailyDir": "~/Notes/daily", "owner": "earl", "slideSummaries": true }
  *
  * Env (overrides settings):
  *      PI_MEETING_MODEL=provider/<id>[,…]  PI_MEETING_REASONING=off|low|…
+ *      PI_MEETING_SLIDES=0 (no slide summaries)
  *      PI_MEETING_ME="First Last"  PI_MEETING_ABOUT=<file>
  *      PI_MEETING_OWNER=<session name>  PI_MEETING_WATCH=1 (arm)  PI_MEETING_LOCK=<file>
  *      PI_MEETING_NOTES_FILE=<file>  PI_CANVAS_ROOT (where the notes file defaults to)
@@ -182,14 +198,17 @@ import {
 	type Cadence,
 	emptyNotes,
 	fitNotesPrompt,
+	formatDigest,
 	freshCadence,
 	hasNotes,
+	maskSecrets,
 	mergeNotes,
 	nameAlertText,
 	normText,
 	type Notes,
 	parseScoutReply,
 	pushAlert,
+	readArchivedSlides,
 	type Reply,
 	recapBlock,
 	recapBody,
@@ -213,9 +232,32 @@ import {
 	writeNotesArchive,
 	writeNotesFile,
 } from "./notes.ts";
+import {
+	buildSlidePrompt,
+	buildSlideSystem,
+	formatSlideSummary,
+	nearbyLines,
+	newSlideWork,
+	markSlideDone,
+	noteSlideCall,
+	ocrTimeout,
+	parseSlideReply,
+	queueSlide,
+	type SlideJob,
+	type SlideSummary,
+	type SlideWork,
+	slideDone,
+	slideFailed,
+	slideGap,
+	summaryMatches,
+	takeSlide,
+	waitForOcr,
+	withSummary,
+} from "./slides.ts";
 
 export * from "./capture.ts";
 export * from "./notes.ts";
+export * from "./slides.ts";
 
 // ── config ───────────────────────────────────────────────────────────────────
 
@@ -229,6 +271,9 @@ const ABOUT_FILE = process.env.PI_MEETING_ABOUT || path.join(os.homedir(), ".pi/
 let DAILY_DIR = MEETING_DEFAULTS.dailyDir;
 let OWNER = MEETING_DEFAULTS.owner;
 let MODEL = MEETING_DEFAULTS.model;
+let SLIDES = MEETING_DEFAULTS.slideSummaries;
+/** Slide summaries on: the setting, and PI_MEETING_SLIDES not 0 (read each time, so a test or a shell can flip it). */
+const slidesOn = () => SLIDES && !/^(0|false|no|off)$/i.test((process.env.PI_MEETING_SLIDES ?? "").trim());
 /** work.redact, compiled: applied to what the notes scout is told about this session. */
 let REDACTIONS: { re: RegExp; replace: string }[] = [];
 const redactText = (s: string) => REDACTIONS.reduce((t, r) => t.replace(r.re, r.replace), s);
@@ -239,6 +284,7 @@ export function applyMeetingSettings(m: MeetingSettings = meetingSettings(), wor
 	DAILY_DIR = m.dailyDir;
 	OWNER = m.owner;
 	MODEL = m.model;
+	SLIDES = m.slideSummaries;
 	REDACTIONS = compileRedactions(work.redact ?? []);
 	applyWorkSettings(work);
 }
@@ -252,6 +298,7 @@ const PREV_TRANSCRIPT_CHARS = 16_000;
 const CALL_TIMEOUT_MS = 60_000;
 const BACKGROUND_WAIT_MS = 10_000;
 const SLIDES_READ = 20; // newest slides whose OCR a call reads
+const SLIDE_CALL_TIMEOUT_MS = 60_000;
 const MSG_TYPE = "meeting";
 const WIDGET_KEY = "meeting";
 
@@ -477,12 +524,20 @@ type Meeting = {
 	slides: number; // distinct slide events seen
 	slideOn?: number; // the slide on screen
 	lines: string[];
+	lineMs: number[]; // when each line was said (ms, 0 unknown), parallel to lines: the talk around a slide
 	firstFile: string; // the capture the meeting started in; keys the daily-note recap
 	sentUpTo: number; // lines the scout has seen
 	trig: Cadence;
 	notes: Notes; // the scout's rolling notes
 	reply: { to: string; text: string; at: string } | null; // someone is waiting on you
 	sentReplies: SentReply[];
+	slideSums: SlideSummary[]; // summaries by slide number (sorted by n)
+	slideWork: SlideWork; // which slide is summarized next
+	slideModels: Model<Api>[]; // the notes models that can read images
+	slideBusy: boolean;
+	slideAbort?: AbortController;
+	slideTimer?: ReturnType<typeof setTimeout>; // wakes the worker when the next pending slide is due
+	about?: string; // meeting-context.md, for the slide prompt
 	alerts: Alert[];
 	alertSeq: number;
 	nameAlertAt: Map<string, number>; // per speaker, for the 2 min limit
@@ -641,6 +696,8 @@ function main(pi: ExtensionAPI) {
 		if (timer) clearInterval(timer);
 		timer = undefined;
 		st?.abort?.abort();
+		st?.slideAbort?.abort();
+		if (st?.slideTimer) clearTimeout(st.slideTimer);
 		if (st?.auto && done) doneStarts.add(st.auto.startedAt);
 		if (st) last = st;
 		st = undefined;
@@ -667,6 +724,7 @@ function main(pi: ExtensionAPI) {
 			to: lineClock(m.lines.at(-1)),
 			updates: m.checks,
 			notes: m.notes,
+			slides: m.slideSums,
 		});
 		try {
 			const before = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
@@ -684,7 +742,7 @@ function main(pi: ExtensionAPI) {
 		pi.sendMessage(
 			{
 				customType: MSG_TYPE,
-				content: [`${headline}${note ? ` · recap in ${tilde(note)}` : ""}`, ...recapBody(m.notes)].join("\n"),
+				content: [`${headline}${note ? ` · recap in ${tilde(note)}` : ""}`, ...recapBody(m.notes, null, m.slideSums)].join("\n"),
 				display: true,
 				details: { kind: "recap", notes: m.notes, note },
 			},
@@ -710,6 +768,9 @@ function main(pi: ExtensionAPI) {
 				reply: m.reply,
 				alerts: m.alerts,
 				alertSeq: m.alertSeq,
+				slides: m.slideSums,
+				slidesOn: slidesOn() && m.slideModels.length > 0,
+				slidesFailed: m.slideWork.failed,
 			});
 			writeNotesFile(file);
 			// And for good, under the meeting's id: the canvas's history keeps showing them after this file is dropped.
@@ -795,12 +856,17 @@ function main(pi: ExtensionAPI) {
 			return;
 		}
 		if (ev.kind === "slide") {
-			if (!ev.revisit) m.slides++;
+			if (!ev.revisit) {
+				m.slides++;
+				// A revisit never queues a summary: it reuses the one the slide has.
+				if (slidesOn() && m.slideModels.length > 0 && !queueSlide(m.slideWork, ev.n, ev.ts, Date.parse(ev.ts) || now) && m.slideWork.failed.has(ev.n)) writeNotes(m); // past the cap: tell the canvas
+			}
 			m.slideOn = ev.n;
 			if (!history) wantEarly(m, now); // a new slide is worth a look, within the 60 s floor
 			return;
 		}
 		m.lines.push(formatLine(ev));
+		m.lineMs.push(Date.parse(ev.ts) || 0);
 		if (!m.trig.unsent) m.trig.firstUnsentAt = history ? 0 : now;
 		m.trig.unsent++;
 		m.trig.lastLineAt = history ? 0 : now;
@@ -930,11 +996,17 @@ function main(pi: ExtensionAPI) {
 
 	// ── the notes scout ──
 
-	/** OCR text of the slides shown so far, oldest first (a replay shows only what has played). */
-	async function slideTexts(m: Meeting): Promise<SlideText[]> {
+	/** The slides folder of this meeting (a replay's own, else the one state.json names for it), or null. */
+	function slidesDirOf(m: Meeting): string | null {
 		const state = m.auto ? readState() : null;
-		const dir = m.replay ? m.replay.slidesDir : state && state.startedAt === m.auto?.startedAt ? state.slidesDir : (m.auto?.slidesDir ?? null);
+		return m.replay ? m.replay.slidesDir : state && state.startedAt === m.auto?.startedAt ? state.slidesDir : (m.auto?.slidesDir ?? null);
+	}
+
+	/** The slides shown so far, oldest first (a replay shows only what has played): the summary where there is one, else the OCR text. */
+	async function slideTexts(m: Meeting): Promise<SlideText[]> {
+		const dir = slidesDirOf(m);
 		if (!dir) return [];
+		const sums = new Map(m.slideSums.map((s) => [s.n, s]));
 		const index = parseIndex(await fs.promises.readFile(path.join(dir, "index.jsonl"), "utf8").catch(() => ""));
 		const r = m.replay;
 		const seen = r ? Math.min(r.t0 + (Date.now() - r.startedAt) * r.speed, r.last) : undefined;
@@ -943,8 +1015,9 @@ function main(pi: ExtensionAPI) {
 			shown.map(async (e) => ({
 				n: e.n,
 				at: clock(e.at),
-				text: await fs.promises.readFile(ocrPath(dir, e), "utf8").then((t) => t.slice(0, 4000), () => ""),
+				text: sums.has(e.n) ? "" : await fs.promises.readFile(ocrPath(dir, e), "utf8").then((t) => t.slice(0, 4000), () => ""),
 				onScreen: e.n === m.slideOn,
+				...(sums.has(e.n) ? { summary: { title: sums.get(e.n)!.title, what: sums.get(e.n)!.what, why: sums.get(e.n)!.why } } : {}),
 			})),
 		);
 	}
@@ -1074,6 +1147,130 @@ function main(pi: ExtensionAPI) {
 		if (JSON.stringify([m.notes, m.reply, m.alerts]) !== before) writeNotes(m);
 	}
 
+	// ── slide summaries ──
+
+	/** Start the next slide summary if one is due. One at a time, newest first; see slides.ts SlideWork. */
+	function slideTick(m: Meeting) {
+		if (m.slideBusy || m.phase !== "live" || !slidesOn() || m.slideModels.length === 0 || !ctxRef) return;
+		const job = takeSlide(m.slideWork, Date.now(), slideGap(m.replay?.speed ?? 1));
+		if (!job) return;
+		m.slideBusy = true;
+		m.slideAbort = new AbortController();
+		void summarizeSlide(m, job, m.slideAbort.signal)
+			.catch(() => {
+				if (st !== m || m.slideAbort?.signal.aborted) return;
+				// Back off like the notes scout (60 s, doubled each failure in a row); three failures and the slide is given up.
+				const speed = m.replay?.speed ?? 1;
+				if (slideFailed(m.slideWork, job, Date.now(), retryWait(m.slideWork.streak + 1, m.replay ? scaleCadence(speed) : CADENCE, speed)) === "gave-up") writeNotes(m);
+			})
+			.finally(() => {
+				if (st !== m) return;
+				m.slideBusy = false;
+				m.slideAbort = undefined;
+				if (m.slideWork.active === job.n) m.slideWork.active = null; // aborted mid-call: back to the queue's hands
+				wakeSlides(m);
+			});
+	}
+
+	/** After a call, come back when the next pending slide is due (the gap, a backoff or a retry), without waiting for the next 1 s tick. */
+	function wakeSlides(m: Meeting) {
+		const w = m.slideWork;
+		if (m.slideTimer || w.pending.length === 0) return;
+		const due = Math.max(w.holdUntil, w.lastCallAt + slideGap(m.replay?.speed ?? 1), Math.min(...w.pending.map((j) => j.retryAt)));
+		m.slideTimer = setTimeout(() => {
+			m.slideTimer = undefined;
+			if (st === m) slideTick(m);
+		}, Math.max(10, due - Date.now() + 5));
+		m.slideTimer.unref?.();
+	}
+
+	/** One slide: wait for its OCR, send the image with the context, keep the summary. Throws on any failure. */
+	async function summarizeSlide(m: Meeting, job: SlideJob, signal: AbortSignal): Promise<void> {
+		const ctx = ctxRef;
+		if (!ctx) throw new Error("no session");
+		const dir = slidesDirOf(m);
+		if (!dir) throw new Error("no slides folder");
+		const index = parseIndex(await fs.promises.readFile(path.join(dir, "index.jsonl"), "utf8").catch(() => ""));
+		const entry = index.find((e) => e.n === job.n);
+		if (!entry) throw new Error(`slide ${job.n} is not in index.jsonl yet`);
+		const speed = m.replay?.speed ?? 1;
+		// meeting-capture writes the OCR a second or two after the slide, the first slide of a session up to a minute later.
+		const ocr = await waitForOcr(() => fs.promises.readFile(ocrPath(dir, entry), "utf8").then((t) => t, () => null), {
+			// Counted from when the slide appeared, not from now: catching up after a reload must not hold the worker 90 s a slide.
+			timeoutMs: ocrTimeout(job.ms, Date.now(), speed, Boolean(m.replay)),
+			pollMs: speed > 1 ? Math.max(20, 1000 / speed) : 1000,
+			signal,
+			noWait: () => m.phase === "ended",
+		});
+		if (ocr.state === "aborted" || st !== m) return;
+		const file = slideFile(dir, entry);
+		const size = await fs.promises.stat(file).then((s) => s.size, () => -1);
+		if (size < 0) throw new Error("the slide image is missing");
+		if (size > IMAGE_MAX_BYTES) throw new Error("the slide image is over the size limit");
+		const pic = await resizeImage(await fs.promises.readFile(file), "image/jpeg");
+		if (!pic) throw new Error("the slide image could not be resized");
+		if (st !== m) return;
+
+		let digest = "";
+		try {
+			digest = formatDigest(sessionDigest(ctx.sessionManager.getBranch(), sessionName() ?? "", redactText));
+		} catch {
+			// no session digest this time
+		}
+		m.about ??= await fs.promises.readFile(ABOUT_FILE, "utf8").then((s) => s.slice(0, 4000), () => "");
+		const near = nearbyLines(m.lines, m.lineMs, job.ms);
+		const user = buildSlidePrompt({
+			title: m.title,
+			app: m.app,
+			focus: m.focus,
+			me: m.me,
+			digest,
+			n: job.n,
+			shownAt: clock(job.at) || clock(entry.at),
+			ocr: { ...ocr, text: maskSecrets(ocr.text) },
+			before: near.before,
+			after: near.after,
+			previous: m.slideSums.filter((s) => s.n < job.n && s.title).slice(-8).map((s) => ({ n: s.n, title: s.title })),
+		});
+		const system = buildSlideSystem(m.me, m.meTokens, m.about);
+		noteSlideCall(m.slideWork, Date.now());
+		const errors: string[] = [];
+		let res: AssistantMessage | undefined;
+		for (const model of m.slideModels) {
+			const stream = ctx.modelRegistry.streamSimple(
+				model,
+				{
+					systemPrompt: system,
+					messages: [{ role: "user", content: [{ type: "text", text: user }, { type: "image", data: pic.data, mimeType: pic.mimeType }], timestamp: Date.now() }],
+				},
+				{
+					...(REASONING === "off" ? {} : { reasoning: REASONING as ThinkingLevel }),
+					maxTokens: 3000,
+					cacheRetention: "short",
+					sessionId: `${m.sessionId}-slides`,
+					signal: AbortSignal.any([signal, AbortSignal.timeout(SLIDE_CALL_TIMEOUT_MS)]),
+				},
+			);
+			const r = await stream.result();
+			m.cost += r.usage?.cost?.total ?? 0;
+			if (r.stopReason === "error" || r.stopReason === "aborted") {
+				errors.push(`${model.provider}/${model.id}: ${(r.errorMessage || r.stopReason).slice(0, 80)}`);
+				if (signal.aborted) break;
+				continue;
+			}
+			res = r;
+			break;
+		}
+		if (st !== m) return;
+		if (!res) throw new Error(errors.join("; ") || "no model answered");
+		const text = res.content.map((c) => (c.type === "text" ? c.text : "")).join("");
+		const reply = parseSlideReply(text);
+		if (!reply) throw new Error(`unparseable reply: ${text.replace(/\s+/g, " ").slice(0, 60)}`);
+		m.slideSums = withSummary(m.slideSums, { n: job.n, ...reply, at: job.at || entry.at });
+		slideDone(m.slideWork, job);
+		writeNotes(m);
+	}
+
 	// ── tick ──
 
 	async function tick() {
@@ -1096,6 +1293,7 @@ function main(pi: ExtensionAPI) {
 				await pollFile();
 			}
 			if (st !== m) return;
+			slideTick(m);
 			if (!m.busy) {
 				const final = m.phase === "ended";
 				// One last call at the end, before the recap; if it fails, the recap goes out without it.
@@ -1104,7 +1302,8 @@ function main(pi: ExtensionAPI) {
 					m.forceNext = false;
 					if (final) m.finalTried = true;
 					void check();
-				} else if (final) {
+				} else if (final && !m.slideBusy) {
+					// A slide call still in flight finishes first, so the recap has its summary.
 					return finish(m.replay ? "replay finished" : "meeting ended");
 				}
 			}
@@ -1187,6 +1386,10 @@ function main(pi: ExtensionAPI) {
 			.filter((m): m is Model<Api> => !!m && registry.hasConfiguredAuth(m));
 		if (models.length === 0)
 			notify(`The meeting notes model isn't available (${specs.join(", ") || "none set"}): no notes, only name alerts. Set meeting.model or PI_MEETING_MODEL`, "warning");
+		// Slide summaries need a model that reads images; without one they are skipped, with one hint.
+		const slideModels = models.filter((m) => m.input?.includes("image"));
+		if (slidesOn() && models.length > 0 && slideModels.length === 0)
+			notify(`The meeting notes model can't read images (${models.map((m) => m.name || m.id).join(", ")}): no slide summaries. Pick a vision model in meeting.model, or PI_MEETING_SLIDES=0 to stop this note`);
 
 		const who = process.env.PI_MEETING_ME || (await run("git", ["config", "--global", "--includes", "user.name"], 3000)).trim();
 		return {
@@ -1200,11 +1403,16 @@ function main(pi: ExtensionAPI) {
 			people: [],
 			slides: 0,
 			lines: [],
+			lineMs: [],
 			sentUpTo: 0,
 			trig: freshCadence(),
 			notes: emptyNotes(),
 			reply: null,
 			sentReplies: [],
+			slideSums: [],
+			slideWork: newSlideWork(),
+			slideModels,
+			slideBusy: false,
 			alerts: [],
 			alertSeq: 0,
 			nameAlertAt: new Map(),
@@ -1241,13 +1449,18 @@ function main(pi: ExtensionAPI) {
 		m.app = s.app;
 		m.startedMs = s.startedMs;
 		// After a /reload, /resume or /fork, pick the notes up where the last instance left them: no re-alerting for what it already said.
-		const back = restoreNotes(s.startedAt);
+		const back = restoreNotes(s.startedAt, undefined, s.appId);
+		// After `/meeting watch off` the notes file is gone but the archive stays: its summaries are not made (and paid for) again.
+		const slides = back?.slides.length ? back.slides : readArchivedSlides(s.appId, s.startedAt);
+		m.slideSums = slides;
+		for (const x of slides) markSlideDone(m.slideWork, x.n);
 		if (back) {
 			m.notes = back.notes;
 			m.reply = back.reply;
 			m.alerts = back.alerts;
 			m.alertSeq = back.alertSeq;
 			m.alerted = back.alerted;
+			for (const n of back.failed) if (!m.slideWork.done.has(n)) m.slideWork.failed.add(n);
 			if (back.reply) m.sentReplies.push({ key: normText(back.reply.text), to: normText(back.reply.to), at: Date.parse(back.reply.at) || Date.now() });
 		}
 		st = m;
@@ -1341,6 +1554,7 @@ function main(pi: ExtensionAPI) {
 		endedAt: string;
 		replayNow?: number; // epoch ms the replay has reached
 		replayRecs?: Rec[];
+		appId: string; // "" for a replay: its summaries are in memory
 	};
 
 	function toolSource(): Source | undefined {
@@ -1359,6 +1573,7 @@ function main(pi: ExtensionAPI) {
 				live: m.phase !== "ended",
 				ended: m.phase === "ended",
 				endedAt: "",
+				appId: "",
 				replayNow: now,
 				replayRecs: r.recs.filter((x) => !x.ms || x.ms <= now),
 			};
@@ -1376,7 +1591,15 @@ function main(pi: ExtensionAPI) {
 			live: isLive(s),
 			ended: s.ended,
 			endedAt: s.endedAt,
+			appId: s.appId,
 		};
+	}
+
+	/** The slide summaries of the meeting a tool call reads: in memory for the one this session runs (or just ran, or replays), else from its archived notes. */
+	function summariesFor(src: Source): SlideSummary[] {
+		if (src.replayNow !== undefined) return st?.slideSums ?? [];
+		for (const m of [st, last]) if (m?.auto && !m.replay && m.auto.startedAt === src.startedAt) return m.slideSums;
+		return readArchivedSlides(src.appId, src.startedAt);
 	}
 
 	const readIndex = async (src: Source): Promise<SlideEntry[]> => {
@@ -1387,14 +1610,14 @@ function main(pi: ExtensionAPI) {
 	};
 
 	const MeetingParams = Type.Object({
-		action: Type.Union([Type.Literal("status"), Type.Literal("transcript"), Type.Literal("slide")], {
-			description: "status: title, people, slides; transcript: what was said; slide: one slide's time, OCR text and image",
+		action: Type.Union([Type.Literal("status"), Type.Literal("transcript"), Type.Literal("slide"), Type.Literal("slides")], {
+			description: "status: title, people, slides; transcript: what was said; slide: one slide's summary, time, OCR text and image; slides: every slide's summary",
 		}),
 		minutes: Type.Optional(Type.Number({ description: "transcript: only the last N minutes" })),
 		since: Type.Optional(Type.String({ description: 'transcript: from this time, "HH:MM" or "HH:MM:SS" as the transcript shows them, or ISO' })),
 		until: Type.Optional(Type.String({ description: "transcript: up to this time, same formats" })),
 		speaker: Type.Optional(Type.String({ description: "transcript: only this person (case-insensitive part of the name, first name works)" })),
-		query: Type.Optional(Type.String({ description: "transcript: only lines with all these words (case-insensitive)" })),
+		query: Type.Optional(Type.String({ description: "transcript or slides: only lines (or slide summaries) with all these words (case-insensitive)" })),
 		limit: Type.Optional(Type.Number({ description: `transcript: most lines to return, newest kept (default ${TOOL_LIMIT})` })),
 		slide: Type.Optional(Type.Number({ description: "slide: the slide number (default: the one on screen)" })),
 	});
@@ -1430,8 +1653,10 @@ function main(pi: ExtensionAPI) {
 			const index = await readIndex(src);
 			const done = src.slidesDir ? index.filter((e) => fs.existsSync(ocrPath(src.slidesDir as string, e))).length : 0;
 			const end = !src.live && src.endedAt ? Date.parse(src.endedAt) || last : last;
+			const sums = summariesFor(src).slice(-20);
 			return out(
-				formatStatus({
+				[
+					formatStatus({
 					title: src.title,
 					app: src.app,
 					startedAt: src.startedAt,
@@ -1442,8 +1667,20 @@ function main(pi: ExtensionAPI) {
 					slides: slideCount(recs),
 					slideOn,
 					ocr: src.slidesDir ? { done, total: index.length } : undefined,
-				}),
+					}),
+					...(sums.length ? ["Slide summaries:", ...sums.map((s) => `${s.n}. ${s.title || s.what}`)] : []),
+				].join("\n"),
 			);
+		}
+
+		if (p.action === "slides") {
+			const all = summariesFor(src);
+			if (all.length === 0) return out(slidesOn() ? "No slide summaries yet: slides are summarized a little after they appear, if the notes model can read images." : "Slide summaries are off (meeting.slideSummaries, PI_MEETING_SLIDES).");
+			const list = p.query?.trim() ? all.filter((s) => summaryMatches(s, p.query as string)) : all;
+			if (list.length === 0) return out(`No slide summary matches "${p.query}". ${all.length} slide${all.length === 1 ? " is" : "s are"} summarized.`);
+			const blocks = list.map((s) => [`Slide ${s.n}: ${s.title || "(no title)"}`, ...(s.what ? [`  What: ${s.what}`] : []), ...(s.why ? [`  Why it matters to you: ${s.why}`] : [])].join("\n"));
+			const { text: body } = truncateLines(blocks, p.limit);
+			return out(`Slide summaries: ${list.length}${list.length === all.length ? "" : ` of ${all.length}`}\n${body}`, { slides: list.map((s) => s.n) });
 		}
 
 		if (p.action === "transcript") {
@@ -1485,10 +1722,12 @@ function main(pi: ExtensionAPI) {
 		} catch {
 			ocr = "OCR not ready yet";
 		}
+		const summary = summariesFor(src).find((s) => s.n === n);
 		const head = [
 			`Slide ${n}${n === slideOn ? " (on screen now)" : ""} of ${index.length}: ${entry.file}${entry.width ? ` · ${entry.width}×${entry.height}` : ""}${entry.reason ? ` · ${entry.reason}` : ""}`,
 			`First shown at ${shown || "unknown"}${again.length ? `; back on screen at ${again.join(", ")}` : ""}`,
 			"",
+			...(summary ? [...formatSlideSummary(summary), ""] : []),
 			"OCR text:",
 			ocr,
 		];
@@ -1511,10 +1750,10 @@ function main(pi: ExtensionAPI) {
 		name: "meeting",
 		label: "Meeting",
 		description:
-			"Read the meeting Eric is in (or the last one) from meeting-capture, read-only. action=status: title, people, slide count, the slide on screen. action=transcript: what was said, with optional minutes (last N min), since/until (HH:MM[:SS] as the transcript shows them, or ISO), speaker (part of a name), query (words that must all appear), limit; lines still being spoken come last. action=slide: one slide's time shown, OCR text and the image (default: the slide on screen). When nothing is live it reads the most recent meeting and says so.",
-		promptSnippet: "Read the live meeting: status, transcript (what was said, by time/speaker/words), or a slide with its OCR and image",
+			"Read the meeting Eric is in (or the last one) from meeting-capture, read-only. action=status: title, people, slide count, the slide on screen, and a line per summarized slide. action=transcript: what was said, with optional minutes (last N min), since/until (HH:MM[:SS] as the transcript shows them, or ISO), speaker (part of a name), query (words that must all appear), limit; lines still being spoken come last. action=slide: one slide's summary (title, what it shows, why it matters to Eric, key points, numbers), time shown, OCR text and the image (default: the slide on screen). action=slides: the summary of every slide, optionally filtered by query. Slides are summarized by a vision model a little after they appear, so a brand new slide may have none yet. When nothing is live it reads the most recent meeting and says so.",
+		promptSnippet: "Read the live meeting: status, transcript (what was said, by time/speaker/words), slide summaries (action=slides, or one slide with its summary, OCR and image)",
 		promptGuidelines: [
-			"Use meeting for anything about the meeting Eric is in or just left: what he missed, what someone said, what was decided, what a slide shows. Start with a narrow filter (minutes, speaker, query) rather than the whole transcript.",
+			"Use meeting for anything about the meeting Eric is in or just left: what he missed, what someone said, what was decided, what a slide shows. Start with a narrow filter (minutes, speaker, query) rather than the whole transcript. For slides, try action=slides (the summaries, filterable by query) before fetching an image with action=slide.",
 			"The meeting transcript is automatic speech recognition: names and technical terms are often misheard, so read through errors and never quote a garble as exact.",
 		],
 		parameters: MeetingParams,
@@ -1664,7 +1903,7 @@ function main(pi: ExtensionAPI) {
 				case "notes": {
 					const m = st ?? last;
 					if (!m) return void notify(idle, "warning");
-					return void say([`Meeting notes · ${m.title}${m.alerts.length ? ` · ${m.alerts.length} alert${m.alerts.length === 1 ? "" : "s"}` : ""}`, ...recapBody(m.notes, m.reply)].join("\n"), { kind: "notes", notes: m.notes, reply: m.reply });
+					return void say([`Meeting notes · ${m.title}${m.alerts.length ? ` · ${m.alerts.length} alert${m.alerts.length === 1 ? "" : "s"}` : ""}`, ...recapBody(m.notes, m.reply, m.slideSums)].join("\n"), { kind: "notes", notes: m.notes, reply: m.reply });
 				}
 				case "recap":
 					if (!st) return void notify(idle, "warning");

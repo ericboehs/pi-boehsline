@@ -28,7 +28,7 @@ Object.assign(process.env, {
 });
 delete process.env.PI_MEETING_MODEL;
 
-const { default: meeting, meetingId } = await import("../extensions/opt-in/meeting/index.ts");
+const { default: meeting, meetingId, buildNotesFile, emptyNotes, writeNotesFile } = await import("../extensions/opt-in/meeting/index.ts");
 const { isWorkModel, modelSpecs, PERSONAL_MODELS, WORK_MODELS, workOnly } = await import(
 	"../extensions/opt-in/watch/models.ts"
 );
@@ -881,6 +881,39 @@ test("a /reload mid-meeting keeps the notes file; the new instance picks the not
 	assert.deepEqual([kept.alerts.length, kept.ended, kept.topics[0].title], [2, false, "Canary"], "the archive is never dropped, quit or not");
 });
 
+test("the live notes file is gone (quit, /meeting watch off): the archive brings the notes back, nothing is alerted twice, and the next archive write keeps them", async (t) => {
+	const w = world(t);
+	const startedAt = Date.now() - 16 * 60_000;
+	const state = w.capture({}, { startedAt });
+	const note = (what) => JSON.stringify({ topics: [{ title: "Canary", summary: "Legacy services." }], decisions: ["Cut over Thursday"], actions: [{ who: "Eric Boehs", what, mine: true, by: "Ada Lovelace" }], questions: [{ q: "Who owns the rollback?", why: "No owner yet" }], reply: null });
+	const first = scripted([note("own moving the legacy services onto canary")]);
+	const before = w.session("earl", "earl-id", [], { registry: first });
+	await before.fire("session_start");
+	await until(() => before.sent.some((m) => m.content.startsWith("✅")), "the action alert");
+	await until(() => fs.existsSync(w.archive(state)) && JSON.parse(fs.readFileSync(w.archive(state), "utf8")).alerts.length === 1, "the archive has the alert");
+	await before.fire("session_shutdown", { reason: "quit" });
+	assert.equal(fs.existsSync(w.notesFile), false, "the live file went with the session");
+	assert.equal(JSON.parse(fs.readFileSync(w.archive(state), "utf8")).alerts.length, 1, "the archive stays");
+
+	// A second session starts with only the archive: no live file. Its scout leaves every field out, so what the notes hold is what was restored.
+	const second = scripted([JSON.stringify({ reply: null })]);
+	const after = w.session("earl", "earl-id", [], { registry: second });
+	await after.fire("session_start");
+	await until(() => after.started() === 1 && second.calls.length === 1, "the new instance's first call");
+	assert.match(second.calls[0].user, /<previous_notes>\n\{"topics":\[\{"title":"Canary"/, "it starts from the archived notes");
+	await wait(300);
+	assert.deepEqual(after.sent.filter((m) => !m.content.startsWith("Meeting copilot on ")), [], "no alert again for what the archive already had");
+
+	// The next alert counts on from the archive's, and the archive keeps what was there.
+	fs.appendFileSync(state.jsonl, JSON.stringify({ type: "caption", speaker: "Ada Lovelace", text: "Eric, are you there?", ts: iso(Date.now()) }) + "\n");
+	await until(() => after.sent.some((m) => m.content.startsWith("🔔")), "a name alert");
+	await until(() => JSON.parse(fs.readFileSync(w.archive(state), "utf8")).alerts.length === 2, "both alerts in the archive");
+	const kept = JSON.parse(fs.readFileSync(w.archive(state), "utf8"));
+	assert.deepEqual(kept.alerts.map((x) => x.id), ["a1", "a2"], "alertSeq carried on");
+	assert.deepEqual([kept.topics[0]?.title, kept.decisions[0]?.text, kept.questions[0]?.q], ["Canary", "Cut over Thursday", "Who owns the rollback?"]);
+	await after.fire("session_shutdown", { reason: "quit" });
+});
+
 test("the daily-note recap lists topics, decisions, action items and open questions, and a replay never writes one", async (t) => {
 	const w = world(t);
 	const daily = path.join(w.root, "daily");
@@ -951,4 +984,318 @@ test("/q research is gone: no /q command, no input hook, no /meeting list", asyn
 		commands.meeting.getArgumentCompletions("").map((c) => c.value),
 		["watch", "ask", "notes", "recap", "focus ", "stop", "replay"],
 	);
+});
+
+// ── slide summaries, end to end ──
+
+/**
+ * A registry whose model reads images. Slide calls (their content is a list with the image) answer from
+ * `slide(n, k)` (k: how many calls that slide has had before this one); scout calls answer with some notes.
+ * `slide` may return {error} to fail the call.
+ */
+function vision({ images = true, slide } = {}) {
+	const calls = [];
+	const reply =
+		slide ??
+		((n) => JSON.stringify({ title: `Title ${n}`, what: `What ${n} shows.`, why: n === 3 ? "Your canary move is on it." : "", points: [`point ${n}`], numbers: [`${n}0 ms`] }));
+	return {
+		calls,
+		slideCalls: () => calls.filter((c) => c.slide !== undefined),
+		noteCalls: () => calls.filter((c) => c.slide === undefined),
+		find: (provider, id) => ({ provider, id, name: "Claude Haiku 5.5", ...(images ? { input: ["text", "image"] } : {}) }),
+		hasConfiguredAuth: () => true,
+		streamSimple: (model, context) => {
+			const content = context.messages[0].content;
+			const isSlide = Array.isArray(content);
+			const text = isSlide ? content.find((c) => c.type === "text").text : content;
+			const n = isSlide ? Number(/This is slide (\d+)/.exec(text)[1]) : undefined;
+			const k = isSlide ? calls.filter((c) => c.slide === n).length : 0;
+			calls.push({ model: `${model.provider}/${model.id}`, system: context.systemPrompt, user: text, image: isSlide ? content.find((c) => c.type === "image") : undefined, slide: n, at: Date.now() });
+			const answer = isSlide ? reply(n, k) : JSON.stringify({ topics: [{ title: "Canary", summary: "Rollout." }], decisions: [], actions: [], questions: [], reply: null });
+			return {
+				result: async () =>
+					typeof answer === "object"
+						? { stopReason: "error", errorMessage: answer.error, content: [], usage: { cost: { total: 0 } } }
+						: { stopReason: "stop", content: [{ type: "text", text: answer }], usage: { cost: { total: 0.001 } } },
+			};
+		},
+	};
+}
+
+const T0 = "2026-10-28T14:00:00-05:00";
+const tsAt = (hms) => `2026-10-28T${hms}-05:00`;
+
+/** A finished capture to replay: three slides at once (with OCR), a revisit, captions around them, a late caption to keep the replay running. */
+function slideReplayFixture(name, { ocr = true } = {}) {
+	const base = path.join(dir, `20261028_140000-teams-${name}`);
+	const slides = `${base}.slides`;
+	fs.mkdirSync(slides, { recursive: true });
+	const files = [1, 2, 3].map((n) => `000${n}-14010${n}.jpg`);
+	files.forEach((f) => fs.writeFileSync(path.join(slides, f), SMALL_JPG));
+	fs.writeFileSync(path.join(slides, "index.jsonl"), files.map((file, i) => JSON.stringify({ n: i + 1, at: tsAt(`14:01:0${i + 1}`), file, reason: "change", width: 1382, height: 863 })).join("\n") + "\n");
+	if (ocr) {
+		fs.writeFileSync(path.join(slides, "0001-140101.txt"), "Agenda\nCanary rollout\n");
+		fs.writeFileSync(path.join(slides, "0002-140102.txt"), "");
+		fs.writeFileSync(path.join(slides, "0003-140103.txt"), "Shared content | Canary.pptx\nCanary Thursday\n12\n");
+	}
+	const cap = (hms, text) => ({ type: "caption", ts: tsAt(hms), speaker: "Ada Lovelace", text });
+	const recs = [
+		{ type: "metadata", meeting: "Canary Plan", app: "Teams", meeting_started_at: T0 },
+		cap("14:00:10", "Welcome, today is the canary plan."),
+		cap("14:00:50", "Next, the rollout."),
+		...files.map((file, i) => ({ type: "slide", slide: i + 1, file: path.join(slides, file), ts: tsAt(`14:01:0${i + 1}`) })),
+		cap("14:01:20", "So canary goes Thursday."),
+		{ type: "revisit", slide: 1, file: path.join(slides, files[0]), reason: "revisit", ts: tsAt("14:02:00") },
+		cap("14:04:00", "Questions about the rest later."),
+		cap("14:20:00", "That is all."),
+	];
+	fs.writeFileSync(`${base}.jsonl`, recs.map((r) => JSON.stringify(r)).join("\n") + "\n");
+	return `${base}.jsonl`;
+}
+
+const asked = [{ type: "message", message: { role: "user", content: "fix the canary config" } }];
+
+test("slide summaries in a replay: a burst goes newest first, one at a time and paced; the prompt has everything; a revisit reuses; nothing is written", async (t) => {
+	const w = world(t);
+	const file = slideReplayFixture("replay-burst");
+	const registry = vision();
+	const s = w.session("solo", "solo-id", asked, { registry });
+	await s.command(`replay 300 ${file}`);
+
+	await until(() => registry.slideCalls().length === 3, "three slide calls", 12000);
+	const calls = registry.slideCalls();
+	assert.deepEqual(calls.map((c) => c.slide), [3, 2, 1], "the newest first, then backwards");
+	assert.ok(calls[1].at - calls[0].at >= 25 && calls[2].at - calls[1].at >= 25, "paced: 10 s scaled by the replay's speed (33 ms here)");
+
+	const first = calls[0];
+	assert.equal(first.model, "github-copilot/claude-haiku-5.5", "the notes model");
+	assert.match(first.system, /You describe one slide from a meeting Eric Boehs is sitting in/);
+	assert.match(first.user, /^Meeting: Canary Plan \(Teams\)\n/);
+	assert.match(first.user, /<session>[\s\S]*- fix the canary config[\s\S]*<\/session>/, "what he is working on");
+	assert.match(first.user, /<ocr>\nCanary Thursday\n12\n<\/ocr>/, "OCR, the window title line stripped");
+	assert.doesNotMatch(first.user, /Shared content/);
+	assert.match(first.user, /<said_before>\n\[14:00:10\] Ada Lovelace: Welcome, today is the canary plan\.\n\[14:00:50\] Ada Lovelace: Next, the rollout\.\n<\/said_before>/, "the 90 s before");
+	assert.match(first.user, /<said_after>\n\[14:01:20\] Ada Lovelace: So canary goes Thursday\.\n<\/said_after>/, "and after, what had been said by call time; 14:04 is too far");
+	assert.doesNotMatch(first.user, /<previous_slides>/, "the first one has no earlier titles");
+	assert.equal(first.image.mimeType, "image/jpeg");
+	assert.equal(first.image.data, SMALL_JPG.toString("base64"), "the full jpg goes out (through the resize path)");
+	assert.match(calls[1].user, /<ocr>\n\(the OCR found no text on this slide\)\n<\/ocr>/, "a 0 byte OCR file means no text");
+	assert.match(calls[2].user, /<ocr>\nAgenda\nCanary rollout\n<\/ocr>/);
+
+	// The session model can read them (the replay's summaries live in memory), and the revisit asked for nothing more.
+	await until(async () => (await s.toolText({ action: "slides" })).includes("Slide 1: Title 1"), "all three summaries");
+	assert.equal(registry.slideCalls().length, 3, "a revisit reuses its slide's summary: no call");
+	const all = await s.toolText({ action: "slides" });
+	assert.match(all, /^This is a replay of Canary Plan \(Teams\), as far as it has played\.\n\nSlide summaries: 3\nSlide 1: Title 1\n {2}What: What 1 shows\.\nSlide 2: Title 2\n {2}What: What 2 shows\.\nSlide 3: Title 3\n {2}What: What 3 shows\.\n {2}Why it matters to you: Your canary move is on it\.$/);
+	assert.match(await s.toolText({ action: "status" }), /Slide summaries:\n1\. Title 1\n2\. Title 2\n3\. Title 3$/);
+
+	await until(() => s.stopped(), "the replay to finish", 12000);
+	assert.equal(fs.existsSync(w.notesFile), false, "a replay writes no notes file");
+	assert.equal(fs.existsSync(process.env.PI_MEETING_NOTES_DIR), false, "and no archive");
+});
+
+test("slide summaries when a model fails: back off, retry, and give up on a slide after three failures", async (t) => {
+	const w = world(t);
+	const file = slideReplayFixture("replay-failing");
+	// Slide 3 never works; slide 2 fails once; slide 1 is fine.
+	const registry = vision({
+		slide: (n, k) => (n === 3 ? { error: "429 rate limited" } : n === 2 && k === 0 ? { error: "overloaded" } : JSON.stringify({ title: `Title ${n}`, what: `What ${n}.`, why: "", points: [], numbers: [] })),
+	});
+	const s = w.session("solo", "solo-id", asked, { registry });
+	await s.command(`replay 1000 ${file}`);
+	await until(() => s.stopped(), "the replay to finish", 12000);
+	assert.deepEqual(registry.slideCalls().map((c) => c.slide), [3, 3, 3, 2, 2, 1], "slide 3 three tries then given up (no fourth), slide 2 retried once, slide 1 still got its turn");
+	const at = registry.slideCalls().map((c) => c.at);
+	assert.ok(at[1] - at[0] >= 50 && at[2] - at[1] >= 100, "each failure waits longer (the scout's backoff, scaled by the replay's speed)");
+	await wait(400);
+	assert.equal(registry.slideCalls().length, 6, "no retry storm after the give-up");
+	assert.ok(registry.noteCalls().length >= 1, "the notes scout is not held up by it");
+});
+
+test("slide summaries in a live meeting: restored ones are kept and never called again, the newest slide waits for its OCR, the file and archive carry them, the scout and the tool use them, the recap lists what matters", async (t) => {
+	const w = world(t);
+	// Slide 3 came up a few seconds ago: its OCR wait runs from then, not from when the worker picks it.
+	const startedAt = Date.now() - 14 * 60_000 - 5000;
+	const state = w.capture({}, { startedAt });
+	const slides = path.join(w.root, "data", "20261028_140000-teams-weekly-sync.slides");
+	fs.writeFileSync(path.join(slides, "0003-141400.jpg"), SMALL_JPG);
+	// Slide 1 was summarized before a /reload: it is in the notes file.
+	writeNotesFile(
+		buildNotesFile({
+			pid: process.pid,
+			sessionId: "earl-id",
+			sessionName: "earl",
+			startedAt: state.started_at,
+			appId: "teams",
+			title: "Weekly Sync",
+			at: "A",
+			ended: false,
+			me: [],
+			notes: emptyNotes(),
+			reply: null,
+			alerts: [],
+			alertSeq: 0,
+			slides: [{ n: 1, title: "Agenda", what: "The meeting agenda.", why: "", points: [], numbers: [], at: iso(startedAt + 60_000) }],
+		}),
+	);
+	const registry = vision({
+		slide: (n) => JSON.stringify({ title: `Q3 canary plan`, what: "Canary rollout dates.", why: "Your canary move is on it.", points: ["Thursday cutover"], numbers: ["Oct 28 cutover"] }),
+	});
+	const earl = w.session("earl", "earl-id", asked, { registry });
+	await earl.fire("session_start");
+	await until(() => earl.started() === 1, "the copilot to start");
+	// The newest slide's OCR is not there yet: it waits, and goes on when the file lands.
+	await wait(700);
+	assert.equal(registry.slideCalls().length, 0, "waiting for the OCR file");
+	setTimeout(() => fs.writeFileSync(path.join(slides, "0003-141400.txt"), "Shared content | Teams\nRaw canary OCR words\n"), 300);
+	await until(() => registry.slideCalls().length === 1, "the slide call once its OCR exists", 12000);
+	const call = registry.slideCalls()[0];
+	assert.equal(call.slide, 3, "the newest slide, not slide 2 and never the restored slide 1");
+	assert.match(call.user, /<previous_slides>\nTitles of the slides before this one, for continuity:\n1\. Agenda\n<\/previous_slides>/);
+	assert.match(call.user, /<ocr>\nRaw canary OCR words\n<\/ocr>/);
+	assert.equal(call.image.data, SMALL_JPG.toString("base64"));
+
+	// Cached by slide number, in memory and in the notes file and the archive.
+	await until(() => JSON.parse(fs.readFileSync(w.notesFile, "utf8")).slides?.length === 2, "the summary in the notes file");
+	const file = JSON.parse(fs.readFileSync(w.notesFile, "utf8"));
+	assert.deepEqual(file.slides.map((x) => [x.n, x.title, x.why]), [[1, "Agenda", ""], [3, "Q3 canary plan", "Your canary move is on it."]]);
+	assert.deepEqual(file.slides[1], { n: 3, title: "Q3 canary plan", what: "Canary rollout dates.", why: "Your canary move is on it.", points: ["Thursday cutover"], numbers: ["Oct 28 cutover"], at: file.slides[1].at });
+	assert.deepEqual(JSON.parse(fs.readFileSync(w.archive(state), "utf8")).slides, file.slides, "the archive carries them too");
+	assert.equal(file.slidesOn, true, "the canvas is told summaries are running");
+	assert.deepEqual(file.slidesFailed, []);
+
+	// The notes scout reads summaries instead of raw OCR where it has them, raw OCR for the rest.
+	await earl.command("ask");
+	await until(() => registry.noteCalls().length >= 2, "the next scout call");
+	const scout = registry.noteCalls().at(-1).user;
+	assert.match(scout, /Slide 3 \(\d\d:\d\d:\d\d\) \(summary\):\nQ3 canary plan: Canary rollout dates\. Why it matters: Your canary move is on it\./);
+	assert.match(scout, /Slide 1 \(\d\d:\d\d:\d\d\) \(summary\):\nAgenda: The meeting agenda\./);
+	assert.match(scout, /Slide 2 \(\d\d:\d\d:\d\d\), on screen now:\nCert rotation plan\nOwner: Amy/, "slide 2 has no summary yet: its OCR");
+	assert.doesNotMatch(scout, /Raw canary OCR words/);
+	assert.equal(registry.slideCalls().length, 1, "at most one slide call per 10 s");
+
+	// No chat noise for summaries.
+	assert.ok(earl.sent.every((m) => /^(Meeting copilot on |🔔|✅|↳)/.test(m.content)), earl.sent.map((m) => m.content).join(" | "));
+	assert.match(earl.showing(), /^● Weekly Sync · 14m · slide 2( ·|$)/, "and no new part in the status line");
+
+	// The tool: the session that runs it (memory) and another session (the archive) both see them.
+	const reader = w.session("reader");
+	for (const who of [earl, reader]) {
+		const slide3 = await who.tool({ action: "slide", slide: 3 });
+		const text = slide3.content[0].text;
+		assert.match(text, /First shown at [^\n]*\n\nSummary: Q3 canary plan\nWhat it shows: Canary rollout dates\.\nWhy it matters to you: Your canary move is on it\.\nKey points:\n- Thursday cutover\nNumbers:\n- Oct 28 cutover\n\nOCR text:\nShared content \| Teams\nRaw canary OCR words/, "the summary sits above the OCR text");
+		assert.equal(slide3.content[1].type, "image");
+		assert.match(await who.toolText({ action: "status" }), /Slide summaries:\n1\. Agenda\n3\. Q3 canary plan$/);
+		assert.match(await who.toolText({ action: "slides" }), /^Slide summaries: 2\nSlide 1: Agenda\n {2}What: The meeting agenda\.\nSlide 3: Q3 canary plan\n {2}What: Canary rollout dates\.\n {2}Why it matters to you: Your canary move is on it\.$/);
+		assert.match(await who.toolText({ action: "slides", query: "CUTOVER canary" }), /^Slide summaries: 1 of 2\nSlide 3: Q3 canary plan/);
+		assert.match(await who.toolText({ action: "slides", query: "kubernetes" }), /^No slide summary matches "kubernetes"\. 2 slides are summarized\.$/);
+		assert.doesNotMatch(await who.toolText({ action: "slide", slide: 2 }), /Summary:/, "a slide without one shows only its OCR");
+	}
+
+	// The meeting ends: the recap lists the slides that matter to him (those with a why).
+	w.state({ ...state, ended: true, ended_at: iso(Date.now()), duration: "0:16:00" });
+	await until(() => earl.stopped(), "the copilot to stop");
+	assert.match(earl.sent.at(-1).content, /\nSlides:\n3\. Q3 canary plan — Your canary move is on it\.$/);
+	assert.doesNotMatch(earl.sent.at(-1).content, /1\. Agenda/, "no why, not listed");
+	assert.equal(JSON.parse(fs.readFileSync(w.notesFile, "utf8")).slides.length, 2);
+});
+
+test("slide summaries off: PI_MEETING_SLIDES=0 means no slide call, and the tool says so", async (t) => {
+	const w = world(t);
+	w.capture({}, { startedAt: Date.now() - 16 * 60_000 });
+	process.env.PI_MEETING_SLIDES = "0";
+	t.after(() => delete process.env.PI_MEETING_SLIDES);
+	const registry = vision();
+	const earl = w.session("earl", "earl-id", asked, { registry });
+	await earl.fire("session_start");
+	await until(() => registry.noteCalls().length >= 1, "the notes scout");
+	await wait(1800);
+	assert.equal(registry.slideCalls().length, 0);
+	assert.ok(!earl.notes.some((n) => /read images/.test(n)), "off is quiet");
+	assert.match(await earl.toolText({ action: "slides" }), /Slide summaries are off/);
+});
+
+test("no vision model: slide summaries are skipped, with one hint; notes carry on", async (t) => {
+	const w = world(t);
+	w.capture({}, { startedAt: Date.now() - 16 * 60_000 });
+	const registry = vision({ images: false });
+	const earl = w.session("earl", "earl-id", asked, { registry });
+	await earl.fire("session_start");
+	await until(() => registry.noteCalls().length >= 1, "the notes scout");
+	await wait(1800);
+	assert.equal(registry.slideCalls().length, 0);
+	assert.equal(earl.notes.filter((n) => /can't read images/.test(n)).length, 1, "one hint, not one per slide");
+	assert.match(earl.notes.find((n) => /can't read images/.test(n)), /Claude Haiku 5\.5.*no slide summaries/);
+	assert.match(await earl.toolText({ action: "slides" }), /^No slide summaries yet/);
+});
+
+test("the OCR wait runs from when the slide appeared: a slide shown minutes ago with no OCR file is not waited for", async (t) => {
+	const w = world(t);
+	const state = w.capture({}, { startedAt: Date.now() - 16 * 60_000 });
+	const slides = path.join(w.root, "data", "20261028_140000-teams-weekly-sync.slides");
+	fs.writeFileSync(path.join(slides, "0003-141400.jpg"), SMALL_JPG);
+	const registry = vision();
+	const earl = w.session("earl", "earl-id", asked, { registry });
+	const t0 = Date.now();
+	await earl.fire("session_start");
+	await until(() => registry.slideCalls().length >= 1, "the first slide call, without a 90 s wait", 6000);
+	assert.ok(Date.now() - t0 < 6000);
+	const call = registry.slideCalls()[0];
+	assert.equal(call.slide, 3);
+	assert.match(call.user, /<ocr>\n\(the OCR text was not ready: go by the image\)\n<\/ocr>/);
+	assert.ok(state);
+});
+
+test("after /meeting watch off the archive still holds the summaries: they come back and are not made again", async (t) => {
+	const w = world(t);
+	const state = w.capture({}, { startedAt: Date.now() - 16 * 60_000 });
+	const slides = path.join(w.root, "data", "20261028_140000-teams-weekly-sync.slides");
+	fs.writeFileSync(path.join(slides, "0003-141400.jpg"), SMALL_JPG);
+	// Only the archive is left (no live notes file): slides 1 and 3 were summarized earlier.
+	writeNotesFile(
+		buildNotesFile({
+			pid: process.pid,
+			sessionId: "earl-id",
+			sessionName: "earl",
+			startedAt: state.started_at,
+			appId: "teams",
+			title: "Weekly Sync",
+			at: "A",
+			ended: false,
+			me: [],
+			notes: emptyNotes(),
+			reply: null,
+			alerts: [],
+			alertSeq: 0,
+			slides: [1, 3].map((n) => ({ n, title: `Old ${n}`, what: `Old what ${n}.`, why: "", points: [], numbers: [], at: iso(Date.now()) })),
+		}),
+	);
+	fs.mkdirSync(path.dirname(w.archive(state)), { recursive: true });
+	fs.copyFileSync(w.notesFile, w.archive(state));
+	fs.rmSync(w.notesFile);
+	const registry = vision();
+	const earl = w.session("earl", "earl-id", asked, { registry });
+	await earl.fire("session_start");
+	await until(() => registry.slideCalls().length >= 1, "the one slide still without a summary");
+	assert.deepEqual([...new Set(registry.slideCalls().map((c) => c.slide))], [2], "only slide 2: 1 and 3 came back from the archive");
+	const status = await earl.toolText({ action: "status" });
+	assert.match(status, /\n1\. Old 1\n/);
+	assert.match(status, /\n3\. Old 3(\n|$)/);
+});
+
+test("the notes file says whether slide summaries run: off by setting, or without an image model, it says no", async (t) => {
+	for (const mode of ["setting", "novision"]) {
+		const w = world(t);
+		w.capture({}, { startedAt: Date.now() - 16 * 60_000 });
+		if (mode === "setting") process.env.PI_MEETING_SLIDES = "0";
+		t.after(() => delete process.env.PI_MEETING_SLIDES);
+		const registry = vision({ images: mode !== "novision" });
+		const earl = w.session("earl", "earl-id", asked, { registry });
+		await earl.fire("session_start");
+		await until(() => registry.noteCalls().length >= 1 && fs.existsSync(w.notesFile), "the notes file");
+		const file = JSON.parse(fs.readFileSync(w.notesFile, "utf8"));
+		assert.equal(file.slidesOn, false, mode);
+		assert.deepEqual(file.slidesFailed, []);
+		delete process.env.PI_MEETING_SLIDES;
+	}
 });

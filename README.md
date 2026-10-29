@@ -53,7 +53,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [approval-guardian](extensions/opt-in/approval-guardian/README.md) | Fail-closed gate: a reviewer model checks risky tool calls | `/approval-guardian` |
 | [image-prune](extensions/opt-in/image-prune/README.md) | Shrinks big tool result images on arrival, and swaps old images for a note with their path past a size threshold | `/image-prune` |
 | [watch](extensions/opt-in/watch/README.md) | Slack, bot feed and notification watcher with digests and drafts | `/watch`, `watch_items` tool |
-| [meeting](extensions/opt-in/meeting/README.md) | Live meeting copilot: rolling notes, name and action alerts, and chat answers, from the transcript | `/meeting` |
+| [meeting](extensions/opt-in/meeting/README.md) | Live meeting copilot: rolling notes, name and action alerts, slide summaries, and chat answers, from the transcript | `/meeting` |
 | [omlx](extensions/opt-in/omlx/README.md) | Adds models loaded in a local oMLX server to `/model` |  |
 | [scheduler-tool](packages/scheduler/README.md#letting-the-agent-set-timers-schedule-tool) | Lets the agent set and manage `/once` and `/loop` timers | `schedule` tool (deferred) |
 | [sc](extensions/opt-in/sc/README.md) | Attach the newest screenshot from iCloud Downloads | `/sc` |
@@ -109,7 +109,7 @@ Everything below goes in `~/.pi/agent/boehsline.json`, or comes from a package t
     "notifBin": ""                                    // "" = Boehsline's build, else PATH
   },
 
-  "meeting": { "model": "github-copilot/claude-haiku-5.5", "qmdCollections": ["notes"], "dailyDir": "~/Notes/daily", "owner": "earl" },
+  "meeting": { "model": "github-copilot/claude-haiku-5.5", "qmdCollections": ["notes"], "dailyDir": "~/Notes/daily", "owner": "earl", "slideSummaries": true },
   "image-prune": { "thresholdMB": 5, "keepTurns": 2, "shrinkMaxPx": 1568, "shrinkMinKB": 512 },  // "enabled": false pauses it; /image-prune now still works
   "scheduler-tool": { "exposure": "deferred" },  // "direct" puts the schedule tool in every prompt
   "update": { "dir": "~/dotfiles", "task": "update:pi" },  // no dir: the checkout that holds ~/.config/mise/config.toml

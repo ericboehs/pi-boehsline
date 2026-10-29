@@ -299,11 +299,10 @@ the review prompt — so a renderer never reaches for a page global.
 - **Meeting.** While [meeting-capture](https://github.com/ericboehs/meeting-capture)
   is following a meeting, a **Meeting** card (`auto-meeting`) sits at the top of every
   session's side panel: a green **Live** dot and ticking elapsed time, the title and
-  app, people and slide counts, the newest slide's thumbnail and the latest
-  captions or chat lines, one block per speaker (four at most) under a short name
-  ("Compton, Tori K. (Acme Llc)" reads "Tori Compton"; the full name is the
-  tooltip), the in-progress line in italics, a long turn cut at its start, not
-  its end. When the [meeting copilot](../opt-in/meeting/README.md)
+  app, people and slide counts, the newest slide's thumbnail (with the
+  copilot's summary of it under the thumbnail when there is one: its title in bold,
+  then why it matters to you, or what it shows when that is empty, two lines at
+  most, and never a flash) and the last four captions or chat lines. When the [meeting copilot](../opt-in/meeting/README.md)
   is running in a pi session, its **alerts** (someone said your name, a new
   action on you) sit at the top of the card in a warn-tinted box, newest first,
   at most three with their time and who, then **Your action items**; the card
@@ -316,19 +315,36 @@ the review prompt — so a renderer never reaches for a page global.
   `/meeting?id=<id>` in a new tab, and **View all ↗**; with no meetings at all
   there is no card. `/meeting` shows the shared screen's
   current slide large, with a thumbnail strip, and the transcript beside it.
-  The transcript has speaker colours, chat, people and slide markers, and
+  The transcript has speaker colours, people and slide markers (meeting chat is
+  kept out of it, in its own Chat box, below), and
   the in-progress lines greyed at the bottom with a cursor. It follows the
   bottom until you scroll up (then **Jump to live**). A thumbnail or a slide
   marker pins that slide and scrolls the transcript to it; `f` follows the
-  slide on screen again, ← / → step through slides, `/` filters the transcript and a
+  slide on screen again, ← / → step through slides, `/` filters the transcript and the chat, and a
   click on the slide opens it full size. A `revisit` (the screen went back to
   a frame saved earlier) makes that slide current again, adds a "↺ Back to
   slide N" marker and marks its thumbnail ↺ (with a count past one); it adds
-  no thumbnail, and the slide count stays distinct frames. A **Notes** panel
+  no thumbnail, and the slide count stays distinct frames. Under the large slide
+  a **summary panel** (from the copilot's slide summaries) gives the shown
+  slide's title, what it shows, "Why it matters: …" (only when there is a
+  reason), its key points and its numbers as small tags; it says "Summarizing…"
+  while a live meeting's newest slide has none yet (only when the copilot's notes
+  are there). A thumbnail's tooltip and label carry the title, a slide marker in
+  the transcript reads "▣ Slide 3 · title", and a past meeting shows its archived
+  summaries the same way. A **Notes** panel
   beside the transcript shows the copilot's alerts, your action items,
-  decisions, topics, questions (only if there are any) and the suggested reply;
-  from 1400 px wide it is a third column (about 340 px), narrower a
-  **Transcript / Notes** switch at the top of the column swaps them. Transcript
+  decisions, topics, slides (`n. title`, click to show that slide), questions
+  (only if there are any) and the suggested reply;
+  from 1400 px wide it is a third column (about 340 px) with the **Chat** box on
+  top (about 40 % of its height, its own scroll, following the bottom until you
+  scroll up; a one-line "No chat yet" while there is none) and Notes below;
+  narrower, a **Transcript / Chat / Notes** switch at the top of the column
+  swaps them, and the Chat tab shows an unread count for messages that came in
+  while it wasn't shown. A chat row is time, speaker (coloured as in the
+  transcript) and text, with `http(s)` URLs as links (`target=_blank`,
+  `rel="noopener noreferrer"`; every piece is a text node, never markup). The
+  `#e<n>` jump also works for a chat entry (it scrolls the Chat box and, on a
+  narrow screen, brings up its tab). Transcript and chat
   lines where someone else says your name get a subtle warn highlight. After
   the meeting `/meeting` keeps the last one until the next starts.
   `/meeting?id=<id>` shows any past meeting the same way (header "Ended · Tue
@@ -343,8 +359,11 @@ the review prompt — so a renderer never reaches for a page global.
   `/api/meetings?offset=&limit=` (limit ≤ 100, default 50). `/` focuses the search box
   (debounced 200 ms, Esc clears): `/api/meetings/search?q=` needs every
   whitespace-separated term, in one transcript line or in the meeting's title,
-  people or notes, case-insensitively, and each meeting shows up to three
-  matching lines (terms in `<mark>`) that open the meeting at that line. A search
+  people, notes or slide summaries (title, what, why, points), case-insensitively, and each meeting shows up to three
+  matching lines (terms in `<mark>`) that open the meeting at that line. Chat
+  messages are searched too: such a line has `type: "chat"` and a small "chat"
+  tag before the speaker, and the meeting's `fields` says `chat` (alongside
+  `transcript` when a spoken line matched as well). A search
   needs two characters, stops after 30 meetings and skips transcripts over 20 MB
   (parsed lines are kept in a 50 MB LRU, trimmed back to that after every search).
   One search reads at most 25 MB of uncached transcripts, holds at most 75 MB of
@@ -362,9 +381,16 @@ the review prompt — so a renderer never reaches for a page global.
   `<root>/.meeting-notes.json` (`PI_MEETING_NOTES_FILE`), read when its stat
   changes and used only while its `meeting.started_at` equals the live state's
   and its pid is alive (or it says `ended`); a notes change is a card refresh
-  like a new caption. The card's transcript tail polls
-  `/api/meeting?tail=1&since=<n>` on every meeting event (about every 300 ms),
-  which answers only `{id, from, total, entries, live}`. It polls with a few `stat`s
+  like a new caption. Its `slides` (the copilot's vision summaries: `{ n, title,
+  what, why, points, numbers, at }`) are bounded like the rest (at most 120, `n` an
+  integer of 1 or more, one per `n`, clipped strings, at most 4 points and 4
+  numbers); `/api/meeting` sends them as a `summaries` map by slide number
+  instead of inside `notes`, and the card's `slide.summary` carries only the
+  current slide's title, what and why; `slidesOn` and `slidesFailed` stay in
+  `notes` (the page says "Summarizing…" only while `slidesOn` and the newest slide
+  is not in `slidesFailed`). The card's transcript tail polls
+  `/api/meeting?tail=1&since=<n>`, which answers only `{id, from, total, entries,
+  live}`. It polls with a few `stat`s
   every 250 ms during a meeting and every 2 s otherwise, and sends a
   `meeting` event on each change. `/meeting`
   ([`meeting-page.mjs`](meeting-page.mjs)) then fetches only the entries
@@ -380,9 +406,18 @@ the review prompt — so a renderer never reaches for a page global.
   `~/.local/share/meeting-capture`. Each `<YYYYMMDD_HHMMSS>-<app_id>-<slug>.jsonl`
   (+ `.slides/`) is a meeting, listed at most every 10 s and re-parsed only when its
   size or mtime changes; one with no `stopped` line that isn't the live one
-  reads as Ended (it crashed), its duration running to the last line. A meeting's
+  reads as Ended (it crashed), its duration running to the last line. Real data is
+  untidy, so the history copes: the app id is the metadata's `app_id`, else its
+  `source` without a trailing `-ax`, else the file name's token (`teams`, `zoom`,
+  `meet` or `slack`; older names omit it: `YYYYMMDD_HHMMSS-<slug>`); a
+  `<base>-merged.jsonl` hides the fragments its `merged_from` lists and takes
+  their slides, numbered consecutively in fragment order (only fragments that exist
+  in the data folder count, and a slide is served from its fragment's folder, never
+  from a path in the file); a title that is empty or starts with "Meeting join" is
+  replaced by the file name's slug, humanized ("Platform weekly sync"); files
+  under 300 bytes and `*-slack-notifications-*` captures are not meetings. A meeting's
   id is the same for the live view and its history entry (`sha1(app_id|started_at)`,
-  first 12 hex characters; the file's `app_id`, else the file name, and
+  first 12 hex characters; the app id as above, and
   `recorded_at`), the daemon loads a past one whole (three kept in memory) and
   finds its slides by id, never by a client path. Notes for past meetings come from
   the copilot's archive, `<root>/meetings/<id>.json` (`PI_MEETING_NOTES_DIR`),

@@ -13,14 +13,21 @@
 //
 // And one file of pi's, the /meeting copilot's rolling notes
 // (extensions/opt-in/meeting, notes.ts): <canvas root>/.meeting-notes.json, or
-// PI_MEETING_NOTES_FILE. Topics, decisions, action items, alerts and a suggested
-// reply. It counts only while it names this meeting (meeting.started_at equals
+// PI_MEETING_NOTES_FILE. Topics, decisions, action items, alerts, a suggested
+// reply and the slide summaries (a vision model's title, what, why, points and
+// numbers per slide, by slide number). It counts only while it names this meeting (meeting.started_at equals
 // state.json's) and its session is still there (pid alive) or it says ended.
 //
 // History (the /meetings page, the card's recent list): meeting-capture's data
 // directory, one <base>.jsonl (+ <base>.slides/) per meeting, and the copilot's
 // archived notes, <canvas root>/meetings/<id>.json (PI_MEETING_NOTES_DIR). The
 // live meeting and its history entry share one id, sha1(app_id|started_at).
+// Real data is untidy: app_id comes from the metadata's app_id, else its source
+// without a trailing -ax, else the file name's token (teams|zoom|meet|slack;
+// older names have none); a <base>-merged.jsonl hides the fragments it lists
+// (merged_from) and takes their slides, numbered consecutively in fragment order;
+// a title like "Meeting join…" is replaced by the file name's slug; files under
+// 300 bytes and the Slack notification captures are not meetings.
 //
 // Nothing here touches the network or copies a file: the daemon serves slides
 // straight from slides_dir, and only names listed in index.jsonl.
@@ -95,8 +102,33 @@ export function parseState(raw, { mtimeMs = Date.now(), alive = pidAlive } = {})
   };
 }
 
-const NOTE_LIMITS = { topics: 8, decisions: 20, actions: 20, questions: 2, alerts: 20, me: 8 };
+const NOTE_LIMITS = { topics: 8, decisions: 20, actions: 20, questions: 2, alerts: 20, me: 8, slides: 120, points: 4, numbers: 4 };
 const list = (v, max) => (Array.isArray(v) ? v.slice(0, max) : []);
+
+/** The copilot's slide summaries, checked: n an integer of 1 or more, one per n (the last wins), sorted by n, bounded strings and lists. */
+export function normalizeSlideSummaries(raw) {
+  if (!Array.isArray(raw)) return [];
+  const byN = new Map();
+  const texts = (v, max, n) => (Array.isArray(v) ? v : []).filter((x) => typeof x === "string" && x.trim()).slice(0, max).map((x) => x.slice(0, n));
+  for (const s of raw) {
+    if (!s || typeof s !== "object" || !Number.isInteger(s.n) || s.n < 1) continue;
+    const title = str(s.title, 120);
+    const what = str(s.what, 500);
+    if (!title.trim() && !what.trim()) continue;
+    byN.set(s.n, { n: s.n, title, what, why: str(s.why, 400), points: texts(s.points, NOTE_LIMITS.points, 200), numbers: texts(s.numbers, NOTE_LIMITS.numbers, 100), at: str(s.at, 40) });
+  }
+  return [...byN.values()].sort((a, b) => a.n - b.n).slice(-NOTE_LIMITS.slides);
+}
+
+/** Summaries by slide number, as the page wants them (no `n` or `at` inside). */
+const summaryMap = (n) => Object.fromEntries((n?.slides ?? []).map(({ n: k, title, what, why, points, numbers }) => [k, { title, what, why, points, numbers }]));
+
+/** The notes without the summaries: those travel as a map by slide number. */
+const withoutSlides = (n) => {
+  if (!n) return null;
+  const { slides: _s, ...rest } = n;
+  return rest;
+};
 
 /**
  * The copilot's notes file, checked: { pid, notes } or null. Bounded strings and
@@ -125,6 +157,9 @@ export function normalizeNotes(raw) {
       questions: objs(raw.questions, NOTE_LIMITS.questions).map((q) => ({ q: str(q.q, 300), why: str(q.why, 200) })).filter((q) => q.q),
       reply,
       alerts,
+      slides: normalizeSlideSummaries(raw.slides),
+      slidesOn: raw.slidesOn === true,
+      slidesFailed: [...new Set((Array.isArray(raw.slidesFailed) ? raw.slidesFailed : []).filter((n) => Number.isInteger(n) && n >= 1))].sort((a, b) => a - b).slice(-NOTE_LIMITS.slides),
     },
   };
 }
@@ -274,7 +309,50 @@ const PAST_TAIL_BYTES = 8 * 1024 * 1024; // a past meeting over 20 MB loads this
 const LOADED_KEEP = 3;
 const LOADED_BYTES = 48 * 1024 * 1024;
 const ID_RE = /^[0-9a-f]{12}$/;
-const BASE_RE = /^(\d{8})_(\d{6})-([^-]+)(?:-(.*))?\.jsonl$/;
+const FILE_RE = /^(\d{8})_(\d{6})-(.+)\.jsonl$/;
+const APP_TOKENS = new Set(["teams", "zoom", "meet", "slack"]);
+const MIN_BYTES = 300; // a smaller file is a stub, not a meeting
+const NOISE_RE = /-slack-notifications(-|\.)/;
+const FRAGMENT_RE = /^\d{8}_\d{6}-[\w.-]+$/;
+
+/**
+ * A data folder listing, newest first, with the merged files ahead of the rest: a time-capped scan then reads
+ * a merged file (which hides its fragments) before it can list a fragment, and find() meets "X-merged" before "X".
+ */
+function newestFirst(names) {
+  const sorted = [...names].sort().reverse();
+  return [...sorted.filter((f) => /-merged\.jsonl$/.test(f)), ...sorted.filter((f) => !/-merged\.jsonl$/.test(f))];
+}
+
+/**
+ * A data folder's file name as [file, date, time, app token, slug], or null. Newer names are
+ * <date>_<time>-<app>-<slug>.jsonl; older ones omit the app (<date>_<time>-<slug>), so the token
+ * is only taken when it is teams, zoom, meet or slack, else "" and the whole rest is the slug.
+ * Noise (the Slack notification captures) is null too.
+ */
+function splitName(f) {
+  const m = FILE_RE.exec(f);
+  if (!m || NOISE_RE.test(f)) return null;
+  const rest = m[3];
+  const i = rest.indexOf("-");
+  const tok = (i < 0 ? rest : rest.slice(0, i)).toLowerCase();
+  return APP_TOKENS.has(tok) ? [f, m[1], m[2], tok, i < 0 ? "" : rest.slice(i + 1)] : [f, m[1], m[2], "", rest];
+}
+
+/** The app id for the history: the metadata's app_id, else its source without a trailing -ax, else the file name's token. */
+const appIdOf = (meta, name) => str(meta?.app_id, 40) || str(meta?.source, 40).replace(/-ax$/, "") || name[3];
+
+/** A slug as a title: "weekly-sync-merged" is "Weekly sync". */
+function slugTitle(slug) {
+  const t = String(slug || "").replace(/-merged$/, "").replace(/-/g, " ").trim();
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+/** The title shown: the metadata's meeting unless it is empty or junk ("Meeting join…"), then the slug. */
+function titleOf(meta, name) {
+  const t = str(meta?.meeting, 300).trim();
+  return t && !/^Meeting join/i.test(t) ? t : slugTitle(name[4]) || t;
+}
 const pad2 = (n) => String(n).padStart(2, "0");
 /** "1:02:03" from milliseconds, "" for nonsense. */
 const hms = (ms) => {
@@ -310,6 +388,50 @@ function tailRecords(path, from, size) {
   return parseLines(text.endsWith("\n") ? text : `${text}\n`).records;
 }
 
+/**
+ * A <base>-merged.jsonl's parts: metadata.merged_from names the fragments (base names). Only bases that
+ * exist in the same data folder count, and every path is built from the folder and the base, never taken
+ * from the file. Its slides are the fragments' slides, numbered consecutively in fragment order; `map`
+ * turns a slide event's (fragment base, image name) or (fragment base, old number) into the new number.
+ * null for a file that merges nothing here.
+ */
+function mergedOf(path, meta) {
+  if (!Array.isArray(meta?.merged_from)) return null;
+  const dir = dirname(path);
+  const own = path.split(sep).pop().replace(/\.jsonl$/, "");
+  const bases = [];
+  for (const v of meta.merged_from) {
+    if (typeof v !== "string") continue;
+    const b = v.split("/").pop().replace(/\.jsonl$/, "");
+    if (b === own || !FRAGMENT_RE.test(b) || b.includes("..") || bases.includes(b) || !existsSync(join(dir, `${b}.jsonl`))) continue;
+    bases.push(b);
+  }
+  if (!bases.length) return null;
+  const slides = [];
+  const map = new Map();
+  for (const base of bases) {
+    const sdir = join(dir, `${base}.slides`);
+    for (const s of readSlideIndex(sdir).sort((a, b) => a.n - b.n)) {
+      const n = slides.length + 1;
+      slides.push({ ...s, n, dir: sdir });
+      map.set(`${base}/${s.file}`, n);
+      map.set(`${base}#${s.n}`, n);
+    }
+  }
+  return { bases, slides, map };
+}
+
+/** A merged meeting's slide or revisit record with its slide number mapped to the merged numbering (null: not one of the fragments' slides). Other records pass through. */
+function remapMerged(r, merged) {
+  if (!merged || (r?.type !== "slide" && r?.type !== "revisit")) return r;
+  const parts = (typeof r.file === "string" ? r.file : "").split("/");
+  const file = parts.pop();
+  const dir = parts.pop() ?? "";
+  const base = dir.endsWith(".slides") ? dir.slice(0, -7) : "";
+  const n = merged.map.get(`${base}/${file}`) ?? merged.map.get(`${base}#${r.slide}`);
+  return n ? { ...r, slide: n } : null;
+}
+
 /** A transcript's meeting id from its first line only (the metadata header), like parseMeetingFile derives it. "" when unreadable. */
 function headId(path, name) {
   let meta = null;
@@ -322,7 +444,7 @@ function headId(path, name) {
     return "";
   }
   const stampMs = new Date(+name[1].slice(0, 4), +name[1].slice(4, 6) - 1, +name[1].slice(6, 8), +name[2].slice(0, 2), +name[2].slice(2, 4), +name[2].slice(4, 6)).getTime();
-  return meetingId({ appId: str(meta?.app_id, 40) || name[3], startedAt: str(meta?.recorded_at, 40) || new Date(stampMs).toISOString() });
+  return meetingId({ appId: appIdOf(meta, name), startedAt: str(meta?.recorded_at, 40) || new Date(stampMs).toISOString() });
 }
 
 /**
@@ -347,6 +469,7 @@ function parseMeetingFile(path, name, size = 0) {
     return null;
   }
   if (!records.length) return null;
+  const merged = mergedOf(path, records.find((r) => r?.type === "metadata" && r.event !== "stopped"));
   let meta = null;
   let stopped = null;
   let people = null;
@@ -360,7 +483,7 @@ function parseMeetingFile(path, name, size = 0) {
       else if (!meta) meta = r;
       continue;
     }
-    const e = normalizeRecord(r);
+    const e = normalizeRecord(remapMerged(r, merged));
     if (!e) continue;
     if (e.type === "caption") captions++;
     else if (e.type === "people") people = e;
@@ -369,17 +492,17 @@ function parseMeetingFile(path, name, size = 0) {
   const stampMs = new Date(+name[1].slice(0, 4), +name[1].slice(4, 6) - 1, +name[1].slice(6, 8), +name[2].slice(0, 2), +name[2].slice(2, 4), +name[2].slice(4, 6)).getTime();
   const startedAt = str(meta?.recorded_at, 40) || new Date(stampMs).toISOString();
   const startedMs = Date.parse(startedAt) || stampMs;
-  const appId = str(meta?.app_id, 40) || name[3];
+  const appId = appIdOf(meta, name);
   const endedAt = stopped ? str(stopped.stopped_at, 40) || lastTs : lastTs;
   const slidesDir = path.replace(/\.jsonl$/, ".slides");
-  const slideIndex = readSlideIndex(slidesDir);
+  const slideIndex = merged ? merged.slides : readSlideIndex(slidesDir);
   return {
     id: meetingId({ appId, startedAt }),
     path,
     slidesDir,
     app: str(meta?.app, 80),
     appId,
-    title: str(meta?.meeting, 300) || (name[4] || "").replace(/-/g, " "),
+    title: titleOf(meta, name),
     startedAt,
     startedMs,
     endedAt,
@@ -392,6 +515,8 @@ function parseMeetingFile(path, name, size = 0) {
     slideCount: slideIndex.length || slideSet.size,
     thumb: slideIndex.some((s) => s.n === 1),
     slideIndex,
+    merged,
+    fragments: merged ? merged.bases : [],
     size: 0,
   };
 }
@@ -575,7 +700,7 @@ export class MeetingFeed {
    */
   snapshot(since = 0, id = "", cur = id) {
     if (id && !(this.state && id === this.id)) return this.pastSnapshot(since, id, cur);
-    if (!this.state) return { id: "", state: null, entries: [], total: 0, from: 0, slides: [], live: [], people: null, notes: null };
+    if (!this.state) return { id: "", state: null, entries: [], total: 0, from: 0, slides: [], live: [], people: null, notes: null, summaries: {} };
     const from = cur === this.id && Number.isInteger(since) && since >= 0 && since <= this.entries.length ? since : 0;
     const p = this.people();
     const { jsonl: _j, txt: _t, slidesDir: _s, live: _l, ...state } = this.state;
@@ -588,11 +713,12 @@ export class MeetingFeed {
       slides: this.slides.map(({ n, at, reason, width, height, thumb }) => ({ n, at, reason, width, height, thumb: Boolean(thumb) })),
       live: this.live,
       people: p ? { count: p.count, people: p.people } : null,
-      notes: this.notes,
+      notes: withoutSlides(this.notes),
+      summaries: summaryMap(this.notes),
     };
   }
 
-  /** The card's light poll (/api/meeting?tail=1): only the new entries and the in-progress lines, none of the slide list, notes or people. */
+  /** The card's light poll (/api/meeting?tail=1): only the new entries and the in-progress lines, none of the slide list, notes, people or summaries. */
   tailSnapshot(since = 0, id = "", cur = id) {
     const { id: sid, from, total, entries, live } = this.snapshot(since, id, cur);
     return { id: sid, from, total, entries, live };
@@ -601,7 +727,7 @@ export class MeetingFeed {
   /** A past meeting for /meeting?id=: its whole transcript from the data folder (by id, never a client path), or notFound. */
   pastSnapshot(since, id, cur) {
     const p = this.loadPast(id);
-    if (!p) return { id: "", state: null, entries: [], total: 0, from: 0, slides: [], live: [], people: null, notes: null, notFound: true };
+    if (!p) return { id: "", state: null, entries: [], total: 0, from: 0, slides: [], live: [], people: null, notes: null, summaries: {}, notFound: true };
     const { info, entries, slides } = p;
     const from = cur === id && Number.isInteger(since) && since >= 0 && since <= entries.length ? since : 0;
     let people = null;
@@ -615,7 +741,8 @@ export class MeetingFeed {
       slides: slides.map(({ n, at, reason, width, height, thumb }) => ({ n, at, reason, width, height, thumb: Boolean(thumb) })),
       live: [],
       people,
-      notes: this.notesOf(info),
+      notes: withoutSlides(this.notesOf(info)),
+      summaries: summaryMap(this.notesOf(info)),
       ...(p.partial ? { partial: true } : {}),
     };
   }
@@ -660,7 +787,7 @@ export class MeetingFeed {
       people: p?.count ?? null,
       captions: this.entries.filter((e) => e.type === "caption").length,
       slides: this.slides.length,
-      slide: last ? { n: last.n, thumb: Boolean(last.thumb) } : null,
+      slide: last ? { n: last.n, thumb: Boolean(last.thumb), ...this.slideSummaryOf(last.n) } : null,
       lines,
       live: this.live,
       total: this.entries.length,
@@ -668,6 +795,12 @@ export class MeetingFeed {
       notes: this.notesSummary(),
       at,
     };
+  }
+
+  /** { summary: { title, what, why } } for slide n when the copilot has summarized it, else {}: the card shows only this much of it. */
+  slideSummaryOf(n) {
+    const s = this.notes?.slides.find((x) => x.n === n);
+    return s ? { summary: { title: s.title, what: s.what, why: s.why } } : {};
   }
 
   /** The card's slice of the notes: the alert count, the newest alert's id and the newest 3 (newest last), Eric's open actions, questions, the reply. */
@@ -712,15 +845,14 @@ export class MeetingFeed {
     try {
       names = readdirSync(dir);
     } catch {}
-    names.sort().reverse(); // <YYYYMMDD_HHMMSS>-…: newest first
-    const list = [];
-    const byId = new Map();
+    names = newestFirst(names); // <YYYYMMDD_HHMMSS>-…: newest first, merged files before the fragments they hide
+    const all = [];
     const seen = new Set();
     const t0 = performance.now();
     let parsed = 0;
     let partial = false;
     for (const f of names) {
-      const m = BASE_RE.exec(f);
+      const m = splitName(f);
       if (!m) continue;
       const path = join(dir, f);
       if (this.state?.jsonl === path) continue;
@@ -730,7 +862,7 @@ export class MeetingFeed {
       } catch {
         continue;
       }
-      if (!st.isFile()) continue;
+      if (!st.isFile() || st.size < MIN_BYTES) continue;
       seen.add(path);
       const sig = fileSig(st);
       let c = this.infos.get(path);
@@ -745,10 +877,13 @@ export class MeetingFeed {
           this.infos.set(path, c);
         }
       }
-      if (!c?.info) continue;
-      list.push(c.info);
-      if (!byId.has(c.info.id)) byId.set(c.info.id, c.info);
+      if (c?.info) all.push(c.info);
     }
+    // A merged file stands in for the fragments it lists.
+    const hidden = new Set(all.flatMap((i) => i.fragments.map((b) => join(dir, `${b}.jsonl`))));
+    const list = all.filter((i) => !hidden.has(i.path));
+    const byId = new Map();
+    for (const i of list) if (!byId.has(i.id)) byId.set(i.id, i);
     for (const k of [...this.infos.keys()]) if (!seen.has(k)) this.infos.delete(k);
     for (const k of [...this.headIds.keys()]) if (!seen.has(k)) this.headIds.delete(k);
     this.scanned = { dir, at: t, list, byId, partial };
@@ -764,25 +899,28 @@ export class MeetingFeed {
   find(id) {
     const s = this.scan();
     const known = s.byId.get(id);
-    if (known || !s.partial) return known;
+    // A half-done scan may know only a fragment under the id its merged file shares: look for the merged file first.
+    if (!s.partial || (known && known.merged)) return known;
     const dir = s.dir;
     let names = [];
     try {
       names = readdirSync(dir);
     } catch {}
-    names.sort().reverse();
+    names = newestFirst(names);
+    // A fragment a merged file already read says it replaces is not an answer.
+    const hidden = new Set([...this.infos.values()].flatMap((c) => c.info?.fragments ?? []).map((b) => join(dir, `${b}.jsonl`)));
     for (const f of names) {
-      const m = BASE_RE.exec(f);
+      const m = splitName(f);
       if (!m) continue;
       const path = join(dir, f);
-      if (this.state?.jsonl === path) continue;
+      if (this.state?.jsonl === path || hidden.has(path)) continue;
       let st;
       try {
         st = statSync(path);
       } catch {
         continue;
       }
-      if (!st.isFile()) continue;
+      if (!st.isFile() || st.size < MIN_BYTES) continue;
       const sig = fileSig(st);
       if (this.infos.get(path)?.sig === sig) continue; // parsed: byId already had it
       let h = this.headIds.get(path);
@@ -796,7 +934,7 @@ export class MeetingFeed {
       this.infos.set(path, { sig, info });
       if (info?.id === id) return info;
     }
-    return undefined;
+    return known;
   }
 
   /** The live (or just ended) meeting as a list item, from memory. null before it has a transcript or while only a stale state is left. */
@@ -931,7 +1069,7 @@ export class MeetingFeed {
     } catch {
       return null;
     }
-    const p = { info, entries: records.map(normalizeRecord).filter(Boolean), slides: readSlideIndex(info.slidesDir), partial };
+    const p = { info, entries: records.map((r) => normalizeRecord(remapMerged(r, info.merged))).filter(Boolean), slides: info.merged ? info.slideIndex : readSlideIndex(info.slidesDir), partial };
     this.loaded.set(id, { sig, p, bytes: partial ? PAST_TAIL_BYTES : st.size });
     let total = 0;
     for (const v of this.loaded.values()) total += v.bytes;
@@ -949,10 +1087,10 @@ export class MeetingFeed {
     return Boolean(hit && hit.sig === info.sig);
   }
 
-  /** A meeting's caption and chat lines for searching: { i (entry index), ts, speaker, text, lower }. null when the file is too big. */
+  /** A meeting's caption and chat lines for searching: { i (entry index), type (caption | chat), ts, speaker, text, lower }. null when the file is too big. */
   linesOf(info) {
     const make = (entries) =>
-      entries.flatMap((e, i) => (e.type === "caption" || e.type === "chat" ? [{ i, ts: e.ts, speaker: e.speaker, text: e.text, lower: `${e.speaker} ${e.text}`.toLowerCase() }] : []));
+      entries.flatMap((e, i) => (e.type === "caption" || e.type === "chat" ? [{ i, type: e.type, ts: e.ts, speaker: e.speaker, text: e.text, lower: `${e.speaker} ${e.text}`.toLowerCase() }] : []));
     if (info.fromFeed) return make(this.entries);
     if (info.size > SEARCH_MAX_FILE) return null;
     const hit = this.linesCache.get(info.path);
@@ -967,7 +1105,7 @@ export class MeetingFeed {
     } catch {
       return null;
     }
-    const lines = make(parseLines(text.endsWith("\n") ? text : `${text}\n`).records.map(normalizeRecord).filter(Boolean));
+    const lines = make(parseLines(text.endsWith("\n") ? text : `${text}\n`).records.map((r) => normalizeRecord(remapMerged(r, info.merged))).filter(Boolean));
     const bytes = lines.reduce((n, l) => n + l.text.length * 4 + l.speaker.length * 2 + 120, 0);
     if (hit) this.linesBytes -= hit.bytes;
     this.linesCache.delete(info.path);
@@ -1035,20 +1173,24 @@ export class MeetingFeed {
       searched++;
       const notes = this.notesOf(info);
       const n = notes ? [...notes.topics.flatMap((t) => [t.title, t.summary]), ...notes.decisions.map((d) => d.text), ...notes.actions.flatMap((a) => [a.who, a.what]), ...notes.questions.map((x) => x.q)] : [];
-      const fields = { title: info.title.toLowerCase(), people: info.people.join("\n").toLowerCase(), notes: n.join("\n").toLowerCase() };
-      const metaHit = terms.every((t) => `${fields.title}\n${fields.people}\n${fields.notes}`.includes(t));
+      const sl = notes ? notes.slides.flatMap((x) => [x.title, x.what, x.why, ...x.points]) : [];
+      const fields = { title: info.title.toLowerCase(), people: info.people.join("\n").toLowerCase(), notes: n.join("\n").toLowerCase(), slides: sl.join("\n").toLowerCase() };
+      const metaHit = terms.every((t) => `${fields.title}\n${fields.people}\n${fields.notes}\n${fields.slides}`.includes(t));
       let hits = 0;
+      let chatHits = 0;
       const lines = [];
       const found = this.linesOf(info);
       if (!info.fromFeed) held += this.linesCache.get(info.path)?.bytes ?? 0;
       for (const l of found ?? []) {
         if (!terms.every((t) => l.lower.includes(t))) continue;
         hits++;
-        if (lines.length < 3) lines.push({ ts: l.ts, speaker: l.speaker, text: snippet(l.text, terms), i: l.i });
+        if (l.type === "chat") chatHits++;
+        if (lines.length < 3) lines.push({ type: l.type, ts: l.ts, speaker: l.speaker, text: snippet(l.text, terms), i: l.i });
       }
       if (!hits && !metaHit) continue;
-      const matched = metaHit ? ["title", "people", "notes"].filter((f) => terms.some((t) => fields[f].includes(t))) : [];
-      if (hits) matched.push("transcript");
+      const matched = metaHit ? ["title", "people", "notes", "slides"].filter((f) => terms.some((t) => fields[f].includes(t))) : [];
+      if (hits > chatHits) matched.push("transcript");
+      if (chatHits) matched.push("chat");
       results.push({ ...this.entryOf(info, notes), hits, fields: matched, lines });
     }
     this.trimLines();
@@ -1080,9 +1222,10 @@ function resolveSlide(dir, slides, n, thumb) {
   if (!s) return null;
   const name = thumb && s.thumb ? s.thumb : s.file;
   if (!SLIDE_FILE.test(name)) return null;
+  const from = s.dir || dir; // a merged meeting's slides each sit in their fragment's folder (set by mergedOf, never by the client)
   try {
-    const root = realpathSync(dir);
-    const path = realpathSync(join(dir, name));
+    const root = realpathSync(from);
+    const path = realpathSync(join(from, name));
     return path.startsWith(root + sep) && existsSync(path) ? path : null;
   } catch {
     return null;

@@ -7,7 +7,7 @@ A live meeting copilot: it follows a meeting transcript, keeps rolling notes
 asking), alerts you when someone says your name or hands you an action, and
 suggests a reply when someone is waiting on you. It starts and stops by itself,
 and you can ask the session about the meeting in plain chat.
-**Command:** `/meeting`. **Tool:** `meeting` (status, transcript, slide), for the session model.
+**Command:** `/meeting`. **Tool:** `meeting` (status, transcript, slide, slides), for the session model.
 **Needs:** [meeting-capture](https://github.com/ericboehs/meeting-capture) (or
 anything that writes its `state.json` and transcript, see its
 `docs/canvas-contract.md`). The copilot only reads those files.
@@ -22,13 +22,14 @@ In `~/.pi/agent/boehsline.json`. Environment variables (`PI_MEETING_*`) still ov
     "model": "github-copilot/claude-haiku-5.5",   // the notes scout (the default); comma-separate to add fallbacks
     "qmdCollections": ["notes"],   // background search for the scout's context
     "dailyDir": "~/Notes/daily",   // the recap lands here
-    "owner": "earl"                // the session with this name runs the copilot by itself
+    "owner": "earl",               // the session with this name runs the copilot by itself
+    "slideSummaries": true         // a vision model summarizes each slide (default true)
   }
 }
 ```
 
-`PI_MEETING_MODEL` overrides `meeting.model` and `PI_MEETING_OWNER` overrides
-`meeting.owner`. Environment only: `PI_MEETING_ME`
+`PI_MEETING_MODEL` overrides `meeting.model`, `PI_MEETING_OWNER` overrides
+`meeting.owner` and `PI_MEETING_SLIDES=0` turns `meeting.slideSummaries` off. Environment only: `PI_MEETING_ME`
 (your name, else git's `user.name`), `PI_MEETING_ABOUT` (a file about you, else
 `~/.pi/agent/meeting-context.md`), `PI_MEETING_REASONING`, `PI_MEETING_WATCH=1`
 (arm the session, for testing), `PI_MEETING_LOCK` (the lock file),
@@ -115,7 +116,8 @@ Each call sends:
 - a digest of the pi session running the copilot: its name, your last five
   messages (300 characters each) and the last assistant message (600): what
   you are working on right now
-- the OCR text of the slides shown so far, newest first, about 4k characters
+- the slides shown so far, newest first, about 4k characters: a slide's
+  summary (title, what, why, below) where it has one, else its raw OCR text
 - the previous notes, so it updates them instead of rewriting
 - the transcript, with the part that is new since the last call marked
 
@@ -139,6 +141,52 @@ The model is never polled. Code decides when a call is worth it:
   out without it)
 
 `/meeting ask` forces one.
+
+### Slide summaries
+
+When the notes model can read images (`meeting.model`, default Haiku 5.5), every
+**new** slide meeting-capture saves is summarized, so you can follow a deck you
+only half watch and ask about it later. Without a vision-capable model they are
+skipped, with one hint ("can't read images") when the meeting starts.
+`meeting.slideSummaries: false` or `PI_MEETING_SLIDES=0` turns it off.
+
+- **When.** On a `slide` event, never on a `revisit` (that reuses the summary the
+  slide has). One call at a time, **newest slide first** (a burst is summarized
+  newest first, then backwards), at most **one call per 10 s** (shrunk by a
+  replay's speed) and **80 slides** a meeting. A failed call backs off like the
+  notes scout (60 s, doubling) and the slide is retried; after **3 failures** it is
+  given up for good. Once the meeting has ended, no new call starts (one in
+  flight finishes first, so the recap has it).
+- **OCR first.** meeting-capture writes `NNNN-HHMMSS.txt` beside the jpg
+  atomically: present means complete, 0 bytes means no text, missing means not
+  yet (usually 1 to 2 s, up to a minute for a session's first slide). The call
+  waits up to **90 s from when the slide appeared** (not from when the worker
+  picks it up, so catching up after a reload never sits on old slides), then goes
+  on with the image alone. A leading
+  `Shared content | …` line (the Teams window title) is dropped, and the text is
+  cut at 3k characters.
+- **What it is sent.** The full jpg (not the 480 px thumbnail), through the same
+  resize path as the `meeting` tool; the cleaned OCR text; who you are
+  (`meeting-context.md` and your name); the session digest (masked, like the
+  scout's); `/meeting focus`; the meeting's title; the transcript from about 90 s
+  before to 90 s after the slide came up (whatever exists when the call is made);
+  and the titles of the earlier slides' summaries, for continuity.
+- **What comes back.** JSON, read leniently:
+  `{title (≤ 80), what (1–2 sentences), why (1 sentence, or ""), points (≤ 4), numbers (≤ 4)}`.
+  `why` is how the slide matters to *you*, and `""` is the normal answer: the
+  prompt says not to invent relevance, and to say nothing beyond the image, the
+  OCR and the transcript.
+- **Kept.** Cached by slide number in memory and in the notes file and archive
+  as `slides: [{ n, title, what, why, points, numbers, at }]` (sorted by n, at most
+  120, strings bounded); a `/reload` reads them back and never summarizes them
+  again; if the notes file is gone (`/meeting watch off`), the archive is read
+  instead. The file also says `slidesOn` (summaries are running for this meeting)
+  and `slidesFailed` (slide numbers given up on or past the cap), so the canvas
+  shows "Summarizing…" only where a summary can still come. A replay summarizes
+  in memory (so the tool works) and writes no file.
+- **No noise.** No chat message and no status-line part; the notes scout reads the
+  summaries, the canvas shows them, and the recap gets a **Slides** section
+  (`n. title — why`, only slides with a non-empty why, at most 8).
 
 ### Alerts
 
@@ -181,7 +229,10 @@ Whenever the notes or the alerts change, the extension writes
   "actions": [{ "who": "…", "what": "…", "mine": true, "at": "ISO" }],
   "questions": [{ "q": "…", "why": "…" }], "reply": { "to": "…", "text": "…", "at": "ISO" },
   "alerts": [{ "id": "a1", "kind": "name", "who": "Ada", "text": "…", "at": "ISO" }],  // newest last, the last 20
-  "alertSeq": 1 }                                                                      // the last alert id's number
+  "alertSeq": 1,                                                                       // the last alert id's number
+  "slides": [{ "n": 3, "title": "…", "what": "…", "why": "", "points": ["…"], "numbers": ["…"], "at": "ISO" }],  // sorted by n, ≤ 120
+  "slidesOn": true,                                                                    // summaries are running for this meeting
+  "slidesFailed": [7] }                                                                // slides that will get none (gave up, or past the cap), ≤ 120
 ```
 
 The [canvas](../../canvas/README.md) shows it on the Meeting card and on
@@ -203,12 +254,19 @@ archive is never removed, never written for a replay, and it is what the
 canvas's `/meetings` history shows (topics, ★ action items, search) and what
 `/meeting?id=<id>` shows in its Notes column for a past meeting.
 
+When the live file is gone (`/meeting watch off` then on, a restart after quitting),
+the copilot picks the same meeting's notes back up from the archive (topics,
+decisions, actions, questions, alerts and their numbering, the "already alerted"
+set and slide summaries), so the next archive write doesn't replace them with
+empty notes.
+
 ### The recap
 
 When the meeting ends, the recap goes into the session and into the daily note
 (`meeting.dailyDir`, for the capture's date; none set, no note). It is a `###`
 block at the end of `## Meetings` with **Topics**, **Decisions**, **Action
-items** (yours first, starred) and **Open questions**. A hidden marker ties the
+items** (yours first, starred), **Open questions** and **Slides** (those that
+matter to you, `n. title — why`). A hidden marker ties the
 block to its capture, so `/meeting recap` mid-meeting and the final recap
 rewrite the same block. Replays never write to the note.
 
@@ -232,7 +290,12 @@ and the slide images, so use it only in a session whose model may read them.
 |---|---|
 | `status` | title, app, start and elapsed, people, slide count, the slide on screen, whether OCR exists |
 | `transcript` | `[HH:MM:SS] Speaker: text`; chat as `(chat)`, `▣ slide N`, `↺ back to slide N`, `👥 N in the meeting`; lines still being spoken come last, marked "(still speaking)" |
-| `slide` | the slide's time first shown and every revisit, its OCR text ("OCR not ready yet" if missing) and the jpg as an image, scaled and re-encoded like the read tool does (skipped over 4 MB) |
+| `slide` | the slide's summary (title, what it shows, why it matters to you, key points, numbers; none while it is still being summarized), the time first shown and every revisit, its OCR text ("OCR not ready yet" if missing) and the jpg as an image, scaled and re-encoded like the read tool does (skipped over 4 MB) |
+| `slides` | every slide's summary (number, title, what, why), or only those matching `query` (every word, case-insensitive) |
+
+`status` adds one `n. title` line per summarized slide (the newest 20, newest
+last). A session that isn't running the copilot reads the summaries from the
+archive (`<canvas root>/meetings/<id>.json`).
 
 `transcript` takes `minutes` (the last N), `since` / `until` (`HH:MM`,
 `HH:MM:SS` in the meeting's own time zone, or ISO), `speaker` (a case-insensitive part of the name; a

@@ -75,6 +75,8 @@ export interface MeetingSettings extends ConfigObject {
 	model: string;
 	/** Session name (agent-link name) that runs the copilot on its own, e.g. "earl"; "" means none. */
 	owner: string;
+	/** A vision model summarizes each slide meeting-capture saves (the notes model, when it can read images). PI_MEETING_SLIDES=0 turns it off. */
+	slideSummaries: boolean;
 }
 
 export const WORK_DEFAULTS: WorkSettings = {
@@ -97,7 +99,7 @@ export const WATCH_DEFAULTS: WatchSettings = {
 	notifBin: "",
 };
 
-export const MEETING_DEFAULTS: MeetingSettings = { qmdCollections: [], dailyDir: "", model: "github-copilot/claude-haiku-5.5", owner: "" };
+export const MEETING_DEFAULTS: MeetingSettings = { qmdCollections: [], dailyDir: "", model: "github-copilot/claude-haiku-5.5", owner: "", slideSummaries: true };
 
 const list = (raw: string) =>
 	raw
@@ -122,6 +124,7 @@ export function meetingSettings(env: NodeJS.ProcessEnv = process.env): MeetingSe
 		dailyDir: expandHome(env.PI_MEETING_DAILY_DIR ?? s.dailyDir),
 		model: (env.PI_MEETING_MODEL ?? s.model).trim(),
 		owner: (env.PI_MEETING_OWNER ?? s.owner).trim(),
+		slideSummaries: env.PI_MEETING_SLIDES !== undefined && /^(0|false|no|off)$/i.test(env.PI_MEETING_SLIDES.trim()) ? false : s.slideSummaries !== false,
 	};
 }
 
