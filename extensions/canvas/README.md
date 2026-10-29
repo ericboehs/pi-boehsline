@@ -302,10 +302,14 @@ the review prompt — so a renderer never reaches for a page global.
   is running in a pi session, its **alerts** (someone said your name, a new
   action on you) sit at the top of the card in a warn-tinted box, newest first,
   at most three with their time and who, then **Your action items**; the card
-  flashes when a new alert arrives (its id changes; other rewrites stay quiet). It
-  stays for 15 minutes after the meeting ends (the alerts and your action
-  items stay on it), then disappears. **Open the live view** (**Open the
-  transcript** once it has ended) goes to `/meeting`. That page shows the shared screen's
+  flashes when a new alert arrives (its id changes; other rewrites stay quiet). The card
+  stays expanded for 15 minutes after the meeting ends (the alerts and your
+  action items, with the recent list below). Its bottom row is **Open the live
+  view ↗** (`/meeting`) and **Previous meetings ↗** (`/meetings`). With no
+  meeting live or fresh the card becomes **Recent meetings**: the last four
+  (title, "Today 14:00 · 32m", ★ N for your action items), each opening
+  `/meeting?id=<id>` in a new tab, and **View all ↗**; with no meetings at all
+  there is no card. `/meeting` shows the shared screen's
   current slide large, with a thumbnail strip, and the transcript beside it.
   The transcript has speaker colours, chat, people and slide markers, and
   the in-progress lines greyed at the bottom with a cursor. It follows the
@@ -322,6 +326,28 @@ the review prompt — so a renderer never reaches for a page global.
   **Transcript / Notes** switch at the top of the column swaps them. Transcript
   lines where someone else says your name get a subtle warn highlight. After
   the meeting `/meeting` keeps the last one until the next starts.
+  `/meeting?id=<id>` shows any past meeting the same way (header "Ended · Tue
+  Oct 28", whole transcript, its slides and archived notes), `#e<n>` scrolls to
+  transcript entry n and flashes it, and an unknown id says "Meeting not found"
+  with a link back. `/meeting` has an **All meetings** link beside **Canvas**; `/meetings` has **Canvas**.
+  **`/meetings`** ([`meetings-page.mjs`](meetings-page.mjs)) is the history: the
+  live meeting pinned on top, then meetings newest first grouped by day (Today,
+  Yesterday, "Tue Oct 28"), each row with the first slide's thumbnail, title,
+  app · start · duration · people · slides, ★ your action items and up to four
+  topic tags, linking to `/meeting?id=<id>`; **Load more** pages through
+  `/api/meetings?offset=&limit=` (limit ≤ 100, default 50). `/` focuses the search box
+  (debounced 200 ms, Esc clears): `/api/meetings/search?q=` needs every
+  whitespace-separated term, in one transcript line or in the meeting's title,
+  people or notes, case-insensitively, and each meeting shows up to three
+  matching lines (terms in `<mark>`) that open the meeting at that line. A search
+  needs two characters, stops after 30 meetings and skips transcripts over 20 MB
+  (parsed lines are kept in a 50 MB LRU, trimmed back to that after every search).
+  One search reads at most 25 MB of uncached transcripts, holds at most 75 MB of
+  the cache and runs for about 150 ms; past any of those it stops and the page says "Showing results from the newest N meetings".
+  A transcript over 20 MB is listed from its first line and last 64 KB (and
+  `/meeting?id=` shows only its last 8 MB), and the first listing of a big
+  archive parses for about 50 ms per request, newest files first: the list says
+  "Still reading older meetings…" and fills in on the next polls.
   The daemon reads meeting-capture's files directly (the contract is
   meeting-capture's `docs/canvas-contract.md`): `state.json` in
   `MEETING_CAPTURE_STATE_DIR` (default `~/.local/state/meeting-capture`),
@@ -340,7 +366,22 @@ the review prompt — so a renderer never reaches for a page global.
   meeting-capture pid is gone reads as stopped unexpectedly. Nothing is
   copied into `~/.pi/canvas` and no absolute path reaches the page. Slides
   are served from `/meeting/<meeting id>/slide/<n>[.thumb].jpg`, and only
-  names `index.jsonl` lists that resolve inside the slides folder.
+  names `index.jsonl` lists that resolve inside the slides folder. History comes from
+  meeting-capture's data folder: `--meeting-data`, else `MEETING_CAPTURE_DATA_DIR`,
+  else the folder of the live state's `jsonl` (remembered after `state.json`
+  goes away), else `$XDG_DATA_HOME/meeting-capture`, else
+  `~/.local/share/meeting-capture`. Each `<YYYYMMDD_HHMMSS>-<app_id>-<slug>.jsonl`
+  (+ `.slides/`) is a meeting, listed at most every 10 s and re-parsed only when its
+  size or mtime changes; one with no `stopped` line that isn't the live one
+  reads as Ended (it crashed), its duration running to the last line. A meeting's
+  id is the same for the live view and its history entry (`sha1(app_id|started_at)`,
+  first 12 hex characters; the file's `app_id`, else the file name, and
+  `recorded_at`), the daemon loads a past one whole (three kept in memory) and
+  finds its slides by id, never by a client path. Notes for past meetings come from
+  the copilot's archive, `<root>/meetings/<id>.json` (`PI_MEETING_NOTES_DIR`),
+  validated and bounded like the live file; the live meeting keeps the live-file
+  rules. The card's recent list rides on the same `meeting` event: a meeting
+  starting or ending is a final change, nothing else is.
 - **Diffs and lightbox.** Before the agent's first `edit` or `write` to a file,
   the extension copies what the file held (`base-<id>`, never served). After
   each turn, `git diff --no-index` writes `diff-<id>.patch`, the change since

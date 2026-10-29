@@ -23,6 +23,9 @@ import {
 	sameAction,
 	actionAlertText,
 	buildNotesFile,
+	archiveDir,
+	meetingId,
+	writeNotesArchive,
 	buildNotesPrompt,
 	buildSystemPrompt,
 	CADENCE,
@@ -1182,4 +1185,58 @@ test("the /meeting status says armed, owner, lock holder and meeting", () => {
 	]);
 	assert.match(statusReport({ ...base, lock: lock(), mine: true, state: parseState(rawState({ ended: true, duration: "0:30:00" })) })[3], /^Meeting: none live; the last was Weekly Sync \(Microsoft Teams\), ended, 0:30:00$/);
 	assert.match(statusReport({ ...base, lock: lock(), lockAlive: false })[2], /^Lock: earl \(via owner, pid 100, gone\)$/);
+});
+
+// ── the archive of every meeting's notes ──
+
+test("meetingId is the canvas feed's id: sha1 of app_id|started_at, 12 hex chars", async () => {
+	const { meetingId: feedId } = await import("../extensions/canvas/meeting-feed.mjs");
+	for (const [appId, startedAt] of [["teams", "2026-10-28T14:00:00-05:00"], ["zoom", "2026-10-28T14:00:00Z"], ["", ""]]) {
+		assert.equal(meetingId(appId, startedAt), feedId({ appId, startedAt }));
+		assert.match(meetingId(appId, startedAt), /^[0-9a-f]{12}$/);
+	}
+	assert.notEqual(meetingId("teams", "a"), meetingId("zoom", "a"));
+	assert.equal(feedId(null), "", "no state, no id");
+});
+
+test("the archive: <meeting id>.json, atomic, mode 600 in a 700 folder, rewritten in place, never removed with the live file", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-archive-"));
+	const saved = [process.env.PI_MEETING_NOTES_DIR, process.env.PI_MEETING_NOTES_FILE, process.env.PI_CANVAS_ROOT];
+	process.env.PI_MEETING_NOTES_DIR = path.join(dir, "a", "meetings");
+	process.env.PI_MEETING_NOTES_FILE = path.join(dir, "a", ".meeting-notes.json");
+	try {
+		const f = (over = {}) => buildNotesFile({ pid: 5, sessionId: "mine", sessionName: "", startedAt: "2026-10-28T14:00:00-05:00", appId: "teams", title: "T", at: "A", ended: false, me: [], notes: emptyNotes(), reply: null, alerts: [], alertSeq: 0, ...over });
+		const id = meetingId("teams", "2026-10-28T14:00:00-05:00");
+		const file = path.join(process.env.PI_MEETING_NOTES_DIR, `${id}.json`);
+		writeNotesFile(f());
+		writeNotesArchive(f());
+		assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+		assert.equal(fs.statSync(process.env.PI_MEETING_NOTES_DIR).mode & 0o777, 0o700);
+		assert.deepEqual(fs.readdirSync(process.env.PI_MEETING_NOTES_DIR), [`${id}.json`], "no temp file left");
+		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), JSON.parse(fs.readFileSync(notesPath(), "utf8")), "the same shape as the live file");
+		writeNotesArchive(f({ ended: true, title: "T2" }));
+		assert.deepEqual([JSON.parse(fs.readFileSync(file, "utf8")).ended, JSON.parse(fs.readFileSync(file, "utf8")).meeting.title], [true, "T2"], "rewritten in place");
+		// Another meeting is another file; removing the live file leaves both.
+		writeNotesArchive(f({ startedAt: "2026-10-28T16:00:00-05:00" }));
+		assert.equal(fs.readdirSync(process.env.PI_MEETING_NOTES_DIR).length, 2);
+		removeNotesFile({ pid: 5, sessionId: "mine" });
+		assert.equal(fs.existsSync(notesPath()), false);
+		assert.equal(fs.readdirSync(process.env.PI_MEETING_NOTES_DIR).length, 2);
+		// Without a start time there is nothing to name the file by.
+		writeNotesArchive(f({ startedAt: "" }));
+		assert.equal(fs.readdirSync(process.env.PI_MEETING_NOTES_DIR).length, 2);
+		// A folder that already exists with looser permissions is tightened.
+		fs.chmodSync(process.env.PI_MEETING_NOTES_DIR, 0o755);
+		writeNotesArchive(f());
+		assert.equal(fs.statSync(process.env.PI_MEETING_NOTES_DIR).mode & 0o777, 0o700);
+		// The folder defaults to meetings/ in the canvas root.
+		delete process.env.PI_MEETING_NOTES_DIR;
+		delete process.env.PI_CANVAS_ROOT;
+		assert.equal(archiveDir(), path.join(os.homedir(), ".pi", "canvas", "meetings"));
+		process.env.PI_CANVAS_ROOT = "/tmp/canvas-x";
+		assert.equal(archiveDir(), "/tmp/canvas-x/meetings");
+	} finally {
+		for (const [i, k] of ["PI_MEETING_NOTES_DIR", "PI_MEETING_NOTES_FILE", "PI_CANVAS_ROOT"].entries()) saved[i] === undefined ? delete process.env[k] : (process.env[k] = saved[i]);
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
 });

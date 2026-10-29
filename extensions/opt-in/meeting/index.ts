@@ -72,8 +72,11 @@
  *                             mid-meeting or the copilot stops for any
  *                             reason but the meeting ending; kept over a
  *                             reload (the new instance reads it back) and at
- *                             the end (ended:true). The canvas daemon shows it on
- *                             the Meeting card and /meeting (extensions/canvas)
+ *                             the end (ended:true). Every write is also kept for
+ *                             good as <canvas root>/meetings/<meeting id>.json
+ *                             (PI_MEETING_NOTES_DIR; folder 700, files 600),
+ *                             never for a replay and never dropped. The canvas daemon shows it on the
+ *                             Meeting card and /meeting (extensions/canvas)
  *   /meeting notes            the current notes, as one chat message
  *   recap                     at the end: Topics, Decisions, Action items
  *                             (Eric's first, starred), Open questions: posted
@@ -110,6 +113,7 @@
  *      PI_MEETING_ME="First Last"  PI_MEETING_ABOUT=<file>
  *      PI_MEETING_OWNER=<session name>  PI_MEETING_WATCH=1 (arm)  PI_MEETING_LOCK=<file>
  *      PI_MEETING_NOTES_FILE=<file>  PI_CANVAS_ROOT (where the notes file defaults to)
+ *      PI_MEETING_NOTES_DIR=<dir>  (the archive of every meeting's notes, default <canvas root>/meetings)
  *      MEETING_CAPTURE_STATE_DIR  PI_MEETING_DIR (where /meeting replay looks for a transcript)
  *      PI_MEETING_QMD_COLLECTIONS=notes,team-docs ("" disables)
  *      PI_MEETING_DAILY_DIR=~/Notes/daily ("" disables the daily-note recap)
@@ -206,6 +210,7 @@ import {
 	takeNameAlert,
 	widgetLines,
 	type WidgetView,
+	writeNotesArchive,
 	writeNotesFile,
 } from "./notes.ts";
 
@@ -707,6 +712,8 @@ function main(pi: ExtensionAPI) {
 				alertSeq: m.alertSeq,
 			});
 			writeNotesFile(file);
+			// And for good, under the meeting's id: the canvas's history keeps showing them after this file is dropped.
+			writeNotesArchive(file);
 		} catch {
 			// the canvas just doesn't see the notes; the chat still has them
 		}

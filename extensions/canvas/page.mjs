@@ -166,6 +166,8 @@ dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: h
 .m-dot.rec { background: var(--ok); animation: m-rec 1.6s infinite; }
 @keyframes m-rec { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); } 70%, 100% { box-shadow: 0 0 0 6px transparent; } }
 .m-title { font-weight: 600; line-height: 1.35; }
+.m-title.link { display: block; color: inherit; text-decoration: none; }
+.m-title.link:hover { color: var(--accent); }
 .m-title span { color: var(--dim); font-weight: 400; font-size: 12px; margin-left: 6px; }
 .m-slide { display: block; position: relative; }
 .m-slide img { display: block; width: 100%; max-height: 160px; object-fit: contain; background: var(--soft); border-radius: 6px; }
@@ -182,8 +184,16 @@ dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: h
 .m-h { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-top: 2px; }
 .m-todo { margin: 0; padding-left: 18px; line-height: 1.4; }
 .m-todo li { margin: 1px 0; }
+.m-links { display: flex; flex-wrap: wrap; gap: 4px 14px; }
 .m-open { align-self: flex-start; color: var(--accent); text-decoration: none; font-size: 12.5px; }
 .m-open:hover { text-decoration: underline; }
+.m-list { display: flex; flex-direction: column; }
+.m-item { display: block; padding: 6px 0; border-top: 1px solid var(--line); color: inherit; text-decoration: none; line-height: 1.35; }
+.m-item:first-child { border-top: 0; }
+.m-item:hover .m-it { color: var(--accent); }
+.m-it { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+.m-is { color: var(--dim); font-size: 12px; }
+.m-is .star { color: var(--warn); font-weight: 600; margin-left: 6px; }
 /* Watching (auto-watch): the /watch watcher's items, on every session's page */
 .watch { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
 .w-status { color: var(--dim); font-size: 12.5px; line-height: 1.45; padding-bottom: 6px; }
@@ -529,6 +539,13 @@ img.shot { display: block; max-width: 100%; margin: 0 auto; border-radius: 6px; 
 .chip.next { color: var(--accent); }
 .sessions .row .side { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; text-align: right; }
 .sessions .row .side time { color: var(--dim); font-size: 12px; }
+/* Simple index: name, goal on one line, state and time. */
+.idx-simple .sessions .row { padding: 7px 14px; align-items: center; }
+.idx-simple .sessions .row .cwd, .idx-simple .sessions .row .nowline, .idx-simple .sessions .row .chips { display: none; }
+.idx-simple .sessions .row .line1 { display: inline; }
+.idx-simple .sessions .row .main { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+.idx-simple .sessions .row .goal { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+.idx-simple .sessions .row .side { flex-direction: row; align-items: baseline; gap: 10px; }
 .sessions .row.ended .name, .sessions .row.ended .goal { color: color-mix(in srgb, var(--ink) 75%, var(--dim)); }
 .err { color: #c0392b; font-size: 13px; white-space: pre-wrap; }
 
@@ -546,13 +563,6 @@ img.shot { display: block; max-width: 100%; margin: 0 auto; border-radius: 6px; 
 .waitchip.error { border-color: color-mix(in srgb, var(--bad) 55%, var(--line)); }
 .waitchip .nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .waitchip .st { color: var(--dim); white-space: nowrap; }
-/* Simple index: name, goal on one line, state and time. */
-.idx-simple .sessions .row { padding: 7px 14px; align-items: center; }
-.idx-simple .sessions .row .cwd, .idx-simple .sessions .row .nowline, .idx-simple .sessions .row .chips { display: none; }
-.idx-simple .sessions .row .line1 { display: inline; }
-.idx-simple .sessions .row .main { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
-.idx-simple .sessions .row .goal { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
-.idx-simple .sessions .row .side { flex-direction: row; align-items: baseline; gap: 10px; }
 
 /* Cmd-K picker */
 .cmdk-back { position: fixed; inset: 0; z-index: 50; display: flex; justify-content: center; align-items: flex-start; padding-top: 12vh; background: color-mix(in srgb, #000 35%, transparent); }
@@ -1146,7 +1156,7 @@ function withWatch(sections, watch) {
 /** meeting-capture's live meeting as the auto-meeting widget, on every session's page (the daemon's meeting-feed.mjs). */
 function withMeeting(sections, meeting) {
   if (!meeting || typeof meeting !== "object") return sections;
-  return [...sections.filter((s) => s.id !== "auto-meeting"), { id: "auto-meeting", title: "Meeting", kind: "meeting", by: "auto", at: meeting.at, data: meeting }];
+  return [...sections.filter((s) => s.id !== "auto-meeting"), { id: "auto-meeting", title: meeting.kind === "list" ? "Recent meetings" : "Meeting", kind: "meeting", by: "auto", at: meeting.at, data: meeting }];
 }
 /** A new needs-you item since the last snapshot: worth the flash the other rewrites skip. */
 function watchGrew(prev, next) {
@@ -2560,18 +2570,47 @@ const meetingClock = (iso) => {
 };
 /** The Meeting card flashes when the copilot raises an alert (a new newest id: the list is capped, so a count would stop); any other rewrite stays quiet. */
 const meetingLastAlert = (sec) => sec?.data?.notes?.lastAlertId ?? "";
+/** "Today 14:00", "Yesterday 09:30", else "Tue Oct 28 16:00". */
+function meetingWhen(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(+d)) return "";
+  const now = new Date();
+  const same = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  const y = new Date(now);
+  y.setDate(y.getDate() - 1);
+  const day = same(d, now) ? "Today" : same(d, y) ? "Yesterday" : `${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()]} ${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getMonth()]} ${d.getDate()}`;
+  return `${day} ${meetingClock(iso)}`;
+}
+/** "1:02:03" → "1h 02m", "0:32:10" → "32m", under a minute "<1m". */
+function meetingDur(s) {
+  const m = /^(\d+):(\d\d):(\d\d)$/.exec(String(s || ""));
+  if (!m) return "";
+  if (Number(m[1])) return `${Number(m[1])}h ${m[2]}m`;
+  return Number(m[2]) ? `${Number(m[2])}m` : "<1m";
+}
+/** One row of the recent list: title, when and how long, ★ your action items; opens that meeting in a new tab. */
+function meetingItem(e) {
+  const when = [e.live ? "Live" : meetingWhen(e.started_at), e.live ? "" : meetingDur(e.duration)].filter(Boolean).join(" · ");
+  return h("a", { class: "m-item", href: `/meeting?id=${encodeURIComponent(e.id)}`, target: "_blank" }, h("span", { class: "m-it" }, e.title || e.app || "Meeting"), h("span", { class: "m-is" }, when, e.notes?.mine ? h("span", { class: "star", title: "Action items for you" }, `★ ${e.notes.mine}`) : null));
+}
 function renderMeeting(m) {
-  const elapsed = h("b", { class: "m-elapsed", "data-start": m.recording ? m.startedAt : null }, meetingElapsed(m));
+  const recent = Array.isArray(m.recent) ? m.recent : [];
+  const viewAll = (label) => h("a", { class: "m-open", href: "/meetings", target: "_blank" }, label);
+  // Nothing live and nothing fresh: the last few meetings.
+  if (m.kind === "list") return h("div", { class: "meet" }, h("div", { class: "m-list" }, recent.map(meetingItem)), viewAll("View all ↗"));
+  const live = m.recording;
+  const elapsed = h("b", { class: "m-elapsed", "data-start": live ? m.startedAt : null }, meetingElapsed(m));
   const status = h(
     "div",
     { class: "m-status" },
-    h("span", { class: `m-dot${m.recording ? " rec" : ""}` }),
-    h("span", {}, m.recording ? "Live" : m.crashed ? "Stopped unexpectedly" : "Ended"),
+    h("span", { class: `m-dot${live ? " rec" : ""}` }),
+    h("span", {}, live ? "Live" : m.crashed ? "Stopped unexpectedly" : "Ended"),
     elapsed,
     m.people != null ? h("span", {}, plural(m.people, "person", "people")) : null,
     m.slides ? h("span", {}, plural(m.slides, "slide")) : null,
   );
-  const out = [status, h("div", { class: "m-title" }, m.title || "Meeting", m.app ? h("span", {}, m.app) : null)];
+  const title = live ? h("div", { class: "m-title" }, m.title || "Meeting", m.app ? h("span", {}, m.app) : null) : h("a", { class: "m-title link", href: `/meeting?id=${encodeURIComponent(m.id)}`, target: "_blank" }, m.title || "Meeting", m.app ? h("span", {}, m.app) : null);
+  const out = [status, title];
   // The copilot's alerts (a name said, a new action on you), newest first, then your open actions.
   const notes = m.notes && typeof m.notes === "object" ? m.notes : null;
   const alerts = Array.isArray(notes?.alerts) ? notes.alerts.slice(-3).reverse() : [];
@@ -2580,13 +2619,20 @@ function renderMeeting(m) {
   }
   const todo = Array.isArray(notes?.actions) ? notes.actions.filter((a) => a.mine) : [];
   if (todo.length) out.push(h("div", { class: "m-h" }, "Your action items"), h("ul", { class: "m-todo" }, todo.map((a) => h("li", {}, a.what))));
+  if (!live) {
+    // Just ended: this one stays expanded, the rest of the history is a list under it.
+    const rest = recent.filter((e) => e.id !== m.id);
+    if (rest.length) out.push(h("div", { class: "m-h" }, "Recent meetings"), h("div", { class: "m-list" }, rest.map(meetingItem)));
+    out.push(viewAll("View all ↗"));
+    return h("div", { class: "meet" }, out);
+  }
   if (m.slide && m.id) {
     out.push(h("a", { class: "m-slide", href: "/meeting", target: "_blank", title: "Open the live view" }, h("img", { src: `/meeting/${encodeURIComponent(m.id)}/slide/${m.slide.n}${m.slide.thumb ? ".thumb" : ""}.jpg`, alt: `Slide ${m.slide.n}`, loading: "lazy" }), h("span", {}, `slide ${m.slide.n}`)));
   }
-  const recent = Array.isArray(m.recent) ? m.recent : [];
-  if (recent.length) out.push(h("div", { class: "m-lines" }, recent.map((e) => h("div", { class: `m-line${e.type === "chat" ? " chat" : ""}` }, e.speaker ? h("b", { style: `color:${meetColor(e.speaker)}` }, `${e.type === "chat" ? "(chat) " : ""}${e.speaker}`) : null, e.text))));
-  else if (m.recording) out.push(h("div", { class: "m-wait" }, "Waiting for captions…"));
-  out.push(h("a", { class: "m-open", href: "/meeting", target: "_blank" }, m.recording ? "Open the live view ↗" : "Open the transcript ↗"));
+  const lines = Array.isArray(m.lines) ? m.lines : [];
+  if (lines.length) out.push(h("div", { class: "m-lines" }, lines.map((e) => h("div", { class: `m-line${e.type === "chat" ? " chat" : ""}` }, e.speaker ? h("b", { style: `color:${meetColor(e.speaker)}` }, `${e.type === "chat" ? "(chat) " : ""}${e.speaker}`) : null, e.text))));
+  else out.push(h("div", { class: "m-wait" }, "Waiting for captions…"));
+  out.push(h("div", { class: "m-links" }, h("a", { class: "m-open", href: "/meeting", target: "_blank" }, "Open the live view ↗"), h("a", { class: "m-open", href: "/meetings", target: "_blank" }, "Previous meetings ↗")));
   return h("div", { class: "meet" }, out);
 }
 // The card's elapsed time ticks without a rebuild.
@@ -4309,6 +4355,28 @@ async function indexView() {
 
   const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
+  // Simple / Detailed: how much each row shows, per browser. `v` flips it.
+  const VIEW_KEY = "canvas:index-view";
+  const simple = () => localStorage.getItem(VIEW_KEY) === "simple";
+  const applyView = () => $app.classList.toggle("idx-simple", simple());
+  const setView = (v) => {
+    try {
+      localStorage.setItem(VIEW_KEY, v);
+    } catch {}
+    applyView();
+    viewToggle.querySelectorAll(".seg").forEach((b) => b.classList.toggle("on", b.dataset.v === v));
+  };
+  const seg = (v, label) => h("button", { class: `seg${(v === "simple") === simple() ? " on" : ""}`, type: "button", "data-v": v, title: `${label} rows (v)`, onclick: () => setView(v) }, label);
+  const viewToggle = h("span", { class: "segs" }, seg("simple", "Simple"), seg("detailed", "Detailed"));
+  // ?view=simple|detailed sets it too (a bookmark, or a link from elsewhere).
+  const asked = new URLSearchParams(location.search).get("view");
+  if (asked === "simple" || asked === "detailed") setView(asked);
+  applyView();
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "v" || e.metaKey || e.ctrlKey || e.altKey || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "") || document.activeElement?.isContentEditable) return;
+    setView(simple() ? "detailed" : "simple");
+  });
+
   function row(s) {
     const st = stateOf(s);
     const endedAt = s.ended || (s.live ? undefined : new Date(s.updated).toISOString());
@@ -4377,28 +4445,6 @@ async function indexView() {
     for (const [day, list] of byDay) out.push(group(day, list));
     groups.replaceChildren(...out);
   }
-  // Simple / Detailed: how much each row shows, per browser. `v` flips it.
-  const VIEW_KEY = "canvas:index-view";
-  const simple = () => localStorage.getItem(VIEW_KEY) === "simple";
-  const applyView = () => $app.classList.toggle("idx-simple", simple());
-  const setView = (v) => {
-    try {
-      localStorage.setItem(VIEW_KEY, v);
-    } catch {}
-    applyView();
-    viewToggle.querySelectorAll(".seg").forEach((b) => b.classList.toggle("on", b.dataset.v === v));
-  };
-  const seg = (v, label) => h("button", { class: `seg${(v === "simple") === simple() ? " on" : ""}`, type: "button", "data-v": v, title: `${label} rows (v)`, onclick: () => setView(v) }, label);
-  const viewToggle = h("span", { class: "segs" }, seg("simple", "Simple"), seg("detailed", "Detailed"));
-  // ?view=simple|detailed sets it too (a bookmark, or a link from elsewhere).
-  const asked = new URLSearchParams(location.search).get("view");
-  if (asked === "simple" || asked === "detailed") setView(asked);
-  applyView();
-  document.addEventListener("keydown", (e) => {
-    if (e.key !== "v" || e.metaKey || e.ctrlKey || e.altKey || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "") || document.activeElement?.isContentEditable) return;
-    setView(simple() ? "detailed" : "simple");
-  });
-
 
   await refresh();
   pageHooks.refresh = refresh;

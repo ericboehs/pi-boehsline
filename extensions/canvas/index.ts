@@ -39,7 +39,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const DAEMON = join(HERE, "daemon.mjs");
 const PAGE = join(HERE, "page.mjs");
 /** Everything the page loads from /assets/ as code, hashed by daemonVersion(). */
-const PAGE_MODULES = [PAGE, join(HERE, "render.mjs"), join(HERE, "nav.mjs"), join(HERE, "theme.mjs"), join(HERE, "meeting-feed.mjs"), join(HERE, "meeting-page.mjs")];
+const PAGE_MODULES = [PAGE, join(HERE, "render.mjs"), join(HERE, "nav.mjs"), join(HERE, "theme.mjs"), join(HERE, "meeting-feed.mjs"), join(HERE, "meeting-page.mjs"), join(HERE, "meetings-page.mjs")];
 
 const MAX_BODY = 2 * 1024 * 1024;
 const MAX_FILE = 20 * 1024 * 1024;

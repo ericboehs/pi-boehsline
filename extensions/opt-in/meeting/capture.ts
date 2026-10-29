@@ -16,6 +16,7 @@
  * so no session restarts them).
  */
 
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -66,6 +67,13 @@ export function parseState(raw: unknown): CaptureState | null {
 		duration: str(r.duration, 20),
 	};
 }
+
+/**
+ * A meeting's short id, sha1("<app_id>|<started_at>") cut to 12 hex chars. The
+ * canvas's meeting-feed.mjs computes the same, so the live meeting, its history
+ * entry and its archived notes (<id>.json) all agree.
+ */
+export const meetingId = (appId: string, startedAt: string): string => createHash("sha1").update(`${appId}|${startedAt}`).digest("hex").slice(0, 12);
 
 /** Whether a process exists. EPERM means it does, and belongs to someone else. */
 export function pidAlive(pid: number): boolean {

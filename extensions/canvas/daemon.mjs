@@ -22,7 +22,7 @@ import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { systemTheme, themeDefault } from "./theme.mjs";
 
-import { MEETING_STATE_DIR, MeetingFeed, notesFilePath } from "./meeting-feed.mjs";
+import { MEETING_STATE_DIR, MeetingFeed, notesDirPath, notesFilePath } from "./meeting-feed.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 function arg(name, fallback) {
@@ -42,8 +42,10 @@ export const PEERS = resolve(arg("peers", process.env.PI_CANVAS_PEERS || join(ho
 export const USAGE_CACHE = resolve(arg("usage", process.env.PI_CANVAS_USAGE || join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "usage-cache.json")));
 const VERSION = arg("version", "dev");
 // meeting-capture's state folder (MEETING_CAPTURE_STATE_DIR): the Meeting card and /meeting.
-// The /meeting copilot's notes ride along: PI_MEETING_NOTES_FILE or <root>/.meeting-notes.json.
-export const meeting = new MeetingFeed(resolve(arg("meeting", MEETING_STATE_DIR)), { notesFile: notesFilePath(ROOT) });
+// The /meeting copilot's notes ride along: PI_MEETING_NOTES_FILE or <root>/.meeting-notes.json,
+// and its archive of finished meetings' notes (PI_MEETING_NOTES_DIR or <root>/meetings).
+// --meeting-data (else MEETING_CAPTURE_DATA_DIR) is where the transcripts live, for /meetings.
+export const meeting = new MeetingFeed(resolve(arg("meeting", MEETING_STATE_DIR)), { notesFile: notesFilePath(ROOT), notesDir: notesDirPath(ROOT), dataDir: arg("meeting-data", "") });
 const RETAIN_DAYS = Number(process.env.PI_CANVAS_RETAIN_DAYS || 30);
 
 // Browser libraries, fetched once from jsdelivr and checked against these
@@ -422,6 +424,7 @@ const ASSETS = {
   "/assets/render.css": ["render.css", "text/css; charset=utf-8"],
   "/assets/theme-boot.js": ["theme-boot.js", JS],
   "/assets/meeting-page.mjs": ["meeting-page.mjs", JS],
+  "/assets/meetings-page.mjs": ["meetings-page.mjs", JS],
   "/assets/themes.json": ["themes.json", "application/json; charset=utf-8"],
 };
 
@@ -448,6 +451,18 @@ const MEETING_SHELL = `<!doctype html>
 <link rel="icon" href="data:,">
 <script src="/assets/theme-boot.js"></script>
 <script src="/assets/meeting-page.mjs" type="module"></script>
+<body><div id="app"></div></body>
+</html>`;
+
+// The meetings browser: the same kind of page, its own module.
+const MEETINGS_SHELL = `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meetings</title>
+<link rel="icon" href="data:,">
+<script src="/assets/theme-boot.js"></script>
+<script src="/assets/meetings-page.mjs" type="module"></script>
 <body><div id="app"></div></body>
 </html>`;
 
@@ -774,7 +789,25 @@ function handler(req, res) {
     return;
   }
   if (url.pathname === "/meeting") return send(res, 200, MEETING_SHELL, { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": PAGE_CSP });
-  if (url.pathname === "/api/meeting") return json(res, meeting.snapshot(Number(url.searchParams.get("since") || 0), url.searchParams.get("id") || ""));
+  if (url.pathname === "/meetings") return send(res, 200, MEETINGS_SHELL, { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": PAGE_CSP });
+  // id: the meeting wanted (empty: the live one); cur: the id the page's cursor (since) belongs to.
+  if (url.pathname === "/api/meeting") {
+    const id = url.searchParams.get("id") || "";
+    return json(res, meeting.snapshot(Number(url.searchParams.get("since") || 0), id, url.searchParams.get("cur") ?? id));
+  }
+  if (url.pathname === "/api/meetings") {
+    const offset = Math.max(0, Math.floor(Number(url.searchParams.get("offset"))) || 0);
+    const asked = Math.floor(Number(url.searchParams.get("limit")));
+    const limit = asked >= 1 ? Math.min(100, asked) : 50;
+    const { meetings, total, partial } = meeting.listing({ limit, offset });
+    // partial: older meetings are still being read (a big archive); asking again gets more.
+    return json(res, { meetings, live: meeting.state?.recording ? meeting.id : null, more: offset + meetings.length < total, partial });
+  }
+  if (url.pathname === "/api/meetings/search") {
+    const q = (url.searchParams.get("q") || "").slice(0, 200);
+    // partial: the search stopped early (it reads at most 25 MB, in about 150 ms); searched = the newest N meetings it covered.
+    return json(res, { q, ...meeting.searchResult(q) });
+  }
   // Slides: /meeting/<meeting id>/slide/<n>.jpg or <n>.thumb.jpg, only files index.jsonl lists.
   if (parts[0] === "meeting" && parts.length === 4 && parts[2] === "slide") {
     const m = /^(\d{1,6})(\.thumb)?\.jpg$/.exec(parts[3]);

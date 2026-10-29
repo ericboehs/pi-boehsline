@@ -28,7 +28,7 @@ Object.assign(process.env, {
 });
 delete process.env.PI_MEETING_MODEL;
 
-const { default: meeting } = await import("../extensions/opt-in/meeting/index.ts");
+const { default: meeting, meetingId } = await import("../extensions/opt-in/meeting/index.ts");
 const { isWorkModel, modelSpecs, PERSONAL_MODELS, WORK_MODELS, workOnly } = await import(
 	"../extensions/opt-in/watch/models.ts"
 );
@@ -209,11 +209,12 @@ const WIDE_JPG = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABALDA4MChAODQ4SER
 /** A temp world: capture state dir, data dir and lock file, env pointed at it. */
 function world(t, { owner = "earl" } = {}) {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-auto-"));
-	const saved = Object.fromEntries(["MEETING_CAPTURE_STATE_DIR", "PI_MEETING_LOCK", "PI_MEETING_OWNER", "PI_MEETING_WATCH", "PI_MEETING_NOTES_FILE"].map((k) => [k, process.env[k]]));
+	const saved = Object.fromEntries(["MEETING_CAPTURE_STATE_DIR", "PI_MEETING_LOCK", "PI_MEETING_OWNER", "PI_MEETING_WATCH", "PI_MEETING_NOTES_FILE", "PI_MEETING_NOTES_DIR"].map((k) => [k, process.env[k]]));
 	process.env.MEETING_CAPTURE_STATE_DIR = path.join(root, "state");
 	process.env.PI_MEETING_LOCK = path.join(root, "meeting-owner.json");
 	process.env.PI_MEETING_OWNER = owner;
 	process.env.PI_MEETING_NOTES_FILE = path.join(root, "canvas", ".meeting-notes.json");
+	process.env.PI_MEETING_NOTES_DIR = path.join(root, "canvas", "meetings");
 	delete process.env.PI_MEETING_WATCH;
 	fs.mkdirSync(path.join(root, "state"));
 	fs.mkdirSync(path.join(root, "data"));
@@ -228,6 +229,8 @@ function world(t, { owner = "earl" } = {}) {
 	const w = {
 		root,
 		notesFile: process.env.PI_MEETING_NOTES_FILE,
+		/** The archived notes of a meeting from w.capture (state.started_at, app "teams"). */
+		archive: (state) => path.join(process.env.PI_MEETING_NOTES_DIR, `${meetingId("teams", state.started_at)}.json`),
 		lockPath,
 		lock: () => JSON.parse(fs.readFileSync(lockPath, "utf8")),
 		/** A finished-or-running capture: captions, chat, people, 3 slides, a revisit. Returns the state record. */
@@ -830,12 +833,19 @@ test("a live meeting: notes, alerts, the reply once, the notes file, /meeting no
 	assert.match(stop, /Action items:\n- ★ Eric Boehs: own moving/);
 	const ended = JSON.parse(fs.readFileSync(w.notesFile, "utf8"));
 	assert.equal(ended.ended, true, "the final notes stay for the canvas");
+	// The same notes are archived under the meeting's id, mode 600 in a 700 folder, no temp file left.
+	const archived = w.archive(state);
+	assert.deepEqual(JSON.parse(fs.readFileSync(archived, "utf8")), ended, "the archive has the live file's shape and content");
+	assert.equal(fs.statSync(archived).mode & 0o777, 0o600);
+	assert.equal(fs.statSync(path.dirname(archived)).mode & 0o777, 0o700);
+	assert.deepEqual(fs.readdirSync(path.dirname(archived)), [path.basename(archived)]);
 	assert.equal(ended.topics[0].summary, "Final.");
 	assert.equal(earl.showing(), "", "the status line is gone");
 
 	// Quitting right after the call leaves the final notes for the canvas.
 	await earl.fire("session_shutdown", { reason: "quit" });
 	assert.equal(JSON.parse(fs.readFileSync(w.notesFile, "utf8")).ended, true);
+	assert.equal(JSON.parse(fs.readFileSync(archived, "utf8")).ended, true);
 });
 
 test("a /reload mid-meeting keeps the notes file; the new instance picks the notes up and doesn't alert again, and quitting takes the file away", async (t) => {
@@ -867,6 +877,8 @@ test("a /reload mid-meeting keeps the notes file; the new instance picks the not
 
 	await after.fire("session_shutdown", { reason: "quit" });
 	assert.equal(fs.existsSync(w.notesFile), false, "quitting mid-meeting takes it away");
+	const kept = JSON.parse(fs.readFileSync(w.archive(state), "utf8"));
+	assert.deepEqual([kept.alerts.length, kept.ended, kept.topics[0].title], [2, false, "Canary"], "the archive is never dropped, quit or not");
 });
 
 test("the daily-note recap lists topics, decisions, action items and open questions, and a replay never writes one", async (t) => {
@@ -893,11 +905,14 @@ test("the daily-note recap lists topics, decisions, action items and open questi
 
 	// A replay of the same capture adds nothing to the note.
 	const before = fs.readFileSync(noteFile, "utf8");
+	const archiveBefore = fs.readFileSync(w.archive(state), "utf8");
 	const s = w.session("solo", "solo-id", [], { registry: scripted([JSON.stringify({ topics: [{ title: "Replay", summary: "x" }], reply: null })]) });
 	await s.fire("session_start");
 	await s.command(`replay 100000 ${state.jsonl}`);
 	await until(() => s.stopped(), "the replay to finish", 12000);
 	assert.equal(fs.readFileSync(noteFile, "utf8"), before, "no recap for a replay");
+	assert.equal(fs.readFileSync(w.archive(state), "utf8"), archiveBefore, "a replay never writes or touches the archive");
+	assert.equal(fs.readdirSync(path.dirname(w.archive(state))).length, 1);
 	assert.deepEqual([JSON.parse(fs.readFileSync(w.notesFile, "utf8")).session.id, JSON.parse(fs.readFileSync(w.notesFile, "utf8")).ended], ["earl-id", true], "and the replay left the notes file alone");
 });
 
@@ -912,6 +927,7 @@ test("when the copilot stops for any reason but the meeting ending, the notes fi
 	await until(() => fs.existsSync(w.notesFile), "the notes file");
 	await s.command("stop");
 	assert.equal(fs.existsSync(w.notesFile), false, "/meeting stop removes it");
+	assert.equal(fs.readdirSync(process.env.PI_MEETING_NOTES_DIR).length, 1, "but not the archive");
 });
 
 test("/q research is gone: no /q command, no input hook, no /meeting list", async (t) => {

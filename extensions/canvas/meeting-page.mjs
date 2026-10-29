@@ -7,6 +7,9 @@
 // items, decisions, topics, questions, a suggested reply), from the notes file
 // the daemon merges into /api/meeting. From 1400 px it is a third column; below
 // that a Transcript / Notes switch at the top of the column swaps them.
+//
+// /meeting follows the live meeting. /meeting?id=<id> shows one from the history
+// (/meetings), whole and ended; #e<n> scrolls to transcript entry n and flashes it.
 
 const CSS = `
 :root { color-scheme: light dark; --bg:#f7f5f0; --card:#fff; --ink:#1c1b19; --dim:#8a8578; --line:#e6e1d6; --soft:#f0ece3; --accent:#b4541f; --ok:#1f7a52; --warn:#a86a00; --bad:#c0392b; --c1:#3b7dd8; --c2:#e0703a; --c3:#2f9e72; --c4:#c4475b; --c5:#8a63c9; --c6:#b8901c; --c7:#2e9bb0; --c8:#8c8577; }
@@ -28,6 +31,7 @@ header .meta .state.rec { color: var(--ok); font-weight: 600; }
 header input { font: inherit; font-size: 13px; padding: 5px 9px; width: 200px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); }
 header a.back { color: var(--dim); font-size: 12.5px; text-decoration: none; }
 header a.back:hover { color: var(--accent); }
+header .links { flex: none; display: flex; gap: 12px; }
 main { flex: 1; min-height: 0; display: flex; }
 .stage { flex: 3 1 0; min-width: 0; display: flex; flex-direction: column; border-right: 1px solid var(--line); }
 body:not(.has-slides) .stage { display: none; }
@@ -152,6 +156,9 @@ let stick = true; // the transcript follows the bottom until you scroll up
 let lastSpeaker = null;
 let filter = "";
 let notes = null; // the copilot's notes, when it has some for this meeting
+const wanted = new URLSearchParams(location.search).get("id") || ""; // a past meeting's id; empty follows the live one
+let jumpTo = /^#e(\d{1,7})$/.exec(location.hash)?.[1] ?? null; // the entry to scroll to once it is loaded
+let notFound = false;
 
 // ── transcript / notes switch (below 1400 px; the CSS hides it above) ──
 const bars = [];
@@ -198,7 +205,7 @@ const ui = {
 };
 ui.scroll.append(ui.rows, ui.live);
 $app.append(
-  h("header", {}, ui.dot, h("div", { class: "who" }, ui.title, ui.meta), ui.search, h("a", { class: "back", href: "/" }, "Canvas")),
+  h("header", {}, ui.dot, h("div", { class: "who" }, ui.title, ui.meta), ui.search, h("div", { class: "links" }, h("a", { class: "back", href: "/meetings" }, "All meetings"), h("a", { class: "back", href: "/" }, "Canvas"))),
   h(
     "main",
     {},
@@ -217,12 +224,13 @@ const slideOf = (n) => slides.find((s) => s.n === n);
 function renderHeader() {
   const st = state;
   ui.dot.className = `dot${st?.recording ? " rec" : ""}`;
+  ui.jump.textContent = st && !st.recording ? "↓ Jump to end" : "↓ Jump to live";
   ui.title.textContent = st ? st.title || st.app || "Meeting" : "Meeting";
   document.title = st ? `${st.recording ? "● " : ""}${st.title || "Meeting"}` : "Meeting";
   const bits = [];
   if (!st) bits.push(h("span", {}, "No meeting"));
   else {
-    bits.push(h("span", { class: `state${st.recording ? " rec" : ""}` }, st.recording ? "Live" : st.crashed ? "Stopped unexpectedly" : "Ended"));
+    bits.push(h("span", { class: `state${st.recording ? " rec" : ""}` }, st.recording ? "Live" : `${st.crashed ? "Stopped unexpectedly" : "Ended"}${dayOf(st.startedAt) ? ` · ${dayOf(st.startedAt)}` : ""}`));
     if (st.app) bits.push(h("span", {}, st.app));
     bits.push(h("span", {}, h("b", { class: "elapsed" }, elapsed())));
     if (people) bits.push(h("span", { title: people.people.join("\n") }, h("b", {}, people.count), people.count === 1 ? " person" : " people"));
@@ -231,6 +239,11 @@ function renderHeader() {
   }
   ui.meta.replaceChildren(...bits);
 }
+/** "Tue Oct 28" for a start time ("" when it won't parse). */
+const dayOf = (iso) => {
+  const d = new Date(iso);
+  return Number.isNaN(+d) ? "" : `${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()]} ${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getMonth()]} ${d.getDate()}`;
+};
 function elapsed() {
   const st = state;
   if (!st) return "";
@@ -250,7 +263,13 @@ function renderEmpty() {
   document.querySelector("main .tx").hidden = none;
   if (none) document.body.classList.remove("has-notes", "view-notes");
   document.body.classList.toggle("has-slides", !none && slides.length > 0);
-  if (none) ui.empty.replaceChildren(h("h2", {}, "No meeting"), h("div", {}, "This page fills in by itself when meeting-capture starts a meeting."));
+  if (none) {
+    ui.empty.replaceChildren(
+      h("h2", {}, notFound ? "Meeting not found" : "No meeting"),
+      h("div", {}, notFound ? "There is no saved meeting with that id." : "This page fills in by itself when meeting-capture starts a meeting."),
+      h("div", {}, h("a", { class: "back", href: "/meetings" }, "All meetings →")),
+    );
+  }
 }
 
 // ── slides ──
@@ -376,14 +395,15 @@ function rowFor(e) {
 }
 const rowText = (e) => `${e.speaker || ""} ${e.text || ""} ${e.type === "slide" || e.type === "revisit" ? `slide ${e.n}` : ""}`.toLowerCase();
 
-function appendEntries(list) {
+function appendEntries(list, base = 0) {
   const frag = document.createDocumentFragment();
-  for (const e of list) {
+  for (const [k, e] of list.entries()) {
     if (e.type === "slide" || e.type === "revisit") onScreen = e.n;
     if (e.type === "revisit") shownAgain.set(e.n, (shownAgain.get(e.n) || 0) + 1);
     const row = rowFor(e);
     if (!row) continue;
     row.dataset.q = rowText(e);
+    row.dataset.i = base + k;
     if (e.type === "caption" || e.type === "chat") {
       row.dataset.sp = e.speaker || "";
       row.dataset.tx = e.text || "";
@@ -463,8 +483,10 @@ function apply(d) {
   if (d.id !== id || d.from !== entries.length) {
     resetTranscript();
     id = d.id;
+    if (wanted && d.state && !d.state.recording) stick = false; // a past meeting opens at the top
     if (d.from !== 0) return void (id = ""), pull(); // out of step: start over
   }
+  notFound = Boolean(d.notFound);
   state = d.state;
   slides = d.slides || [];
   people = d.people;
@@ -473,8 +495,9 @@ function apply(d) {
   renderEmpty();
   renderSlides();
   if (d.entries.length) {
+    const base = entries.length;
     entries.push(...d.entries);
-    appendEntries(d.entries);
+    appendEntries(d.entries, base);
     markRevisits();
     showSlide();
   }
@@ -483,7 +506,23 @@ function apply(d) {
   renderHeader();
   renderNotes();
   markMentions();
-  followBottom();
+  if (!jumpToEntry()) followBottom();
+}
+
+/** #e<n>: scroll that transcript entry into view and flash it, once, as soon as it is loaded. */
+function jumpToEntry() {
+  if (jumpTo == null) return false;
+  const row = ui.rows.querySelector(`.row[data-i="${jumpTo}"]`);
+  if (!row) return false;
+  jumpTo = null;
+  if (row.hidden) return false;
+  stick = false;
+  ui.jump.hidden = false;
+  row.scrollIntoView({ block: "center" });
+  row.classList.remove("flash");
+  void row.offsetWidth;
+  row.classList.add("flash");
+  return true;
 }
 
 let inflight = false;
@@ -492,7 +531,7 @@ async function pull() {
   if (inflight) return void (again = true);
   inflight = true;
   try {
-    const r = await fetch(`/api/meeting?since=${entries.length}&id=${encodeURIComponent(id)}`, { cache: "no-store" });
+    const r = await fetch(`/api/meeting?since=${entries.length}&id=${encodeURIComponent(wanted)}&cur=${encodeURIComponent(id)}`, { cache: "no-store" });
     if (r.ok) apply(await r.json());
   } catch {}
   inflight = false;

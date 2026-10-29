@@ -17,18 +17,39 @@
 // reply. It counts only while it names this meeting (meeting.started_at equals
 // state.json's) and its session is still there (pid alive) or it says ended.
 //
+// History (the /meetings page, the card's recent list): meeting-capture's data
+// directory, one <base>.jsonl (+ <base>.slides/) per meeting, and the copilot's
+// archived notes, <canvas root>/meetings/<id>.json (PI_MEETING_NOTES_DIR). The
+// live meeting and its history entry share one id, sha1(app_id|started_at).
+//
 // Nothing here touches the network or copies a file: the daemon serves slides
 // straight from slides_dir, and only names listed in index.jsonl.
 
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 export const MEETING_STATE_DIR = resolve(process.env.MEETING_CAPTURE_STATE_DIR || join(homedir(), ".local", "state", "meeting-capture"));
 
 /** The copilot's notes file: PI_MEETING_NOTES_FILE, else .meeting-notes.json in the canvas root. */
 export const notesFilePath = (root) => resolve(process.env.PI_MEETING_NOTES_FILE || join(root, ".meeting-notes.json"));
+
+/** The copilot's archived notes, one <meeting id>.json each: PI_MEETING_NOTES_DIR, else meetings/ in the canvas root. Kept forever. */
+export const notesDirPath = (root) => resolve(process.env.PI_MEETING_NOTES_DIR || join(root, "meetings"));
+
+/**
+ * Where meeting-capture keeps its transcripts. An explicit dir (the daemon's
+ * --meeting-data) or MEETING_CAPTURE_DATA_DIR wins, then the folder of the live
+ * state's jsonl, then the last one seen (state.json may be gone), then the XDG default.
+ */
+export function meetingDataDir({ explicit = "", jsonl = null, last = "", env = process.env } = {}) {
+  const e = explicit || env.MEETING_CAPTURE_DATA_DIR;
+  if (e) return resolve(e);
+  if (jsonl) return dirname(jsonl);
+  if (last) return last;
+  return resolve(env.XDG_DATA_HOME ? join(env.XDG_DATA_HOME, "meeting-capture") : join(homedir(), ".local", "share", "meeting-capture"));
+}
 
 /** How long an ended meeting keeps its card in the side panel. */
 export const CARD_AFTER_END_MS = 15 * 60_000;
@@ -238,13 +259,178 @@ export class JsonlTail {
 /** A meeting's short id: the page's cursor and the slide URLs' cache key. */
 export const meetingId = (state) => (state ? createHash("sha1").update(`${state.appId}|${state.startedAt}`).digest("hex").slice(0, 12) : "");
 
+// ── history ──
+
+const SCAN_MS = 10_000;
+const SEARCH_MAX_FILE = 20 * 1024 * 1024; // over this: the list reads the head and tail only, search skips the lines, /meeting?id= shows the end
+const LINES_CACHE_BYTES = 50 * 1024 * 1024;
+const SEARCH_READ_BYTES = 25 * 1024 * 1024; // one search reads at most this much from disk; with the cache's own cap it bounds the cache during a search
+const SEARCH_BUDGET_MS = 150; // one search runs for about this long, then stops and says partial
+const ID_HEAD_BYTES = 8 * 1024; // find() reads this much of a file to learn its id: the header line
+const SCAN_BUDGET_MS = 50; // one scan() call parses files for about this long, then returns what is ready
+const HEAD_BYTES = 64 * 1024;
+const TAIL_BYTES = 64 * 1024;
+const PAST_TAIL_BYTES = 8 * 1024 * 1024; // a past meeting over 20 MB loads this much of its end
+const LOADED_KEEP = 3;
+const LOADED_BYTES = 48 * 1024 * 1024;
+const ID_RE = /^[0-9a-f]{12}$/;
+const BASE_RE = /^(\d{8})_(\d{6})-([^-]+)(?:-(.*))?\.jsonl$/;
+const pad2 = (n) => String(n).padStart(2, "0");
+/** "1:02:03" from milliseconds, "" for nonsense. */
+const hms = (ms) => {
+  if (!(ms >= 0)) return "";
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 3600)}:${pad2(Math.floor(s / 60) % 60)}:${pad2(s % 60)}`;
+};
+const fileSig = (st) => `${st.size}:${st.mtimeMs}`;
+
+/** A slides folder's index.jsonl as normalized slides (one per n, the last wins). */
+function readSlideIndex(slidesDir) {
+  let text = "";
+  try {
+    text = readFileSync(join(slidesDir, "index.jsonl"), "utf8");
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const s of parseLines(text.endsWith("\n") ? text : `${text}\n`).records.map(normalizeSlide).filter(Boolean)) {
+    const i = out.findIndex((x) => x.n === s.n);
+    if (i >= 0) out[i] = s;
+    else out.push(s);
+  }
+  return out;
+}
+
+/** Whole lines of the end of a file: the bytes from `from` on, minus the (probably cut) first line. */
+function tailRecords(path, from, size) {
+  const buf = readRange(path, from, size);
+  const nl = buf.indexOf(0x0a);
+  if (nl < 0) return [];
+  const text = buf.subarray(nl + 1).toString("utf8");
+  return parseLines(text.endsWith("\n") ? text : `${text}\n`).records;
+}
+
+/** A transcript's meeting id from its first line only (the metadata header), like parseMeetingFile derives it. "" when unreadable. */
+function headId(path, name) {
+  let meta = null;
+  try {
+    const head = readRange(path, 0, ID_HEAD_BYTES).toString("utf8");
+    const nl = head.indexOf("\n");
+    const r = nl < 0 ? null : parseLines(head.slice(0, nl + 1)).records[0];
+    if (r?.type === "metadata" && r.event !== "stopped") meta = r;
+  } catch {
+    return "";
+  }
+  const stampMs = new Date(+name[1].slice(0, 4), +name[1].slice(4, 6) - 1, +name[1].slice(6, 8), +name[2].slice(0, 2), +name[2].slice(2, 4), +name[2].slice(4, 6)).getTime();
+  return meetingId({ appId: str(meta?.app_id, 40) || name[3], startedAt: str(meta?.recorded_at, 40) || new Date(stampMs).toISOString() });
+}
+
+/**
+ * One finished-or-abandoned transcript, for the list: what the file says. null
+ * when empty. A file over 20 MB is read in part: its first line (the header)
+ * and its last 64 KB (people, stopped, the last ts); its caption count then
+ * only covers that tail.
+ */
+function parseMeetingFile(path, name, size = 0) {
+  let records;
+  const partial = size > SEARCH_MAX_FILE;
+  try {
+    if (partial) {
+      const head = readRange(path, 0, HEAD_BYTES).toString("utf8");
+      const nl = head.indexOf("\n");
+      records = [...(nl < 0 ? [] : parseLines(head.slice(0, nl + 1)).records), ...tailRecords(path, Math.max(0, size - TAIL_BYTES), size)];
+    } else {
+      const text = readFileSync(path, "utf8");
+      records = parseLines(text.endsWith("\n") ? text : `${text}\n`).records;
+    }
+  } catch {
+    return null;
+  }
+  if (!records.length) return null;
+  let meta = null;
+  let stopped = null;
+  let people = null;
+  let lastTs = "";
+  let captions = 0;
+  const slideSet = new Set();
+  for (const r of records) {
+    if (r && typeof r === "object" && typeof r.ts === "string" && r.ts) lastTs = r.ts.slice(0, 40);
+    if (r?.type === "metadata") {
+      if (r.event === "stopped") stopped = r;
+      else if (!meta) meta = r;
+      continue;
+    }
+    const e = normalizeRecord(r);
+    if (!e) continue;
+    if (e.type === "caption") captions++;
+    else if (e.type === "people") people = e;
+    else if (e.type === "slide") slideSet.add(e.n);
+  }
+  const stampMs = new Date(+name[1].slice(0, 4), +name[1].slice(4, 6) - 1, +name[1].slice(6, 8), +name[2].slice(0, 2), +name[2].slice(2, 4), +name[2].slice(4, 6)).getTime();
+  const startedAt = str(meta?.recorded_at, 40) || new Date(stampMs).toISOString();
+  const startedMs = Date.parse(startedAt) || stampMs;
+  const appId = str(meta?.app_id, 40) || name[3];
+  const endedAt = stopped ? str(stopped.stopped_at, 40) || lastTs : lastTs;
+  const slidesDir = path.replace(/\.jsonl$/, ".slides");
+  const slideIndex = readSlideIndex(slidesDir);
+  return {
+    id: meetingId({ appId, startedAt }),
+    path,
+    slidesDir,
+    app: str(meta?.app, 80),
+    appId,
+    title: str(meta?.meeting, 300) || (name[4] || "").replace(/-/g, " "),
+    startedAt,
+    startedMs,
+    endedAt,
+    duration: (stopped && str(stopped.duration, 20)) || hms(Date.parse(endedAt) - startedMs),
+    stopped: Boolean(stopped),
+    live: false,
+    partial,
+    people: people?.people ?? [],
+    captions,
+    slideCount: slideIndex.length || slideSet.size,
+    thumb: slideIndex.some((s) => s.n === 1),
+    slideIndex,
+    size: 0,
+  };
+}
+
+/** The list's one-line notes: counts and up to four topic titles. null without notes. */
+const notesBrief = (n) => (n ? { actions: n.actions.length, mine: n.actions.filter((a) => a.mine).length, topics: n.topics.map((t) => t.title).filter(Boolean).slice(0, 4) } : null);
+
+/** A matching line, cut to a window around the first term when it is long. */
+function snippet(text, terms) {
+  if (text.length <= 400) return text;
+  const low = text.toLowerCase();
+  const found = terms.map((t) => low.indexOf(t)).filter((i) => i >= 0);
+  const at = found.length ? Math.min(...found) : 0; // a term can match only the speaker
+  const from = Math.max(0, at - 120);
+  return `${from ? "…" : ""}${text.slice(from, from + 400)}…`;
+}
+
 /**
  * The live meeting, kept current by poll(): the daemon calls it on a timer
  * (fast while recording) and tells pages what changed.
  */
 export class MeetingFeed {
-  constructor(dir = MEETING_STATE_DIR, { now = Date.now, alive = pidAlive, notesFile = "" } = {}) {
+  constructor(dir = MEETING_STATE_DIR, { now = Date.now, alive = pidAlive, notesFile = "", notesDir = "", dataDir = "", scanBudgetMs = SCAN_BUDGET_MS, searchBytes = SEARCH_READ_BYTES, searchBudgetMs = SEARCH_BUDGET_MS, linesCacheBytes = LINES_CACHE_BYTES } = {}) {
     this.dir = dir;
+    this.notesDir = notesDir; // the archived notes: <id>.json
+    this.dataDirOpt = dataDir; // --meeting-data; MEETING_CAPTURE_DATA_DIR is read when needed
+    this.lastDataDir = ""; // the last transcript folder state.json named
+    this.scanBudgetMs = scanBudgetMs;
+    this.searchBytes = searchBytes;
+    this.searchBudgetMs = searchBudgetMs;
+    this.linesCacheBytes = linesCacheBytes;
+    this.searchGen = 0; // the current search: the lines cache keeps what it used
+    this.scanned = null; // { dir, at, list, byId, partial }
+    this.infos = new Map(); // path → { sig, info }
+    this.headIds = new Map(); // path → { sig, id }: find()'s ids from file headers, for files not parsed yet
+    this.linesCache = new Map(); // path → { sig, lines, bytes, gen } (LRU by bytes)
+    this.linesBytes = 0;
+    this.loaded = new Map(); // id → { sig, p, bytes } (LRU, 3 and a byte budget)
+    this.archive = new Map(); // id → { sig, notes }
     this.now = now;
     this.alive = alive;
     this.notesFile = notesFile;
@@ -290,6 +476,7 @@ export class MeetingFeed {
         }
         this.state = next;
         this.id = id;
+        if (next?.jsonl) this.lastDataDir = dirname(next.jsonl);
         final = true;
       }
     }
@@ -381,10 +568,15 @@ export class MeetingFeed {
     return this.slides[this.slides.length - 1] || null;
   }
 
-  /** The page's view: entries after `since` (all of them when `id` is another meeting's). */
-  snapshot(since = 0, id = "") {
+  /**
+   * The page's view: entries after `since`. `id` picks the meeting: empty or the
+   * live one's id is the live meeting, another is a past one (ended, or
+   * notFound). `cur` is the id the caller's cursor belongs to (default `id`).
+   */
+  snapshot(since = 0, id = "", cur = id) {
+    if (id && !(this.state && id === this.id)) return this.pastSnapshot(since, id, cur);
     if (!this.state) return { id: "", state: null, entries: [], total: 0, from: 0, slides: [], live: [], people: null, notes: null };
-    const from = id === this.id && Number.isInteger(since) && since >= 0 && since <= this.entries.length ? since : 0;
+    const from = cur === this.id && Number.isInteger(since) && since >= 0 && since <= this.entries.length ? since : 0;
     const p = this.people();
     const { jsonl: _j, txt: _t, slidesDir: _s, live: _l, ...state } = this.state;
     return {
@@ -400,18 +592,55 @@ export class MeetingFeed {
     };
   }
 
-  /** The side panel card's data, or null when there's nothing to show (no meeting, or ended a while ago). */
+  /** A past meeting for /meeting?id=: its whole transcript from the data folder (by id, never a client path), or notFound. */
+  pastSnapshot(since, id, cur) {
+    const p = this.loadPast(id);
+    if (!p) return { id: "", state: null, entries: [], total: 0, from: 0, slides: [], live: [], people: null, notes: null, notFound: true };
+    const { info, entries, slides } = p;
+    const from = cur === id && Number.isInteger(since) && since >= 0 && since <= entries.length ? since : 0;
+    let people = null;
+    for (let i = entries.length - 1; i >= 0 && !people; i--) if (entries[i].type === "people") people = { count: entries[i].count, people: entries[i].people };
+    return {
+      id,
+      state: { app: info.app, appId: info.appId, title: info.title, startedAt: info.startedAt, recording: false, ended: true, crashed: !info.stopped, endedAt: info.endedAt, duration: info.duration, hasTranscript: true, hasSlides: slides.length > 0 },
+      entries: entries.slice(from),
+      total: entries.length,
+      from,
+      slides: slides.map(({ n, at, reason, width, height, thumb }) => ({ n, at, reason, width, height, thumb: Boolean(thumb) })),
+      live: [],
+      people,
+      notes: this.notesOf(info),
+      ...(p.partial ? { partial: true } : {}),
+    };
+  }
+
+  /**
+   * The side panel card's data, or null when there's nothing to show. kind:
+   * "live" (recording), "ended" (within 15 minutes of the end: the card keeps
+   * the alerts and your action items) or "list" (just the recent meetings).
+   * `recent` is the newest four meetings, the live one among them.
+   */
   summary() {
     const st = this.state;
-    if (!st) return null;
-    if (st.ended) {
-      const end = Date.parse(st.endedAt);
-      if (!Number.isFinite(end) || this.now() - end > CARD_AFTER_END_MS) return null;
+    let kind = "list";
+    if (st) {
+      if (!st.ended) kind = "live";
+      else {
+        const end = Date.parse(st.endedAt);
+        if (Number.isFinite(end) && this.now() - end <= CARD_AFTER_END_MS) kind = "ended";
+      }
     }
-    const recent = this.entries.filter((e) => e.type === "caption" || e.type === "chat").slice(-4);
+    // The live card never shows the list; the other two do.
+    const recent = kind === "live" ? [] : this.history({ limit: 4 });
+    // `at` is what the page re-renders on: the feed's last change, the card's kind (the 15 minutes
+    // run out with no feed change) and what the list shows (new meetings, new ★ counts).
+    const at = `${this.changedAt}|${kind}|${recent.map((e) => `${e.id}.${e.live ? 1 : 0}.${e.duration}.${e.notes?.mine ?? ""}`).join(",")}`;
+    if (kind === "list") return recent.length ? { kind, id: "", recording: false, ended: false, recent, notes: null, at } : null;
+    const lines = this.entries.filter((e) => e.type === "caption" || e.type === "chat").slice(-4);
     const last = this.current();
     const p = this.people();
     return {
+      kind,
       id: this.id,
       title: st.title,
       app: st.app,
@@ -425,9 +654,10 @@ export class MeetingFeed {
       captions: this.entries.filter((e) => e.type === "caption").length,
       slides: this.slides.length,
       slide: last ? { n: last.n, thumb: Boolean(last.thumb) } : null,
+      lines,
       recent,
       notes: this.notesSummary(),
-      at: this.changedAt,
+      at,
     };
   }
 
@@ -446,23 +676,406 @@ export class MeetingFeed {
     };
   }
 
+  // ── history: every meeting in the data folder, newest first ──
+
+  /** The transcript folder now (see meetingDataDir). */
+  dataDir() {
+    return meetingDataDir({ explicit: this.dataDirOpt, jsonl: this.state?.jsonl ?? null, last: this.lastDataDir });
+  }
+
+  /** Drop the scan cache: the next history, search or lookup lists the folder again. */
+  rescan() {
+    this.scanned = null;
+  }
+
   /**
-   * A slide's file on disk, or null. Only names index.jsonl listed, and only
-   * inside slides_dir once symlinks are resolved. thumb falls back to the full image.
+   * The folder's meetings, listed at most every 10 s; a file is parsed again
+   * only when its size or mtime changed. The live meeting's own file is the
+   * feed's, not parsed here. Newest files first, and a call parses for about
+   * 50 ms: with a big cold archive it returns what is ready with partial: true
+   * (and is not cached, so the next call goes on). `full` ignores the budget.
    */
-  slideFile(id, n, thumb = false) {
-    const st = this.state;
-    if (!st?.slidesDir || id !== this.id) return null;
-    const s = this.slides.find((x) => x.n === n);
-    if (!s) return null;
-    const name = thumb && s.thumb ? s.thumb : s.file;
-    if (!SLIDE_FILE.test(name)) return null;
+  scan(full = false) {
+    const dir = this.dataDir();
+    const t = this.now();
+    if (this.scanned && this.scanned.dir === dir && !this.scanned.partial && t - this.scanned.at < SCAN_MS) return this.scanned;
+    let names = [];
     try {
-      const root = realpathSync(st.slidesDir);
-      const path = realpathSync(join(st.slidesDir, name));
-      return path.startsWith(root + sep) && existsSync(path) ? path : null;
+      names = readdirSync(dir);
+    } catch {}
+    names.sort().reverse(); // <YYYYMMDD_HHMMSS>-…: newest first
+    const list = [];
+    const byId = new Map();
+    const seen = new Set();
+    const t0 = performance.now();
+    let parsed = 0;
+    let partial = false;
+    for (const f of names) {
+      const m = BASE_RE.exec(f);
+      if (!m) continue;
+      const path = join(dir, f);
+      if (this.state?.jsonl === path) continue;
+      let st;
+      try {
+        st = statSync(path);
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      seen.add(path);
+      const sig = fileSig(st);
+      let c = this.infos.get(path);
+      if (!c || c.sig !== sig) {
+        if (!full && parsed > 0 && performance.now() - t0 >= this.scanBudgetMs) {
+          partial = true; // out of time: the next call goes on from here (a changed file keeps its old row meanwhile)
+        } else {
+          const info = parseMeetingFile(path, m, st.size);
+          parsed++;
+          if (info) Object.assign(info, { size: st.size, sig });
+          c = { sig, info };
+          this.infos.set(path, c);
+        }
+      }
+      if (!c?.info) continue;
+      list.push(c.info);
+      if (!byId.has(c.info.id)) byId.set(c.info.id, c.info);
+    }
+    for (const k of [...this.infos.keys()]) if (!seen.has(k)) this.infos.delete(k);
+    for (const k of [...this.headIds.keys()]) if (!seen.has(k)) this.headIds.delete(k);
+    this.scanned = { dir, at: t, list, byId, partial };
+    return this.scanned;
+  }
+
+  /**
+   * A past meeting's scan entry by id. An id the half-done scan has not reached
+   * is looked up without finishing the scan: the id is sha1(app_id|started_at),
+   * so each file not parsed yet gets its id from its header line (cached by
+   * size and mtime), and only the file that matches is parsed.
+   */
+  find(id) {
+    const s = this.scan();
+    const known = s.byId.get(id);
+    if (known || !s.partial) return known;
+    const dir = s.dir;
+    let names = [];
+    try {
+      names = readdirSync(dir);
+    } catch {}
+    names.sort().reverse();
+    for (const f of names) {
+      const m = BASE_RE.exec(f);
+      if (!m) continue;
+      const path = join(dir, f);
+      if (this.state?.jsonl === path) continue;
+      let st;
+      try {
+        st = statSync(path);
+      } catch {
+        continue;
+      }
+      if (!st.isFile()) continue;
+      const sig = fileSig(st);
+      if (this.infos.get(path)?.sig === sig) continue; // parsed: byId already had it
+      let h = this.headIds.get(path);
+      if (!h || h.sig !== sig) {
+        h = { sig, id: headId(path, m) };
+        this.headIds.set(path, h);
+      }
+      if (h.id !== id) continue;
+      const info = parseMeetingFile(path, m, st.size);
+      if (info) Object.assign(info, { size: st.size, sig });
+      this.infos.set(path, { sig, info });
+      if (info?.id === id) return info;
+    }
+    return undefined;
+  }
+
+  /** The live (or just ended) meeting as a list item, from memory. null before it has a transcript or while only a stale state is left. */
+  liveInfo() {
+    const st = this.state;
+    if (!st || (!st.jsonl && !st.recording)) return null;
+    const p = this.people();
+    const startedMs = Date.parse(st.startedAt) || 0;
+    return {
+      id: this.id,
+      fromFeed: true,
+      live: st.recording,
+      app: st.app,
+      appId: st.appId,
+      title: st.title,
+      startedAt: st.startedAt,
+      startedMs,
+      endedAt: st.ended ? st.endedAt : "",
+      duration: st.ended ? st.duration || hms(Date.parse(st.endedAt) - startedMs) : "",
+      stopped: !st.crashed,
+      people: p?.people ?? [],
+      captions: this.entries.filter((e) => e.type === "caption").length,
+      slideCount: this.slides.length,
+      thumb: this.slides.some((s) => s.n === 1),
+    };
+  }
+
+  /** Every meeting, newest first: the live one (from memory) plus the scanned files. */
+  ordered() {
+    const lv = this.liveInfo();
+    const all = lv ? [lv, ...this.scan().list.filter((i) => i.id !== lv.id)] : [...this.scan().list];
+    return all.sort((a, b) => b.startedMs - a.startedMs);
+  }
+
+  /** One meeting as the pages' list item. No paths. */
+  entryOf(info, notes = this.notesOf(info)) {
+    return {
+      id: info.id,
+      title: info.title,
+      app: info.app,
+      started_at: info.startedAt,
+      ...(info.endedAt ? { ended_at: info.endedAt } : {}),
+      duration: info.duration,
+      live: info.live,
+      people: info.people.length,
+      names: info.people.slice(0, 8),
+      slides: info.slideCount,
+      captions: info.captions,
+      thumb: info.thumb,
+      notes: notesBrief(notes),
+    };
+  }
+
+  /** One page of the list, newest first, with the total and whether older meetings are still being read (partial). */
+  listing({ limit = 50, offset = 0 } = {}) {
+    const from = Math.max(0, Number(offset) || 0);
+    const all = this.ordered();
+    return {
+      meetings: all.slice(from, from + Math.max(0, Number(limit) || 0)).map((i) => this.entryOf(i)),
+      total: all.length,
+      partial: Boolean(this.scanned?.partial),
+    };
+  }
+
+  /** Newest first. */
+  history(opts) {
+    return this.listing(opts).meetings;
+  }
+
+  /** How many meetings there are (for "more"). */
+  total() {
+    return this.ordered().length;
+  }
+
+  /** The notes that belong to a meeting: the live logic for the live one, else the archive. */
+  notesOf(info) {
+    if (info.fromFeed && this.notes) return this.notes;
+    return this.archived(info.id);
+  }
+
+  /** <notes dir>/<id>.json, validated and bounded like the live notes; kept forever by the copilot. */
+  archived(id) {
+    const dir = this.notesDir || (process.env.PI_MEETING_NOTES_DIR ? resolve(process.env.PI_MEETING_NOTES_DIR) : "");
+    if (!dir || !ID_RE.test(String(id))) return null;
+    const path = join(dir, `${id}.json`);
+    let st;
+    try {
+      st = statSync(path);
+    } catch {
+      this.archive.delete(id);
+      return null;
+    }
+    const sg = fileSig(st);
+    const c = this.archive.get(id);
+    if (c && c.sig === sg) return c.notes;
+    const notes = normalizeNotes(readJson(path))?.notes ?? null;
+    if (this.archive.size > 500) this.archive.clear();
+    this.archive.set(id, { sig: sg, notes });
+    return notes;
+  }
+
+  /**
+   * A past meeting's transcript and slide index, 3 kept within a byte budget
+   * (revalidated by size and mtime). A file over 20 MB loads only its last 8 MB
+   * (partial: true). null for an unknown id.
+   */
+  loadPast(id) {
+    if (!ID_RE.test(String(id))) return null;
+    const info = this.find(id);
+    if (!info) return null;
+    let st;
+    try {
+      st = statSync(info.path);
     } catch {
       return null;
     }
+    const sig = fileSig(st);
+    const hit = this.loaded.get(id);
+    if (hit && hit.sig === sig) {
+      this.loaded.delete(id);
+      this.loaded.set(id, hit);
+      return hit.p;
+    }
+    const partial = st.size > SEARCH_MAX_FILE;
+    let records;
+    try {
+      if (partial) records = tailRecords(info.path, st.size - PAST_TAIL_BYTES, st.size);
+      else {
+        const text = readFileSync(info.path, "utf8");
+        records = parseLines(text.endsWith("\n") ? text : `${text}\n`).records;
+      }
+    } catch {
+      return null;
+    }
+    const p = { info, entries: records.map(normalizeRecord).filter(Boolean), slides: readSlideIndex(info.slidesDir), partial };
+    this.loaded.set(id, { sig, p, bytes: partial ? PAST_TAIL_BYTES : st.size });
+    let total = 0;
+    for (const v of this.loaded.values()) total += v.bytes;
+    for (const [k, v] of this.loaded) {
+      if (this.loaded.size <= 1 || (this.loaded.size <= LOADED_KEEP && total <= LOADED_BYTES)) break;
+      this.loaded.delete(k);
+      total -= v.bytes;
+    }
+    return p;
+  }
+
+  /** Is this meeting's line list in the cache (so searching it reads nothing)? */
+  linesCached(info) {
+    const hit = this.linesCache.get(info.path);
+    return Boolean(hit && hit.sig === info.sig);
+  }
+
+  /** A meeting's caption and chat lines for searching: { i (entry index), ts, speaker, text, lower }. null when the file is too big. */
+  linesOf(info) {
+    const make = (entries) =>
+      entries.flatMap((e, i) => (e.type === "caption" || e.type === "chat" ? [{ i, ts: e.ts, speaker: e.speaker, text: e.text, lower: `${e.speaker} ${e.text}`.toLowerCase() }] : []));
+    if (info.fromFeed) return make(this.entries);
+    if (info.size > SEARCH_MAX_FILE) return null;
+    const hit = this.linesCache.get(info.path);
+    if (hit && hit.sig === info.sig) {
+      this.linesCache.delete(info.path);
+      this.linesCache.set(info.path, { ...hit, gen: this.searchGen });
+      return hit.lines;
+    }
+    let text;
+    try {
+      text = readFileSync(info.path, "utf8");
+    } catch {
+      return null;
+    }
+    const lines = make(parseLines(text.endsWith("\n") ? text : `${text}\n`).records.map(normalizeRecord).filter(Boolean));
+    const bytes = lines.reduce((n, l) => n + l.text.length * 4 + l.speaker.length * 2 + 120, 0);
+    if (hit) this.linesBytes -= hit.bytes;
+    this.linesCache.delete(info.path);
+    this.linesCache.set(info.path, { sig: info.sig, lines, bytes, gen: this.searchGen });
+    this.linesBytes += bytes;
+    // Oldest first, but never what the current search has already used: a corpus bigger than the cache
+    // would otherwise evict each entry just before the next search wanted it.
+    for (const [k, v] of this.linesCache) {
+      if (this.linesBytes <= this.linesCacheBytes || this.linesCache.size <= 1) break;
+      if (v.gen === this.searchGen) continue;
+      this.linesCache.delete(k);
+      this.linesBytes -= v.bytes;
+    }
+    return lines;
+  }
+
+  /** Evict the oldest cached line lists until the cache is back within its byte cap (a search may exceed it while it runs). */
+  trimLines() {
+    for (const [k, v] of this.linesCache) {
+      if (this.linesBytes <= this.linesCacheBytes || this.linesCache.size <= 1) break;
+      this.linesCache.delete(k);
+      this.linesBytes -= v.bytes;
+    }
+  }
+
+  /**
+   * Meetings matching every whitespace-separated term, case-insensitively: in one
+   * transcript line, or in the meeting's title, people and notes. Newest first,
+   * `limit` meetings at most, each with up to 3 matching lines (i: the entry's
+   * index, so the page can jump to it), hits (all matching lines) and fields.
+   * A search reads at most searchBytes (25 MB) of transcripts that are not cached
+   * and runs for about 150 ms. What it uses of the lines cache (hits too) is held
+   * for the search and may not pass linesCacheBytes + searchBytes; the cache is
+   * trimmed back to linesCacheBytes afterwards. Past any of these (or while the
+   * folder is still being listed) it stops and says partial, with how many
+   * meetings it got through.
+   */
+  searchResult(q, { limit = 30 } = {}) {
+    const text = String(q ?? "").trim();
+    const terms = text.toLowerCase().split(/\s+/).filter(Boolean);
+    if (text.length < 2 || !terms.length) return { results: [], partial: false, searched: 0 };
+    this.searchGen++;
+    const all = this.ordered();
+    let partial = Boolean(this.scanned?.partial);
+    let budget = this.searchBytes;
+    let held = 0; // cache bytes this search has used: protected from eviction
+    const cap = this.linesCacheBytes + this.searchBytes;
+    const t0 = performance.now();
+    let searched = 0;
+    const results = [];
+    for (const info of all) {
+      if (results.length >= limit) break;
+      if (searched > 0 && performance.now() - t0 >= this.searchBudgetMs) {
+        partial = true;
+        break;
+      }
+      if (!info.fromFeed && info.size <= SEARCH_MAX_FILE) {
+        const hit = this.linesCached(info) ? this.linesCache.get(info.path) : null;
+        if (hit ? held + hit.bytes > cap : info.size > budget || held + info.size > cap) {
+          partial = true;
+          break;
+        }
+        if (!hit) budget -= info.size;
+      }
+      searched++;
+      const notes = this.notesOf(info);
+      const n = notes ? [...notes.topics.flatMap((t) => [t.title, t.summary]), ...notes.decisions.map((d) => d.text), ...notes.actions.flatMap((a) => [a.who, a.what]), ...notes.questions.map((x) => x.q)] : [];
+      const fields = { title: info.title.toLowerCase(), people: info.people.join("\n").toLowerCase(), notes: n.join("\n").toLowerCase() };
+      const metaHit = terms.every((t) => `${fields.title}\n${fields.people}\n${fields.notes}`.includes(t));
+      let hits = 0;
+      const lines = [];
+      const found = this.linesOf(info);
+      if (!info.fromFeed) held += this.linesCache.get(info.path)?.bytes ?? 0;
+      for (const l of found ?? []) {
+        if (!terms.every((t) => l.lower.includes(t))) continue;
+        hits++;
+        if (lines.length < 3) lines.push({ ts: l.ts, speaker: l.speaker, text: snippet(l.text, terms), i: l.i });
+      }
+      if (!hits && !metaHit) continue;
+      const matched = metaHit ? ["title", "people", "notes"].filter((f) => terms.some((t) => fields[f].includes(t))) : [];
+      if (hits) matched.push("transcript");
+      results.push({ ...this.entryOf(info, notes), hits, fields: matched, lines });
+    }
+    this.trimLines();
+    return { results, partial, searched };
+  }
+
+  /** searchResult's matches. */
+  search(q, opts) {
+    return this.searchResult(q, opts).results;
+  }
+
+  /**
+   * A slide's file on disk, or null. Only names index.jsonl listed, and only
+   * inside the slides folder once symlinks are resolved; the folder comes from
+   * the live state or the meeting id, never from the client. thumb falls back to
+   * the full image.
+   */
+  slideFile(id, n, thumb = false) {
+    if (!ID_RE.test(String(id))) return null;
+    const st = this.state;
+    if (st && id === this.id) return st.slidesDir ? resolveSlide(st.slidesDir, this.slides, n, thumb) : null;
+    const info = this.find(id);
+    return info ? resolveSlide(info.slidesDir, info.slideIndex, n, thumb) : null;
+  }
+}
+
+function resolveSlide(dir, slides, n, thumb) {
+  const s = slides.find((x) => x.n === n);
+  if (!s) return null;
+  const name = thumb && s.thumb ? s.thumb : s.file;
+  if (!SLIDE_FILE.test(name)) return null;
+  try {
+    const root = realpathSync(dir);
+    const path = realpathSync(join(dir, name));
+    return path.startsWith(root + sep) && existsSync(path) ? path : null;
+  } catch {
+    return null;
   }
 }

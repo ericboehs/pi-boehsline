@@ -33,7 +33,8 @@ In `~/.pi/agent/boehsline.json`. Environment variables (`PI_MEETING_*`) still ov
 `~/.pi/agent/meeting-context.md`), `PI_MEETING_REASONING`, `PI_MEETING_WATCH=1`
 (arm the session, for testing), `PI_MEETING_LOCK` (the lock file),
 `PI_MEETING_NOTES_FILE` (the notes file the canvas reads, see below;
-`PI_CANVAS_ROOT` moves its default),
+`PI_CANVAS_ROOT` moves its default), `PI_MEETING_NOTES_DIR` (the archive of
+every meeting's notes, default `<canvas root>/meetings`),
 `MEETING_CAPTURE_STATE_DIR` (where meeting-capture's `state.json` is, default
 `~/.local/state/meeting-capture`) and `PI_MEETING_DIR` (where `/meeting replay`
 looks for a transcript when you give no path).
@@ -192,6 +193,15 @@ it: the new instance reads it back (when `started_at` matches) so its notes,
 alerts and "already alerted" list carry on instead of starting over. When the
 meeting ends it stays, marked `ended: true`, even after pi quits, so the
 canvas can show the final notes. A replay writes none.
+
+Every write is also kept for good as `~/.pi/canvas/meetings/<meeting id>.json`
+(`PI_MEETING_NOTES_DIR`; atomic, files mode 600, the folder mode 700), the same
+content under the meeting's id: `sha1("<app_id>|<started_at>")`, 12 hex
+characters (`meetingId` in `capture.ts`, and the same in the canvas's
+`meeting-feed.mjs`). The "removed when pi quits" rule is for the live file only; the
+archive is never removed, never written for a replay, and it is what the
+canvas's `/meetings` history shows (topics, ★ action items, search) and what
+`/meeting?id=<id>` shows in its Notes column for a past meeting.
 
 ### The recap
 

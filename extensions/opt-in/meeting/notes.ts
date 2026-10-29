@@ -20,7 +20,7 @@ import * as path from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { estTokens, PROMPT_MAX_TOKENS } from "../watch/models.ts";
-import { writeAtomic } from "./capture.ts";
+import { meetingId, writeAtomic } from "./capture.ts";
 
 // ── the notes ────────────────────────────────────────────────────────────────
 
@@ -567,6 +567,31 @@ export function buildNotesFile(i: {
 /** Atomic, mode 600. */
 export function writeNotesFile(f: NotesFile): void {
 	writeAtomic(notesPath(), `${JSON.stringify(f)}\n`);
+}
+
+/**
+ * Where finished meetings' notes are kept, one <meeting id>.json each:
+ * PI_MEETING_NOTES_DIR, else meetings/ in the canvas root. Never removed.
+ */
+export const archiveDir = () => process.env.PI_MEETING_NOTES_DIR || path.join(process.env.PI_CANVAS_ROOT || path.join(os.homedir(), ".pi", "canvas"), "meetings");
+
+/**
+ * The same notes as writeNotesFile, kept for good as <archive>/<id>.json (id = meetingId of app_id and
+ * started_at): atomic, file mode 600, folder mode 700. The canvas's /meetings history reads these;
+ * the live .meeting-notes.json can be dropped when pi quits, this never is. Skipped without a start time.
+ */
+export function writeNotesArchive(f: NotesFile): void {
+	if (!f.meeting.started_at) return;
+	const dir = archiveDir();
+	if (!fs.existsSync(dir)) {
+		fs.mkdirSync(path.dirname(dir), { recursive: true });
+		fs.mkdirSync(dir, { mode: 0o700 });
+	} else {
+		try {
+			fs.chmodSync(dir, 0o700); // a folder made earlier (or by hand) is tightened too
+		} catch {}
+	}
+	writeAtomic(path.join(dir, `${meetingId(f.meeting.app_id, f.meeting.started_at)}.json`), `${JSON.stringify(f)}\n`);
 }
 
 /** What a new instance takes back from the notes file of the meeting it is joining. */
