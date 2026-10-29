@@ -1,5 +1,7 @@
 # canvas
 
+<img width="2864" height="1690" alt="Screenshot 2026-10-29 at 14 02 20@2x" src="https://github.com/user-attachments/assets/af4f7034-fa7d-4c40-924a-a99b40eea7cc" />
+
 A live local web page for each session, where the agent posts tables, charts, diffs, checklists, timelines and findings beside the terminal. **Tool:** `canvas`. **Command:** `/canvas`.
 
 Gives each pi session a live local web page for output
