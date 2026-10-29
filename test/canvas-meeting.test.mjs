@@ -50,6 +50,33 @@ test("normalizeRecord: no absolute paths reach the page", () => {
   assert.equal(normalizeRecord({ type: "metadata", app: "Teams" }), null);
 });
 
+test("normalizeRecord: a revisit keeps its own type and points at the original frame", () => {
+  assert.deepEqual(normalizeRecord({ type: "revisit", slide: 2, file: "/abs/0002-141030.jpg", reason: "revisit", text: "▣ back to slide 2", ts: "t" }), { type: "revisit", n: 2, reason: "revisit", ts: "t" });
+  assert.equal(normalizeRecord({ type: "revisit", slide: "2" }), null);
+});
+
+test("MeetingFeed: a revisit makes an earlier slide current without adding one", () => {
+  const f = fixture();
+  try {
+    const feed = new MeetingFeed(f.state, { alive: () => true });
+    f.writeState({});
+    for (const n of [1, 2]) {
+      writeFileSync(join(f.slides, `000${n}-14010${n}.jpg`), "jpg");
+      appendFileSync(join(f.slides, "index.jsonl"), line({ n, file: `000${n}-14010${n}.jpg` }));
+    }
+    writeFileSync(f.jsonl, line({ type: "slide", slide: 1, ts: "t1" }) + line({ type: "slide", slide: 2, ts: "t2" }) + line({ type: "revisit", slide: 1, ts: "t3" }));
+    feed.poll();
+    const s = feed.summary();
+    assert.deepEqual([s.slides, s.slide.n], [2, 1]);
+    assert.deepEqual(feed.snapshot().entries.map((e) => `${e.type}${e.n}`), ["slide1", "slide2", "revisit1"]);
+    appendFileSync(f.jsonl, line({ type: "slide", slide: 2, ts: "t4" }));
+    feed.poll();
+    assert.equal(feed.summary().slide.n, 2);
+  } finally {
+    f.done();
+  }
+});
+
 test("normalizeSlide and normalizeLive: names only, bounded", () => {
   assert.equal(normalizeSlide({ n: 1, file: "../../etc/passwd" }), null);
   assert.equal(normalizeSlide({ n: 1, file: "/abs/0001-144210.jpg" }).file, "0001-144210.jpg");

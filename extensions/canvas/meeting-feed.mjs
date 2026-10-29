@@ -79,8 +79,9 @@ export function normalizeRecord(r) {
       return { type: "people", count: people.length, people, text: str(r.text, 400), ts };
     }
     case "slide":
+    case "revisit": // back to a frame saved earlier: nothing new in slides_dir, n is the original
       if (!Number.isInteger(r.slide) || r.slide < 0) return null;
-      return { type: "slide", n: r.slide, reason: str(r.reason, 40), ts };
+      return { type: r.type, n: r.slide, reason: str(r.reason, 40), ts };
     case "metadata":
       if (r.event === "stopped") return { type: "stopped", duration: str(r.duration, 20), ts };
       return null; // the header: state.json already carries app, title and start
@@ -303,6 +304,15 @@ export class MeetingFeed {
     return null;
   }
 
+  /** The slide on screen now: the newest slide or revisit event (else the newest saved frame). */
+  current() {
+    for (let i = this.entries.length - 1; i >= 0; i--) {
+      const e = this.entries[i];
+      if ((e.type === "slide" || e.type === "revisit") && this.slides.some((s) => s.n === e.n)) return this.slides.find((s) => s.n === e.n);
+    }
+    return this.slides[this.slides.length - 1] || null;
+  }
+
   /** The page's view: entries after `since` (all of them when `id` is another meeting's). */
   snapshot(since = 0, id = "") {
     if (!this.state) return { id: "", state: null, entries: [], total: 0, from: 0, slides: [], live: [], people: null };
@@ -330,7 +340,7 @@ export class MeetingFeed {
       if (!Number.isFinite(end) || this.now() - end > CARD_AFTER_END_MS) return null;
     }
     const recent = this.entries.filter((e) => e.type === "caption" || e.type === "chat").slice(-4);
-    const last = this.slides[this.slides.length - 1];
+    const last = this.current();
     const p = this.people();
     return {
       id: this.id,

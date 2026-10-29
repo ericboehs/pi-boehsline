@@ -303,8 +303,11 @@ the review prompt — so a renderer never reaches for a page global.
   the in-progress lines greyed at the bottom with a cursor. It follows the
   bottom until you scroll up (then **Jump to live**). A thumbnail or a slide
   marker pins that slide and scrolls the transcript to it; `f` follows the
-  newest again, ← / → step through slides, `/` filters the transcript and a
-  click on the slide opens it full size. After the meeting `/meeting` keeps
+  slide on screen again, ← / → step through slides, `/` filters the transcript and a
+  click on the slide opens it full size. A `revisit` (the screen went back to
+  a frame saved earlier) makes that slide current again, adds a "↺ Back to
+  slide N" marker and marks its thumbnail ↺ (with a count past one); it adds
+  no thumbnail, and the slide count stays distinct frames. After the meeting `/meeting` keeps
   the last one until the next starts.
   The daemon reads meeting-capture's files directly (the contract is
   meeting-capture's `docs/canvas-contract.md`): `state.json` in

@@ -37,6 +37,7 @@ body:not(.has-slides) .stage { display: none; }
 .strip button { flex: none; padding: 0; border: 2px solid transparent; border-radius: 6px; background: none; cursor: pointer; position: relative; }
 .strip button.on { border-color: var(--accent); }
 .strip img { display: block; height: 72px; width: auto; border-radius: 4px; background: var(--soft); }
+.strip i { position: absolute; right: 4px; top: 3px; font: 600 10.5px/1 -apple-system, sans-serif; font-style: normal; color: #fff; background: rgb(0 0 0 / .55); padding: 2px 4px; border-radius: 3px; }
 .strip span { position: absolute; left: 4px; bottom: 3px; font: 600 10.5px/1 ui-monospace, Menlo, monospace; color: #fff; background: rgb(0 0 0 / .55); padding: 2px 4px; border-radius: 3px; }
 .tx { flex: 2 1 0; min-width: 360px; position: relative; display: flex; flex-direction: column; }
 body:not(.has-slides) .tx { max-width: 920px; margin: 0 auto; width: 100%; }
@@ -111,7 +112,9 @@ let entries = [];
 let slides = [];
 let live = [];
 let people = null;
-let pinned = null; // a slide n picked by hand; null follows the newest
+let pinned = null; // a slide n picked by hand; null follows the one on screen
+let onScreen = null; // the newest slide or revisit event's n
+const shownAgain = new Map(); // slide n → times it came back (revisits)
 let stick = true; // the transcript follows the bottom until you scroll up
 let lastSpeaker = null;
 let filter = "";
@@ -200,13 +203,25 @@ function renderSlides() {
   for (const s of slides) {
     if (have.has(s.n)) continue;
     ui.strip.append(
-      h("button", { type: "button", "data-n": s.n, title: `Slide ${s.n} · ${clock(s.at)}`, onclick: () => pickSlide(s.n, true) }, h("img", { src: slideUrl(s.n, s.thumb), alt: `Slide ${s.n}`, loading: "lazy" }), h("span", {}, s.n)),
+      h("button", { type: "button", "data-n": s.n, title: `Slide ${s.n} · ${clock(s.at)}`, onclick: () => pickSlide(s.n, true) }, h("img", { src: slideUrl(s.n, s.thumb), alt: `Slide ${s.n}`, loading: "lazy" }), h("span", {}, s.n), h("i", { hidden: true })),
     );
   }
+  markRevisits();
   showSlide();
 }
+/** A thumbnail shown more than once gets ↺ and how many times it came back. */
+function markRevisits() {
+  for (const b of ui.strip.children) {
+    const k = shownAgain.get(Number(b.dataset.n)) || 0;
+    const i = b.querySelector("i");
+    if (!i) continue;
+    i.hidden = !k;
+    i.textContent = k > 1 ? `↺${k}` : "↺";
+    b.title = `Slide ${b.dataset.n}${k ? ` · shown again ${k === 1 ? "once" : `${k} times`}` : ""}`;
+  }
+}
 function showSlide() {
-  const n = pinned ?? slides[slides.length - 1]?.n;
+  const n = pinned ?? (slideOf(onScreen) ? onScreen : slides[slides.length - 1]?.n);
   const s = slideOf(n);
   if (!s) return;
   const src = slideUrl(s.n, false);
@@ -219,15 +234,17 @@ function showSlide() {
     h("span", {}, clock(s.at)),
     s.reason ? h("span", {}, s.reason) : null,
     h("span", { class: "grow" }),
-    pinned != null ? h("button", { type: "button", onclick: () => pickSlide(null) }, "Follow latest  f") : h("span", {}, state?.recording ? "following latest" : ""),
+    pinned != null ? h("button", { type: "button", onclick: () => pickSlide(null) }, "Follow the screen  f") : h("span", {}, state?.recording ? "following the screen" : ""),
   );
 }
 /** Pick a slide (null: follow the newest); jump: scroll the transcript to where it appeared. */
 function pickSlide(n, jump = false) {
-  pinned = n != null && n === slides[slides.length - 1]?.n && state?.recording ? null : n;
+  pinned = n != null && n === onScreen && state?.recording ? null : n;
   showSlide();
   if (!jump || n == null) return;
-  const row = ui.rows.querySelector(`.row[data-slide="${n}"]`);
+  // Where it was last on screen: its newest marker (a revisit, or where it first appeared).
+  const marks = ui.rows.querySelectorAll(`.row[data-slide="${n}"]`);
+  const row = marks[marks.length - 1];
   if (row) {
     stick = false;
     row.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -253,24 +270,26 @@ function rowFor(e) {
   }
   lastSpeaker = null;
   if (e.type === "chat") return h("div", { class: "row chat first" }, t, h("div", { class: "body" }, h("span", { class: "tag" }, "chat"), e.speaker ? h("span", { class: "sp", style: `color:${colorOf(e.speaker)}` }, e.speaker) : null, e.text));
-  if (e.type === "slide") {
+  if (e.type === "slide" || e.type === "revisit") {
     const s = slideOf(e.n);
     return h(
       "div",
-      { class: "row slide-mark", "data-slide": e.n, title: "Show this slide", onclick: () => pickSlide(e.n) },
+      { class: `row slide-mark ${e.type}`, "data-slide": e.n, title: "Show this slide", onclick: () => pickSlide(e.n) },
       t,
-      h("div", { class: "body" }, s ? h("img", { src: slideUrl(e.n, s.thumb), alt: "", loading: "lazy" }) : null, h("span", {}, `▣ Slide ${e.n}`)),
+      h("div", { class: "body" }, s ? h("img", { src: slideUrl(e.n, s.thumb), alt: "", loading: "lazy" }) : null, h("span", {}, e.type === "revisit" ? `↺ Back to slide ${e.n}` : `▣ Slide ${e.n}`)),
     );
   }
   if (e.type === "people") return h("div", { class: "row note" }, t, h("div", { class: "body", title: e.people.join("\n") }, `👥 ${e.count} in the meeting`));
   if (e.type === "stopped") return h("div", { class: "row note first" }, t, h("div", { class: "body" }, `■ Meeting ended${e.duration ? ` · ${e.duration}` : ""}`));
   return null;
 }
-const rowText = (e) => `${e.speaker || ""} ${e.text || ""} ${e.type === "slide" ? `slide ${e.n}` : ""}`.toLowerCase();
+const rowText = (e) => `${e.speaker || ""} ${e.text || ""} ${e.type === "slide" || e.type === "revisit" ? `slide ${e.n}` : ""}`.toLowerCase();
 
 function appendEntries(list) {
   const frag = document.createDocumentFragment();
   for (const e of list) {
+    if (e.type === "slide" || e.type === "revisit") onScreen = e.n;
+    if (e.type === "revisit") shownAgain.set(e.n, (shownAgain.get(e.n) || 0) + 1);
     const row = rowFor(e);
     if (!row) continue;
     row.dataset.q = rowText(e);
@@ -290,6 +309,8 @@ function renderLive() {
 function resetTranscript() {
   entries = [];
   lastSpeaker = null;
+  onScreen = null;
+  shownAgain.clear();
   ui.rows.replaceChildren();
   ui.strip.replaceChildren();
   ui.img.removeAttribute("src");
@@ -332,6 +353,8 @@ function apply(d) {
   if (d.entries.length) {
     entries.push(...d.entries);
     appendEntries(d.entries);
+    markRevisits();
+    showSlide();
   }
   if (state && !entries.length && !ui.rows.querySelector(".waiting")) ui.rows.append(h("div", { class: "waiting" }, state.recording ? "Waiting for the first caption…" : "No transcript was written."));
   renderLive();
