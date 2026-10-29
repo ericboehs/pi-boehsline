@@ -1,6 +1,6 @@
 /**
- * Meeting copilot: transcript parsing, trigger cadence, scout replies, prompts,
- * file picking and the widget.
+ * Meeting copilot: transcript parsing, the scout's cadence, prompts and JSON,
+ * alerts, the notes file, file picking, the status line and the recap.
  *
  *   bin/pi-ext-check            # typecheck + these tests
  *   node --test .pi-agent/test  # tests only (needs .pi-agent/node_modules)
@@ -16,26 +16,33 @@ import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 import {
-	applyUpdate,
-	briefAnswer,
-	buildDigPrompt,
+	maskSecrets,
+	addressesMe,
+	restoreNotes,
+	retryWait,
+	sameAction,
+	actionAlertText,
+	buildNotesFile,
+	buildNotesPrompt,
 	buildSystemPrompt,
-	buildUserPrompt,
+	CADENCE,
 	canClaim,
 	clock,
 	createLock,
 	currentSlide,
 	dailyNoteName,
+	emptyNotes,
 	filterLive,
 	filterRecords,
+	fitNotesPrompt,
+	formatDigest,
 	formatLine,
 	formatLive,
 	formatRec,
+	formatSlides,
 	formatStatus,
-	freshTrigger,
-	HOLD_MS,
+	freshCadence,
 	isCandidate,
-	isInvite,
 	isLive,
 	isMine,
 	isMe,
@@ -44,12 +51,14 @@ import {
 	markStopped,
 	meetingKey,
 	mentionsMe,
+	mergeNotes,
+	nameAlertText,
 	nameMatches,
 	nameTokens,
+	normText,
+	notesPath,
 	ocrPath,
 	parseArgs,
-	parseDigArgs,
-	parseDigInput,
 	parseEvent,
 	parseIndex,
 	parseLive,
@@ -60,10 +69,10 @@ import {
 	parseState,
 	parseTimeSpec,
 	pickNewest,
-	pickShown,
 	pickStartedSince,
 	previousTranscript,
 	promptLine,
+	pushAlert,
 	queryMatches,
 	readLock,
 	readStopped,
@@ -71,24 +80,32 @@ import {
 	recapBody,
 	recapMarker,
 	releaseLock,
+	removeNotesFile,
+	replyDue,
+	replyText,
 	roundedElapsed,
-	shouldFire,
+	scaleCadence,
+	sessionDigest,
+	shouldCall,
 	slideCount,
 	slideTimes,
 	speakerMatches,
 	stateReader,
 	statusReport,
 	stoppedPath,
+	takeNameAlert,
 	toStamp,
-	TRIGGER,
 	truncateLines,
 	upsertRecap,
-	writeLock,
 	widgetLines,
+	writeLock,
+	writeNotesFile,
 } from "../extensions/opt-in/meeting/index.ts";
 
+import { estTokens, PROMPT_MAX_TOKENS } from "../extensions/opt-in/watch/models.ts";
+
 const plain = { fg: (_color, s) => s };
-const Q = (id, overrides = {}) => ({ id, q: `question ${id}?`, why: "", at: 0, clock: "11:00", status: "open", ...overrides });
+
 
 // ── parsing ──
 
@@ -137,209 +154,475 @@ test("a mention needs the whole name part, not a substring", () => {
 	assert.ok(mentionsMe("that's on boehs's list", me));
 	assert.ok(!mentionsMe("across America", me));
 	assert.ok(!mentionsMe("generic numeric stuff", me));
+	assert.ok(!mentionsMe("Erica said she'd send it", me), "Erica is not Eric");
+	assert.ok(!mentionsMe("Ericsson's boxes", me));
 });
 
-test("recognizes an invitation for questions", () => {
-	assert.ok(isInvite("OK, any questions before we move on?"));
-	assert.ok(isInvite("Thoughts?"));
-	assert.ok(!isInvite("I had questions about the runner yesterday"));
+test("a first name another participant shares isn't enough to be addressed", () => {
+	const me = nameTokens("Eric Boehs");
+	const people = ["Eric Boehs", "Eric Smith", "Ada Lovelace"];
+	assert.ok(!addressesMe("Eric, can you own the canary move?", me, people), "which Eric?");
+	assert.ok(addressesMe("Eric Boehs, can you own the canary move?", me, people), "the last name settles it");
+	assert.ok(addressesMe("Boehs, are you there?", me, people));
+	assert.ok(addressesMe("Eric, can you own it?", me, ["Eric Boehs", "Ada Lovelace"]), "only one Eric in the call");
+	assert.ok(addressesMe("Eric, can you own it?", me), "no roster, no doubt");
+	assert.ok(!addressesMe("Erica, can you own it?", me, people));
+	assert.ok(!addressesMe("Eric, can you own it?", me, ["Boehs, Eric (GUILD)", "Smith, Eric Jr (X)"]), "Teams' Last, First format too");
 });
 
-// ── triggers ──
+// ── slide events ──
 
-test("nothing new, nothing to do", () => {
-	assert.equal(shouldFire(freshTrigger(), 1_000_000), null);
+test("slides and revisits are events too, for the cadence and the status line", () => {
+	assert.deepEqual(parseEvent('{"type":"slide","slide":4,"ts":"2026-10-05T13:00:00-05:00"}'), { kind: "slide", ts: "2026-10-05T13:00:00-05:00", n: 4, revisit: false });
+	assert.deepEqual(parseEvent('{"type":"revisit","slide":2,"ts":"t"}'), { kind: "slide", ts: "t", n: 2, revisit: true });
+	assert.equal(parseEvent('{"type":"slide","slide":"4"}'), null);
 });
 
-test("a batch of lines waits for a pause and the minimum gap", () => {
-	const now = 1_000_000;
-	const t = { unsent: TRIGGER.batch, firstUnsentAt: now - 10_000, lastLineAt: now - 3_000, lastCallAt: now - 20_000, cue: null };
-	assert.equal(shouldFire(t, now), "batch");
-	assert.equal(shouldFire({ ...t, lastLineAt: now - 500 }, now), null, "still talking");
-	assert.equal(shouldFire({ ...t, lastCallAt: now - 5_000 }, now), null, "checked too recently");
-	assert.equal(shouldFire({ ...t, unsent: 2 }, now), null, "too few lines");
+// ── when code lets the scout run ──
+
+const cad = (over = {}) => ({ ...freshCadence(), ...over });
+const MIN = 60_000;
+
+test("no new lines, nothing to do", () => {
+	assert.equal(shouldCall(freshCadence(), 10 * MIN), null);
+	assert.equal(shouldCall(cad({ early: true, earlyAt: 1 }), 10 * MIN), null, "an early request waits for a line to send");
 });
 
-test("a trickle fires once it has waited long enough", () => {
-	const now = 1_000_000;
-	const t = { unsent: 2, firstUnsentAt: now - TRIGGER.maxWaitMs, lastLineAt: now - 3_000, lastCallAt: now - 60_000, cue: null };
-	assert.equal(shouldFire(t, now), "batch");
+test("about three minutes of new talk makes a call, not before", () => {
+	const t = cad({ unsent: 5, firstUnsentAt: 1_000_000, lastLineAt: 1_000_000 + 2 * MIN + 55_000, lastCallAt: 1_000_000 - 5 * MIN });
+	assert.equal(shouldCall(t, 1_000_000 + 2 * MIN + 59_000), null);
+	assert.equal(shouldCall(t, 1_000_000 + 3 * MIN), "talk");
 });
 
-test("a flood fires without waiting for a pause", () => {
-	const now = 1_000_000;
-	const t = { unsent: TRIGGER.flood, firstUnsentAt: now - 1_000, lastLineAt: now, lastCallAt: now - 20_000, cue: null };
-	assert.equal(shouldFire(t, now), "batch");
+test("never while a call is in flight", () => {
+	const t = cad({ unsent: 5, firstUnsentAt: 1, lastLineAt: 1, lastCallAt: 0, early: true, earlyAt: 1 });
+	assert.equal(shouldCall(t, 10 * MIN, { busy: true }), null);
+	assert.equal(shouldCall(t, 10 * MIN, { busy: true, final: true }), null);
+	assert.equal(shouldCall(t, 10 * MIN), "early");
 });
 
-test("a cue skips the batch size and the gap, but lets the sentence land", () => {
-	const now = 1_000_000;
-	const t = { unsent: 1, firstUnsentAt: now - 2_000, lastLineAt: now - 2_000, lastCallAt: now - 1_000, cue: "mention" };
-	assert.equal(shouldFire(t, now), "cue");
-	assert.equal(shouldFire({ ...t, lastLineAt: now - 100 }, now), null);
+test("a new slide or a name alert calls sooner, once the sentence has landed, at most once a minute", () => {
+	const now = 5 * MIN;
+	const base = { unsent: 2, firstUnsentAt: now - 20_000, early: true, earlyAt: now - 10_000 };
+	assert.equal(shouldCall(cad({ ...base, lastLineAt: now - 1000, lastCallAt: now - 5 * MIN }), now), null, "someone is still talking");
+	assert.equal(shouldCall(cad({ ...base, lastLineAt: now - 3000, lastCallAt: now - 5 * MIN }), now), "early");
+	assert.equal(shouldCall(cad({ ...base, lastLineAt: now - 3000, lastCallAt: now - 59_000 }), now), null, "the 60 s floor");
+	assert.equal(shouldCall(cad({ ...base, lastLineAt: now - 3000, lastCallAt: now - 61_000 }), now), "early");
+	// Talk that never pauses doesn't starve it forever.
+	assert.equal(shouldCall(cad({ ...base, lastLineAt: now - 100, lastCallAt: 0, earlyAt: now - 16_000 }), now), "early");
 });
 
-test("a cue never holds back a flood", () => {
-	const now = 1_000_000;
-	const t = { unsent: TRIGGER.flood, firstUnsentAt: now - 5_000, lastLineAt: now, lastCallAt: now - 20_000, cue: "mention" };
-	assert.equal(shouldFire(t, now), "batch");
+test("the floor holds for talk too, and the end gets one look at what's left", () => {
+	const t = cad({ unsent: 3, firstUnsentAt: 0, lastLineAt: 1, lastCallAt: 10 * MIN - 30_000 });
+	assert.equal(shouldCall(t, 10 * MIN), null);
+	assert.equal(shouldCall(t, 10 * MIN, { final: true }), "final", "no waiting at the end");
+	assert.equal(shouldCall(cad({ lastCallAt: 1 }), 10 * MIN, { final: true }), null, "nothing left, no call");
 });
 
-test("once the meeting is over, any leftover lines get a look", () => {
-	const now = 1_000_000;
-	const t = { unsent: 1, firstUnsentAt: now - 5_000, lastLineAt: now - 5_000, lastCallAt: now - 20_000, cue: null };
-	assert.equal(shouldFire(t, now), null);
-	assert.equal(shouldFire(t, now, true), "batch");
+test("a replay scales every wait", () => {
+	assert.deepEqual(scaleCadence(1), CADENCE);
+	assert.equal(scaleCadence(100).talkMs, 1800);
+	assert.ok(scaleCadence(100000).quietMs >= 20);
 });
 
-// ── scout replies ──
+// ── the scout's JSON ──
 
-test("reads the scout's JSON through fences and prose", () => {
-	const u = parseScoutReply(
-		'Sure:\n```json\n{"topic":"runner migration","add":[{"q":"Who owns the image rebuild?","why":"no owner named"}],"closed":[{"id":"Q2","by":"asked","note":""},{"id":3,"by":"answered","note":"Kyle: Friday"}],"top":["Q4",1],"reply":""}\n```',
-	);
-	assert.deepEqual(u, {
-		topic: "runner migration",
-		add: [{ q: "Who owns the image rebuild?", why: "no owner named" }],
-		closed: [
-			{ id: 2, by: "asked", note: "" },
-			{ id: 3, by: "answered", note: "Kyle: Friday" },
-		],
-		top: [4, 1],
-		reply: "",
-	});
+const full = {
+	topics: [{ title: "Cert rotation", summary: "Thursday, owner Amy." }, { title: "Canary", summary: "Legacy services next." }],
+	decisions: ["Rotate Thursday"],
+	actions: [{ who: "Eric", what: "own moving the legacy services onto canary", mine: true, by: "Ada" }, { who: "Amy", what: "rotate the cert", mine: false }],
+	questions: [{ q: "Who signs off before Thursday?", why: "no approver named" }],
+	reply: { to: "Katherine", text: "I can have a plan by Friday." },
+};
+
+test("reads the notes through fences and prose", () => {
+	const u = parseScoutReply(`Sure!\n\`\`\`json\n${JSON.stringify(full)}\n\`\`\`\nHope that helps.`);
+	assert.deepEqual(u.topics, full.topics);
+	assert.deepEqual(u.decisions, ["Rotate Thursday"]);
+	assert.deepEqual(u.actions[0], { who: "Eric", what: "own moving the legacy services onto canary", mine: true, by: "Ada" });
+	assert.deepEqual(u.actions[1], { who: "Amy", what: "rotate the cert", mine: false, by: "" });
+	assert.deepEqual(u.questions, full.questions);
+	assert.deepEqual(u.reply, { to: "Katherine", text: "I can have a plan by Friday." });
 });
 
-test("tolerates loose shapes and rejects non-JSON", () => {
-	const u = parseScoutReply('{"add":["Is Friday firm?", {"question":"Who signs off?"}], "closed":[5, "Q6"], "drop":[1]}');
-	assert.deepEqual(u.add, [
-		{ q: "Is Friday firm?", why: "" },
-		{ q: "Who signs off?", why: "" },
-	]);
-	assert.deepEqual(u.closed, [
-		{ id: 5, by: "answered", note: "" },
-		{ id: 6, by: "answered", note: "" },
-	]);
-	assert.deepEqual(u.top, [], "no top, no ranking");
-	assert.equal(parseScoutReply("no questions right now"), null);
-	assert.equal(parseScoutReply("{broken"), null);
-});
+test("tolerates loose shapes, bounds everything, and rejects what isn't the notes", () => {
+	const loose = parseScoutReply('{"topics":["Runner migration"],"decisions":[{"text":"Ship it"}],"actions":["Sam: write the doc"],"questions":["Is Friday firm?"],"reply":"Yes, on track."}');
+	assert.deepEqual(loose.topics, [{ title: "Runner migration", summary: "" }]);
+	assert.deepEqual(loose.decisions, ["Ship it"]);
+	assert.deepEqual(loose.actions, [{ who: "", what: "Sam: write the doc", mine: false, by: "" }]);
+	assert.deepEqual(loose.questions, [{ q: "Is Friday firm?", why: "" }]);
+	assert.deepEqual(loose.reply, { to: "", text: "Yes, on track." });
+	assert.equal(parseScoutReply('{"actions":[{"what":"x","mine":"true"},{"what":"y","mine":"no"}]}').actions.map((a) => a.mine).join(), "true,false");
 
-const update = (overrides = {}) => ({ topic: "", add: [], closed: [], top: [], reply: "", ...overrides });
-
-test("an update closes what was answered and adds the rest, deduped against everything", () => {
-	const qs = [Q(1, { q: "Is Friday firm?" }), Q(2, { q: "Who signs off?", status: "answered" })];
-	const r = applyUpdate(
-		qs,
-		update({
-			add: [{ q: "who signs off", why: "" }, { q: "Does CSOC need a ticket?", why: "Kyle said pending" }],
-			closed: [{ id: 1, by: "answered", note: "Blake: yes, Friday" }, { id: 2, by: "asked", note: "" }],
-		}),
-		3,
-		1000,
-		"11:05",
-		2,
-	);
-	assert.deepEqual(r.closed, [{ ...qs[0], status: "answered", closedClock: "11:05", note: "Blake: yes, Friday" }]);
-	assert.equal(r.questions[1].status, "answered", "an already-closed question stays as it was");
-	assert.deepEqual(r.added, [{ id: 3, q: "Does CSOC need a ticket?", why: "Kyle said pending", at: 1000, clock: "11:05", status: "open" }]);
-	assert.equal(r.questions.length, 3);
-	assert.equal(r.nextId, 4);
-});
-
-test("no question leaves the list unless it's closed", () => {
-	const qs = [1, 2, 3, 4, 5].map((id) => Q(id));
-	const r = applyUpdate(qs, update({ add: [{ q: "one more", why: "" }, { q: "and another", why: "" }] }), 6, 0);
-	assert.deepEqual(r.questions.map((q) => q.id), [1, 2, 3, 4, 5, 6], "one add per update by default");
-	assert.ok(r.questions.every((q) => q.status === "open"));
-});
-
-test("the widget shows new questions first, then the scout's ranking, then the newest", () => {
-	const qs = [1, 2, 3, 4, 5].map((id) => Q(id));
-	assert.deepEqual(pickShown([], qs, [], 0).map((s) => s.id), [3, 4, 5]);
-	assert.deepEqual(pickShown([], qs, [2, 1], 0).map((s) => s.id), [1, 2, 5]);
-});
-
-test("a re-ranked question waits for a shown one to have had its time", () => {
-	const qs = [1, 2, 3, 4].map((id) => Q(id));
-	const shown = [1, 2, 3].map((id) => ({ id, since: 0 }));
-	assert.deepEqual(pickShown(shown, qs, [4], HOLD_MS - 1).map((s) => s.id), [1, 2, 3], "Q4 waits");
-	const later = pickShown(shown, qs, [4, 1, 2], HOLD_MS);
-	assert.deepEqual(later.map((s) => s.id), [1, 2, 4], "Q4 takes the worst-ranked slot");
-	assert.equal(later.find((s) => s.id === 4).since, HOLD_MS);
-	assert.equal(later.find((s) => s.id === 1).since, 0, "kept questions keep their clock");
-});
-
-test("a new question shows at once, bumping one past its hold if there is one", () => {
-	const qs = [1, 2, 3, 4].map((id) => Q(id));
-	const young = [1, 2, 3].map((id) => ({ id, since: 1000 }));
-	assert.deepEqual(pickShown(young, qs, [4], 2000, [4]).map((s) => s.id), [2, 3, 4], "the worst-ranked young one goes");
-	const mixed = [{ id: 1, since: 1000 }, { id: 2, since: 0 }, { id: 3, since: 1000 }];
-	assert.deepEqual(pickShown(mixed, qs, [4, 1], HOLD_MS, [4]).map((s) => s.id), [1, 3, 4], "Q2 had its time");
-});
-
-test("an answered question frees its slot at once", () => {
-	const qs = [Q(1, { status: "answered" }), Q(2), Q(3), Q(4)];
-	const shown = [1, 2, 3].map((id) => ({ id, since: 0 }));
-	assert.deepEqual(pickShown(shown, qs, [4], 10).map((s) => s.id), [2, 3, 4]);
-});
-
-// ── prompts ──
-
-const promptInput = (overrides = {}) => ({
-	title: "CORE Weekly Sync",
-	app: "Microsoft Teams",
-	people: ["Jordan Blake", "Eric Boehs"],
-	lines: ["[13:00:00] Jordan Blake: Runner cutover is Friday.", "[13:00:05] Kyle: Pending CSOC."],
-	newFrom: 0,
-	open: [],
-	focus: "",
-	cue: null,
-	me: "Eric Boehs",
-	now: new Date(2026, 9, 5, 13, 0, 10),
-	...overrides,
-});
-
-test("the first look says so; later looks point at the new lines", () => {
-	assert.match(buildUserPrompt(promptInput()), /This is your first look\./);
-	const later = buildUserPrompt(
-		promptInput({
-			newFrom: 1,
-			open: [Q(4, { q: "Is Friday firm?", why: "no date set" })],
-			closed: [Q(2, { q: "Who signs off?", status: "answered" })],
+	const many = parseScoutReply(
+		JSON.stringify({
+			topics: Array.from({ length: 12 }, (_, i) => ({ title: `t${i}`, summary: "x".repeat(900) })),
+			questions: ["a?", "b?", "c?", "d?"],
+			decisions: Array.from({ length: 30 }, (_, i) => `d${i}`),
+			reply: { to: "x".repeat(500), text: "y".repeat(2000) },
 		}),
 	);
-	assert.match(later, /New since your last update: the lines from \[13:00:05\] Kyle/);
-	assert.match(later, /Q4: Is Friday firm\? \(no date set\)/);
-	assert.match(later, /Already answered or asked \(don't add again\):\nQ2: Who signs off\?/);
-	assert.doesNotMatch(buildUserPrompt(promptInput()), /Already answered/);
+	assert.deepEqual(many.topics.map((t) => t.title), ["t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11"], "newest eight, newest last");
+	assert.equal(many.topics[0].summary.length, 300);
+	assert.equal(many.questions.length, 2, "at most two questions");
+	assert.equal(many.decisions.length, 20);
+	assert.deepEqual([many.reply.to.length, many.reply.text.length], [80, 500]);
+
+	assert.equal(parseScoutReply("not json"), null);
+	assert.equal(parseScoutReply("{}"), null, "no notes keys: not the notes");
+	assert.equal(parseScoutReply('{"hello":1}'), null);
+	assert.equal(parseScoutReply("[1]"), null);
+	assert.deepEqual(parseScoutReply('{"reply":null}').reply, null);
+	assert.equal(parseScoutReply('{"reply":{"to":"A","text":" "}}').reply, null);
+	assert.equal(parseScoutReply('{"questions":[]}').topics, undefined, "a field left out stays as it was");
 });
 
-test("the transcript comes before anything that changes between calls", () => {
-	const p = buildUserPrompt(promptInput({ focus: "push for a cutover date", cue: "mention" }));
-	assert.ok(p.indexOf("</transcript>") < p.indexOf("Now:"));
-	assert.ok(p.indexOf("</transcript>") < p.indexOf("goals for this meeting"));
-	assert.match(p, /Eric Boehs was just named/);
+test("merging keeps the time items were first noted and finds the new actions on you", () => {
+	const first = mergeNotes(emptyNotes(), parseScoutReply(JSON.stringify(full)), "T1");
+	assert.deepEqual(first.newMine.map((a) => a.what), ["own moving the legacy services onto canary"]);
+	assert.equal(first.notes.actions[0].at, "T1");
+	assert.deepEqual(first.notes.decisions, [{ text: "Rotate Thursday", at: "T1" }]);
+
+	// The scout repeats everything (reworded punctuation) and adds one: only the new one is new.
+	const again = parseScoutReply(
+		JSON.stringify({
+			...full,
+			decisions: ["Rotate Thursday.", "Canary by Q3"],
+			actions: [...full.actions.map((a) => ({ ...a, what: `${a.what}.` })), { who: "Eric", what: "send the runbook", mine: true }],
+			questions: [],
+		}),
+	);
+	const second = mergeNotes(first.notes, again, "T2");
+	assert.deepEqual(second.newMine.map((a) => a.what), ["send the runbook"]);
+	assert.deepEqual(second.notes.actions.map((a) => a.at), ["T1", "T1", "T2"]);
+	assert.deepEqual(second.notes.decisions.map((d) => d.at), ["T1", "T2"]);
+	assert.deepEqual(second.notes.questions, [], "questions are the current ones, not a log");
+
+	// A field the scout left out stays; a duplicate inside one answer counts once.
+	const quiet = mergeNotes(second.notes, { reply: null }, "T3");
+	assert.deepEqual(quiet.notes, second.notes);
+	const dup = mergeNotes(emptyNotes(), { actions: [{ who: "E", what: "Do it", mine: true, by: "" }, { who: "E", what: "do it!", mine: true, by: "" }], reply: null }, "T");
+	assert.equal(dup.notes.actions.length, 1);
+	assert.equal(dup.newMine.length, 1);
 });
 
-test("a very long transcript keeps its tail", () => {
-	const lines = Array.from({ length: 3000 }, (_, i) => `[13:00:00] A: line ${i} ${"x".repeat(40)}`);
-	const p = buildUserPrompt(promptInput({ lines, newFrom: 2999 }));
-	assert.match(p, /earlier lines omitted/);
-	assert.match(p, /line 2999 /);
-	assert.doesNotMatch(p, /line 0 /);
+test("a reworded action is the same action, and only a move onto Eric is new to him", () => {
+	assert.ok(sameAction("own moving the legacy services onto canary", "own migrating legacy services to canary"));
+	assert.ok(sameAction("own moving the legacy services onto canary", "Own moving the two legacy services onto canary this week."));
+	assert.ok(sameAction("send the runbook", "Send the runbook!"));
+	assert.ok(!sameAction("send the runbook", "rotate the cert"));
+	assert.ok(!sameAction("rotate the staging cert", "rotate the production cert and update the dashboard"));
+	assert.ok(sameAction("own the legacy services", "take the legacy service"), "service and services match");
+	for (const [x, y] of [
+		["review PR 123", "review PR 124"],
+		["update the staging config", "update the production config"],
+		["send the deck to Ada", "send the deck to Bob"],
+		["write the ATO docs", "review the ATO docs"],
+		["file a ticket for the login bug", "file a ticket for the logout bug"],
+		["schedule a meeting with security", "schedule a meeting with legal"],
+		["review PR 123", "review PR"],
+	]) {
+		assert.ok(!sameAction(x, y), `${x} / ${y}`);
+		assert.ok(!sameAction(y, x), `${y} / ${x}`);
+	}
+	assert.ok(!sameAction("ship", "ship it"), "one-word actions need to match exactly");
+
+	const first = mergeNotes(emptyNotes(), parseScoutReply(JSON.stringify(full)), "T1");
+	const reworded = parseScoutReply(JSON.stringify({ ...full, actions: [{ who: "Eric", what: "own migrating legacy services to canary", mine: true, by: "Ada" }] }));
+	const second = mergeNotes(first.notes, reworded, "T2");
+	assert.deepEqual(second.newMine, [], "no second alert for the same task in new words");
+	assert.equal(second.notes.actions[0].at, "T1", "and it keeps the time it was first noted");
+	assert.equal(second.notes.actions[0].what, "own migrating legacy services to canary");
+
+	// First noted for someone else, then moved to Eric with the same text: that is news to him.
+	const theirs = mergeNotes(emptyNotes(), { actions: [{ who: "Ada", what: "own the canary move", mine: false, by: "" }], reply: null }, "T1");
+	assert.deepEqual(theirs.newMine, []);
+	const moved = mergeNotes(theirs.notes, { actions: [{ who: "Eric", what: "own the canary move", mine: true, by: "Ada" }], reply: null }, "T2");
+	assert.deepEqual(moved.newMine.map((a) => a.what), ["own the canary move"]);
+	assert.equal(moved.notes.actions[0].at, "T1");
 });
 
-test("the system prompt carries the rules, the JSON shape and the background", () => {
-	const s = buildSystemPrompt("Eric Boehs", "Engineer on CORE.", "## Notes\n- runner");
+test("a failed call waits twice as long each time, up to five minutes", () => {
+	assert.deepEqual([1, 2, 3, 4, 5, 6, 9].map((n) => retryWait(n) / 60_000), [1, 2, 4, 5, 5, 5, 5]);
+	assert.equal(retryWait(0), CADENCE.minGapMs);
+	assert.ok(retryWait(9, scaleCadence(10), 10) < 31_000, "a replay shrinks it");
+	const now = 10_000_000;
+	const t = cad({ unsent: 3, firstUnsentAt: now - 4 * MIN, lastLineAt: now - 4000, lastCallAt: now - 90_000, retryMs: retryWait(2) });
+	assert.equal(shouldCall(t, now), null, "the retry wait outlasts the 60 s floor");
+	assert.equal(shouldCall({ ...t, lastCallAt: now - 121_000 }, now), "talk");
+	assert.equal(shouldCall(t, now, { final: true }), "final", "the last call doesn't wait");
+});
+
+// ── what the scout is asked ──
+
+const sys = () => buildSystemPrompt("Eric Boehs", ["eric", "boehs"], "Engineer on CORE.", "## Notes\n- runner");
+
+test("the system prompt carries who he is, the quality bar for questions, the JSON shape and the background", () => {
+	const s = sys();
 	assert.match(s, /live meeting copilot for Eric Boehs/);
-	assert.match(s, /"add": \[\{"q"/);
-	assert.match(s, /"closed": \[\{"id": 1, "by": "answered"/);
-	assert.match(s, /Never close a question just because the conversation moved on/);
+	assert.match(s, /may be called eric or boehs/);
+	assert.match(s, /AT MOST 2, and usually none\. Empty is the normal answer/);
+	assert.match(s, /grounded in what Eric Boehs is working on \(the session digest, the about text, the slides\)/);
+	assert.match(s, /Never generic/);
+	assert.match(s, /"mine" is true only when the task is assigned to or taken by Eric Boehs/);
+	assert.match(s, /"reply": only when someone is waiting on Eric Boehs right now/);
+	assert.match(s, /Update them instead of rewriting/);
+	assert.match(s, /"topics": \[\{"title"/);
 	assert.match(s, /<about>\nEngineer on CORE\.\n<\/about>/);
 	assert.match(s, /<background>\n## Notes/);
-	assert.doesNotMatch(buildSystemPrompt("", "", ""), /<about>|<background>/);
+	assert.doesNotMatch(buildSystemPrompt("", [], "", ""), /<about>|<background>|may be called/);
 });
+
+const branch = [
+	{ type: "message", message: { role: "user", content: "first thing" } },
+	{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "old reply" }] } },
+	{ type: "custom_message", customType: "meeting", content: "ignored" },
+	...Array.from({ length: 6 }, (_, i) => ({ type: "message", message: { role: "user", content: [{ type: "text", text: `user message ${i} ${"w".repeat(400)}` }, { type: "image", data: "x" }] } })),
+	{ type: "message", message: { role: "toolResult", content: [{ type: "text", text: "tool output" }] } },
+	{ type: "message", message: { role: "assistant", content: [{ type: "text", text: `latest ${"a".repeat(900)}` }, { type: "toolCall", id: "1" }] } },
+	{ type: "message", message: { role: "user", content: "   " } },
+];
+
+test("the session digest is the last 5 user messages (300 chars) and the last assistant message (600)", () => {
+	const d = sessionDigest(branch, "earl");
+	assert.equal(d.name, "earl");
+	assert.equal(d.user.length, 5);
+	assert.deepEqual(d.user.map((u) => u.slice(0, 14)), ["user message 1", "user message 2", "user message 3", "user message 4", "user message 5"]);
+	assert.ok(d.user.every((u) => u.length === 300 && u.endsWith("…")));
+	assert.equal(d.assistant.length, 600);
+	assert.match(d.assistant, /^latest a+…$/);
+	assert.deepEqual(sessionDigest([], ""), { name: "", user: [], assistant: "" });
+	assert.equal(formatDigest(sessionDigest([], "")), "", "nothing to say, no block");
+	assert.match(formatDigest(d), /^<session>\nWhat the user is working on right now, from their pi session "earl":\nTheir last messages:\n- user message 1/);
+});
+
+test("the session digest masks secrets and applies the work redact rules, before clipping", () => {
+	const mixed = "Zq8vK2mXp4Lr7TnB1cWd9YeH3sJf6GuA"; // 32 mixed-case letters and digits: looks random
+	const prefixed = `ghp_${"x7".repeat(18)}`;
+	const header = `Bearer ${"abc123".repeat(3)}`;
+	const entries = [
+		{ type: "message", message: { role: "user", content: `use ${prefixed} and ${header}, key ${mixed}; build EMP123456 fails` } },
+		{ type: "message", message: { role: "user", content: "clone https://bob:pw1234@git.example.com/x.git, see extensions/opt-in/meeting/notes-scout-review-notes.ts" } },
+		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: `sha ${"a1b2c3d4".repeat(5)} done` }] } },
+	];
+	const d = sessionDigest(entries, "earl", (s) => s.replace(/EMP\d{6}/g, "[EMP]"));
+	assert.equal(d.user[0], "use [token] and Bearer [token], key [token]; build [EMP] fails");
+	assert.equal(d.user[1], "clone https://[redacted]@git.example.com/x.git, see extensions/opt-in/meeting/notes-scout-review-notes.ts");
+	assert.equal(d.assistant, `sha ${"a1b2c3d4".repeat(5)} done`, "a 40-character commit SHA is left alone");
+	assert.equal(maskSecrets(`sha ${"a1b2c3d4".repeat(8)}`), "sha [token]", "a longer hex run is still masked");
+	const words = "plain-kebab-case-name-that-is-quite-long and CamelCaseIdentifierWithoutDigitsAtAll";
+	assert.equal(maskSecrets(words), words, "words and names pass");
+	for (const prose of ["skateboarding", "pkgconfiguration", "skip-dependency-resolution-in-ci", "npm-check-updates", "hfrequencytrading", "Basic authentication", "bearer responsibilities", "Bearer authentication", "Basic configuration"]) {
+		assert.equal(maskSecrets(`about ${prose} today`), `about ${prose} today`, prose);
+	}
+	for (const [secret, masked] of [["sk-abcdefghijklmnop", "[token]"], ["glpat" + "-abcdefghij1234567890", "[token]"], ["AKIA" + "ABCDEFGHIJKLMNOP", "[token]"], ["xoxb-123456789012-abcdef", "[token]"], ["npm_abcdefghij1234567890", "[token]"], ["Basic dXNlcjpwYXNz1234", "Basic [token]"]]) {
+		assert.equal(maskSecrets(secret), masked, secret);
+	}
+	assert.equal(sessionDigest([], "").name, "");
+});
+
+test("a new instance takes this meeting's notes back (and only this meeting's)", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-restore-"));
+	const file = path.join(dir, ".meeting-notes.json");
+	const saved = process.env.PI_MEETING_NOTES_FILE;
+	process.env.PI_MEETING_NOTES_FILE = file;
+	try {
+		assert.equal(restoreNotes("S"), null, "no file");
+		const notes = mergeNotes(emptyNotes(), parseScoutReply(JSON.stringify(full)), "2026-10-28T14:12:00.000Z").notes;
+		const alerts = [
+			{ id: "a3", kind: "name", who: "Ada", text: "Eric, can you own it?", at: "T" },
+			{ id: "a7", kind: "action", who: "Ada", text: "own the second thing", at: "T" },
+		];
+		writeNotesFile(buildNotesFile({ pid: 1, sessionId: "x", sessionName: "", startedAt: "S", appId: "teams", title: "T", at: "A", ended: false, me: ["eric"], notes, reply: { to: "K", text: "Friday.", at: "R" }, alerts, alertSeq: 12 }));
+		assert.equal(restoreNotes("other"), null, "another meeting's notes are not ours");
+		const back = restoreNotes("S");
+		assert.deepEqual(back.notes.actions.map((a) => a.what), notes.actions.map((a) => a.what));
+		assert.equal(back.notes.topics.length, notes.topics.length);
+		assert.deepEqual(back.alerts.map((a) => a.id), ["a3", "a7"]);
+		assert.equal(back.alertSeq, 12, "ids keep counting");
+		assert.deepEqual(back.reply, { to: "K", text: "Friday.", at: "R" });
+		assert.ok(back.alerted.has("own moving the legacy services onto canary") && back.alerted.has("own the second thing"));
+		// What the restored notes already hold isn't new when the scout repeats it.
+		assert.deepEqual(mergeNotes(back.notes, parseScoutReply(JSON.stringify(full)), "T9").newMine, []);
+		fs.writeFileSync(file, "not json");
+		assert.equal(restoreNotes("S"), null);
+	} finally {
+		saved === undefined ? delete process.env.PI_MEETING_NOTES_FILE : (process.env.PI_MEETING_NOTES_FILE = saved);
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("slide text: newest first, empty ones skipped, capped in all", () => {
+	const slides = [
+		{ n: 1, at: "14:01:00", text: "Agenda", onScreen: false },
+		{ n: 2, at: "14:10:00", text: "  ", onScreen: false },
+		{ n: 3, at: "14:14:00", text: "Cert rotation plan\nOwner: Amy", onScreen: true },
+	];
+	const t = formatSlides(slides);
+	assert.match(t, /^<slides>\nText on the slides shown so far:\nSlide 3 \(14:14:00\), on screen now:\nCert rotation plan\nOwner: Amy\nSlide 1 \(14:01:00\):\nAgenda\n<\/slides>$/);
+	assert.doesNotMatch(t, /Slide 2/);
+	assert.equal(formatSlides([]), "");
+	const big = formatSlides([{ n: 1, at: "", text: "old ".repeat(2000), onScreen: false }, { n: 2, at: "", text: "x".repeat(3000), onScreen: false }, { n: 3, at: "", text: "y".repeat(3000), onScreen: false }]);
+	assert.ok(big.includes("y".repeat(3000)) && big.includes("[… cut]"), "the newest slide is whole, the next is cut at the cap");
+	assert.ok(!big.includes("old old"), "nothing older once the cap is spent");
+	assert.ok(big.length < 4400, `${big.length} chars`);
+});
+
+const notesIn = (over = {}) => ({
+	title: "CORE Weekly Sync",
+	app: "Teams",
+	people: ["Jordan Blake", "Eric Boehs"],
+	lines: ["[13:00:00] Jordan Blake: Runner cutover is Friday.", "[13:00:05] Kyle: Pending CSOC.", "[13:00:09] Kyle: Eric, can you own the canary?"],
+	newFrom: 0,
+	focus: "",
+	me: "Eric Boehs",
+	now: new Date(2026, 9, 5, 13, 0, 10),
+	prev: emptyNotes(),
+	...over,
+});
+
+test("the user prompt has the meeting, session digest, slides, previous notes and the transcript with the new part marked", () => {
+	const first = buildNotesPrompt(notesIn({ digest: sessionDigest(branch, "earl"), slides: [{ n: 3, at: "13:00:00", text: "Cert plan", onScreen: true }], focus: "push for a cutover date" }));
+	assert.match(first, /^Meeting: CORE Weekly Sync \(Teams\)\nPeople: Jordan Blake; Eric Boehs\nEric Boehs's goals for this meeting: push for a cutover date\nNow: 13:00:10\n\n<session>/);
+	assert.match(first, /<slides>[\s\S]*Cert plan[\s\S]*<\/slides>/);
+	assert.match(first, /<previous_notes>\n\(none yet: this is your first look\)\n<\/previous_notes>/);
+	assert.match(first, /<transcript>\n\[13:00:00\] Jordan Blake: Runner cutover is Friday\.\n/);
+	assert.doesNotMatch(first, /── new since/);
+	assert.match(first, /Write the first notes\.$/);
+
+	const prev = mergeNotes(emptyNotes(), parseScoutReply(JSON.stringify(full)), "T").notes;
+	const later = buildNotesPrompt(notesIn({ newFrom: 2, prev }));
+	assert.match(later, /<previous_notes>\n\{"topics":\[\{"title":"Cert rotation"/);
+	assert.match(later, /"actions":\[\{"who":"Eric","what":"own moving the legacy services onto canary","mine":true,"by":"Ada"\}/);
+	assert.match(later, /Kyle: Pending CSOC\.\n── new since your last update ──\n\[13:00:09\] Kyle: Eric, can you own the canary\?\n<\/transcript>/);
+	assert.match(later, /The lines after "── new since your last update ──" are new since your last update\. Update the notes\.$/);
+	assert.doesNotMatch(later, /<session>|<slides>|goals for this meeting/, "left out when empty");
+});
+
+test("trimming drops the oldest transcript first and stays under the cap", () => {
+	const lines = Array.from({ length: 4000 }, (_, i) => `[10:${String(i % 60).padStart(2, "0")}:00] Speaker ${i % 7}: ${"some words here ".repeat(5)}line ${i}`);
+	const p = notesIn({ lines, newFrom: 3990, digest: sessionDigest(branch, "earl"), slides: [{ n: 1, at: "", text: "slide ".repeat(100), onScreen: true }] });
+	const system = "s".repeat(120_000); // a big background: ~40k tokens
+	const user = fitNotesPrompt(system, p);
+	assert.ok(estTokens(system) + estTokens(user) <= PROMPT_MAX_TOKENS, `${estTokens(system) + estTokens(user)} tokens`);
+	assert.match(user, /line 3999\n<\/transcript>/, "the newest line stays");
+	assert.match(user, /<transcript>\n\[… earlier lines omitted …\]\n/);
+	assert.match(user, /── new since your last update ──\n/, "the new part stays marked");
+	assert.match(user, /<session>/, "the digest isn't what gets cut");
+	assert.ok(estTokens(buildNotesPrompt(p)) > estTokens(user));
+	assert.equal(fitNotesPrompt("system", notesIn()), buildNotesPrompt(notesIn()), "a short meeting is untouched");
+	assert.match(fitNotesPrompt("s".repeat(120_000), notesIn(), 1000), /<transcript>\n\[… earlier lines omitted …\]\n<\/transcript>/, "even the system prompt too big: the transcript shrinks to its marker");
+});
+
+// ── alerts ──
+
+test("one name alert per speaker per two minutes, repeats collapse", () => {
+	const last = new Map();
+	assert.equal(takeNameAlert(last, "Smith, Ada (ORG)", 1000), true);
+	assert.equal(takeNameAlert(last, "Smith, Ada (ORG)", 1000 + 119_000), false, "a repeat inside two minutes");
+	assert.equal(takeNameAlert(last, "Alan Turing", 1000 + 5_000), true, "another speaker has their own clock");
+	assert.equal(takeNameAlert(last, "Smith, Ada (ORG)", 1000 + 120_000), true, "two minutes later");
+	assert.equal(takeNameAlert(last, "Smith, Ada (ORG)", 1000 + 121_000), false, "the clock restarted at the last alert");
+	assert.equal(takeNameAlert(new Map(), "", 5), true);
+});
+
+test("the alert list keeps the newest 20", () => {
+	let list = [];
+	for (let i = 0; i < 25; i++) list = pushAlert(list, { id: `a${i}`, kind: "name", who: "A", text: "t", at: "T" });
+	assert.deepEqual([list.length, list[0].id, list.at(-1).id], [20, "a5", "a24"]);
+});
+
+test("alert messages: a name, an action, and a reply on its own", () => {
+	const long = `Eric, can you own moving the legacy services onto canary ${"this quarter and ".repeat(8)}so we can plan?`;
+	const clipped = nameAlertText("Ada Lovelace", "14:12:30", long);
+	assert.match(clipped, /^🔔 Ada Lovelace said your name \(14:12\): "Eric, can you own moving the legacy services onto canary this quarter and .*…"$/);
+	assert.equal(clipped.split('"')[1].length, 140, "the quote is clipped to 140 characters");
+	assert.equal(nameAlertText("Ada Lovelace", "14:12:30", "Eric, can you own moving the legacy services?"), '🔔 Ada Lovelace said your name (14:12): "Eric, can you own moving the legacy services?"');
+	assert.equal(nameAlertText("Ada", "14:12:30", "Eric?", { to: "Ada", text: "Yes." }), '🔔 Ada said your name (14:12): "Eric?"\n↳ You could say: "Yes."');
+	assert.equal(nameAlertText("", "", "Eric"), '🔔 Someone said your name: "Eric"');
+	assert.equal(actionAlertText("own moving the legacy services onto canary", "Ada", "14:12:30"), "✅ Action on you: own moving the legacy services onto canary (Ada, 14:12)");
+	assert.equal(actionAlertText("send the runbook", "", "14:20"), "✅ Action on you: send the runbook (14:20)");
+	assert.equal(actionAlertText("x", "", "", { to: "K", text: "ok" }), '✅ Action on you: x\n↳ You could say: "ok"');
+	assert.equal(replyText({ to: "Katherine", text: "I can have it Friday." }), '↳ Katherine is waiting on you. You could say: "I can have it Friday."');
+	assert.equal(replyText({ to: "", text: "Sure." }), '↳ Someone is waiting on you. You could say: "Sure."');
+});
+
+test("a reply posts once: not the same words again, not another to the same person within two minutes", () => {
+	const r = { to: "Katherine", text: "I can have it Friday." };
+	assert.equal(replyDue([], r, 0), true);
+	const sent = [{ key: normText(r.text), to: normText(r.to), at: 1000 }];
+	assert.equal(replyDue(sent, { to: "Alan", text: "I can have it Friday!" }, 1_000_000), false, "same words");
+	assert.equal(replyDue(sent, { to: "Katherine", text: "Make it Monday." }, 1000 + 119_000), false, "same person, a rewording");
+	assert.equal(replyDue(sent, { to: "Katherine", text: "Make it Monday." }, 1000 + 121_000), true);
+	assert.equal(replyDue(sent, { to: "Alan", text: "Make it Monday." }, 2000), true);
+	assert.equal(replyDue([], { to: "A", text: "!" }, 0), false, "nothing to say");
+});
+
+// ── the notes file ──
+
+test("the notes file has the shape the canvas reads", () => {
+	const notes = mergeNotes(emptyNotes(), parseScoutReply(JSON.stringify(full)), "2026-10-28T14:12:00.000Z").notes;
+	const file = buildNotesFile({
+		pid: 7,
+		sessionId: "s-1",
+		sessionName: "earl",
+		startedAt: "2026-10-28T14:00:00-05:00",
+		appId: "teams",
+		title: "Weekly Sync",
+		at: "2026-10-28T14:13:00.000Z",
+		ended: false,
+		me: ["eric", "boehs"],
+		notes,
+		reply: { to: "Katherine", text: "Friday.", at: "2026-10-28T14:12:30.000Z" },
+		alerts: Array.from({ length: 22 }, (_, i) => ({ id: `a${i}`, kind: i % 2 ? "action" : "name", who: "Ada", text: "t", at: "T" })),
+	});
+	assert.deepEqual(Object.keys(file), ["v", "pid", "session", "meeting", "at", "ended", "me", "topics", "decisions", "actions", "questions", "reply", "alerts", "alertSeq"]);
+	assert.deepEqual([file.v, file.pid, file.session, file.meeting], [1, 7, { id: "s-1", name: "earl" }, { started_at: "2026-10-28T14:00:00-05:00", app_id: "teams", title: "Weekly Sync" }]);
+	assert.deepEqual(file.actions[0], { who: "Eric", what: "own moving the legacy services onto canary", mine: true, at: "2026-10-28T14:12:00.000Z" });
+	assert.deepEqual(file.decisions, [{ text: "Rotate Thursday", at: "2026-10-28T14:12:00.000Z" }]);
+	assert.equal(file.alerts.length, 20);
+	assert.equal(file.alerts.at(-1).id, "a21");
+	assert.deepEqual(file.reply, { to: "Katherine", text: "Friday.", at: "2026-10-28T14:12:30.000Z" });
+	assert.equal(buildNotesFile({ ...{ pid: 1, sessionId: "", sessionName: "", startedAt: "", appId: "", title: "", at: "", ended: true, me: [], notes: emptyNotes(), alerts: [], alertSeq: 0 }, reply: null }).reply, null);
+});
+
+test("the notes file is written atomically at mode 600, and only its writer removes it", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-notes-"));
+	const saved = process.env.PI_MEETING_NOTES_FILE;
+	process.env.PI_MEETING_NOTES_FILE = path.join(dir, "sub", ".meeting-notes.json");
+	try {
+		const f = (pid, id) => buildNotesFile({ pid, sessionId: id, sessionName: "", startedAt: "S", appId: "teams", title: "T", at: "A", ended: false, me: [], notes: emptyNotes(), reply: null, alerts: [], alertSeq: 0 });
+		writeNotesFile(f(5, "mine"));
+		assert.equal(fs.statSync(notesPath()).mode & 0o777, 0o600);
+		assert.deepEqual(fs.readdirSync(path.join(dir, "sub")), [".meeting-notes.json"], "no temp file left");
+		assert.equal(JSON.parse(fs.readFileSync(notesPath(), "utf8")).session.id, "mine");
+		removeNotesFile({ pid: 5, sessionId: "other" });
+		assert.ok(fs.existsSync(notesPath()), "another session's remove leaves it");
+		removeNotesFile({ pid: 6, sessionId: "mine" });
+		assert.ok(fs.existsSync(notesPath()), "another process's too");
+		removeNotesFile({ pid: 5, sessionId: "mine" });
+		assert.equal(fs.existsSync(notesPath()), false);
+		removeNotesFile({ pid: 5, sessionId: "mine" }); // already gone: fine
+	} finally {
+		saved === undefined ? delete process.env.PI_MEETING_NOTES_FILE : (process.env.PI_MEETING_NOTES_FILE = saved);
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("the notes file defaults to the canvas root", () => {
+	const saved = [process.env.PI_MEETING_NOTES_FILE, process.env.PI_CANVAS_ROOT];
+	delete process.env.PI_MEETING_NOTES_FILE;
+	try {
+		delete process.env.PI_CANVAS_ROOT;
+		assert.equal(notesPath(), path.join(os.homedir(), ".pi", "canvas", ".meeting-notes.json"));
+		process.env.PI_CANVAS_ROOT = "/tmp/canvas-x";
+		assert.equal(notesPath(), "/tmp/canvas-x/.meeting-notes.json");
+	} finally {
+		saved[0] === undefined ? delete process.env.PI_MEETING_NOTES_FILE : (process.env.PI_MEETING_NOTES_FILE = saved[0]);
+		saved[1] === undefined ? delete process.env.PI_CANVAS_ROOT : (process.env.PI_CANVAS_ROOT = saved[1]);
+	}
+});
+
 
 // ── files ──
 
@@ -397,112 +680,66 @@ test("parses subcommands, flags and targets", () => {
 	assert.equal(parseArgs("stop").sub, "stop");
 	assert.deepEqual(parseArgs("focus push for a cutover date"), { sub: "focus", target: "", rest: "push for a cutover date" });
 	assert.deepEqual(parseArgs("watch off"), { sub: "watch", target: "", rest: "off" });
-	const a = parseArgs("replay 20 ~/x.jsonl --model inco/deepseek-v4.1-flash:fast");
-	assert.deepEqual([a.sub, a.replay, a.target, a.model], ["replay", 20, `${os.homedir()}/x.jsonl`, "inco/deepseek-v4.1-flash:fast"]);
+	const a = parseArgs("replay 20 ~/x.jsonl --model prov/model-x:fast");
+	assert.deepEqual([a.sub, a.replay, a.target, a.model], ["replay", 20, `${os.homedir()}/x.jsonl`, "prov/model-x:fast"]);
 	assert.equal(parseArgs("replay").replay, 10, "ten times speed unless told");
 	assert.equal(parseArgs("replay core").target, "core");
 	assert.equal(parseArgs("replay core").replay, 10);
 	assert.equal(parseArgs("start").sub, "start", "start is only a pointer to /meeting watch now");
 	assert.equal(parseArgs("core").sub, "unknown", "a bare word no longer starts anything");
-	assert.equal(parseArgs("list").sub, "list");
-	assert.equal(parseArgs("expand").sub, "list");
+	assert.equal(parseArgs("notes").sub, "notes");
 	assert.equal(parseArgs("recap").sub, "recap");
-});
-
-// ── research ──
-
-test("/q3 and /q 3 name a question, with optional steering", () => {
-	assert.deepEqual(parseDigInput("/q3"), { id: 3, steer: "" });
-	assert.deepEqual(parseDigInput("  /Q12 check the ATO docs \n"), { id: 12, steer: "check the ATO docs" });
-	assert.equal(parseDigInput("/q"), null);
-	assert.equal(parseDigInput("/quit"), null);
-	assert.equal(parseDigInput("what about /q3"), null);
-	assert.deepEqual(parseDigArgs("3"), { id: 3, steer: "" });
-	assert.deepEqual(parseDigArgs("Q3 who owns it"), { id: 3, steer: "who owns it" });
-	assert.equal(parseDigArgs(""), null);
-	assert.equal(parseDigArgs("three"), null);
-});
-
-test("the brief's Answer line is the one-liner", () => {
-	assert.equal(briefAnswer("Answer: Kyle's team owns DR, per the Sept runbook\n- runbook.md\nAsk: ..."), "Kyle's team owns DR, per the Sept runbook");
-	assert.equal(briefAnswer("**Answer:** Not found\n- searched Slack"), "Not found");
-	assert.equal(briefAnswer("\nNo answer line here\nmore"), "No answer line here");
-	assert.equal(briefAnswer(`Answer: ${"x".repeat(300)}`).length, 160);
-	const long = briefAnswer(`Answer: ${"milestone one closes on discovery, ".repeat(8)}`);
-	assert.ok(long.length <= 160 && / (milestone|one|closes|on|discovery)…$/.test(long), `cut mid-word: ${long}`);
-});
-
-test("a research subagent gets the question, why, steer, background and the transcript tail", () => {
-	const lines = Array.from({ length: 400 }, (_, i) => `[11:${String(i % 60).padStart(2, "0")}] Kyle: line ${i} ${"words ".repeat(5)}`);
-	const { system, task } = buildDigPrompt({
-		me: "Eric Boehs",
-		about: "I work on CORE.",
-		title: "EI: Cloud Config",
-		app: "teams",
-		question: Q(3, { q: "How did 97 systems pass ATO with no DR?", why: "0/97 with DR" }),
-		steer: "check eMASS notes",
-		lines,
-		clock: "11:39",
-	});
-	assert.match(system, /Return only the brief/);
-	assert.match(system, /under 3 minutes/);
-	assert.match(system, /Read only/);
-	assert.match(system, /qmd search/);
-	assert.match(system, /^Answer: /m);
-	assert.match(task, /^Meeting: EI: Cloud Config \(teams\) · now 11:39$/m);
-	assert.match(task, /^Research Q3: How did 97 systems pass ATO with no DR\?$/m);
-	assert.match(task, /^Why it came up: 0\/97 with DR$/m);
-	assert.match(task, /^Eric Boehs adds: check eMASS notes$/m);
-	assert.match(task, /<about>\nI work on CORE\.\n<\/about>/);
-	assert.ok(task.includes("line 399"), "keeps the latest lines");
-	assert.ok(!task.includes("line 0 "), "drops the oldest");
-	assert.ok(task.length < 9000, `${task.length} chars`);
+	assert.equal(parseArgs("ask").sub, "ask");
+	assert.equal(parseArgs("list").sub, "unknown", "the question list is gone");
+	assert.equal(parseArgs("expand").sub, "unknown");
 });
 
 // ── recap ──
 
-const meetingQs = [
-	Q(1, { q: "Who picks the candidate systems?", status: "answered", note: "Kyle's team, by Friday", clock: "11:09", closedClock: "11:13" }),
-	Q(2, { q: "Is the explainer due this week?", status: "asked", clock: "11:10", closedClock: "11:10" }),
-	Q(3, { q: "How did 97 systems pass ATO with no DR recorded?", why: "Eric found 0/97 with DR", clock: "11:17" }),
-];
+const meetingNotes = mergeNotes(
+	emptyNotes(),
+	parseScoutReply(
+		JSON.stringify({
+			topics: [{ title: "Cert rotation", summary: "Thursday, owner Amy." }, { title: "Canary", summary: "" }],
+			decisions: ["Rotate Thursday"],
+			actions: [{ who: "Amy", what: "rotate the cert", mine: false }, { who: "Eric", what: "own the canary move", mine: true, by: "Ada" }],
+			questions: [{ q: "Who signs off before Thursday?", why: "no approver named" }],
+		}),
+	),
+	"T",
+).notes;
 
-test("the recap groups every question by outcome", () => {
-	assert.deepEqual(recapBody(meetingQs), [
-		"Still open (never asked):",
-		"- Q3 How did 97 systems pass ATO with no DR recorded? (11:17; Eric found 0/97 with DR)",
+test("the recap lists topics, decisions, action items (yours first, starred) and open questions", () => {
+	assert.deepEqual(recapBody(meetingNotes), [
+		"Topics:",
+		"- Cert rotation: Thursday, owner Amy.",
+		"- Canary",
 		"",
-		"Answered:",
-		"- Q1 Who picks the candidate systems? → Kyle's team, by Friday (11:09–11:13)",
+		"Decisions:",
+		"- Rotate Thursday",
 		"",
-		"Asked:",
-		"- Q2 Is the explainer due this week? (11:10)",
+		"Action items:",
+		"- ★ Eric: own the canary move (from Ada)",
+		"- Amy: rotate the cert",
+		"",
+		"Open questions:",
+		"- Who signs off before Thursday? (no approver named)",
 	]);
-	assert.deepEqual(recapBody([]), ["No questions came up."]);
-});
-
-test("a researched question carries its answer into the recap", () => {
-	const qs = [...meetingQs];
-	qs[2] = { ...qs[2], dig: { state: "done", startedAt: 0, answer: "Inherited from the GovCloud package" } };
-	qs[1] = { ...qs[1], dig: { state: "failed", startedAt: 0, error: "timed out" } };
-	const body = recapBody(qs);
-	assert.deepEqual(body.slice(0, 3), [
-		"Still open (never asked):",
-		"- Q3 How did 97 systems pass ATO with no DR recorded? (11:17; Eric found 0/97 with DR)",
-		"  - Researched: Inherited from the GovCloud package",
-	]);
-	assert.ok(!body.some((l) => l.includes("timed out")), "a failed run leaves no trace");
+	assert.deepEqual(recapBody(emptyNotes()), ["No notes were taken."]);
+	assert.deepEqual(recapBody({ ...emptyNotes(), decisions: [{ text: "x", at: "" }] }), ["Decisions:", "- x"], "empty sections are left out");
+	assert.deepEqual(recapBody(emptyNotes(), { to: "Kat", text: "Friday." }), ["Suggested reply to Kat: Friday."]);
 });
 
 const file = `${os.homedir()}/.local/share/meeting-capture/20261006_110421-teams-ei-cloud-config.jsonl`;
-const block = recapBlock({ title: "EI: Cloud Config", file, from: "11:04", to: "11:20", checks: 14, questions: meetingQs });
+const block = recapBlock({ title: "EI: Cloud Config", file, from: "11:04", to: "11:20", updates: 14, notes: meetingNotes });
 const marker = recapMarker(file);
 
 test("the daily-note block has a heading, a hidden marker and the transcript", () => {
 	const lines = block.split("\n");
-	assert.equal(lines[0], "### 11:04–11:20 EI: Cloud Config · copilot questions");
+	assert.equal(lines[0], "### 11:04–11:20 EI: Cloud Config · copilot notes");
 	assert.equal(lines[1], "<!-- meeting-copilot:20261006_110421-teams-ei-cloud-config -->");
-	assert.equal(lines[2], "Transcript: `~/.local/share/meeting-capture/20261006_110421-teams-ei-cloud-config.txt` · 14 checks");
+	assert.equal(lines[2], "Transcript: `~/.local/share/meeting-capture/20261006_110421-teams-ei-cloud-config.txt` · 14 notes updates");
+	assert.equal(lines[4], "Topics:");
 	assert.equal(dailyNoteName(file), "2026-10-06.md");
 	assert.equal(dailyNoteName("/tmp/x.jsonl", new Date(2026, 0, 2)), "2026-01-02.md");
 });
@@ -532,15 +769,15 @@ test("the recap goes at the end of ## Meetings and leaves the rest alone", () =>
 
 test("writing the recap again replaces it in place", () => {
 	const once = upsertRecap(note, block, marker);
-	const newer = block.replace("14 checks", "15 checks");
+	const newer = block.replace("14 notes updates", "15 notes updates");
 	const twice = upsertRecap(once, newer, marker);
-	assert.equal(twice, once.replace("14 checks", "15 checks"));
+	assert.equal(twice, once.replace("14 notes updates", "15 notes updates"));
 	assert.equal(twice.split(marker).length, 2, "one block");
 	assert.equal(upsertRecap(twice, newer, marker), twice, "idempotent");
 });
 
 test("two meetings stack under the heading; a note without one gets the section", () => {
-	const other = recapBlock({ title: "Fraud sync", file: "/x/20261006_140500-teams-fraud.jsonl", from: "14:05", to: "14:30", checks: 3, questions: [] });
+	const other = recapBlock({ title: "Fraud sync", file: "/x/20261006_140500-teams-fraud.jsonl", from: "14:05", to: "14:30", updates: 3, notes: emptyNotes() });
 	const both = upsertRecap(upsertRecap(note, block, marker), other, recapMarker("/x/20261006_140500-teams-fraud.jsonl"));
 	assert.ok(both.indexOf("EI: Cloud Config · copilot") < both.indexOf("Fraud sync · copilot"));
 	assert.ok(both.indexOf("Fraud sync · copilot") < both.indexOf("## Standup"));
@@ -548,116 +785,52 @@ test("two meetings stack under the heading; a note without one gets the section"
 	assert.equal(upsertRecap("", "### x", "m"), "## Meetings\n\n### x\n");
 });
 
-// ── widget ──
+// ── the status line ──
 
 const view = (overrides = {}) => ({
 	phase: "live",
-	title: "CORE Weekly Sync",
+	title: "Weekly Sync",
 	startedMs: 0,
-	topic: "runner migration",
-	checks: 3,
-	cost: 0,
+	slide: undefined,
+	alerts: 0,
+	questions: 0,
+	hasLines: true,
 	busy: false,
 	error: "",
-	questions: [],
-	shown: [],
-	expanded: false,
-	reply: "",
 	replay: false,
-	endsAt: 0,
 	...overrides,
 });
 
-test("waiting shows one line", () => {
-	assert.deepEqual(widgetLines(view({ phase: "waiting", title: "Weekly Sync" }), plain, 120), ["◌ meeting · Weekly Sync · waiting for captions · /meeting stop"]);
-	assert.deepEqual(widgetLines(view({ phase: "waiting", title: "" }), plain, 120), ["◌ meeting · waiting for captions · /meeting stop"]);
-});
-
-test("live shows the header, the shown questions, what's hidden, and a reply", () => {
+test("one line, zero parts left out", () => {
 	const now = 1_000_000_000;
-	const lines = widgetLines(
-		view({
-			startedMs: now - 16 * 60_000,
-			questions: [Q(1), Q(2, { status: "answered" }), Q(3, { q: "Is the Friday cutover still blocked on CSOC?", why: "Kyle said pending" }), Q(4)],
-			shown: [3],
-			reply: "Yes, PR is up and waiting on review.",
-		}),
-		plain,
-		120,
-		now,
-	);
-	assert.deepEqual(lines, [
-		"● meeting · CORE Weekly Sync · 16m · runner migration · 3 checks · /meeting stop",
-		"  Q3 Is the Friday cutover still blocked on CSOC? — Kyle said pending",
-		"  +2 more open · 1 answered or asked · /meeting list",
-		"  ↳ say: Yes, PR is up and waiting on review.",
-	]);
+	const line = (v) => widgetLines(view({ startedMs: now - 16 * 60_000, ...v }), plain, 120, now);
+	assert.deepEqual(line({ slide: 4, alerts: 2, questions: 1 }), ["● Weekly Sync · 16m · slide 4 · 2 alerts · 1 question"]);
+	assert.deepEqual(line({ alerts: 1 }), ["● Weekly Sync · 16m · 1 alert"]);
+	assert.deepEqual(line({}), ["● Weekly Sync · 16m"]);
+	assert.deepEqual(line({ slide: 0, questions: 2 }), ["● Weekly Sync · 16m · slide 0 · 2 questions"]);
+	assert.deepEqual(line({ hasLines: false, slide: 2 }), ["● Weekly Sync · 16m · waiting for captions"], "no captions yet: that, and no counts");
+	assert.deepEqual(widgetLines(view({ phase: "waiting", hasLines: false }), plain, 120), ["◌ Weekly Sync · waiting for captions"]);
+	assert.deepEqual(widgetLines(view({ phase: "waiting", title: "", hasLines: false }), plain, 120), ["◌ meeting · waiting for captions"]);
 });
 
-test("expanded lists every question, open first", () => {
-	const lines = widgetLines(
-		view({ expanded: true, shown: [3], questions: [Q(1), Q(2, { status: "answered", note: "Friday" }), Q(3), Q(4, { status: "asked" })] }),
-		plain,
-		120,
-	);
-	assert.deepEqual(lines.slice(1), [
-		"  Q1 question 1?",
-		"  Q3 question 3?",
-		"  ✓ Q2 question 2? → Friday",
-		"  ✓ Q4 question 4? (asked)",
-		"  /meeting list to collapse",
-	]);
+test("ended, replay, busy, error and no-model states", () => {
+	const now = 1_000_000_000;
+	const line = (v) => widgetLines(view({ startedMs: now - 16 * 60_000, ...v }), plain, 200, now)[0];
+	assert.equal(line({ phase: "ended", alerts: 2 }), "● Weekly Sync · 16m · call ended · 2 alerts");
+	assert.equal(line({ phase: "ended", replay: true, questions: 1 }), "● Weekly Sync (replay) · 16m · replay done · 1 question");
+	assert.equal(line({ replay: true }), "● Weekly Sync (replay) · 16m");
+	assert.equal(line({ busy: true }), "◐ Weekly Sync · 16m · updating notes…");
+	assert.equal(line({ error: "429 rate limited" }), "✕ Weekly Sync · 16m · error: 429 rate limited");
+	assert.equal(line({ rulesOnly: true, alerts: 1 }), "● Weekly Sync · 16m · 1 alert · name alerts only");
 });
 
-test("expanded stays bounded however long the meeting runs", () => {
-	const questions = Array.from({ length: 40 }, (_, i) => Q(i + 1, { status: i < 25 ? "answered" : "open" }));
-	const lines = widgetLines(view({ expanded: true, questions }), plain, 120);
-	assert.ok(lines.length <= 21, `${lines.length} lines`);
-	assert.ok(lines.includes("  Q40 question 40?"), "every open question fits here");
-	assert.ok(lines.some((l) => /✓ \d+ more answered or asked · \/meeting recap/.test(l)));
-});
-
-test("an ended call counts down to the stop", () => {
-	const now = 1_000_000;
-	const head = (v) => widgetLines(view({ phase: "ended", ...v }), plain, 200, now)[0];
-	assert.match(head({ endsAt: now + 72_000 }), / · call ended · stopping in 1:12 unless it resumes · /);
-	assert.match(head({ endsAt: now - 1 }), / · call ended · /);
-	assert.match(head({ replay: true }), / · replay done · /);
-});
-
-test("research shows a timer while it runs and the answer once it lands", () => {
-	const now = 1_000_000;
-	const lines = widgetLines(
-		view({
-			questions: [
-				Q(1, { dig: { state: "running", startedAt: now - 80_000 } }),
-				Q(2, { dig: { state: "done", startedAt: 0, answer: "Kyle's team, per the runbook" } }),
-				Q(3, { dig: { state: "failed", startedAt: 0, error: "x" } }),
-			],
-			shown: [1, 2, 3],
-		}),
-		plain,
-		120,
-		now,
-	);
-	assert.deepEqual(lines.slice(1), [
-		"  Q1 🔎 1:20 question 1?",
-		"  Q2 🔎✓ question 2?",
-		"    → Kyle's team, per the runbook",
-		"  Q3 🔎✕ question 3?",
-	]);
-	const ended = (v) => widgetLines(view({ phase: "ended", questions: [Q(1, { dig: { state: "running", startedAt: now } })], ...v }), plain, 200, now)[0];
-	assert.match(ended({ endsAt: now - 1 }), / · call ended · finishing research · /);
-	assert.match(ended({ replay: true }), / · replay done · finishing research · /);
-	assert.match(ended({ endsAt: now + 5000 }), /stopping in 0:05/, "the countdown still shows first");
-});
-
-test("every widget line fits the width", () => {
-	const lines = widgetLines(view({ questions: [Q(1, { q: "a long question ".repeat(12), why: "because ".repeat(6) })], shown: [1], busy: true }), plain, 40);
-	assert.ok(lines.length > 2);
-	for (const l of lines) assert.ok(visibleWidth(l) <= 40, `too wide: ${JSON.stringify(l)}`);
+test("the widget line fits the width", () => {
+	const lines = widgetLines(view({ title: "A very long meeting title ".repeat(6), slide: 4, alerts: 12, questions: 2, busy: true }), plain, 40);
+	assert.equal(lines.length, 1);
+	assert.ok(visibleWidth(lines[0]) <= 40, `too wide: ${JSON.stringify(lines[0])}`);
 	assert.match(lines[0], /^◐ /);
 });
+
 
 // ── meeting-capture state and the owner lock ──
 

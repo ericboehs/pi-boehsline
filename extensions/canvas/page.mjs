@@ -175,6 +175,13 @@ dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: h
 .m-line b { font-weight: 600; margin-right: 5px; }
 .m-line.chat { color: var(--dim); }
 .m-wait { color: var(--dim); font-style: italic; }
+.m-alerts { display: flex; flex-direction: column; gap: 4px; padding: 7px 9px; border-radius: 6px; background: color-mix(in srgb, var(--warn) 14%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); }
+.m-alert { line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.m-alert time { color: var(--dim); font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; margin-right: 6px; }
+.m-alert b { font-weight: 600; margin-right: 4px; }
+.m-h { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin-top: 2px; }
+.m-todo { margin: 0; padding-left: 18px; line-height: 1.4; }
+.m-todo li { margin: 1px 0; }
 .m-open { align-self: flex-start; color: var(--accent); text-decoration: none; font-size: 12.5px; }
 .m-open:hover { text-decoration: underline; }
 /* Watching (auto-watch): the /watch watcher's items, on every session's page */
@@ -2547,6 +2554,12 @@ const meetColor = (name) => {
   for (const ch of String(name)) x = (x * 31 + ch.codePointAt(0)) >>> 0;
   return `var(--c${(x % 7) + 1})`;
 };
+const meetingClock = (iso) => {
+  const d = new Date(iso);
+  return Number.isNaN(+d) ? "" : `${meetPad(d.getHours())}:${meetPad(d.getMinutes())}`;
+};
+/** The Meeting card flashes when the copilot raises an alert (a new newest id: the list is capped, so a count would stop); any other rewrite stays quiet. */
+const meetingLastAlert = (sec) => sec?.data?.notes?.lastAlertId ?? "";
 function renderMeeting(m) {
   const elapsed = h("b", { class: "m-elapsed", "data-start": m.recording ? m.startedAt : null }, meetingElapsed(m));
   const status = h(
@@ -2559,6 +2572,14 @@ function renderMeeting(m) {
     m.slides ? h("span", {}, plural(m.slides, "slide")) : null,
   );
   const out = [status, h("div", { class: "m-title" }, m.title || "Meeting", m.app ? h("span", {}, m.app) : null)];
+  // The copilot's alerts (a name said, a new action on you), newest first, then your open actions.
+  const notes = m.notes && typeof m.notes === "object" ? m.notes : null;
+  const alerts = Array.isArray(notes?.alerts) ? notes.alerts.slice(-3).reverse() : [];
+  if (alerts.length) {
+    out.push(h("div", { class: "m-alerts", title: "From the meeting copilot" }, alerts.map((a) => h("div", { class: "m-alert" }, a.at ? h("time", {}, meetingClock(a.at)) : null, h("b", {}, a.kind === "action" ? "✅" : "🔔", a.who ? ` ${a.who}` : ""), a.text))));
+  }
+  const todo = Array.isArray(notes?.actions) ? notes.actions.filter((a) => a.mine) : [];
+  if (todo.length) out.push(h("div", { class: "m-h" }, "Your action items"), h("ul", { class: "m-todo" }, todo.map((a) => h("li", {}, a.what))));
   if (m.slide && m.id) {
     out.push(h("a", { class: "m-slide", href: "/meeting", target: "_blank", title: "Open the live view" }, h("img", { src: `/meeting/${encodeURIComponent(m.id)}/slide/${m.slide.n}${m.slide.thumb ? ".thumb" : ""}.jpg`, alt: `Slide ${m.slide.n}`, loading: "lazy" }), h("span", {}, `slide ${m.slide.n}`)));
   }
@@ -3317,9 +3338,10 @@ async function sessionView(id) {
       if (!c || c.at !== sec.at) {
         const el = sectionCard(id, sec);
         if (c) {
-          if (sec.id === "auto-jobs" || sec.id === "auto-meeting" || (sec.id === "auto-watch" && !watchGrew(c.sec, sec))) {
-            // Rewritten every few seconds while a job runs (the watcher: every read): no flash, and the old
-            // rows stay up until the new ones load, so nothing jumps.
+          if (sec.id === "auto-jobs" || (sec.id === "auto-meeting" && meetingLastAlert(sec) === meetingLastAlert(c.sec)) || (sec.id === "auto-watch" && !watchGrew(c.sec, sec))) {
+            // Rewritten every few seconds while a job runs (the watcher: every read; the meeting: each caption): no
+            // flash, and the old rows stay up until the new ones load, so nothing jumps. The Meeting card does
+            // flash when a new alert arrives.
             const old = c.el.querySelector(":scope > .bd");
             const bd = el.querySelector(":scope > .bd");
             if (old && bd && !bd.childNodes.length) bd.replaceChildren(...old.childNodes);

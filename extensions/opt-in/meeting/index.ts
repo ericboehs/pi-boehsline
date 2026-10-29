@@ -1,17 +1,16 @@
 /**
- * meeting.ts — live meeting copilot.
+ * meeting.ts — live meeting copilot: rolling notes, a few alerts, answers in chat.
  *
  *   /meeting watch [off]    arm this session: it takes over the copilot now, and
  *                           runs every meeting that starts (off disarms)
  *   /meeting replay [speed] [path] [--model provider/id]
  *                           play a finished transcript back, for testing
- *   /meeting ask            check right now
+ *   /meeting ask            run the notes scout right now
+ *   /meeting notes          post the current notes to chat
  *   /meeting focus <text>   what you want out of this meeting (fed to the scout)
- *   /meeting list           every question in the widget (again to collapse)
  *   /meeting recap          post the recap so far and update the daily note
  *   /meeting stop           stop this meeting (it won't restart)
  *   /meeting                status: armed, owner setting, lock holder, live meeting
- *   /q3 [what to look for]  research Q3 with a subagent (/q 3, or /q to pick)
  *
  * Starts by itself. Every 2s each session checks meeting-capture's state.json
  * ($MEETING_CAPTURE_STATE_DIR, default ~/.local/state/meeting-capture; see its
@@ -35,49 +34,52 @@
  * no session or /reload restarts it. A new meeting has a different started_at,
  * and a recorder restart is a new meeting, so there is no wait for a reconnect.
  *
- * Tails the transcript state.json names (finished caption lines only) and,
- * when enough new talk has piled up, asks a small fast work model
- * (work.models) for questions worth asking out loud. No model is polled on a
- * timer: the file is, and code decides when a check is worth a call.
+ * Tails the transcript state.json names (finished caption lines only). ONE model
+ * call, the notes scout (meeting.model, default github-copilot/claude-haiku-5.5;
+ * PI_MEETING_MODEL overrides; called through the in-process model registry),
+ * keeps rolling notes: topics, decisions, action items (Eric's marked), at most
+ * two questions worth asking out loud, and a reply when someone is waiting on
+ * him. It is told who Eric is (meeting-context.md, his name), the meeting
+ * (title, app, /meeting focus, people), a digest of THIS pi session (its name,
+ * the last ~5 user messages, the last assistant message: what he is working on
+ * right now), the OCR text of the slides shown so far, the previous notes and
+ * the transcript. No model is polled on a timer: code decides when to call
+ * (notes.ts shouldCall): about 3 min of new caption talk, or sooner (at most
+ * once a minute) on a new slide or a name alert, never while a call is in
+ * flight, and once at the end before the recap. /meeting ask forces one. Each
+ * call stays under PROMPT_MAX_TOKENS by trimming the oldest transcript first.
+ * With no usable model, name alerts (code rules) still work; no notes appear.
  *
- * Meetings are work text, so only work models run the scout and /q research
- * (watch/models.ts). The `meeting` tool below is NOT limited that way: it hands
- * the transcript and slide images to whatever model the session uses (Eric's
- * choice), so only use it in a session whose model may read work text. Any
- * other model for the scout, from PI_MEETING_MODEL,
- * --model or the session, is refused. With no work model, or while a call
- * fails, code rules carry on: being named and "any questions?" still show in
- * the widget, but no new questions appear. Each scout call stays under
- * PROMPT_MAX_TOKENS by keeping less of the transcript.
- *
- * Triggers: your name said by someone else, or "any questions?", fire after a
- * short pause; otherwise ~6 new lines plus a pause, 45s of unchecked talk, or a
- * flood of lines regardless, and never more than one check per 15s.
+ * Alerts, the only two kinds:
+ *   name     someone other than Eric says his name (code rule, immediate, no
+ *            model; one per speaker per 2 min). It also asks for an early scout
+ *            call so a reply can follow.
+ *   action   the scout reports a new action with mine:true (not in the
+ *            previous notes, by normalized text).
+ * Each is one chat message (a custom "meeting" message, triggerTurn:false:
+ * `🔔 Ada said your name (14:12): "…"`, `✅ Action on you: … (Ada, 14:12)`; a
+ * reply that arrives later is its own `↳ Katherine is waiting on you. You could
+ * say: "…"`, once per reply) and is recorded in the notes file. Nothing else
+ * posts during the meeting; the start and stop messages are one line.
  *
  * Output:
- *   widget above the editor   the 3 open questions most worth asking now (new
- *                             ones show at once; the scout's re-ranking only
- *                             swaps one out after 3 min on screen) and a
- *                             suggested reply when someone is waiting on you
- *   session messages          a short custom message whenever a question is
- *                             added or a reply suggested, sent with
- *                             triggerTurn:false — it lands in the transcript and
- *                             the main model's context without starting a turn,
- *                             so the big model only runs when you ask it to.
- *                             No exceptions: the old --wake flag is gone (the
- *                             scout already writes the reply)
- *   recap                     at the end, every question as still open, answered
- *                             or asked: posted to the session and upserted as a
- *                             ### block at the end of "## Meetings" in the daily
- *                             note for the capture's date (never for a replay)
- *   research                  /q3 runs a separate `pi -p` on the session model
- *                             (read-only tools, 3 min cap, at most 2 at once):
- *                             the brief lands as a session message, the answer
- *                             line in the widget and the recap. It works after
- *                             the meeting too, and then rewrites the recap.
- *
- * Questions only leave the list when the scout sees them answered or asked;
- * the rest stay open and drop out of the compact view, not the list.
+ *   widget above the editor   ONE line: `● Weekly Sync · 16m · slide 4 · 2
+ *                             alerts · 1 question` (zero parts left out)
+ *   notes file for the canvas ~/.pi/canvas/.meeting-notes.json
+ *                             (PI_MEETING_NOTES_FILE; PI_CANVAS_ROOT moves the
+ *                             default): atomic, mode 600, rewritten whenever
+ *                             notes or alerts change. Removed when pi quits
+ *                             mid-meeting or the copilot stops for any
+ *                             reason but the meeting ending; kept over a
+ *                             reload (the new instance reads it back) and at
+ *                             the end (ended:true). The canvas daemon shows it on
+ *                             the Meeting card and /meeting (extensions/canvas)
+ *   /meeting notes            the current notes, as one chat message
+ *   recap                     at the end: Topics, Decisions, Action items
+ *                             (Eric's first, starred), Open questions: posted
+ *                             to the session and upserted as a ### block at the
+ *                             end of "## Meetings" in the daily note for the
+ *                             capture's date (never for a replay)
  *
  * Chat Q&A: the `meeting` tool answers "what did I miss in the last 10 min",
  * "what did Amy say about the cert", "what's this slide about" from the session
@@ -89,41 +91,42 @@
  * While this session runs a live meeting, one line is added to the system
  * prompt per turn ("A meeting is live: Weekly Sync (Microsoft Teams), 16 min
  * in, slide 4 on screen. Use the meeting tool for anything about it."; the
- * minutes round down to 5, "just started" under 5).
+ * minutes round down to 5, "just started" under 5). The tool hands the
+ * transcript and slide images to whatever model the session uses (Eric's
+ * choice), as does the notes scout, which no longer has a work-models-only rule.
  *
  * Scout context: a fixed system prompt (cached) with ~/.pi/agent/meeting-context.md
  * (who you are), the tail of the previous transcript of the same meeting, and
- * `qmd search` hits for the meeting title; then the transcript so far.
+ * `qmd search` hits for the meeting title; then the per-call user prompt.
  *
  * Teams writes a caption only when it scrolls out of its ~3-line window, so the
  * transcript trails the room by a couple of utterances.
  *
- * Settings: Boehsline config blocks "meeting" and "work" (watch/settings.ts), e.g.
- *      "meeting": { "qmdCollections": ["notes", "team-docs"], "dailyDir": "~/Notes/daily", "codeDir": "~/src", "owner": "earl" }
- *      "work":    { "providers": [...], "models": [...], "researchModel": "...", "ghHost": "github.acme.com" }
+ * Settings: Boehsline config block "meeting" (watch/settings.ts), e.g.
+ *      "meeting": { "model": "github-copilot/claude-haiku-5.5", "qmdCollections": ["notes", "team-docs"], "dailyDir": "~/Notes/daily", "owner": "earl" }
  *
  * Env (overrides settings):
- *      PI_MEETING_MODEL=provider/<id>[,…] (work providers only)  PI_MEETING_REASONING=off|low|…
- *      PI_MEETING_RESEARCH_MODEL=provider/<id> (else the session model, if it's a work model)
+ *      PI_MEETING_MODEL=provider/<id>[,…]  PI_MEETING_REASONING=off|low|…
  *      PI_MEETING_ME="First Last"  PI_MEETING_ABOUT=<file>
  *      PI_MEETING_OWNER=<session name>  PI_MEETING_WATCH=1 (arm)  PI_MEETING_LOCK=<file>
+ *      PI_MEETING_NOTES_FILE=<file>  PI_CANVAS_ROOT (where the notes file defaults to)
  *      MEETING_CAPTURE_STATE_DIR  PI_MEETING_DIR (where /meeting replay looks for a transcript)
  *      PI_MEETING_QMD_COLLECTIONS=notes,team-docs ("" disables)
- *      PI_MEETING_DAILY_DIR=~/Notes/daily ("" disables the daily-note recap)  PI_MEETING_CODE_DIR=~/src
+ *      PI_MEETING_DAILY_DIR=~/Notes/daily ("" disables the daily-note recap)
  */
 
-import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Api, AssistantMessage, Model, ThinkingLevel } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { formatDimensionNote, resizeImage } from "@earendil-works/pi-coding-agent";
-import { type AutocompleteItem, Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type AutocompleteItem, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
-import { applyWorkSettings, estTokens, isWorkModel, modelSpecs, PROMPT_MAX_TOKENS, WORK_LABEL, WORK_MODELS, WORK_RESEARCH_MODEL, workOnly } from "../watch/models.ts";
-import { MEETING_DEFAULTS, type MeetingSettings, meetingSettings, WORK_DEFAULTS, type WorkSettings, workSettings } from "../watch/settings.ts";
+import { applyWorkSettings, modelSpecs } from "../watch/models.ts";
+import { compileRedactions, MEETING_DEFAULTS, type MeetingSettings, meetingSettings, type WorkSettings, workSettings } from "../watch/settings.ts";
 import { optIn } from "../../../lib/opt-in.ts";
 import {
 	type CaptureState,
@@ -147,7 +150,6 @@ import {
 	ocrPath,
 	parseIndex,
 	parseLive,
-	parseRecord,
 	parseRecords,
 	pidAlive,
 	promptLine,
@@ -167,8 +169,48 @@ import {
 	type Via,
 	writeLock,
 } from "./capture.ts";
+import {
+	type Alert,
+	actionAlertText,
+	buildNotesFile,
+	buildSystemPrompt,
+	CADENCE,
+	type Cadence,
+	emptyNotes,
+	fitNotesPrompt,
+	freshCadence,
+	hasNotes,
+	mergeNotes,
+	nameAlertText,
+	normText,
+	type Notes,
+	parseScoutReply,
+	pushAlert,
+	type Reply,
+	recapBlock,
+	recapBody,
+	recapMarker,
+	removeNotesFile,
+	replyDue,
+	replyText,
+	restoreNotes,
+	retryWait,
+	sameAction,
+	scaleCadence,
+	type ScoutUpdate,
+	type SentReply,
+	type SessionDigest,
+	sessionDigest,
+	shouldCall,
+	type SlideText,
+	takeNameAlert,
+	widgetLines,
+	type WidgetView,
+	writeNotesFile,
+} from "./notes.ts";
 
 export * from "./capture.ts";
+export * from "./notes.ts";
 
 // ── config ───────────────────────────────────────────────────────────────────
 
@@ -180,55 +222,41 @@ let QMD_COLLECTIONS: string[] = MEETING_DEFAULTS.qmdCollections;
 const ABOUT_FILE = process.env.PI_MEETING_ABOUT || path.join(os.homedir(), ".pi/agent/meeting-context.md");
 
 let DAILY_DIR = MEETING_DEFAULTS.dailyDir;
-let GH_HOST = WORK_DEFAULTS.ghHost;
-let CODE_DIR = MEETING_DEFAULTS.codeDir;
 let OWNER = MEETING_DEFAULTS.owner;
+let MODEL = MEETING_DEFAULTS.model;
+/** work.redact, compiled: applied to what the notes scout is told about this session. */
+let REDACTIONS: { re: RegExp; replace: string }[] = [];
+const redactText = (s: string) => REDACTIONS.reduce((t, r) => t.replace(r.re, r.replace), s);
 
 /** Refresh settings (and models.ts) from env + Boehsline config. */
 export function applyMeetingSettings(m: MeetingSettings = meetingSettings(), work: WorkSettings = workSettings()): void {
 	QMD_COLLECTIONS = m.qmdCollections;
 	DAILY_DIR = m.dailyDir;
-	GH_HOST = work.ghHost;
-	CODE_DIR = m.codeDir;
 	OWNER = m.owner;
+	MODEL = m.model;
+	REDACTIONS = compileRedactions(work.redact ?? []);
 	applyWorkSettings(work);
 }
-/** Research subagents: the session model unless overridden, read-only tools, a hard time cap. */
-const DIG_MODEL = process.env.PI_MEETING_RESEARCH_MODEL || "";
-const DIG_THINKING = process.env.PI_MEETING_RESEARCH_THINKING || "medium";
-const DIG_TOOLS = "read,bash,web_search,web_fetch";
-export const DIG_TIMEOUT_MS = 3 * 60_000;
-const MAX_DIGS = 2;
-const DIG_TRANSCRIPT_CHARS = 8000;
 
-export const TRIGGER = { batch: 6, quietMs: 2500, maxWaitMs: 45_000, minGapMs: 15_000, flood: 14 };
-/** Questions in the compact widget, and the least time one stays there unless answered. */
-export const SHOWN = 3;
-export const HOLD_MS = 3 * 60_000;
-const MAX_ADD = 1;
-const MAX_ADD_FIRST = 2;
-const EXPANDED_ROWS = 18;
 const POLL_MS = 1000;
 const STATE_POLL_MS = 2000;
 const IMAGE_MAX_BYTES = 4 * 1024 * 1024;
 const OCR_MAX_CHARS = 8000;
 const RENDER_MS = 10_000;
-const MAX_TRANSCRIPT_CHARS = 100_000;
 const PREV_TRANSCRIPT_CHARS = 16_000;
 const CALL_TIMEOUT_MS = 60_000;
 const BACKGROUND_WAIT_MS = 10_000;
-const REPLY_TTL_MS = 3 * 60_000;
-const NOTIFY_GAP_MS = 30_000;
+const SLIDES_READ = 20; // newest slides whose OCR a call reads
 const MSG_TYPE = "meeting";
 const WIDGET_KEY = "meeting";
-const INVITE_RE = /\bany (?:other |more |last )?questions\b|\bquestions\s*\?|\bthoughts\s*\?|\banyone (?:else )?(?:have|got) anything\b/i;
 
 // ── transcript parsing ───────────────────────────────────────────────────────
 
 export type MeetingEvent =
 	| { kind: "meta"; title?: string; app?: string; startedAt?: string; stopped: boolean }
 	| { kind: "line"; ts: string; speaker: string; text: string; chat: boolean }
-	| { kind: "people"; people: string[] };
+	| { kind: "people"; people: string[] }
+	| { kind: "slide"; ts: string; n: number; revisit: boolean }; // a new slide, or back to an earlier one
 
 /** One meeting-capture jsonl record, normalized; null for anything unusable. */
 export function parseEvent(raw: string): MeetingEvent | null {
@@ -259,6 +287,9 @@ export function parseEvent(raw: string): MeetingEvent | null {
 			return Array.isArray(ev.people)
 				? { kind: "people", people: ev.people.filter((p): p is string => typeof p === "string") }
 				: null;
+		case "slide":
+		case "revisit":
+			return typeof ev.slide === "number" && Number.isFinite(ev.slide) ? { kind: "slide", ts: str(ev.ts), n: ev.slide, revisit: ev.type === "revisit" } : null;
 		default:
 			return null;
 	}
@@ -288,274 +319,17 @@ export function mentionsMe(text: string, me: string[]): boolean {
 	return me.some((t) => new RegExp(`(^|[^\\p{L}])${escapeRe(t)}($|[^\\p{L}])`, "iu").test(text));
 }
 
-export const isInvite = (text: string) => INVITE_RE.test(text);
-
-// ── triggers ─────────────────────────────────────────────────────────────────
-
-export type Cue = "mention" | "invite" | null;
-export type TriggerState = {
-	unsent: number; // lines since the last check
-	firstUnsentAt: number; // arrival of the oldest unchecked line (ms)
-	lastLineAt: number; // arrival of the newest line (ms)
-	lastCallAt: number; // start of the last check (ms)
-	cue: Cue;
-};
-
-export const freshTrigger = (): TriggerState => ({ unsent: 0, firstUnsentAt: 0, lastLineAt: 0, lastCallAt: 0, cue: null });
-
 /**
- * Whether to spend a model call now. Pure, so the cadence is testable.
- * `final` (meeting over) drops the batch threshold: whatever is left gets one look.
+ * Whether a line is aimed at you: it says one of your name tokens, and that token
+ * isn't also another participant's. With an "Eric Smith" in the meeting, "Eric,"
+ * is ambiguous and stays quiet; "Eric Boehs" or "Boehs" still counts.
  */
-export function shouldFire(t: TriggerState, now: number, final = false, cfg = TRIGGER): "cue" | "batch" | null {
-	if (t.unsent === 0) return null;
-	const quiet = now - t.lastLineAt;
-	// A cue is a fast path, not a gate: if talk runs on, the normal rules still apply.
-	if (t.cue && quiet >= cfg.quietMs / 2) return "cue";
-	if (now - t.lastCallAt < cfg.minGapMs) return null;
-	if (t.unsent >= cfg.flood) return "batch";
-	if (quiet < cfg.quietMs) return null;
-	if (final || t.unsent >= cfg.batch || now - t.firstUnsentAt >= cfg.maxWaitMs) return "batch";
-	return null;
-}
-
-// ── scout replies ────────────────────────────────────────────────────────────
-
-export type Closure = { id: number; by: "asked" | "answered"; note: string };
-export type ScoutUpdate = { topic: string; add: { q: string; why: string }[]; closed: Closure[]; top: number[]; reply: string };
-export type Question = {
-	id: number;
-	q: string;
-	why: string;
-	at: number; // when it was added (ms), for the widget hold
-	clock: string; // meeting time it was added, "HH:MM"
-	status: "open" | "asked" | "answered";
-	closedClock?: string;
-	note?: string; // the answer, when one was given
-	dig?: Dig; // a research subagent's run on this question
-};
-
-export type Dig = {
-	state: "running" | "done" | "failed";
-	startedAt: number;
-	answer?: string; // one line, for the widget and the recap
-	brief?: string;
-	error?: string;
-};
-
-const toId = (v: unknown) => (typeof v === "number" ? v : Number.parseInt(String(v ?? "").replace(/^\s*Q/i, ""), 10));
-
-/** The scout's JSON, tolerant of code fences, prose around it, and loose types. */
-export function parseScoutReply(text: string): ScoutUpdate | null {
-	const start = text.indexOf("{");
-	const end = text.lastIndexOf("}");
-	if (start < 0 || end <= start) return null;
-	let obj: Record<string, unknown>;
-	try {
-		obj = JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
-	} catch {
-		return null;
-	}
-	if (!obj || typeof obj !== "object") return null;
-	const s = (v: unknown, n: number) => (typeof v === "string" ? v.replace(/\s+/g, " ").trim().slice(0, n) : "");
-	const add = (Array.isArray(obj.add) ? obj.add : [])
-		.map((a: unknown) => {
-			if (typeof a === "string") return { q: s(a, 300), why: "" };
-			const r = (a ?? {}) as Record<string, unknown>;
-			return { q: s(r.q ?? r.question, 300), why: s(r.why, 200) };
-		})
-		.filter((a) => a.q);
-	const closed = (Array.isArray(obj.closed) ? obj.closed : [])
-		.map((c: unknown): Closure => {
-			if (typeof c !== "object" || c === null) return { id: toId(c), by: "answered", note: "" };
-			const r = c as Record<string, unknown>;
-			return { id: toId(r.id), by: /ask/i.test(String(r.by ?? "")) ? "asked" : "answered", note: s(r.note ?? r.answer, 160) };
-		})
-		.filter((c) => Number.isFinite(c.id));
-	const top = (Array.isArray(obj.top) ? obj.top : []).map(toId).filter((n) => Number.isFinite(n));
-	return { topic: s(obj.topic, 80), add, closed, top, reply: s(obj.reply, 500) };
-}
-
-const normQ = (s: string) =>
-	s
-		.toLowerCase()
-		.replace(/[^a-z0-9 ]/g, "")
-		.replace(/\s+/g, " ")
-		.trim();
-
-/**
- * Close what was answered or asked, then add (deduped against every question so
- * far, at most `maxAdd`). Nothing else ever leaves the list.
- */
-export function applyUpdate(questions: Question[], u: ScoutUpdate, nextId: number, now: number, clock = "", maxAdd = MAX_ADD) {
-	const byId = new Map(u.closed.map((c) => [c.id, c]));
-	const closed: Question[] = [];
-	const next = questions.map((q) => {
-		const c = q.status === "open" ? byId.get(q.id) : undefined;
-		if (!c) return q;
-		const done: Question = { ...q, status: c.by, closedClock: clock, note: c.note };
-		closed.push(done);
-		return done;
-	});
-	const seen = new Set(next.map((q) => normQ(q.q)));
-	const added: Question[] = [];
-	for (const a of u.add.slice(0, maxAdd)) {
-		const k = normQ(a.q);
-		if (!k || seen.has(k)) continue;
-		seen.add(k);
-		added.push({ id: nextId++, q: a.q, why: a.why, at: now, clock, status: "open" });
-	}
-	return { questions: [...next, ...added], added, closed, nextId };
-}
-
-export type Shown = { id: number; since: number };
-
-/**
- * Which open questions the compact widget shows. `prefer` is best-first (new
- * questions, then the scout's ranking); the newest fill in after that. A new
- * question (`fresh`) shows at once; otherwise a shown question gives up its
- * slot only once it has had `holdMs` on screen. Either way it stays on the list.
- */
-export function pickShown(
-	shown: Shown[],
-	questions: Question[],
-	prefer: number[],
-	now: number,
-	fresh: number[] = [],
-	n = SHOWN,
-	holdMs = HOLD_MS,
-): Shown[] {
-	const open = new Set(questions.filter((q) => q.status === "open").map((q) => q.id));
-	const newest = [...open].sort((a, b) => b - a);
-	const rank = [...new Set([...prefer, ...newest])].filter((id) => open.has(id));
-	const want = rank.slice(0, n);
-	const out = shown.filter((s) => open.has(s.id));
-	const held = (s: Shown) => now - s.since >= holdMs;
-	for (const id of want) {
-		if (out.some((s) => s.id === id)) continue;
-		if (out.length < n) {
-			out.push({ id, since: now });
-			continue;
-		}
-		// Worst-ranked first, and anything past its hold before anything that isn't.
-		const victim = out
-			.filter((s) => !want.includes(s.id) && (fresh.includes(id) || held(s)))
-			.sort((a, b) => Number(held(b)) - Number(held(a)) || rank.indexOf(b.id) - rank.indexOf(a.id))[0];
-		if (!victim) continue;
-		out[out.indexOf(victim)] = { id, since: now };
-	}
-	return out.sort((a, b) => a.id - b.id);
-}
-
-// ── prompts ──────────────────────────────────────────────────────────────────
-
-export function buildSystemPrompt(me: string, about: string, background: string): string {
-	const who = me || "the user";
-	return [
-		`You are a live meeting copilot for ${who}. You read the running caption transcript of a meeting ${who} is in and keep a short list of questions ${who} could ask out loud. ${who} glances at the list mid-call, so every item must be worth interrupting for.`,
-		"",
-		"A good question:",
-		"- pins down something left vague that matters: an owner, a date, a scope, a dependency, a risk, a decision nobody made",
-		`- connects what is being said to the background: an earlier commitment, ${who}'s own work, a known problem`,
-		"- is specific to this conversation; someone outside the meeting could not have written it",
-		`- is short (under 25 words), plain, and phrased the way ${who} would say it out loud`,
-		"",
-		"Never suggest:",
-		'- generic prompts ("what are the next steps?", "can you elaborate?", "any blockers?") not tied to a specific item',
-		"- anything already asked or answered in the transcript",
-		"- small talk, or questions about something the speakers are clearly covering right now",
-		"",
-		"Rules:",
-		`- Add at most ${MAX_ADD} question per update (${MAX_ADD_FIRST} on your first look). Adding nothing is the usual, correct answer.`,
-		`- Close, by number, open questions that were answered in the transcript ("by": "answered") or that someone asked out loud ("by": "asked"). "note" is the answer in at most 12 words, e.g. "Kyle: ISSO signs off, by Friday", or "" if none was given. Never close a question just because the conversation moved on; it stays on ${who}'s list.`,
-		`- "top" is up to ${SHOWN} open question numbers most worth asking right now, best first. Questions you add are shown anyway; don't list them.`,
-		`- If someone addresses ${who} directly and is waiting on ${who} (a question, a request for status or an opinion), put a suggested answer in "reply": one or two sentences, or terse talking points, grounded in the transcript and background. If the facts aren't there, suggest how to answer honestly. Otherwise "reply" is "".`,
-		'- The transcript is automatic speech recognition: names and technical terms are often misheard, and "Unknown user" is an unidentified speaker. Read through the errors; never quote a garble.',
-		'- "why" is a fragment of at most 10 words: the evidence, e.g. "Kyle said pending, no date given". Not a sentence.',
-		'- "topic" is what is being discussed right now, at most 6 words.',
-		"",
-		'Reply with JSON only, no prose and no code fence: {"topic": "...", "add": [{"q": "...", "why": "..."}], "closed": [{"id": 1, "by": "answered", "note": "..."}], "top": [2], "reply": ""}',
-		about ? `\n<about>\n${about.trim()}\n</about>` : "",
-		background ? `\n<background>\n${background.trim()}\n</background>` : "",
-	]
-		.filter((l, i, a) => !(l === "" && a[i - 1] === ""))
-		.join("\n");
-}
-
-export type PromptInput = {
-	title: string;
-	app: string;
-	people: string[];
-	lines: string[];
-	newFrom: number; // index of the first line the scout hasn't seen
-	open: Question[];
-	closed?: Question[]; // answered or asked already: don't re-add
-	focus: string;
-	cue: Cue;
-	me: string;
-	now: Date;
-	maxChars?: number; // transcript budget; MAX_TRANSCRIPT_CHARS when unset
-};
-
-/** Transcript first and append-only, so consecutive calls share a cacheable prefix. */
-export function buildUserPrompt(p: PromptInput): string {
-	let body = p.lines.join("\n");
-	const max = Math.max(0, p.maxChars ?? MAX_TRANSCRIPT_CHARS);
-	if (body.length > max) {
-		const cut = body.indexOf("\n", body.length - max);
-		body = `[… earlier lines omitted …]${cut < 0 ? "" : `\n${body.slice(cut + 1)}`}`;
-	}
-	const who = p.me || "the user";
-	const out = [
-		`Meeting: ${p.title}${p.app ? ` (${p.app})` : ""}`,
-		p.people.length ? `People: ${p.people.join("; ")}` : "",
-		"",
-		"<transcript>",
-		body || "(nothing yet)",
-		"</transcript>",
-		"",
-		`Now: ${p.now.toTimeString().slice(0, 8)}`,
-		p.newFrom <= 0 ? "This is your first look." : `New since your last update: the lines from ${(p.lines[p.newFrom] ?? "").slice(0, 60)} on.`,
-		"Open questions:",
-		...(p.open.length ? p.open.map((q) => `Q${q.id}: ${q.q}${q.why ? ` (${q.why})` : ""}`) : ["(none)"]),
-		...(p.closed?.length ? ["Already answered or asked (don't add again):", ...p.closed.map((q) => `Q${q.id}: ${q.q}`)] : []),
-	];
-	if (p.focus) out.push("", `${who}'s goals for this meeting: ${p.focus}`);
-	if (p.cue === "mention") out.push("", `${who} was just named in the new lines. Check whether someone is waiting on ${who}.`);
-	if (p.cue === "invite") out.push("", "Someone just invited questions. If one question is clearly the best, make sure it is open.");
-	return out.filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n");
-}
-
-/**
- * The user prompt, keeping less of the transcript's start until system + user
- * fit under the cap. The newest lines are what the scout needs most.
- */
-export function fitUserPrompt(system: string, p: PromptInput, cap = PROMPT_MAX_TOKENS): string {
-	let maxChars = Math.min(p.maxChars ?? MAX_TRANSCRIPT_CHARS, MAX_TRANSCRIPT_CHARS);
-	let user = buildUserPrompt({ ...p, maxChars });
-	for (let i = 0; i < 8 && maxChars > 0; i++) {
-		const over = estTokens(system) + estTokens(user) - cap;
-		if (over <= 0) break;
-		maxChars = Math.max(0, maxChars - over * 3 - 500);
-		user = buildUserPrompt({ ...p, maxChars });
-	}
-	return user;
-}
-
-/** What code says when a cue lands and no scout can: who named you, or who asked for questions. */
-export function ruleAlert(cue: Cue, line: { speaker: string; text: string } | undefined): string {
-	if (!cue) return "";
-	const who = line?.speaker || "Someone";
-	const text = (line?.text ?? "").replace(/\s+/g, " ").trim();
-	const said = text ? `: "${text.length > 140 ? `${text.slice(0, 139)}…` : text}"` : "";
-	return cue === "mention" ? `${who} named you${said}` : `${who} asked for questions${said}`;
-}
-
-/** /q research runs only on a work model: PI_MEETING_RESEARCH_MODEL, else the session model, else WORK_RESEARCH_MODEL. */
-export function researchModel(configured: string, session: string): { model: string; refused: string } {
-	if (configured) return isWorkModel(configured) ? { model: configured, refused: "" } : { model: WORK_RESEARCH_MODEL, refused: configured };
-	if (session && isWorkModel(session)) return { model: session, refused: "" };
-	return { model: WORK_RESEARCH_MODEL, refused: session };
+export function addressesMe(text: string, me: string[], people: readonly string[] = []): boolean {
+	const others = people.filter((p) => !isMe(p, me)).map(nameTokens);
+	return mentionsMe(
+		text,
+		me.filter((t) => !others.some((o) => o.includes(t))),
+	);
 }
 
 // ── files ────────────────────────────────────────────────────────────────────
@@ -605,46 +379,6 @@ export function toStamp(ms: number): string {
 	return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-// ── recap ────────────────────────────────────────────────────────────────────
-
-const clockSpan = (q: Question) => (q.closedClock && q.closedClock !== q.clock ? `${q.clock}–${q.closedClock}` : q.clock);
-const paren = (bits: (string | undefined)[]) => {
-	const s = bits.filter(Boolean).join("; ");
-	return s ? ` (${s})` : "";
-};
-
-/** Every question by outcome: plain markdown that reads the same in a terminal and in Obsidian. */
-export function recapBody(questions: Question[]): string[] {
-	if (questions.length === 0) return ["No questions came up."];
-	const researched = (q: Question) => (q.dig?.state === "done" && q.dig.answer ? [`  - Researched: ${q.dig.answer}`] : []);
-	const group = (label: string, qs: Question[], line: (q: Question) => string) =>
-		qs.length ? [label, ...qs.flatMap((q) => [line(q), ...researched(q)]), ""] : [];
-	const closedLine = (q: Question) => `- Q${q.id} ${q.q}${q.note ? ` → ${q.note}` : ""}${paren([clockSpan(q)])}`;
-	const out = [
-		...group("Still open (never asked):", questions.filter((q) => q.status === "open"), (q) => `- Q${q.id} ${q.q}${paren([q.clock, q.why])}`),
-		...group("Answered:", questions.filter((q) => q.status === "answered"), closedLine),
-		...group("Asked:", questions.filter((q) => q.status === "asked"), closedLine),
-	];
-	while (out.at(-1) === "") out.pop();
-	return out;
-}
-
-/** Hidden marker that ties a daily-note block to its capture, so a rewrite replaces it. */
-export const recapMarker = (file: string) => `<!-- meeting-copilot:${path.basename(file).replace(/\.(jsonl|txt)$/, "")} -->`;
-
-export type RecapInput = { title: string; file: string; from: string; to: string; checks: number; questions: Question[] };
-
-export function recapBlock(r: RecapInput): string {
-	const span = [r.from, r.to].filter(Boolean).join("–");
-	return [
-		`### ${span ? `${span} ` : ""}${r.title} · copilot questions`,
-		recapMarker(r.file),
-		`Transcript: \`${r.file.replace(/\.jsonl$/, ".txt").replace(os.homedir(), "~")}\` · ${r.checks} check${r.checks === 1 ? "" : "s"}`,
-		"",
-		...recapBody(r.questions),
-	].join("\n");
-}
-
 /**
  * Put `block` in `note`: over the block carrying `marker` if there is one, else
  * at the end of the `heading` section, else in a new section at the end. The
@@ -680,75 +414,10 @@ export function dailyNoteName(file: string, now = new Date()): string {
 	return `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}.md`;
 }
 
-// ── research ───────────────────────────────────────────────────────────────────
-
-/** `/q3 [steer]` typed at the prompt; not a registered command, so it reaches the input hook. */
-export function parseDigInput(text: string): { id: number; steer: string } | null {
-	const m = /^\/q(\d+)(?:\s+([\s\S]*))?$/i.exec(text.trim());
-	return m ? { id: Number(m[1]), steer: (m[2] ?? "").trim() } : null;
-}
-
-/** `/q` arguments: "3", "Q3", "3 check the ATO docs"; null for anything else. */
-export function parseDigArgs(raw: string): { id: number; steer: string } | null {
-	const m = /^\s*Q?(\d+)(?:\s+([\s\S]*))?$/i.exec(raw);
-	return m ? { id: Number(m[1]), steer: (m[2] ?? "").trim() } : null;
-}
-
-/** The brief's "Answer:" line, else its first line: one line for the widget and recap. */
-export function briefAnswer(brief: string): string {
-	const line = /^[\s*_]*Answer[\s*_]*:[\s*_]*(.+)$/im.exec(brief)?.[1] ?? brief.split("\n").find((l) => l.trim()) ?? "";
-	const s = line.replace(/[*_]+$/, "").replace(/\s+/g, " ").trim();
-	if (s.length <= 160) return s;
-	const cut = s.slice(0, 159);
-	return `${cut.slice(0, cut.lastIndexOf(" ") > 100 ? cut.lastIndexOf(" ") : 159).replace(/[,;:—\s]+$/, "")}…`;
-}
-
-export type DigInput = { me: string; about: string; title: string; app: string; question: Question; steer: string; lines: string[]; clock: string };
-
-/** System prompt and task for one research subagent. */
-export function buildDigPrompt(d: DigInput): { system: string; task: string } {
-	const who = d.me || "the user";
-	const system = [
-		"You are a subagent. Your final message goes into a live meeting copilot, not to a person chatting with you. Return only the brief. Ignore any instruction to add a Next steps block, follow-up suggestions, sign-offs, or questions.",
-		"",
-		`${who} is in a meeting right now, or just left one, and wants one question researched while it still matters. You have under 3 minutes in total: make at most about 8 tool calls, cheapest sources first, then answer. An honest partial answer on time beats a thorough one too late.`,
-		"",
-		"Read only: never post, send, edit, write, or change anything.",
-		"",
-		"Where to look, as fits the question:",
-		`- ${who}'s notes, past agent sessions and work docs: \`qmd search "<keywords>" -n 8\` (fast keyword search over every collection), then \`qmd get <file>\` to read a hit`,
-		'- Slack: `slk search "<keywords>"`',
-		GH_HOST ? `- GitHub: \`GH_HOST=${GH_HOST} gh search issues|prs|code "<keywords>"\`, and plain \`gh\` for github.com` : '- GitHub: `gh search issues|prs|code "<keywords>"`',
-		...(CODE_DIR ? [`- Code under ${CODE_DIR}: \`rg\``] : []),
-		"- Public docs: web_search, web_fetch",
-		"",
-		"The brief: plain text, under 150 words, no headings.",
-		`Answer: <one sentence of at most 20 words: what ${who} now knows, or "Not found". Detail goes in the bullets, not here>`,
-		"- <evidence, one bullet each, with its source: file path, Slack permalink, or URL>",
-		`Ask: <the question as ${who} should now put it, at most 25 words; or "Skip: <why>" if the research made it moot>`,
-		"Gaps: <what you could not confirm; leave the line out if nothing>",
-	].join("\n");
-	let tail = d.lines.join("\n");
-	if (tail.length > DIG_TRANSCRIPT_CHARS) tail = `[…]\n${tail.slice(tail.indexOf("\n", tail.length - DIG_TRANSCRIPT_CHARS) + 1)}`;
-	const q = d.question;
-	const task = [
-		`Meeting: ${d.title}${d.app ? ` (${d.app})` : ""}${d.clock ? ` · now ${d.clock}` : ""}`,
-		`Research Q${q.id}: ${q.q}`,
-		q.why ? `Why it came up: ${q.why}` : "",
-		q.note ? `Already said in the meeting: ${q.note}` : "",
-		d.steer ? `${who} adds: ${d.steer}` : "",
-		d.about ? `\n<about>\n${d.about.trim()}\n</about>` : "",
-		`\n<transcript, the latest part>\n${tail || "(empty)"}\n</transcript>`,
-	]
-		.filter(Boolean)
-		.join("\n");
-	return { system, task };
-}
-
 // ── args ─────────────────────────────────────────────────────────────────────
 
 export type Args = {
-	sub: "status" | "watch" | "replay" | "start" | "stop" | "ask" | "focus" | "list" | "recap" | "unknown";
+	sub: "status" | "watch" | "replay" | "start" | "stop" | "ask" | "focus" | "notes" | "recap" | "unknown";
 	target: string; // replay: the transcript path, "" for the newest
 	rest: string;
 	replay?: number; // replay speed
@@ -758,9 +427,8 @@ export type Args = {
 export function parseArgs(raw: string): Args {
 	const trimmed = raw.trim();
 	const first = trimmed.split(/\s+/)[0] ?? "";
-	const known = ["watch", "replay", "start", "stop", "ask", "focus", "status", "list", "recap"] as const;
-	const word = first === "expand" ? "list" : first;
-	const sub = (known as readonly string[]).includes(word) ? (word as Args["sub"]) : trimmed ? "unknown" : "status";
+	const known = ["watch", "replay", "start", "stop", "ask", "focus", "status", "notes", "recap"] as const;
+	const sub = (known as readonly string[]).includes(first) ? (first as Args["sub"]) : trimmed ? "unknown" : "status";
 	const rest = trimmed.slice(first.length).trim();
 	const out: Args = { sub, target: "", rest };
 	if (sub !== "replay") return out;
@@ -778,115 +446,11 @@ export function parseArgs(raw: string): Args {
 	return out;
 }
 
-// ── widget ───────────────────────────────────────────────────────────────────
-
-export type WidgetView = {
-	phase: "waiting" | "live" | "ended";
-	title: string;
-	startedMs: number;
-	topic: string;
-	checks: number;
-	cost: number;
-	busy: boolean;
-	error: string;
-	questions: Question[];
-	shown: number[]; // ids for the compact view
-	expanded: boolean;
-	reply: string;
-	replay: boolean;
-	endsAt: number; // when an ended call stops, if it is counting down (ms); 0 for none
-	alert?: string; // a cue said by code rules, when no scout could
-	rulesOnly?: boolean; // no work model: cues only, no questions
-};
-
-export function humanElapsed(ms: number): string {
-	const m = Math.max(0, Math.floor(ms / 60_000));
-	return m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m` : `${m}m`;
-}
-
-const mmss = (ms: number) => {
-	const s = Math.max(0, Math.ceil(ms / 1000));
-	return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-};
-const mmssSince = (t: number) => mmss(Date.now() - t);
-
-export function widgetLines(v: WidgetView, theme: Pick<Theme, "fg">, width: number, now = Date.now()): string[] {
-	const dim = (s: string) => theme.fg("dim", s);
-	const fit = (s: string) => truncateToWidth(s, width);
-	if (v.phase === "waiting") {
-		return [fit(`${dim("◌")} ${dim(["meeting", v.title, "waiting for captions", "/meeting stop"].filter(Boolean).join(" · "))}`)];
-	}
-	const digging = v.questions.some((q) => q.dig?.state === "running");
-	const ended = v.replay
-		? digging
-			? "replay done · finishing research"
-			: "replay done"
-		: v.endsAt > now
-			? `call ended · stopping in ${mmss(v.endsAt - now)} unless it resumes`
-			: digging
-				? "call ended · finishing research"
-				: "call ended";
-	const icon = v.error ? theme.fg("warning", "✕") : v.busy ? theme.fg("accent", "◐") : theme.fg("accent", "●");
-	const bits = [
-		`meeting${v.replay ? " (replay)" : ""}`,
-		v.title,
-		v.startedMs ? humanElapsed(now - v.startedMs) : "",
-		v.phase === "ended" ? ended : v.topic,
-		v.rulesOnly ? "rules only" : `${v.checks} check${v.checks === 1 ? "" : "s"}${v.cost > 0 ? ` $${v.cost.toFixed(3)}` : ""}`,
-		v.busy ? "checking…" : "",
-		v.error ? `error: ${v.error}` : "",
-		"/meeting stop",
-	].filter(Boolean);
-	const lines = [fit(`${icon} ${dim(bits.join(" · "))}`)];
-	const inner = Math.max(10, width - 4);
-	const open = v.questions.filter((q) => q.status === "open");
-	const done = v.questions.filter((q) => q.status !== "open");
-	const digTag = (q: Question) =>
-		q.dig?.state === "running"
-			? theme.fg("warning", ` 🔎 ${mmss(now - q.dig.startedAt)}`)
-			: q.dig?.state === "failed"
-				? theme.fg("warning", " 🔎✕")
-				: q.dig?.state === "done"
-					? theme.fg("success", " 🔎✓")
-					: "";
-	const id = (q: Question) => theme.fg("accent", `Q${q.id}`) + digTag(q);
-	if (v.expanded) {
-		// One line each: all open questions, then the closed ones while they fit.
-		const openRows = open.length > EXPANDED_ROWS ? EXPANDED_ROWS - 1 : open.length;
-		for (const q of open.slice(0, openRows)) lines.push(fit(`  ${id(q)} ${q.q}${q.why ? dim(` — ${q.why}`) : ""}`));
-		if (open.length > openRows) lines.push(fit(dim(`  +${open.length - openRows} more open · /meeting recap`)));
-		const room = EXPANDED_ROWS - Math.min(open.length, EXPANDED_ROWS);
-		const doneRows = done.length > room ? Math.max(0, room - 1) : done.length;
-		for (const q of doneRows ? done.slice(-doneRows) : [])
-			lines.push(fit(dim(`  ✓ Q${q.id} ${q.q}${q.note ? ` → ${q.note}` : ` (${q.status})`}`)));
-		if (done.length > doneRows) lines.push(fit(dim(`  ✓ ${done.length - doneRows} more answered or asked · /meeting recap`)));
-		if (v.questions.length === 0) lines.push(fit(dim("  no questions yet")));
-		else lines.push(fit(dim("  /meeting list to collapse")));
-	} else {
-		const shown = open.filter((q) => v.shown.includes(q.id));
-		for (const q of shown) {
-			const wrapped = wrapTextWithAnsi(`${id(q)} ${q.q}${q.why ? dim(` — ${q.why}`) : ""}`, inner);
-			for (const l of wrapped.slice(0, 3)) lines.push(fit(`  ${l}`));
-			if (q.dig?.state === "done" && q.dig.answer) lines.push(fit(`    ${theme.fg("success", `→ ${q.dig.answer}`)}`));
-		}
-		const more = open.length - shown.length;
-		const bits2 = [more > 0 ? `+${more} more open` : "", done.length ? `${done.length} answered or asked` : ""].filter(Boolean);
-		if (bits2.length) lines.push(fit(dim(`  ${bits2.join(" · ")} · /meeting list`)));
-	}
-	if (v.reply) {
-		for (const l of wrapTextWithAnsi(theme.fg("success", `↳ say: ${v.reply}`), inner).slice(0, 4)) lines.push(fit(`  ${l}`));
-	}
-	if (v.alert) {
-		for (const l of wrapTextWithAnsi(theme.fg("warning", `! ${v.alert}`), inner).slice(0, 3)) lines.push(fit(`  ${l}`));
-	}
-	return lines;
-}
-
 // ── runtime ──────────────────────────────────────────────────────────────────
 
 type Meeting = {
 	phase: WidgetView["phase"];
-	auto?: { startedAt: string; slidesDir: string | null; via: Via }; // started from state.json, not a replay
+	auto?: { startedAt: string; slidesDir: string | null; appId: string; via: Via }; // started from state.json, not a replay
 	file: string; // current .jsonl, "" while waiting for captions
 	offset: number;
 	partial: string;
@@ -908,19 +472,16 @@ type Meeting = {
 	slides: number; // distinct slide events seen
 	slideOn?: number; // the slide on screen
 	lines: string[];
-	sentUpTo: number;
-	trig: TriggerState;
-	questions: Question[]; // every question so far; only answered/asked ones close
-	shown: Shown[];
-	expanded: boolean;
 	firstFile: string; // the capture the meeting started in; keys the daily-note recap
-	nextId: number;
-	topic: string;
-	reply: string;
-	replyAt: number;
-	cueLine?: { speaker: string; text: string }; // the line behind the pending cue
-	alert: string; // from code rules; shown like a reply
-	alertAt: number;
+	sentUpTo: number; // lines the scout has seen
+	trig: Cadence;
+	notes: Notes; // the scout's rolling notes
+	reply: { to: string; text: string; at: string } | null; // someone is waiting on you
+	sentReplies: SentReply[];
+	alerts: Alert[];
+	alertSeq: number;
+	nameAlertAt: Map<string, number>; // per speaker, for the 2 min limit
+	alerted: Set<string>; // normalized actions already alerted
 	focus: string;
 	me: string;
 	meTokens: string[];
@@ -929,15 +490,16 @@ type Meeting = {
 	system: string;
 	backgroundReady?: Promise<void>;
 	sessionId: string;
-	checks: number;
+	checks: number; // scout calls that answered
 	cost: number;
 	busy: boolean;
 	forceNext: boolean;
+	errStreak: number; // scout calls that failed in a row
+	finalTried: boolean; // the end-of-meeting call was made (or can't be)
 	error: string;
 	abort?: AbortController;
 	endedAt: number;
 	lastRender: number;
-	lastNotify: number;
 	announced: boolean;
 };
 
@@ -988,7 +550,7 @@ async function qmdNotes(title: string): Promise<string> {
 function main(pi: ExtensionAPI) {
 	let ctxRef: ExtensionContext | undefined;
 	let st: Meeting | undefined;
-	/** The meeting that just finished: /q can still research its questions. */
+	/** The meeting that just finished: /meeting notes can still post its notes. */
 	let last: Meeting | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let ticking = false;
@@ -1011,22 +573,6 @@ function main(pi: ExtensionAPI) {
 	const eligibleVia = (): Via | undefined => (isArmed() ? "watch" : nameMatches(OWNER, sessionName()) ? "owner" : undefined);
 	const lockMe = (via: Via): Me => ({ pid: process.pid, sessionId: ctxRef?.sessionManager?.getSessionId?.() ?? "", name: sessionName() ?? "", via });
 
-	type DigRun = { m: Meeting; id: number; proc: ChildProcess; cancelled: boolean };
-	const digRuns = new Set<DigRun>();
-	const digging = (m: Meeting) => m.questions.some((q) => q.dig?.state === "running");
-	const cancelDigs = (m?: Meeting) => {
-		for (const r of digRuns) {
-			if (m && r.m !== m) continue;
-			r.cancelled = true;
-			r.proc.kill("SIGTERM");
-			digRuns.delete(r);
-			setDig(r.m, r.id, { state: "failed", startedAt: r.m.questions.find((q) => q.id === r.id)?.dig?.startedAt ?? 0, error: "cancelled" });
-		}
-	};
-	function setDig(m: Meeting, id: number, dig: Dig) {
-		m.questions = m.questions.map((q) => (q.id === id ? { ...q, dig } : q));
-	}
-
 	// Timers outlive the command that started them, so they use the session's
 	// own context rather than a command context.
 	/** Whether /meeting watch was last on or off in this branch. */
@@ -1046,15 +592,17 @@ function main(pi: ExtensionAPI) {
 		void stateTick();
 	});
 	pi.on("session_tree", (_e, ctx) => restoreArmed(ctx));
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (e) => {
 		gen++;
 		if (stateTimer) clearInterval(stateTimer);
 		stateTimer = undefined;
 		// Quitting mid-meeting still leaves the recap in the daily note.
-		if (st && !st.replay && st.questions.length) writeRecap(st);
+		if (st && !st.replay && hasNotes(st.notes)) writeRecap(st);
 		if (st && !st.replay) pi.events.emit("meeting:state", { active: false, title: st.title });
+		// A meeting that ended keeps its final notes for the canvas; a reload, resume or fork keeps the file for the instance that picks the meeting up.
+		const keepNotes = e?.reason !== "quit" || (!st && last?.phase === "ended" && !last.replay);
 		teardown();
-		cancelDigs();
+		if (!keepNotes) dropNotesFile();
 		release();
 		ctxRef = undefined;
 	});
@@ -1072,12 +620,10 @@ function main(pi: ExtensionAPI) {
 			.split("\n")
 			.map((l, i) =>
 				i === 0
-					? `${theme.fg("accent", "◆")} ${theme.fg("dim", l)}`
-					: l.startsWith("−") || l.startsWith("✓")
-						? theme.fg("dim", l)
-						: l.startsWith("↳") || l.startsWith("Answer:")
-							? theme.fg("success", l)
-							: l,
+					? `${theme.fg("accent", "◆")} ${/^(🔔|✅)/u.test(l) ? theme.fg("warning", l) : theme.fg("dim", l)}`
+					: l.startsWith("↳")
+						? theme.fg("success", l)
+						: l,
 			)
 			.join("\n");
 		return new Text(styled, options.outputPad ?? 1, 0);
@@ -1091,10 +637,7 @@ function main(pi: ExtensionAPI) {
 		timer = undefined;
 		st?.abort?.abort();
 		if (st?.auto && done) doneStarts.add(st.auto.startedAt);
-		if (st) {
-			cancelDigs(st); // only /meeting stop gets here with research running; a natural end waits
-			last = st;
-		}
+		if (st) last = st;
 		st = undefined;
 		if (ctxRef?.mode === "tui") ctxRef.ui.setWidget(WIDGET_KEY, undefined);
 	}
@@ -1117,8 +660,8 @@ function main(pi: ExtensionAPI) {
 			file: source,
 			from: lineClock(m.lines[0]),
 			to: lineClock(m.lines.at(-1)),
-			checks: m.checks,
-			questions: m.questions,
+			updates: m.checks,
+			notes: m.notes,
 		});
 		try {
 			const before = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
@@ -1132,17 +675,45 @@ function main(pi: ExtensionAPI) {
 
 	/** Post the recap to the session (and the daily note, unless it's a replay or empty). */
 	function postRecap(m: Meeting, headline: string) {
-		const note = m.questions.length ? writeRecap(m) : undefined;
+		const note = hasNotes(m.notes) ? writeRecap(m) : undefined;
 		pi.sendMessage(
 			{
 				customType: MSG_TYPE,
-				content: [`${headline}${note ? ` · recap in ${tilde(note)}` : ""}`, ...recapBody(m.questions)].join("\n"),
+				content: [`${headline}${note ? ` · recap in ${tilde(note)}` : ""}`, ...recapBody(m.notes)].join("\n"),
 				display: true,
-				details: { kind: "recap", questions: m.questions, note },
+				details: { kind: "recap", notes: m.notes, note },
 			},
 			{ triggerTurn: false },
 		);
 	}
+
+	/** The notes file the canvas reads (see notes.ts). Never for a replay: it has no state.json to match. */
+	function writeNotes(m: Meeting, ended = false) {
+		if (m.replay || !m.auto) return;
+		try {
+			const file = buildNotesFile({
+				pid: process.pid,
+				sessionId: lockMe("watch").sessionId,
+				sessionName: sessionName() ?? "",
+				startedAt: m.auto.startedAt,
+				appId: m.auto.appId,
+				title: m.title,
+				at: new Date().toISOString(),
+				ended,
+				me: m.meTokens,
+				notes: m.notes,
+				reply: m.reply,
+				alerts: m.alerts,
+				alertSeq: m.alertSeq,
+			});
+			writeNotesFile(file);
+		} catch {
+			// the canvas just doesn't see the notes; the chat still has them
+		}
+	}
+
+	/** Remove the notes file if this session wrote it. */
+	const dropNotesFile = () => removeNotesFile({ pid: process.pid, sessionId: lockMe("watch").sessionId });
 
 	function finish(reason: string) {
 		const m = st;
@@ -1157,9 +728,14 @@ function main(pi: ExtensionAPI) {
 			}
 		}
 		if (m.announced) {
-			postRecap(m, `Meeting copilot stopped (${reason}) · ${m.checks} checks · transcript: ${tilde(m.file.replace(/\.jsonl$/, ".txt"))}`);
+			postRecap(m, `Meeting copilot stopped (${reason})`);
 		} else if (ctxRef?.hasUI) {
 			ctxRef.ui.notify(`Meeting copilot stopped (${reason})`, "info");
+		}
+		// The canvas keeps the final notes of a meeting that ended; any other stop takes the file away.
+		if (m.auto && !m.replay) {
+			if (reason === "meeting ended") writeNotes(m, true);
+			else dropNotesFile();
 		}
 		// Only an ended or stopped meeting is done; "watch off" / "no longer armed" can be armed again mid-meeting.
 		teardown(reason === "meeting ended" || reason === "/meeting stop");
@@ -1172,24 +748,17 @@ function main(pi: ExtensionAPI) {
 		const now = Date.now();
 		if (!force && now - m.lastRender < RENDER_MS) return;
 		m.lastRender = now;
-		if (m.reply && now - m.replyAt > REPLY_TTL_MS) m.reply = "";
-		if (m.alert && now - m.alertAt > REPLY_TTL_MS) m.alert = "";
 		const view: WidgetView = {
 			phase: m.phase,
 			title: m.title,
 			startedMs: m.startedMs,
-			topic: m.topic,
-			checks: m.checks,
-			cost: m.cost,
+			slide: m.slideOn,
+			alerts: m.alerts.length,
+			questions: m.notes.questions.length,
+			hasLines: m.lines.length > 0,
 			busy: m.busy,
 			error: m.error,
-			questions: m.questions,
-			shown: m.shown.map((s) => s.id),
-			expanded: m.expanded,
-			reply: m.reply,
 			replay: !!m.replay,
-			endsAt: 0,
-			alert: m.alert,
 			rulesOnly: m.models.length === 0,
 		};
 		ctx.ui.setWidget(
@@ -1218,22 +787,46 @@ function main(pi: ExtensionAPI) {
 			m.people = ev.people;
 			return;
 		}
+		if (ev.kind === "slide") {
+			if (!ev.revisit) m.slides++;
+			m.slideOn = ev.n;
+			if (!history) wantEarly(m, now); // a new slide is worth a look, within the 60 s floor
+			return;
+		}
 		m.lines.push(formatLine(ev));
 		if (!m.trig.unsent) m.trig.firstUnsentAt = history ? 0 : now;
 		m.trig.unsent++;
 		m.trig.lastLineAt = history ? 0 : now;
-		if (history || isMe(ev.speaker, m.meTokens)) return;
-		if (mentionsMe(ev.text, m.meTokens)) {
-			m.trig.cue = "mention";
-			m.cueLine = { speaker: ev.speaker, text: ev.text };
-			if (ctxRef?.hasUI && now - m.lastNotify > NOTIFY_GAP_MS) {
-				m.lastNotify = now;
-				ctxRef.ui.notify(`Meeting: ${ev.speaker}: ${ev.text.slice(0, 140)}`, "info");
-			}
-		} else if (!m.trig.cue && isInvite(ev.text)) {
-			m.trig.cue = "invite";
-			m.cueLine = { speaker: ev.speaker, text: ev.text };
-		}
+		if (history || isMe(ev.speaker, m.meTokens) || !addressesMe(ev.text, m.meTokens, m.people)) return;
+		// The line's own time keeps the 2 min rule honest in a fast replay.
+		if (takeNameAlert(m.nameAlertAt, ev.speaker, Date.parse(ev.ts) || now)) nameAlert(m, ev, now);
+	}
+
+	/** Ask for a scout call sooner than the 3 min of talk. */
+	function wantEarly(m: Meeting, now: number) {
+		if (m.trig.early) return;
+		m.trig.early = true;
+		m.trig.earlyAt = now;
+	}
+
+	/** One short chat message: it lands in the session and the main model's context, and starts no turn. */
+	function say(text: string, details: Record<string, unknown>) {
+		pi.sendMessage({ customType: MSG_TYPE, content: text, display: true, details }, { triggerTurn: false });
+	}
+
+	function addAlert(m: Meeting, kind: Alert["kind"], who: string, text: string): Alert {
+		const alert: Alert = { id: `a${++m.alertSeq}`, kind, who, text: text.replace(/\s+/g, " ").trim().slice(0, 300), at: new Date().toISOString() };
+		m.alerts = pushAlert(m.alerts, alert);
+		return alert;
+	}
+
+	/** Someone else said your name: tell the chat now (no model), and ask for a call so a reply can follow. */
+	function nameAlert(m: Meeting, ev: { ts: string; speaker: string; text: string }, now: number) {
+		const alert = addAlert(m, "name", ev.speaker, ev.text);
+		say(nameAlertText(ev.speaker, clock(ev.ts), ev.text), { kind: "alert", alert });
+		wantEarly(m, now);
+		writeNotes(m);
+		render(true);
 	}
 
 	async function attach(file: string, history: boolean, title = "") {
@@ -1252,15 +845,7 @@ function main(pi: ExtensionAPI) {
 		if (!continuing) m.backgroundReady = buildBackground(file);
 		if (!m.announced && st === m) {
 			m.announced = true;
-			pi.sendMessage(
-				{
-					customType: MSG_TYPE,
-					content: `Meeting copilot on "${m.title}"${m.app ? ` (${m.app})` : ""} via ${m.modelLabel}. Live transcript: ${file.replace(/\.jsonl$/, ".txt")}. These updates are context for later; they need no reply.`,
-					display: true,
-					details: { kind: "start", file },
-				},
-				{ triggerTurn: false },
-			);
+			say(`Meeting copilot on "${m.title}"${m.app ? ` (${m.app})` : ""} via ${m.modelLabel}`, { kind: "start", file });
 		}
 		render(true);
 	}
@@ -1296,12 +881,6 @@ function main(pi: ExtensionAPI) {
 			if (!raw.trim()) continue;
 			const ev = parseEvent(raw);
 			if (ev) ingest(ev, now, history);
-			else {
-				// Slides aren't scout input; they only feed the one prompt line.
-				const rec = parseRecord(raw);
-				if (rec?.kind === "slide") m.slides++;
-				if (rec?.kind === "slide" || rec?.kind === "revisit") m.slideOn = rec.slide;
-			}
 		}
 	}
 
@@ -1339,11 +918,35 @@ function main(pi: ExtensionAPI) {
 		]
 			.filter(Boolean)
 			.join("\n\n");
-		m.system = buildSystemPrompt(m.me, about, bg);
+		m.system = buildSystemPrompt(m.me, m.meTokens, about, bg);
 	}
 
-	// ── checks ──
+	// ── the notes scout ──
 
+	/** OCR text of the slides shown so far, oldest first (a replay shows only what has played). */
+	async function slideTexts(m: Meeting): Promise<SlideText[]> {
+		const state = m.auto ? readState() : null;
+		const dir = m.replay ? m.replay.slidesDir : state && state.startedAt === m.auto?.startedAt ? state.slidesDir : (m.auto?.slidesDir ?? null);
+		if (!dir) return [];
+		const index = parseIndex(await fs.promises.readFile(path.join(dir, "index.jsonl"), "utf8").catch(() => ""));
+		const r = m.replay;
+		const seen = r ? Math.min(r.t0 + (Date.now() - r.startedAt) * r.speed, r.last) : undefined;
+		const shown = index.filter((e) => seen === undefined || !Date.parse(e.at) || Date.parse(e.at) <= seen).slice(-SLIDES_READ);
+		return Promise.all(
+			shown.map(async (e) => ({
+				n: e.n,
+				at: clock(e.at),
+				text: await fs.promises.readFile(ocrPath(dir, e), "utf8").then((t) => t.slice(0, 4000), () => ""),
+				onScreen: e.n === m.slideOn,
+			})),
+		);
+	}
+
+	const markSent = (m: Meeting, r: Reply, now: number) => {
+		m.sentReplies = [...m.sentReplies, { key: normText(r.text), to: normText(r.to), at: now }].slice(-20);
+	};
+
+	/** One scout call: fold its notes in, raise the alerts that are new, post the reply once. */
 	async function check() {
 		const m = st;
 		const ctx = ctxRef;
@@ -1351,14 +954,11 @@ function main(pi: ExtensionAPI) {
 		const registry = ctx.modelRegistry;
 		const newFrom = m.sentUpTo;
 		const upTo = m.lines.length;
-		const cue = m.trig.cue;
-		const cueLine = m.cueLine;
 		const saved = { ...m.trig };
-		m.trig = { unsent: 0, firstUnsentAt: 0, lastLineAt: m.trig.lastLineAt, lastCallAt: Date.now(), cue: null };
+		m.trig = { ...freshCadence(), lastLineAt: m.trig.lastLineAt, lastCallAt: Date.now() };
 		if (m.models.length === 0) {
-			// Rules only: no model reads the meeting, but a cue still reaches the user.
+			// No notes model: name alerts (code rules) still reach the chat, nothing else.
 			m.sentUpTo = upTo;
-			if (cue) raiseAlert(m, ruleAlert(cue, cueLine));
 			render(true);
 			return;
 		}
@@ -1367,19 +967,25 @@ function main(pi: ExtensionAPI) {
 		render(true);
 		try {
 			if (m.backgroundReady) await Promise.race([m.backgroundReady, new Promise((r) => setTimeout(r, BACKGROUND_WAIT_MS))]);
-			const system = m.system || buildSystemPrompt(m.me, "", "");
-			const user = fitUserPrompt(system, {
+			const system = m.system || buildSystemPrompt(m.me, m.meTokens, "", "");
+			let digest: SessionDigest | undefined;
+			try {
+				digest = sessionDigest(ctx.sessionManager.getBranch(), sessionName() ?? "", redactText);
+			} catch {
+				// no session digest this time
+			}
+			const user = fitNotesPrompt(system, {
 				title: m.title,
 				app: m.app,
 				people: m.people,
 				lines: m.lines.slice(0, upTo),
 				newFrom,
-				open: m.questions.filter((q) => q.status === "open"),
-				closed: m.questions.filter((q) => q.status !== "open"),
 				focus: m.focus,
-				cue,
 				me: m.me,
 				now: new Date(),
+				digest,
+				slides: await slideTexts(m),
+				prev: m.notes,
 			});
 			let res: AssistantMessage | undefined;
 			const errors: string[] = [];
@@ -1412,31 +1018,20 @@ function main(pi: ExtensionAPI) {
 			const update = parseScoutReply(text);
 			if (!update) throw new Error(`unparseable reply: ${text.replace(/\s+/g, " ").slice(0, 60)}`);
 			m.error = "";
-			m.alert = ""; // the scout is back and has judged the cue itself
+			m.errStreak = 0;
 			m.sentUpTo = upTo;
-			if (update.topic) m.topic = update.topic;
-			// Stamp with meeting time (the last line checked), not wall time.
-			const at = lineClock(m.lines[upTo - 1]) || new Date().toTimeString().slice(0, 5);
-			const now = Date.now();
-			const applied = applyUpdate(m.questions, update, m.nextId, now, at, newFrom === 0 ? MAX_ADD_FIRST : MAX_ADD);
-			m.questions = applied.questions;
-			m.nextId = applied.nextId;
-			const addedIds = applied.added.map((q) => q.id);
-			m.shown = pickShown(m.shown, m.questions, [...addedIds].reverse().concat(update.top), now, addedIds);
-			if (update.reply) {
-				m.reply = update.reply;
-				m.replyAt = now;
-			}
-			deliver(m, applied.added, applied.closed, update.reply, at);
+			// Stamp with meeting time (the last line seen), not wall time.
+			applyNotes(m, update, lineClock(m.lines[upTo - 1]) || new Date().toTimeString().slice(0, 5));
 		} catch (e) {
 			if (st !== m) return;
 			m.error = String((e as Error)?.message ?? e).slice(0, 120);
-			// Nothing was consumed: put the lines and the cue back for the next trigger.
+			// Nothing was consumed: put the lines back for the next call.
+			if (saved.unsent) m.trig.firstUnsentAt = saved.firstUnsentAt;
 			m.trig.unsent += saved.unsent;
-			m.trig.firstUnsentAt = saved.firstUnsentAt || Date.now();
-			m.trig.cue = m.trig.cue ?? saved.cue;
-			// The scout is down: say the cue by rule now rather than wait for a retry.
-			if (cue) raiseAlert(m, ruleAlert(cue, cueLine));
+			m.trig.early = m.trig.early || saved.early;
+			m.trig.earlyAt = m.trig.earlyAt || saved.earlyAt;
+			// Wait longer after each failure in a row, so a broken model isn't retried every minute with a bigger prompt.
+			m.trig.retryMs = retryWait(++m.errStreak, m.replay ? scaleCadence(m.replay.speed) : CADENCE, m.replay?.speed ?? 1);
 		} finally {
 			if (st === m) {
 				m.busy = false;
@@ -1446,191 +1041,31 @@ function main(pi: ExtensionAPI) {
 		}
 	}
 
-	function raiseAlert(m: Meeting, text: string) {
-		if (!text) return;
-		m.alert = text;
-		m.alertAt = Date.now();
-	}
-
-	function deliver(m: Meeting, added: Question[], closed: Question[], reply: string, at: string) {
-		// Close-only changes stay in the widget (and the recap); the session hears about new things.
-		if (added.length === 0 && !reply) return;
-		const short = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
-		const lines = [`Meeting copilot · ${m.title} · ${at}${m.topic ? ` · ${m.topic}` : ""}`];
-		for (const q of added) lines.push(`+ Q${q.id} ${q.q}${q.why ? ` (${q.why})` : ""}`);
-		for (const q of closed) lines.push(`✓ Q${q.id} ${short(q.q, 80)}${q.note ? ` → ${q.note}` : ` (${q.status})`}`);
-		if (reply) lines.push(`↳ suggested reply: ${reply}`);
-		pi.sendMessage(
-			{ customType: MSG_TYPE, content: lines.join("\n"), display: true, details: { kind: "update", added, closed, reply } },
-			{ triggerTurn: false },
-		);
-	}
-
-	// ── research ──
-
-	const piInvocation = (args: string[]) => {
-		const script = process.argv[1];
-		return script && !script.startsWith("/$bunfs/root/") && fs.existsSync(script)
-			? { cmd: process.execPath, args: [script, ...args] }
-			: { cmd: "pi", args };
-	};
-
-	/**
-	 * Research one question in a separate `pi -p` subprocess: nothing runs in the
-	 * main session, and the brief arrives as a meeting message (triggerTurn:false).
-	 */
-	async function research(id: number, steer: string, ctx: ExtensionContext): Promise<void> {
-		const notify = (msg: string, level: "info" | "warning" | "error" = "info") => {
-			if (ctx.hasUI) ctx.ui.notify(msg, level);
-		};
-		const m = st ?? last;
-		if (!m) return notify("No meeting to research. /meeting watch arms this session", "warning");
-		const q = m.questions.find((x) => x.id === id);
-		if (!q) return notify(`No Q${id} in "${m.title}"`, "warning");
-		if (q.dig?.state === "running") return notify(`Already researching Q${id} (${mmssSince(q.dig.startedAt)})`);
-		if (q.dig?.state === "done" && !steer) return notify(`Q${id}: ${q.dig.answer} · brief is above · /q${id} <what else> digs again`);
-		const running = m.questions.filter((x) => x.dig?.state === "running").length;
-		if (running >= MAX_DIGS) return notify(`${running} research runs already going; try again when one lands`, "warning");
-
-		// Claim it before any await, so a double /q3 can't start two runs.
-		const startedAt = Date.now();
-		setDig(m, id, { state: "running", startedAt });
-		if (m === st && q.status === "open") m.shown = pickShown(m.shown, m.questions, [id], startedAt, [id]);
-		if (m === st) render(true);
-		const picked = researchModel(DIG_MODEL, ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "");
-		const model = picked.model;
-		let tmpDir = "";
-		try {
-			const about = await fs.promises.readFile(ABOUT_FILE, "utf8").then(
-				(s) => s.slice(0, 4000),
-				() => "",
-			);
-			const { system, task } = buildDigPrompt({
-				me: m.me,
-				about,
-				title: m.title,
-				app: m.app,
-				question: q,
-				steer,
-				lines: m.lines,
-				clock: lineClock(m.lines.at(-1)),
-			});
-			tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-meeting-dig-"));
-			const sysFile = path.join(tmpDir, "system.md");
-			await fs.promises.writeFile(sysFile, system, { mode: 0o600 });
-			const args = ["--mode", "json", "-p", "--no-session", ...(model ? ["--model", model] : [])];
-			args.push("--thinking", DIG_THINKING, "--tools", DIG_TOOLS, "--append-system-prompt", sysFile, task);
-			const inv = piInvocation(args);
-			const proc = spawn(inv.cmd, inv.args, { cwd: ctx.cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_SUBAGENT_CHILD: "1" } });
-			const run: DigRun = { m, id, proc, cancelled: false };
-			digRuns.add(run);
-			notify(`Researching Q${id} with ${model}${picked.refused ? ` (${picked.refused} is not ${WORK_LABEL})` : ""}; the brief lands here within 3 min`);
-
-			let final = "";
-			let cost = 0;
-			let buf = "";
-			const stderr: string[] = [];
-			const onLine = (line: string) => {
-				let ev: { type?: string; message?: { role?: string; content?: { type: string; text?: string }[]; usage?: { cost?: { total?: number } } } };
-				try {
-					ev = JSON.parse(line);
-				} catch {
-					return;
-				}
-				const msg = ev.type === "message_end" ? ev.message : undefined;
-				if (msg?.role !== "assistant") return;
-				cost += msg.usage?.cost?.total ?? 0;
-				const text = (msg.content ?? []).map((c) => (c.type === "text" ? (c.text ?? "") : "")).join("");
-				if (text.trim()) final = text;
-			};
-			proc.stdout?.on("data", (d) => {
-				buf += String(d);
-				const parts = buf.split("\n");
-				buf = parts.pop() ?? "";
-				for (const l of parts) if (l.trim()) onLine(l);
-			});
-			proc.stderr?.on("data", (d) => stderr.push(String(d)));
-			let timedOut = false;
-			const killer = setTimeout(() => {
-				timedOut = true;
-				proc.kill("SIGTERM");
-			}, DIG_TIMEOUT_MS);
-			const code = await new Promise<number>((resolve) => {
-				proc.on("close", (c) => resolve(c ?? 1));
-				proc.on("error", () => resolve(1));
-			});
-			clearTimeout(killer);
-			if (buf.trim()) onLine(buf);
-			digRuns.delete(run);
-			if (run.cancelled) return;
-			m.cost += cost;
-			if (timedOut || !final.trim()) {
-				const reason = stderr.join("").trim().split("\n").at(-1) || `exit ${code}`;
-				const error = timedOut ? "timed out after 3 min" : reason.slice(0, 120);
-				setDig(m, id, { state: "failed", startedAt, error });
-				notify(`Q${id} research failed: ${error}`, "warning");
-			} else {
-				const brief = final.trim();
-				const answer = briefAnswer(brief);
-				setDig(m, id, { state: "done", startedAt, answer, brief });
-				pi.sendMessage(
-					{
-						customType: MSG_TYPE,
-						content: [`Meeting copilot · Q${id} research · ${mmssSince(startedAt)}${cost > 0 ? ` · $${cost.toFixed(3)}` : ""}`, `Q${id} ${q.q}`, brief].join("\n"),
-						display: true,
-						details: { kind: "research", id, answer, brief },
-					},
-					{ triggerTurn: false },
-				);
-				notify(`Q${id}: ${answer}`);
-				// After the meeting the recap is already written; refresh it with the answer.
-				if (m !== st) writeRecap(m);
-			}
-		} catch (e) {
-			setDig(m, id, { state: "failed", startedAt, error: String((e as Error)?.message ?? e).slice(0, 120) });
-			notify(`Q${id} research failed: ${(e as Error)?.message ?? e}`, "warning");
-		} finally {
-			if (tmpDir) fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
-			if (m === st) render(true);
+	/** What a scout answer changes: the notes, the alerts for new actions on you, a reply once. */
+	function applyNotes(m: Meeting, update: ScoutUpdate, at: string) {
+		const before = JSON.stringify([m.notes, m.reply, m.alerts]);
+		const now = Date.now();
+		const iso = new Date(now).toISOString();
+		const merged = mergeNotes(m.notes, update, iso);
+		m.notes = merged.notes;
+		const prevReply = m.reply;
+		m.reply = update.reply ? { ...update.reply, at: prevReply && normText(prevReply.text) === normText(update.reply.text) ? prevReply.at : iso } : null;
+		let waiting = update.reply && replyDue(m.sentReplies, update.reply, now) ? update.reply : null;
+		for (const a of merged.newMine) {
+			if ([...m.alerted].some((k) => sameAction(k, a.what))) continue;
+			m.alerted.add(normText(a.what));
+			const alert = addAlert(m, "action", a.by || a.who, a.what);
+			// A reply that came with it rides along on this message instead of posting twice.
+			say(actionAlertText(a.what, a.by ?? "", at, waiting), { kind: "alert", alert });
+			if (waiting) markSent(m, waiting, now);
+			waiting = null;
 		}
+		if (waiting) {
+			say(replyText(waiting), { kind: "reply", reply: waiting });
+			markSent(m, waiting, now);
+		}
+		if (JSON.stringify([m.notes, m.reply, m.alerts]) !== before) writeNotes(m);
 	}
-
-	// /q3 isn't a registered command, so pi hands it to input handlers.
-	pi.on("input", (event, ctx) => {
-		const hit = parseDigInput(event.text);
-		if (!hit) return { action: "continue" as const };
-		ctxRef ??= ctx;
-		void research(hit.id, hit.steer, ctx);
-		return { action: "handled" as const };
-	});
-
-	pi.registerCommand("q", {
-		description: "Research a meeting question with a subagent: /q 3 [what to look for], /q3, or /q to pick",
-		getArgumentCompletions: (prefix: string): AutocompleteItem[] => {
-			const m = st ?? last;
-			const p = prefix.replace(/^q/i, "");
-			return (m?.questions ?? [])
-				.filter((q) => String(q.id).startsWith(p))
-				.map((q) => ({ value: `${q.id} `, label: `Q${q.id}`, description: q.q.slice(0, 90) }));
-		},
-		handler: async (raw, ctx) => {
-			ctxRef ??= ctx;
-			const a = parseDigArgs(raw);
-			if (a) return research(a.id, a.steer, ctx);
-			const notify = (msg: string, level: "info" | "warning" = "info") => {
-				if (ctx.hasUI) ctx.ui.notify(msg, level);
-			};
-			if (raw.trim()) return notify("Usage: /q 3 [what to look for], /q3, or /q to pick", "warning");
-			const m = st ?? last;
-			if (!m?.questions.length) return notify("No meeting questions to research", "warning");
-			if (!ctx.hasUI) return;
-			const ordered = [...m.questions.filter((q) => q.status === "open"), ...m.questions.filter((q) => q.status !== "open")];
-			const tag = (q: Question) => (q.dig?.state === "done" ? " 🔎✓" : q.dig?.state === "running" ? " 🔎" : q.status !== "open" ? ` (${q.status})` : "");
-			const pick = await ctx.ui.select("Research which question?", ordered.map((q) => `Q${q.id}${tag(q)} ${q.q}`));
-			const id = Number(/^Q(\d+)/.exec(pick ?? "")?.[1]);
-			if (id) return research(id, "", ctx);
-		},
-	});
 
 	// ── tick ──
 
@@ -1656,15 +1091,17 @@ function main(pi: ExtensionAPI) {
 			if (st !== m) return;
 			if (!m.busy) {
 				const final = m.phase === "ended";
-				if (m.forceNext || shouldFire(m.trig, now, final)) {
+				// One last call at the end, before the recap; if it fails, the recap goes out without it.
+				const why = m.forceNext ? "ask" : shouldCall(m.trig, now, { final }, m.replay ? scaleCadence(m.replay.speed) : CADENCE);
+				if (why && !(final && m.finalTried)) {
 					m.forceNext = false;
+					if (final) m.finalTried = true;
 					void check();
-				} else if (final && m.trig.unsent === 0 && !digging(m)) {
+				} else if (final) {
 					return finish(m.replay ? "replay finished" : "meeting ended");
 				}
 			}
-			// While a call has ended or research runs, redraw every tick so the timers move.
-			render(m.phase === "ended" || digging(m));
+			render();
 		} catch (e) {
 			if (st) st.error = String((e as Error)?.message ?? e).slice(0, 120);
 		} finally {
@@ -1727,6 +1164,7 @@ function main(pi: ExtensionAPI) {
 		if (!m) return;
 		if (!m.replay) pi.events.emit("meeting:state", { active: false, title: m.title });
 		teardown(false);
+		dropNotesFile();
 	}
 
 	/** Scout models, who you are, and an empty meeting. */
@@ -1735,14 +1173,13 @@ function main(pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.notify(msg, level);
 		};
 		const registry = ctx.modelRegistry;
-		const specs = modelArg ? [modelArg] : modelSpecs(process.env.PI_MEETING_MODEL);
-		const work = workOnly(specs.length ? specs : WORK_MODELS);
-		if (work.refused.length) notify(`Not ${WORK_LABEL}, so never given meeting text: ${work.refused.join(", ")}`, "warning");
-		const models = work.ok
+		// The notes scout (meeting.model, PI_MEETING_MODEL, or --model for a replay), through the in-process registry.
+		const specs = modelArg ? [modelArg] : modelSpecs(MODEL);
+		const models = specs
 			.map((spec) => registry.find(spec.slice(0, spec.indexOf("/")), spec.slice(spec.indexOf("/") + 1)))
 			.filter((m): m is Model<Api> => !!m && registry.hasConfiguredAuth(m));
 		if (models.length === 0)
-			notify(`No ${WORK_LABEL} scout with credentials (${work.ok.join(", ") || "none given"}); cues by rule only, no new questions`, "warning");
+			notify(`The meeting notes model isn't available (${specs.join(", ") || "none set"}): no notes, only name alerts. Set meeting.model or PI_MEETING_MODEL`, "warning");
 
 		const who = process.env.PI_MEETING_ME || (await run("git", ["config", "--global", "--includes", "user.name"], 3000)).trim();
 		return {
@@ -1757,32 +1194,31 @@ function main(pi: ExtensionAPI) {
 			slides: 0,
 			lines: [],
 			sentUpTo: 0,
-			trig: freshTrigger(),
-			questions: [],
-			shown: [],
-			expanded: false,
+			trig: freshCadence(),
+			notes: emptyNotes(),
+			reply: null,
+			sentReplies: [],
+			alerts: [],
+			alertSeq: 0,
+			nameAlertAt: new Map(),
+			alerted: new Set(),
 			firstFile: "",
-			nextId: 1,
-			topic: "",
-			reply: "",
-			replyAt: 0,
-			alert: "",
-			alertAt: 0,
 			focus: "",
 			me: who,
 			meTokens: nameTokens(who),
 			models,
-			modelLabel: models.map((m) => m.name || m.id).join(" → ") || "rules only",
+			modelLabel: models.map((m) => m.name || m.id).join(" → ") || "name alerts only",
 			system: "",
 			sessionId: randomUUID(),
 			checks: 0,
 			cost: 0,
 			busy: false,
 			forceNext: false,
+			errStreak: 0,
+			finalTried: false,
 			error: "",
 			endedAt: 0,
 			lastRender: 0,
-			lastNotify: 0,
 			announced: false,
 		};
 	}
@@ -1793,10 +1229,20 @@ function main(pi: ExtensionAPI) {
 		const m = await newMeeting(ctx);
 		if (st) return; // a replay began while the scout was being set up
 		if (g !== gen || !holding) return; // shut down, or the lock was let go, while the scout was being set up
-		m.auto = { startedAt: s.startedAt, slidesDir: s.slidesDir, via };
+		m.auto = { startedAt: s.startedAt, slidesDir: s.slidesDir, appId: s.appId, via };
 		m.title = s.title;
 		m.app = s.app;
 		m.startedMs = s.startedMs;
+		// After a /reload, /resume or /fork, pick the notes up where the last instance left them: no re-alerting for what it already said.
+		const back = restoreNotes(s.startedAt);
+		if (back) {
+			m.notes = back.notes;
+			m.reply = back.reply;
+			m.alerts = back.alerts;
+			m.alertSeq = back.alertSeq;
+			m.alerted = back.alerted;
+			if (back.reply) m.sentReplies.push({ key: normText(back.reply.text), to: normText(back.reply.to), at: Date.parse(back.reply.at) || Date.now() });
+		}
 		st = m;
 		timer = setInterval(() => void tick(), POLL_MS);
 		timer.unref?.();
@@ -1830,10 +1276,10 @@ function main(pi: ExtensionAPI) {
 			const live = isLive(s);
 			const m = st;
 			if (m?.auto) {
-				// The lock moved: stop at once, even in the ended phase, so a recap still
-				// waiting on its research digs is dropped (the new owner starts fresh). The
-				// other way round, a new started_at can't start until the old meeting's digs
-				// finish and tick() releases it.
+				// The lock moved: stop at once, even in the ended phase, so a final call
+				// still pending is dropped (the new owner starts fresh). The other way
+				// round, a new started_at can't start until the old meeting's final call
+				// is done and tick() releases it.
 				if (!mine && !canClaim(lock, lockMe(via))) {
 					yielded = true;
 					holding = false;
@@ -2111,7 +1557,7 @@ function main(pi: ExtensionAPI) {
 		for (const raw of body.split("\n")) {
 			const ev = raw.trim() ? parseEvent(raw) : null;
 			if (!ev) continue;
-			if (ev.kind === "line") at = Date.parse(ev.ts) || at;
+			if (ev.kind === "line" || ev.kind === "slide") at = Date.parse(ev.ts) || at;
 			if (ev.kind === "meta" && ev.stopped) continue;
 			events.push({ at, ev });
 		}
@@ -2139,27 +1585,19 @@ function main(pi: ExtensionAPI) {
 		m.startedMs = Date.now();
 		m.backgroundReady = buildBackground(file);
 		m.announced = true;
-		pi.sendMessage(
-			{
-				customType: MSG_TYPE,
-				content: `Meeting copilot replaying "${m.title}" at ${speed}× via ${m.modelLabel}. Transcript: ${file.replace(/\.jsonl$/, ".txt")}. These updates are context for later; they need no reply.`,
-				display: true,
-				details: { kind: "start", file, replay: speed },
-			},
-			{ triggerTurn: false },
-		);
+		say(`Meeting copilot replaying "${m.title}" at ${speed}× via ${m.modelLabel}`, { kind: "start", file, replay: speed });
 		timer = setInterval(() => void tick(), POLL_MS);
 		timer.unref?.();
 		render(true);
 	}
 
 	pi.registerCommand("meeting", {
-		description: "Live meeting copilot: suggested questions from the meeting-capture transcript",
+		description: "Live meeting copilot: rolling notes and alerts from the meeting-capture transcript",
 		getArgumentCompletions: (prefix: string): AutocompleteItem[] =>
 			[
 				{ value: "watch", label: "watch", description: "Arm this session to run the copilot for every meeting (watch off to disarm)" },
-				{ value: "ask", label: "ask", description: "Check for questions right now" },
-				{ value: "list", label: "list", description: "Show every question in the widget (again to collapse)" },
+				{ value: "ask", label: "ask", description: "Run the notes scout right now" },
+				{ value: "notes", label: "notes", description: "Post the current notes to chat" },
 				{ value: "recap", label: "recap", description: "Post the recap so far and update the daily note" },
 				{ value: "focus ", label: "focus", description: "Tell the scout what you want out of this meeting" },
 				{ value: "stop", label: "stop", description: "Stop the copilot for this meeting" },
@@ -2204,7 +1642,7 @@ function main(pi: ExtensionAPI) {
 				case "start":
 					return void notify("Meetings start by themselves now: /meeting watch arms this session. To test, /meeting replay [speed] [path]", "warning");
 				case "unknown":
-					return void notify(`Unknown: /meeting ${raw.trim().split(/\s+/)[0]}. Try watch, replay, ask, focus, list, recap, stop`, "warning");
+					return void notify(`Unknown: /meeting ${raw.trim().split(/\s+/)[0]}. Try watch, replay, ask, notes, focus, recap, stop`, "warning");
 				case "stop":
 					return st ? finish("/meeting stop") : void notify("Meeting copilot isn't running");
 				case "ask":
@@ -2216,13 +1654,14 @@ function main(pi: ExtensionAPI) {
 					if (!st) return void notify(idle, "warning");
 					st.focus = a.rest;
 					return void notify(a.rest ? `Meeting focus: ${a.rest}` : "Meeting focus cleared");
-				case "list":
-					if (!st) return void notify(idle, "warning");
-					st.expanded = !st.expanded;
-					return void render(true);
+				case "notes": {
+					const m = st ?? last;
+					if (!m) return void notify(idle, "warning");
+					return void say([`Meeting notes · ${m.title}${m.alerts.length ? ` · ${m.alerts.length} alert${m.alerts.length === 1 ? "" : "s"}` : ""}`, ...recapBody(m.notes, m.reply)].join("\n"), { kind: "notes", notes: m.notes, reply: m.reply });
+				}
 				case "recap":
 					if (!st) return void notify(idle, "warning");
-					return void postRecap(st, `Meeting copilot recap so far · ${st.title} · ${st.checks} checks`);
+					return void postRecap(st, `Meeting copilot recap so far · ${st.title}`);
 				default: {
 					const state = readState();
 					const lock = readLock();
@@ -2242,9 +1681,8 @@ function main(pi: ExtensionAPI) {
 					if (!st) lines.push("Copilot: not running");
 					else {
 						const where = st.file ? path.basename(st.file) : "waiting for captions";
-						const open = st.questions.filter((q) => q.status === "open").length;
 						lines.push(
-							`Copilot: ${where} · ${st.phase}${st.replay ? " (replay)" : ""} · ${st.lines.length} lines · ${st.checks} checks · ${open} open, ${st.questions.length - open} answered or asked · ${st.modelLabel}${st.error ? ` · error: ${st.error}` : ""}`,
+							`Copilot: ${where} · ${st.phase}${st.replay ? " (replay)" : ""} · ${st.lines.length} lines · ${st.checks} notes updates · ${st.alerts.length} alerts · ${st.notes.questions.length} questions · ${st.modelLabel}${st.error ? ` · error: ${st.error}` : ""}`,
 						);
 					}
 					return void notify(lines.join("\n"));
@@ -2254,4 +1692,4 @@ function main(pi: ExtensionAPI) {
 	});
 }
 
-export default optIn("meeting", "Live meeting copilot: questions from the transcript", main);
+export default optIn("meeting", "Live meeting copilot: rolling notes and alerts from the transcript", main);

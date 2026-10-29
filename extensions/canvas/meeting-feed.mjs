@@ -11,6 +11,12 @@
 //                       people, slide)
 //   <slides_dir>/index.jsonl  { n, at, file, thumb?, reason, width, height }
 //
+// And one file of pi's, the /meeting copilot's rolling notes
+// (extensions/opt-in/meeting, notes.ts): <canvas root>/.meeting-notes.json, or
+// PI_MEETING_NOTES_FILE. Topics, decisions, action items, alerts and a suggested
+// reply. It counts only while it names this meeting (meeting.started_at equals
+// state.json's) and its session is still there (pid alive) or it says ended.
+//
 // Nothing here touches the network or copies a file: the daemon serves slides
 // straight from slides_dir, and only names listed in index.jsonl.
 
@@ -20,6 +26,9 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve, sep } from "node:path";
 
 export const MEETING_STATE_DIR = resolve(process.env.MEETING_CAPTURE_STATE_DIR || join(homedir(), ".local", "state", "meeting-capture"));
+
+/** The copilot's notes file: PI_MEETING_NOTES_FILE, else .meeting-notes.json in the canvas root. */
+export const notesFilePath = (root) => resolve(process.env.PI_MEETING_NOTES_FILE || join(root, ".meeting-notes.json"));
 
 /** How long an ended meeting keeps its card in the side panel. */
 export const CARD_AFTER_END_MS = 15 * 60_000;
@@ -62,6 +71,40 @@ export function parseState(raw, { mtimeMs = Date.now(), alive = pidAlive } = {})
     crashed,
     endedAt: ended ? str(raw.ended_at, 40) || new Date(mtimeMs).toISOString() : "",
     duration: str(raw.duration, 20),
+  };
+}
+
+const NOTE_LIMITS = { topics: 8, decisions: 20, actions: 20, questions: 2, alerts: 20, me: 8 };
+const list = (v, max) => (Array.isArray(v) ? v.slice(0, max) : []);
+
+/**
+ * The copilot's notes file, checked: { pid, notes } or null. Bounded strings and
+ * lists, only fields the page shows; no pid, session id or path reaches the page.
+ */
+export function normalizeNotes(raw) {
+  if (!raw || typeof raw !== "object" || raw.v !== 1 || !Number.isInteger(raw.pid)) return null;
+  const meeting = raw.meeting && typeof raw.meeting === "object" ? raw.meeting : {};
+  const reply = raw.reply && typeof raw.reply === "object" && typeof raw.reply.text === "string" && raw.reply.text.trim() ? { to: str(raw.reply.to, 100), text: str(raw.reply.text, 500), at: str(raw.reply.at, 40) } : null;
+  const objs = (v, max) => list(v, max).filter((x) => x && typeof x === "object");
+  const alerts = (Array.isArray(raw.alerts) ? raw.alerts : [])
+    .filter((a) => a && typeof a === "object" && (a.kind === "name" || a.kind === "action") && typeof a.text === "string")
+    .map((a) => ({ id: str(a.id, 40), kind: a.kind, who: str(a.who, 100), text: str(a.text, 400), at: str(a.at, 40) }))
+    .slice(-NOTE_LIMITS.alerts); // newest last: keep the newest
+  return {
+    pid: raw.pid,
+    startedAt: str(meeting.started_at, 40),
+    notes: {
+      session: str(raw.session?.name, 100),
+      at: str(raw.at, 40),
+      ended: raw.ended === true,
+      me: (Array.isArray(raw.me) ? raw.me : []).filter((t) => typeof t === "string").map((t) => t.slice(0, 40)).slice(0, NOTE_LIMITS.me),
+      topics: objs(raw.topics, NOTE_LIMITS.topics).map((t) => ({ title: str(t.title, 120), summary: str(t.summary, 400) })).filter((t) => t.title || t.summary),
+      decisions: objs(raw.decisions, NOTE_LIMITS.decisions).map((d) => ({ text: str(d.text, 400), at: str(d.at, 40) })).filter((d) => d.text),
+      actions: objs(raw.actions, NOTE_LIMITS.actions).map((a) => ({ who: str(a.who, 100), what: str(a.what, 400), mine: a.mine === true, at: str(a.at, 40) })).filter((a) => a.what),
+      questions: objs(raw.questions, NOTE_LIMITS.questions).map((q) => ({ q: str(q.q, 300), why: str(q.why, 200) })).filter((q) => q.q),
+      reply,
+      alerts,
+    },
   };
 }
 
@@ -200,17 +243,20 @@ export const meetingId = (state) => (state ? createHash("sha1").update(`${state.
  * (fast while recording) and tells pages what changed.
  */
 export class MeetingFeed {
-  constructor(dir = MEETING_STATE_DIR, { now = Date.now, alive = pidAlive } = {}) {
+  constructor(dir = MEETING_STATE_DIR, { now = Date.now, alive = pidAlive, notesFile = "" } = {}) {
     this.dir = dir;
     this.now = now;
     this.alive = alive;
+    this.notesFile = notesFile;
+    this.rawNotes = null; // the file as read: { pid, startedAt, notes }
+    this.notes = null; // what counts: it names this meeting and its session is there, or it ended
     this.state = null;
     this.id = "";
     this.entries = [];
     this.slides = [];
     this.live = [];
     this.changedAt = "";
-    this.sigs = { state: "", live: "", index: "" };
+    this.sigs = { state: "", live: "", index: "", notes: "" };
     this.tail = null;
     this.indexTail = null;
   }
@@ -248,6 +294,7 @@ export class MeetingFeed {
       }
     }
     const st = this.state;
+    if (this.syncNotes()) final = true;
     if (!st) return this.mark(final, live);
 
     if (st.jsonl && (!this.tail || this.tail.path !== st.jsonl)) this.tail = new JsonlTail(st.jsonl);
@@ -293,6 +340,27 @@ export class MeetingFeed {
     return this.mark(final, live);
   }
 
+  /**
+   * The notes file, re-read when its stat changes and re-judged every poll (a
+   * dead session's notes stop counting, a new meeting's started_at drops the
+   * old ones). True when what counts changed.
+   */
+  syncNotes() {
+    if (this.notesFile) {
+      const s = sig(this.notesFile);
+      if (s !== this.sigs.notes) {
+        this.sigs.notes = s;
+        this.rawNotes = s ? normalizeNotes(readJson(this.notesFile)) : null;
+      }
+    }
+    const raw = this.rawNotes;
+    const ok = raw && this.state && raw.startedAt === this.state.startedAt && (raw.notes.ended || this.alive(raw.pid));
+    const next = ok ? raw.notes : null;
+    if (JSON.stringify(next) === JSON.stringify(this.notes)) return false;
+    this.notes = next;
+    return true;
+  }
+
   mark(final, live) {
     if (final) this.changedAt = new Date(this.now()).toISOString();
     return { final, live };
@@ -315,7 +383,7 @@ export class MeetingFeed {
 
   /** The page's view: entries after `since` (all of them when `id` is another meeting's). */
   snapshot(since = 0, id = "") {
-    if (!this.state) return { id: "", state: null, entries: [], total: 0, from: 0, slides: [], live: [], people: null };
+    if (!this.state) return { id: "", state: null, entries: [], total: 0, from: 0, slides: [], live: [], people: null, notes: null };
     const from = id === this.id && Number.isInteger(since) && since >= 0 && since <= this.entries.length ? since : 0;
     const p = this.people();
     const { jsonl: _j, txt: _t, slidesDir: _s, live: _l, ...state } = this.state;
@@ -328,6 +396,7 @@ export class MeetingFeed {
       slides: this.slides.map(({ n, at, reason, width, height, thumb }) => ({ n, at, reason, width, height, thumb: Boolean(thumb) })),
       live: this.live,
       people: p ? { count: p.count, people: p.people } : null,
+      notes: this.notes,
     };
   }
 
@@ -357,7 +426,23 @@ export class MeetingFeed {
       slides: this.slides.length,
       slide: last ? { n: last.n, thumb: Boolean(last.thumb) } : null,
       recent,
+      notes: this.notesSummary(),
       at: this.changedAt,
+    };
+  }
+
+  /** The card's slice of the notes: the alert count, the newest alert's id and the newest 3 (newest last), Eric's open actions, questions, the reply. */
+  notesSummary() {
+    const n = this.notes;
+    if (!n) return null;
+    return {
+      ended: n.ended,
+      alertCount: n.alerts.length,
+      lastAlertId: n.alerts.at(-1)?.id ?? "", // the count stops at the cap; the newest id keeps changing
+      alerts: n.alerts.slice(-3),
+      actions: n.actions.filter((a) => a.mine),
+      questions: n.questions,
+      reply: n.reply,
     };
   }
 

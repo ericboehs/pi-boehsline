@@ -16,8 +16,6 @@ import { WATCH_DEFAULTS, WORK_DEFAULTS, type WorkSettings, watchSettings, workSe
 export let WORK_PROVIDERS: readonly string[] = WORK_DEFAULTS.providers;
 /** The work scout. */
 export let WORK_MODELS: readonly string[] = WORK_DEFAULTS.models;
-/** Meeting research when the session model can't read work text. */
-export let WORK_RESEARCH_MODEL = WORK_DEFAULTS.researchModel;
 /** How warnings name the work models: "Work text runs only on <label>". */
 export let WORK_LABEL = WORK_DEFAULTS.label;
 /** The personal scout: flat-subscription models first; pay-per-token ones only by explicit opt-in. */
@@ -27,7 +25,6 @@ export let PERSONAL_MODELS: readonly string[] = WATCH_DEFAULTS.personalModels;
 export function applyWorkSettings(work: WorkSettings = workSettings(), personal: readonly string[] = watchSettings().personalModels): void {
 	WORK_PROVIDERS = work.providers.map((p) => p.toLowerCase());
 	WORK_MODELS = work.models;
-	WORK_RESEARCH_MODEL = work.researchModel;
 	WORK_LABEL = work.label;
 	PERSONAL_MODELS = personal;
 }

@@ -22,7 +22,7 @@ import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { systemTheme, themeDefault } from "./theme.mjs";
 
-import { MEETING_STATE_DIR, MeetingFeed } from "./meeting-feed.mjs";
+import { MEETING_STATE_DIR, MeetingFeed, notesFilePath } from "./meeting-feed.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 function arg(name, fallback) {
@@ -42,7 +42,8 @@ export const PEERS = resolve(arg("peers", process.env.PI_CANVAS_PEERS || join(ho
 export const USAGE_CACHE = resolve(arg("usage", process.env.PI_CANVAS_USAGE || join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "usage-cache.json")));
 const VERSION = arg("version", "dev");
 // meeting-capture's state folder (MEETING_CAPTURE_STATE_DIR): the Meeting card and /meeting.
-export const meeting = new MeetingFeed(resolve(arg("meeting", MEETING_STATE_DIR)));
+// The /meeting copilot's notes ride along: PI_MEETING_NOTES_FILE or <root>/.meeting-notes.json.
+export const meeting = new MeetingFeed(resolve(arg("meeting", MEETING_STATE_DIR)), { notesFile: notesFilePath(ROOT) });
 const RETAIN_DAYS = Number(process.env.PI_CANVAS_RETAIN_DAYS || 30);
 
 // Browser libraries, fetched once from jsdelivr and checked against these

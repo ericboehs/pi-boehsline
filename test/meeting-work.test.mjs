@@ -1,6 +1,7 @@
 /**
- * meeting.ts on Acme Copilot only: the scout, /q research, the prompt cap, and
- * the code rules that carry on when no Acme Copilot model answers.
+ * meeting.ts end to end: the notes scout (a scripted model), alerts, the notes
+ * file, the one-line status, the recap, and the code rules that carry on when
+ * no model answers; plus auto start, ownership and the meeting tool.
  *
  * Its own file so the env is set before meeting.ts reads it at import.
  *
@@ -26,10 +27,9 @@ Object.assign(process.env, {
 	PI_MEETING_ME: "Eric Boehs",
 });
 delete process.env.PI_MEETING_MODEL;
-delete process.env.PI_MEETING_RESEARCH_MODEL;
 
-const { default: meeting, buildUserPrompt, fitUserPrompt, researchModel, ruleAlert, widgetLines } = await import("../extensions/opt-in/meeting/index.ts");
-const { estTokens, isWorkModel, modelSpecs, PERSONAL_MODELS, PROMPT_MAX_TOKENS, WORK_MODELS, WORK_RESEARCH_MODEL, workOnly } = await import(
+const { default: meeting } = await import("../extensions/opt-in/meeting/index.ts");
+const { isWorkModel, modelSpecs, PERSONAL_MODELS, WORK_MODELS, workOnly } = await import(
 	"../extensions/opt-in/watch/models.ts"
 );
 
@@ -39,7 +39,7 @@ const plain = { fg: (_color, s) => s };
 
 test("only Acme Copilot may read work text", () => {
 	assert.deepEqual(WORK_MODELS, ["github-copilot/claude-haiku-5.5"]);
-	assert.ok(WORK_MODELS.every(isWorkModel) && isWorkModel(WORK_RESEARCH_MODEL));
+	assert.ok(WORK_MODELS.every(isWorkModel));
 	assert.ok(!PERSONAL_MODELS.some(isWorkModel), "DeepSeek and GLM are personal only");
 	assert.deepEqual(workOnly(["opencode-go/deepseek-v4.1-flash", "github-copilot/claude-haiku-5.5", "openrouter/anthropic/claude"]), {
 		ok: ["github-copilot/claude-haiku-5.5"],
@@ -56,106 +56,38 @@ test("meeting.ts names no model outside Acme Copilot", () => {
 	assert.doesNotMatch(src, /deepseek|opencode|glm-|openrouter/i);
 });
 
-test("/q research: the configured model or the session's if on Acme Copilot, else Opus there", () => {
-	assert.deepEqual(researchModel("github-copilot/claude-haiku-5.5", "github-copilot/claude-opus-5.5"), { model: "github-copilot/claude-haiku-5.5", refused: "" });
-	assert.deepEqual(researchModel("", "github-copilot/claude-opus-5.5"), { model: "github-copilot/claude-opus-5.5", refused: "" });
-	assert.deepEqual(researchModel("", "opencode-go/deepseek-v4.1-flash"), { model: WORK_RESEARCH_MODEL, refused: "opencode-go/deepseek-v4.1-flash" });
-	assert.deepEqual(researchModel("anthropic/claude-opus-5.5", "github-copilot/claude-opus-5.5"), { model: WORK_RESEARCH_MODEL, refused: "anthropic/claude-opus-5.5" });
-	assert.deepEqual(researchModel("", ""), { model: WORK_RESEARCH_MODEL, refused: "" });
-});
-
-// ── the prompt cap ──
-
-const input = (lines) => ({
-	title: "CORE Weekly Sync",
-	app: "Teams",
-	people: [],
-	lines,
-	newFrom: Math.max(0, lines.length - 5),
-	open: [],
-	focus: "",
-	cue: null,
-	me: "Eric Boehs",
-	now: new Date(2026, 9, 7, 10, 30),
-});
-const talk = (n) => Array.from({ length: n }, (_, i) => `[10:${String(i % 60).padStart(2, "0")}:00] Speaker ${i % 7}: ${"some words here ".repeat(5)}line ${i}`);
-
-test("a short meeting's prompt is untouched", () => {
-	const p = input(talk(10));
-	assert.equal(fitUserPrompt("system", p), buildUserPrompt(p));
-});
-
-test("a long meeting keeps its newest lines and stays under the cap", () => {
-	const p = input(talk(4000));
-	const system = "s".repeat(120_000); // a big background: ~40k tokens
-	const user = fitUserPrompt(system, p);
-	assert.ok(estTokens(system) + estTokens(user) <= PROMPT_MAX_TOKENS, `${estTokens(system) + estTokens(user)} tokens`);
-	assert.match(user, /line 3999\n<\/transcript>/, "the newest line stays");
-	assert.match(user, /<transcript>\n\[… earlier lines omitted …\]\n/);
-	assert.ok(estTokens(buildUserPrompt(p)) > estTokens(user), "trimmed below the plain cap");
-});
-
-test("when even the background is too big, the transcript shrinks to its marker", () => {
-	const user = fitUserPrompt("s".repeat(120_000), input(talk(50)), 1000);
-	assert.match(user, /<transcript>\n\[… earlier lines omitted …\]\n<\/transcript>/);
-});
-
-// ── rules ──
-
-test("ruleAlert says who named you or asked for questions, clipped", () => {
-	assert.equal(ruleAlert("mention", { speaker: "Sam Rivera", text: "Eric, can you  take this one?" }), 'Sam Rivera named you: "Eric, can you take this one?"');
-	assert.equal(ruleAlert("invite", { speaker: "Jordan Blake", text: "Any questions?" }), 'Jordan Blake asked for questions: "Any questions?"');
-	assert.equal(ruleAlert("mention", undefined), "Someone named you");
-	assert.equal(ruleAlert(null, { speaker: "A", text: "b" }), "");
-	const long = ruleAlert("mention", { speaker: "A", text: "x".repeat(300) });
-	assert.ok(long.endsWith('…"') && long.length < 170);
-});
-
-test("widget: rules only in place of the check count, and the alert below", () => {
-	const view = {
-		phase: "live",
-		title: "CORE Weekly Sync",
-		startedMs: 0,
-		topic: "",
-		checks: 0,
-		cost: 0,
-		busy: false,
-		error: "",
-		questions: [],
-		shown: [],
-		expanded: false,
-		reply: "",
-		replay: false,
-		endsAt: 0,
-		rulesOnly: true,
-		alert: 'Jordan Blake asked for questions: "Any questions?"',
-	};
-	assert.deepEqual(widgetLines(view, plain, 120), [
-		"● meeting · CORE Weekly Sync · rules only · /meeting stop",
-		'  ! Jordan Blake asked for questions: "Any questions?"',
-	]);
-});
-
 // ── the extension ──
 
-test("/meeting replay with a DeepSeek --model and no Acme Copilot credentials: refused, rules only, no model called", async (t) => {
-	const file = path.join(dir, "20261007_100000-teams-team-weekly-sync.jsonl");
-	fs.writeFileSync(
-		file,
-		[
-			{ type: "metadata", meeting: "CORE Weekly Sync", app: "Teams", meeting_started_at: "2026-10-07T10:00:00-05:00" },
-			{ type: "caption", ts: "2026-10-07T10:00:01-05:00", speaker: "Jordan Blake", text: "Runner migration is on track." },
-			{ type: "caption", ts: "2026-10-07T10:00:02-05:00", speaker: "Sam Rivera", text: "Eric, can you take the Dynatrace piece?" },
-		]
-			.map((e) => JSON.stringify(e))
-			.join("\n") + "\n",
-	);
+/** A model registry whose scout answers from a script, one reply per call. */
+function scripted(replies, { auth = true, fail = false } = {}) {
+	const calls = [];
+	return {
+		calls,
+		find: (provider, id) => ({ provider, id, name: "Claude Haiku 5.5" }),
+		hasConfiguredAuth: () => auth,
+		streamSimple: (model, context) => {
+			calls.push({ model: `${model.provider}/${model.id}`, system: context.systemPrompt, user: context.messages[0].content });
+			return {
+				result: async () =>
+					fail
+						? { stopReason: "error", errorMessage: "429 rate limited", content: [], usage: { cost: { total: 0 } } }
+						: { stopReason: "stop", content: [{ type: "text", text: typeof replies === "function" ? replies(calls.length) : (replies.shift() ?? "{}") }], usage: { cost: { total: 0.002 } } },
+			};
+		},
+	};
+}
+
+function replayFixture(name, started, lines) {
+	const file = path.join(dir, `${name}.jsonl`);
+	fs.writeFileSync(file, [{ type: "metadata", meeting: lines.title, app: "Teams", meeting_started_at: started }, ...lines.records].map((e) => JSON.stringify(e)).join("\n") + "\n");
+	return file;
+}
+
+async function replaySession(t, registry) {
 	const commands = {};
 	const sent = [];
 	const notes = [];
-	const found = [];
 	const widgets = [];
-	let called = 0;
 	meeting({
 		on: () => {},
 		events: { on: () => {}, emit: () => {} },
@@ -168,85 +100,83 @@ test("/meeting replay with a DeepSeek --model and no Acme Copilot credentials: r
 		hasUI: true,
 		mode: "tui",
 		cwd: dir,
-		model: { provider: "opencode-go", id: "deepseek-v4.1-flash" },
-		modelRegistry: {
-			find: (provider, id) => (found.push(`${provider}/${id}`), { provider, id, name: id }),
-			hasConfiguredAuth: () => false,
-			streamSimple: () => {
-				called++;
-				throw new Error("no model may be called");
-			},
-		},
+		model: { provider: "opencode-go", id: "whatever" },
+		sessionManager: { getBranch: () => [] },
+		modelRegistry: registry,
 		ui: {
 			notify: (m, level) => notes.push(`${level ?? "info"}: ${m}`),
-			setWidget: (_key, factory) => widgets.push(factory ? factory(null, plain).render(160) : undefined),
+			setWidget: (_key, factory) => widgets.push(factory ? factory(null, plain).render(200) : undefined),
 		},
 	};
 	t.after(() => commands.meeting.handler("stop", ctx));
-	await commands.meeting.handler(`replay 100 ${file} --model opencode-go/deepseek-v4.1-flash`, ctx);
+	return { commands, ctx, sent, notes, widgets };
+}
 
-	const alert = '  ! Sam Rivera named you: "Eric, can you take the Dynatrace piece?"';
-	const end = Date.now() + 8000;
-	while (!widgets.some((w) => w?.includes(alert))) {
-		assert.ok(Date.now() < end, `no alert in the widget; notes: ${notes.join(" | ")}`);
-		await new Promise((r) => setTimeout(r, 50));
-	}
-	assert.ok(notes.includes("warning: Not Acme Copilot, so never given meeting text: opencode-go/deepseek-v4.1-flash"), notes.join(" | "));
-	assert.ok(notes.some((n) => n.startsWith("warning: No Acme Copilot scout with credentials (none given); cues by rule only")), notes.join(" | "));
-	assert.deepEqual(found, [], "the registry was never asked for a non-work model");
-	assert.equal(called, 0, "no model call in rules-only mode");
-	assert.match(sent[0].content, /via rules only/);
-	assert.match(widgets.find((w) => w?.includes(alert))[0], /rules only/);
+test("/meeting replay with no usable notes model: warns, calls nothing, and a name still alerts by code rule", async (t) => {
+	const file = replayFixture("20261007_100000-teams-team-weekly-sync", "2026-10-07T10:00:00-05:00", {
+		title: "CORE Weekly Sync",
+		records: [
+			{ type: "caption", ts: "2026-10-07T10:00:01-05:00", speaker: "Jordan Blake", text: "Runner migration is on track." },
+			{ type: "caption", ts: "2026-10-07T10:00:02-05:00", speaker: "Sam Rivera", text: "Eric, can you take the Dynatrace piece?" },
+		],
+	});
+	const registry = scripted([], { auth: false });
+	registry.streamSimple = () => assert.fail("no model may be called");
+	const s = await replaySession(t, registry);
+	await s.commands.meeting.handler(`replay 100 ${file}`, s.ctx);
+
+	await until(() => s.sent.some((m) => m.content.startsWith("🔔")), "the name alert");
+	assert.ok(s.notes.some((n) => n.startsWith("warning: The meeting notes model isn't available (github-copilot/claude-haiku-5.5): no notes, only name alerts")), s.notes.join(" | "));
+	assert.match(s.sent[0].content, /^Meeting copilot replaying "CORE Weekly Sync" at 100× via name alerts only$/);
+	const alert = s.sent.find((m) => m.content.startsWith("🔔"));
+	assert.equal(alert.content, '🔔 Sam Rivera said your name (10:00): "Eric, can you take the Dynatrace piece?"');
+	assert.deepEqual([alert.customType, alert.display], ["meeting", true]);
+	await until(() => s.widgets.some((w) => /^● CORE Weekly Sync \(replay\) · \d+m · 1 alert · name alerts only$/.test(w?.[0] ?? "")), "the status line", 4000);
+	assert.ok(s.widgets.filter(Boolean).every((w) => w.length === 1), "one line");
 });
 
-test("/meeting replay with Haiku failing: only Haiku is tried, the cue still shows by rule, the error says why", async (t) => {
-	const file = path.join(dir, "20261007_110000-teams-platform-sync.jsonl");
-	fs.writeFileSync(
-		file,
-		[
-			{ type: "metadata", meeting: "Platform Sync", app: "Teams", meeting_started_at: "2026-10-07T11:00:00-05:00" },
-			{ type: "caption", ts: "2026-10-07T11:00:01-05:00", speaker: "Jordan Blake", text: "That's the plan. Any questions?" },
-		]
-			.map((e) => JSON.stringify(e))
-			.join("\n") + "\n",
-	);
-	const commands = {};
-	const asked = [];
-	const widgets = [];
-	meeting({
-		on: () => {},
-		events: { on: () => {}, emit: () => {} },
-		registerCommand: (name, def) => (commands[name] = def),
-		registerMessageRenderer: () => {},
-		registerTool: () => {},
-		sendMessage: () => {},
+test("/meeting replay with the scout failing: only the notes model is tried, the name alert stands, the error says why", async (t) => {
+	const file = replayFixture("20261007_110000-teams-platform-sync", "2026-10-07T11:00:00-05:00", {
+		title: "Platform Sync",
+		records: [
+			{ type: "caption", ts: "2026-10-07T11:00:01-05:00", speaker: "Jordan Blake", text: "That's the plan." },
+			{ type: "caption", ts: "2026-10-07T11:00:02-05:00", speaker: "Jordan Blake", text: "Eric, does that work for you?" },
+		],
 	});
-	const ctx = {
-		hasUI: true,
-		mode: "tui",
-		cwd: dir,
-		model: { provider: "opencode-go", id: "deepseek-v4.1-flash" },
-		modelRegistry: {
-			find: (provider, id) => ({ provider, id, name: id }),
-			hasConfiguredAuth: (m) => m.provider === "github-copilot",
-			streamSimple: (m) => {
-				asked.push(`${m.provider}/${m.id}`);
-				return { result: async () => ({ stopReason: "error", errorMessage: "429 rate limited", content: [], usage: { cost: { total: 0 } } }) };
-			},
-		},
-		ui: { notify: () => {}, setWidget: (_key, factory) => widgets.push(factory ? factory(null, plain).render(200) : undefined) },
-	};
-	t.after(() => commands.meeting.handler("stop", ctx));
-	await commands.meeting.handler(`replay 100 ${file}`, ctx);
+	const registry = scripted([], { fail: true });
+	const s = await replaySession(t, registry);
+	await s.commands.meeting.handler(`replay 100 ${file}`, s.ctx);
 
-	const alert = '  ! Jordan Blake asked for questions: "That\'s the plan. Any questions?"';
-	const end = Date.now() + 8000;
-	while (!widgets.some((w) => w?.includes(alert))) {
-		assert.ok(Date.now() < end, "no alert in the widget");
-		await new Promise((r) => setTimeout(r, 50));
-	}
-	assert.ok(asked.length >= 1 && asked.every((s) => s === "github-copilot/claude-haiku-5.5"), asked.join(", "));
-	assert.match(widgets.find((w) => w?.includes(alert))[0], /error: github-copilot\/claude-haiku-5\.5: 429 rate limited/);
+	await until(() => s.widgets.some((w) => w?.[0]?.includes("error: github-copilot/claude-haiku-5.5: 429 rate limited")), "the error in the status line");
+	assert.ok(registry.calls.length >= 1 && registry.calls.every((c) => c.model === "github-copilot/claude-haiku-5.5"), registry.calls.map((c) => c.model).join(", "));
+	assert.ok(s.sent.some((m) => m.content === '🔔 Jordan Blake said your name (11:00): "Eric, does that work for you?"'));
+});
+
+test("/meeting replay: a slide asks for an early call, notes come back, a name alert is rate limited, nothing else posts", async (t) => {
+	const file = replayFixture("20261007_120000-teams-notes-sync", "2026-10-07T12:00:00-05:00", {
+		title: "Notes Sync",
+		records: [
+			{ type: "caption", ts: "2026-10-07T12:00:01-05:00", speaker: "Ada Lovelace", text: "Let's start with the cert." },
+			{ type: "slide", slide: 1, ts: "2026-10-07T12:00:02-05:00" },
+			{ type: "caption", ts: "2026-10-07T12:00:03-05:00", speaker: "Ada Lovelace", text: "Eric, are you there?" },
+			{ type: "caption", ts: "2026-10-07T12:00:30-05:00", speaker: "Ada Lovelace", text: "Eric? Hello?" },
+			{ type: "caption", ts: "2026-10-07T12:03:40-05:00", speaker: "Ada Lovelace", text: "Eric, one more thing." },
+		],
+	});
+	const registry = scripted(() => JSON.stringify({ topics: [{ title: "Cert", summary: "Rotation Thursday." }], decisions: [], actions: [], questions: [], reply: null }));
+	const s = await replaySession(t, registry);
+	await s.commands.meeting.handler(`replay 400 ${file}`, s.ctx);
+
+	await until(() => registry.calls.length >= 1 && s.widgets.some((w) => w?.[0]?.includes("slide 1")), "the first call and the slide in the status line");
+	assert.match(registry.calls[0].user, /<previous_notes>\n\(none yet/);
+	await until(() => s.sent.filter((m) => m.content.startsWith("🔔")).length >= 2, "two name alerts");
+	await wait(300);
+	const names = s.sent.filter((m) => m.content.startsWith("🔔")).map((m) => m.content);
+	assert.equal(names.length, 2, "Ada's second 'Eric' inside two minutes (meeting time) was collapsed");
+	assert.match(names[0], /\(12:00\): "Eric, are you there\?"$/);
+	assert.match(names[1], /\(12:03\): "Eric, one more thing\."$/);
+	// Only the start line and the alerts: no per-question or "check" messages.
+	assert.ok(s.sent.every((m) => m.content.startsWith("Meeting copilot replaying") || m.content.startsWith("🔔") || m.content.startsWith("Meeting copilot stopped")), s.sent.map((m) => m.content).join(" | "));
 });
 
 // ── auto start, ownership and the meeting tool ──
@@ -279,10 +209,11 @@ const WIDE_JPG = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDABALDA4MChAODQ4SER
 /** A temp world: capture state dir, data dir and lock file, env pointed at it. */
 function world(t, { owner = "earl" } = {}) {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-auto-"));
-	const saved = Object.fromEntries(["MEETING_CAPTURE_STATE_DIR", "PI_MEETING_LOCK", "PI_MEETING_OWNER", "PI_MEETING_WATCH"].map((k) => [k, process.env[k]]));
+	const saved = Object.fromEntries(["MEETING_CAPTURE_STATE_DIR", "PI_MEETING_LOCK", "PI_MEETING_OWNER", "PI_MEETING_WATCH", "PI_MEETING_NOTES_FILE"].map((k) => [k, process.env[k]]));
 	process.env.MEETING_CAPTURE_STATE_DIR = path.join(root, "state");
 	process.env.PI_MEETING_LOCK = path.join(root, "meeting-owner.json");
 	process.env.PI_MEETING_OWNER = owner;
+	process.env.PI_MEETING_NOTES_FILE = path.join(root, "canvas", ".meeting-notes.json");
 	delete process.env.PI_MEETING_WATCH;
 	fs.mkdirSync(path.join(root, "state"));
 	fs.mkdirSync(path.join(root, "data"));
@@ -296,6 +227,7 @@ function world(t, { owner = "earl" } = {}) {
 	const lockPath = process.env.PI_MEETING_LOCK;
 	const w = {
 		root,
+		notesFile: process.env.PI_MEETING_NOTES_FILE,
 		lockPath,
 		lock: () => JSON.parse(fs.readFileSync(lockPath, "utf8")),
 		/** A finished-or-running capture: captions, chat, people, 3 slides, a revisit. Returns the state record. */
@@ -351,7 +283,7 @@ function world(t, { owner = "earl" } = {}) {
 			fs.renameSync(`${statePath}.tmp`, statePath);
 			return s;
 		},
-		session(name, id = `${name}-id`, entries = []) {
+		session(name, id = `${name}-id`, entries = [], { registry } = {}) {
 			const handlers = new Map();
 			const tools = {};
 			const commands = {};
@@ -375,7 +307,7 @@ function world(t, { owner = "earl" } = {}) {
 				mode: "tui",
 				cwd: root,
 				sessionManager: { getSessionId: () => id, getBranch: () => entries },
-				modelRegistry: { find: () => undefined, hasConfiguredAuth: () => false, streamSimple: () => assert.fail("no model may be called") },
+				modelRegistry: registry ?? { find: () => undefined, hasConfiguredAuth: () => false, streamSimple: () => assert.fail("no model may be called") },
 				ui: { notify: (m) => notes.push(m), setWidget: (_k, f) => widgets.push(f ? f(null, plain).render(200) : undefined) },
 			};
 			const s = {
@@ -419,8 +351,8 @@ test("an owner-named session starts on a live meeting, holds the lock, and finis
 	const lock = w.lock();
 	assert.deepEqual([lock.pid, lock.sessionId, lock.name, lock.via], [process.pid, "Earl-id", "Earl", "owner"]);
 	assert.equal(fs.statSync(w.lockPath).mode & 0o777, 0o600);
-	assert.match(earl.showing(), /^● meeting · Weekly Sync · 16m · /, "the header shows an auto-started meeting");
-	assert.match(earl.sent[0].content, /Meeting copilot on "Weekly Sync" \(Microsoft Teams\) via rules only/);
+	assert.match(earl.showing(), /^● Weekly Sync · 16m · slide 2 · name alerts only$/, "one status line for an auto-started meeting");
+	assert.equal(earl.sent[0].content, 'Meeting copilot on "Weekly Sync" (Microsoft Teams) via name alerts only', "one line");
 	assert.match(await earl.prompt(), /^A meeting is live: Weekly Sync \(Microsoft Teams\), 15 min in, slide 2 on screen\. Use the meeting tool for anything about it\.$/);
 
 	// The meeting ends: the recap goes out, the prompt line goes away, and it does not restart.
@@ -544,13 +476,13 @@ test("/meeting stop ends it for good; a new started_at is a new meeting. Caption
 	w.state({ started_at: iso(startedAt), jsonl: null });
 	const earl = w.session("earl");
 	await earl.fire("session_start");
-	await until(() => earl.showing().startsWith("◌ meeting · Weekly Sync · waiting for captions"), "waiting for captions");
+	await until(() => earl.showing().startsWith("◌ Weekly Sync · waiting for captions"), "waiting for captions");
 	assert.match(await earl.toolText({ action: "transcript" }), /has no transcript yet/);
 	assert.match(await earl.prompt(), /^A meeting is live: Weekly Sync \(Microsoft Teams\), just started\. Use/, "no slide named until there is one");
 
 	w.capture({}, { startedAt });
 	await until(() => earl.started() === 1, "captions to attach");
-	assert.match(earl.showing(), /^● meeting · Weekly Sync/);
+	assert.match(earl.showing(), /^● Weekly Sync/);
 
 	await earl.command("stop");
 	assert.match(earl.sent.at(-1).content, /^Meeting copilot stopped \(\/meeting stop\)/);
@@ -781,3 +713,226 @@ test("meeting tool: registered read-only with guidelines", async (t) => {
 });
 
 const clockOf = (ms) => iso(ms).slice(11, 19);
+
+// ── the notes scout, alerts, the notes file and the recap, end to end ──
+
+test("a live meeting: notes, alerts, the reply once, the notes file, /meeting notes, a last call at the end, and the file goes with the session", async (t) => {
+	const w = world(t);
+	const startedAt = Date.now() - 16 * 60_000;
+	const state = w.capture({}, { startedAt });
+	const stamp = (min) => iso(startedAt + min * 60_000).slice(11, 16); // the meeting's own clock, as the transcript shows it (the last line before the call is the chat at minute 6)
+	const note = (extra = {}) =>
+		JSON.stringify({
+			topics: [{ title: "Cert rotation", summary: "Rotate Thursday, Amy owns it." }],
+			decisions: ["Rotate the cert Thursday"],
+			actions: [{ who: "Eric Boehs", what: "own moving the legacy services onto canary", mine: true, by: "Ada Lovelace" }, { who: "Amy", what: "rotate the cert", mine: false }],
+			questions: [{ q: "Who signs off before Thursday?", why: "no approver named" }],
+			reply: null,
+			...extra,
+		});
+	const replies = [
+		note({ reply: { to: "Alan Turing", text: "The runbook is in the wiki; I'll drop the link." } }),
+		note({ reply: { to: "Katherine", text: "I can have a plan by Friday." } }),
+		note({ reply: { to: "Katherine", text: "I can have a plan by Friday." } }),
+		note({ topics: [{ title: "Cert rotation", summary: "Final." }], reply: null }),
+	];
+	const registry = scripted(replies);
+	const branch = [
+		{ type: "message", message: { role: "user", content: "can you check the canary rollout config?" } },
+		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "The canary config lives in deploy/canary.yml." }] } },
+	];
+	const earl = w.session("earl", "earl-id", branch, { registry });
+	await earl.fire("session_start");
+	await until(() => earl.started() === 1, "the copilot to start");
+	assert.equal(earl.sent[0].content, 'Meeting copilot on "Weekly Sync" (Microsoft Teams) via Claude Haiku 5.5');
+
+	// First call: caught up on the history, so it goes at once. The reply for Alan rides on the action alert.
+	await until(() => registry.calls.length === 1 && earl.sent.some((m) => m.content.startsWith("✅")), "the first notes");
+	const first = registry.calls[0];
+	assert.equal(first.model, "github-copilot/claude-haiku-5.5");
+	assert.match(first.system, /live meeting copilot for Eric Boehs/);
+	assert.match(first.user, /^Meeting: Weekly Sync \(Microsoft Teams\)\nPeople: Ada Lovelace; Smith, Amy \(ORG\); Alan Turing\n/);
+	assert.match(first.user, /<session>\nWhat the user is working on right now, from their pi session "earl":\nTheir last messages:\n- can you check the canary rollout config\?\nThe assistant's last message:\nThe canary config lives in deploy\/canary\.yml\.\n<\/session>/);
+	assert.match(first.user, /<slides>[\s\S]*Cert rotation plan\nOwner: Amy[\s\S]*<\/slides>/, "OCR of the slides shown");
+	assert.match(first.user, /<previous_notes>\n\(none yet/);
+	assert.match(first.user, /\] Smith, Amy \(ORG\): The cert expires on Friday/);
+
+	const action = earl.sent.find((m) => m.content.startsWith("✅"));
+	assert.equal(action.content, `✅ Action on you: own moving the legacy services onto canary (Ada Lovelace, ${stamp(6)})\n↳ You could say: "The runbook is in the wiki; I'll drop the link."`);
+	assert.equal(action.display, true);
+	assert.ok(!earl.sent.some((m) => m.content.startsWith("↳")), "the reply rode along: no second message for it");
+
+	// The notes file the canvas reads.
+	const file = JSON.parse(fs.readFileSync(w.notesFile, "utf8"));
+	assert.equal(fs.statSync(w.notesFile).mode & 0o777, 0o600);
+	assert.deepEqual([file.v, file.pid, file.session, file.ended], [1, process.pid, { id: "earl-id", name: "earl" }, false]);
+	assert.deepEqual(file.meeting, { started_at: state.started_at, app_id: "teams", title: "Weekly Sync" });
+	assert.deepEqual(file.me, ["eric", "boehs"]);
+	assert.deepEqual(file.topics, [{ title: "Cert rotation", summary: "Rotate Thursday, Amy owns it." }]);
+	assert.deepEqual(file.actions.map((a) => [a.who, a.mine]), [["Eric Boehs", true], ["Amy", false]]);
+	assert.deepEqual(file.questions, [{ q: "Who signs off before Thursday?", why: "no approver named" }]);
+	assert.deepEqual([file.reply.to, file.reply.text], ["Alan Turing", "The runbook is in the wiki; I'll drop the link."]);
+	assert.deepEqual(file.alerts.map((a) => [a.kind, a.who]), [["action", "Ada Lovelace"]]);
+	assert.match(earl.showing(), /^● Weekly Sync · 16m · slide 2 · 1 alert · 1 question$/);
+
+	// Someone says his name: an immediate chat alert with no model; the same speaker again inside 2 min collapses.
+	const at = (ms) => iso(ms);
+	const say = (speaker, text, ms = Date.now()) => fs.appendFileSync(state.jsonl, JSON.stringify({ type: "caption", speaker, text, ts: at(ms) }) + "\n");
+	say("Ada Lovelace", "Eric, are you still with us?");
+	await until(() => earl.sent.some((m) => m.content.startsWith("🔔")), "the name alert");
+	say("Ada Lovelace", "Eric? Hello?");
+	say("Eric Boehs", "Sorry, I'm here. Eric here.");
+	await wait(1500);
+	const names = earl.sent.filter((m) => m.content.startsWith("🔔"));
+	assert.equal(names.length, 1, "a repeat and Eric's own words don't alert");
+	assert.match(names[0].content, /^🔔 Ada Lovelace said your name \(\d\d:\d\d\): "Eric, are you still with us\?"$/);
+	const nameAlertAt = earl.sent.indexOf(names[0]);
+	assert.ok(nameAlertAt > earl.sent.findIndex((m) => m.content.startsWith("✅")));
+	await until(() => JSON.parse(fs.readFileSync(w.notesFile, "utf8")).alerts.length === 2, "the name alert in the notes file");
+	assert.deepEqual(JSON.parse(fs.readFileSync(w.notesFile, "utf8")).alerts.map((a) => a.kind), ["action", "name"]);
+
+	// The name alert asked for an early call (after the 60 s floor, which a test can't wait for): /meeting ask forces one.
+	assert.equal(registry.calls.length, 1, "the 60 s floor holds the early call back");
+	await earl.command("ask");
+	await until(() => registry.calls.length === 2, "the second call");
+	assert.match(registry.calls[1].user, /<previous_notes>\n\{"topics":\[\{"title":"Cert rotation"/, "it updates the previous notes");
+	assert.match(registry.calls[1].user, /── new since your last update ──\n.*Ada Lovelace: Eric, are you still with us\?/s);
+	await until(() => earl.sent.some((m) => m.content.startsWith("↳")), "the reply on its own");
+	const reply = earl.sent.find((m) => m.content.startsWith("↳"));
+	assert.equal(reply.content, '↳ Katherine is waiting on you. You could say: "I can have a plan by Friday."');
+	assert.equal(earl.sent.filter((m) => m.content.startsWith("✅")).length, 1, "the same action isn't alerted twice");
+
+	// The same reply again: once per reply.
+	say("Katherine Johnson", "So, Friday?");
+	await earl.command("ask");
+	await until(() => registry.calls.length === 3, "the third call");
+	await wait(200);
+	assert.equal(earl.sent.filter((m) => m.content.startsWith("↳")).length, 1, "once per reply");
+
+	// Nothing but start, alerts and replies posted during the meeting.
+	assert.ok(earl.sent.every((m) => /^(Meeting copilot on |🔔|✅|↳)/.test(m.content)), earl.sent.map((m) => m.content).join(" | "));
+
+	// On request only: the current notes as one message.
+	const before = earl.sent.length;
+	await earl.command("notes");
+	assert.equal(earl.sent.length, before + 1);
+	const posted = earl.sent.at(-1).content;
+	assert.match(posted, /^Meeting notes · Weekly Sync · 2 alerts\nTopics:\n- Cert rotation: Rotate Thursday, Amy owns it\.\n\nDecisions:\n- Rotate the cert Thursday\n\nAction items:\n- ★ Eric Boehs: own moving the legacy services onto canary \(from Ada Lovelace\)\n- Amy: rotate the cert\n\nOpen questions:\n- Who signs off before Thursday\? \(no approver named\)\n\nSuggested reply to Katherine: I can have a plan by Friday\.$/);
+
+	// The meeting ends: one final call for what's left, then the one-line stop message with the recap; the file stays, ended.
+	say("Alan Turing", "That's all from me.");
+	w.state({ ...state, ended: true, ended_at: iso(Date.now()), duration: "0:16:00" });
+	await until(() => earl.stopped(), "the copilot to stop");
+	assert.equal(registry.calls.length, 4, "one last call before the recap");
+	assert.match(registry.calls[3].user, /That's all from me\./);
+	const stop = earl.sent.at(-1).content;
+	assert.match(stop, /^Meeting copilot stopped \(meeting ended\)\nTopics:\n- Cert rotation: Final\./);
+	assert.match(stop, /Action items:\n- ★ Eric Boehs: own moving/);
+	const ended = JSON.parse(fs.readFileSync(w.notesFile, "utf8"));
+	assert.equal(ended.ended, true, "the final notes stay for the canvas");
+	assert.equal(ended.topics[0].summary, "Final.");
+	assert.equal(earl.showing(), "", "the status line is gone");
+
+	// Quitting right after the call leaves the final notes for the canvas.
+	await earl.fire("session_shutdown", { reason: "quit" });
+	assert.equal(JSON.parse(fs.readFileSync(w.notesFile, "utf8")).ended, true);
+});
+
+test("a /reload mid-meeting keeps the notes file; the new instance picks the notes up and doesn't alert again, and quitting takes the file away", async (t) => {
+	const w = world(t);
+	const startedAt = Date.now() - 16 * 60_000;
+	const state = w.capture({}, { startedAt });
+	const note = (what) => JSON.stringify({ topics: [{ title: "Canary", summary: "Legacy services." }], decisions: [], actions: [{ who: "Eric Boehs", what, mine: true, by: "Ada Lovelace" }], questions: [], reply: null });
+	const first = scripted([note("own moving the legacy services onto canary")]);
+	const before = w.session("earl", "earl-id", [], { registry: first });
+	await before.fire("session_start");
+	await until(() => before.sent.some((m) => m.content.startsWith("✅")), "the action alert");
+	await before.fire("session_shutdown", { reason: "reload" });
+	assert.ok(fs.existsSync(w.notesFile), "a reload keeps the file");
+
+	// The scout words the same task differently on its first look at the whole history.
+	const second = scripted([note("own migrating legacy services to canary")]);
+	const after = w.session("earl", "earl-id", [], { registry: second });
+	await after.fire("session_start");
+	await until(() => after.started() === 1 && second.calls.length === 1, "the new instance's first call");
+	assert.match(second.calls[0].user, /<previous_notes>\n\{"topics":\[\{"title":"Canary"/, "it starts from the restored notes");
+	await wait(300);
+	assert.deepEqual(after.sent.filter((m) => !m.content.startsWith("Meeting copilot on ")), [], "nothing is said again");
+
+	// New alerts keep counting from where the file left off.
+	fs.appendFileSync(state.jsonl, JSON.stringify({ type: "caption", speaker: "Ada Lovelace", text: "Eric, are you there?", ts: iso(Date.now()) }) + "\n");
+	await until(() => after.sent.some((m) => m.content.startsWith("🔔")), "a name alert");
+	await until(() => JSON.parse(fs.readFileSync(w.notesFile, "utf8")).alerts.length === 2, "both alerts in the file");
+	assert.deepEqual(JSON.parse(fs.readFileSync(w.notesFile, "utf8")).alerts.map((x) => x.id), ["a1", "a2"]);
+
+	await after.fire("session_shutdown", { reason: "quit" });
+	assert.equal(fs.existsSync(w.notesFile), false, "quitting mid-meeting takes it away");
+});
+
+test("the daily-note recap lists topics, decisions, action items and open questions, and a replay never writes one", async (t) => {
+	const w = world(t);
+	const daily = path.join(w.root, "daily");
+	fs.mkdirSync(daily);
+	process.env.PI_MEETING_DAILY_DIR = daily;
+	t.after(() => (process.env.PI_MEETING_DAILY_DIR = ""));
+	const startedAt = Date.now() - 16 * 60_000;
+	const state = w.capture({}, { startedAt });
+	const registry = scripted([
+		JSON.stringify({ topics: [{ title: "Canary", summary: "Legacy services next." }], decisions: ["Canary first"], actions: [{ who: "Eric Boehs", what: "move the services", mine: true }], questions: [], reply: null }),
+	]);
+	const earl = w.session("earl", "earl-id", [], { registry });
+	await earl.fire("session_start");
+	await until(() => earl.started() === 1, "the copilot to start");
+	await until(() => registry.calls.length === 1, "the notes");
+	w.state({ ...state, ended: true, ended_at: iso(Date.now()), duration: "0:16:00" });
+	await until(() => earl.stopped(), "the copilot to stop");
+	const noteFile = path.join(daily, "2026-10-28.md");
+	const text = fs.readFileSync(noteFile, "utf8");
+	assert.match(text, /^## Meetings\n\n### \d\d:\d\d–\d\d:\d\d Weekly Sync · copilot notes\n<!-- meeting-copilot:20261028_140000-teams-weekly-sync -->\nTranscript: `.*20261028_140000-teams-weekly-sync\.txt` · 1 notes update\n\nTopics:\n- Canary: Legacy services next\.\n\nDecisions:\n- Canary first\n\nAction items:\n- ★ Eric Boehs: move the services\n$/);
+	assert.match(earl.sent.at(-1).content, /^Meeting copilot stopped \(meeting ended\) · recap in .*2026-10-28\.md\nTopics:/);
+
+	// A replay of the same capture adds nothing to the note.
+	const before = fs.readFileSync(noteFile, "utf8");
+	const s = w.session("solo", "solo-id", [], { registry: scripted([JSON.stringify({ topics: [{ title: "Replay", summary: "x" }], reply: null })]) });
+	await s.fire("session_start");
+	await s.command(`replay 100000 ${state.jsonl}`);
+	await until(() => s.stopped(), "the replay to finish", 12000);
+	assert.equal(fs.readFileSync(noteFile, "utf8"), before, "no recap for a replay");
+	assert.deepEqual([JSON.parse(fs.readFileSync(w.notesFile, "utf8")).session.id, JSON.parse(fs.readFileSync(w.notesFile, "utf8")).ended], ["earl-id", true], "and the replay left the notes file alone");
+});
+
+test("when the copilot stops for any reason but the meeting ending, the notes file goes", async (t) => {
+	const w = world(t, { owner: "" });
+	const startedAt = Date.now() - 16 * 60_000;
+	w.capture({}, { startedAt });
+	const registry = scripted([JSON.stringify({ topics: [{ title: "T", summary: "s" }], reply: null })]);
+	const s = w.session("anyone", "a1", [], { registry });
+	await s.fire("session_start");
+	await s.command("watch");
+	await until(() => fs.existsSync(w.notesFile), "the notes file");
+	await s.command("stop");
+	assert.equal(fs.existsSync(w.notesFile), false, "/meeting stop removes it");
+});
+
+test("/q research is gone: no /q command, no input hook, no /meeting list", async (t) => {
+	const commands = {};
+	const hooks = [];
+	meeting({
+		on: (e) => hooks.push(e),
+		events: { on: () => {}, emit: () => {} },
+		registerCommand: (name, def) => (commands[name] = def),
+		registerMessageRenderer: () => {},
+		registerTool: () => {},
+		sendMessage: () => {},
+	});
+	assert.deepEqual(Object.keys(commands), ["meeting"]);
+	assert.ok(!hooks.includes("input"), "nothing intercepts /q3 any more");
+	const notes = [];
+	const ctx = { hasUI: true, mode: "tui", ui: { notify: (m) => notes.push(m), setWidget() {} } };
+	await commands.meeting.handler("list", ctx);
+	assert.match(notes.at(-1), /^Unknown: \/meeting list\. Try watch, replay, ask, notes, focus, recap, stop$/);
+	assert.deepEqual(
+		commands.meeting.getArgumentCompletions("").map((c) => c.value),
+		["watch", "ask", "notes", "recap", "focus ", "stop", "replay"],
+	);
+});

@@ -7,13 +7,13 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { CARD_AFTER_END_MS, JsonlTail, MeetingFeed, normalizeLive, normalizeRecord, normalizeSlide, parseState } from "../extensions/canvas/meeting-feed.mjs";
+import { CARD_AFTER_END_MS, JsonlTail, MeetingFeed, normalizeLive, normalizeNotes, normalizeRecord, normalizeSlide, notesFilePath, parseState } from "../extensions/canvas/meeting-feed.mjs";
 
 const line = (o) => `${JSON.stringify(o)}\n`;
 
@@ -154,6 +154,8 @@ test("MeetingFeed: tails the transcript, slides and live lines; snapshot since a
     assert.equal(ch.final, true);
     assert.equal(ch.live, true, "live lines clear when it ends");
     assert.equal(feed.summary().ended, true);
+    now = Date.parse("2026-10-28T14:06:00Z") + CARD_AFTER_END_MS - 1;
+    assert.notEqual(feed.summary(), null);
     now = Date.parse("2026-10-28T14:06:00Z") + CARD_AFTER_END_MS + 1;
     assert.equal(feed.summary(), null);
     assert.equal(feed.snapshot().state.ended, true);
@@ -204,6 +206,197 @@ test("MeetingFeed.slideFile: only listed names, inside slides_dir, for the curre
   }
 });
 
+// ── the copilot's notes file ──
+
+const STARTED = "2026-10-28T14:00:00Z";
+const rawNotes = (over = {}) => ({
+  v: 1,
+  pid: 4242,
+  session: { id: "s-secret-id", name: "earl" },
+  meeting: { started_at: STARTED, app_id: "teams", title: "Weekly Sync" },
+  at: "2026-10-28T14:13:00.000Z",
+  ended: false,
+  me: ["eric", "boehs"],
+  topics: [{ title: "Cert rotation", summary: "Thursday." }],
+  decisions: [{ text: "Rotate Thursday", at: "2026-10-28T14:12:00.000Z" }],
+  actions: [
+    { who: "Eric Boehs", what: "own the canary move", mine: true, at: "2026-10-28T14:12:00.000Z" },
+    { who: "Amy", what: "rotate the cert", mine: false, at: "2026-10-28T14:12:00.000Z" },
+  ],
+  questions: [{ q: "Who signs off?", why: "no approver" }],
+  reply: { to: "Katherine", text: "Friday.", at: "2026-10-28T14:12:30.000Z" },
+  alerts: [
+    { id: "a1", kind: "action", who: "Ada", text: "own the canary move", at: "2026-10-28T14:12:00.000Z" },
+    { id: "a2", kind: "name", who: "Alan", text: "Eric, are you there?", at: "2026-10-28T14:13:00.000Z" },
+  ],
+  ...over,
+});
+
+test("normalizeNotes: version 1 with a pid, bounded, no pid or session id for the page", () => {
+  assert.equal(normalizeNotes(null), null);
+  assert.equal(normalizeNotes({ ...rawNotes(), v: 2 }), null);
+  assert.equal(normalizeNotes({ ...rawNotes(), pid: "4242" }), null);
+  const n = normalizeNotes(rawNotes());
+  assert.deepEqual([n.pid, n.startedAt, n.notes.session, n.notes.ended, n.notes.me], [4242, STARTED, "earl", false, ["eric", "boehs"]]);
+  assert.equal(JSON.stringify(n.notes).includes("s-secret-id"), false);
+  assert.equal("pid" in n.notes, false);
+  assert.deepEqual(n.notes.actions.map((a) => [a.what, a.mine]), [["own the canary move", true], ["rotate the cert", false]]);
+
+  const big = normalizeNotes(
+    rawNotes({
+      topics: Array.from({ length: 30 }, (_, i) => ({ title: "t".repeat(500), summary: `s${i}`.padEnd(900, "x") })),
+      decisions: Array.from({ length: 50 }, (_, i) => ({ text: `d${i}`, at: "x".repeat(100) })),
+      actions: Array.from({ length: 50 }, (_, i) => ({ who: "w".repeat(300), what: `a${i}`, mine: i === 0 })),
+      questions: [{ q: "a?" }, { q: "b?" }, { q: "c?" }],
+      alerts: [...Array.from({ length: 30 }, (_, i) => ({ id: `a${i}`, kind: "name", who: "A", text: "x".repeat(900), at: "t" })), { id: "bad", kind: "other", text: "no" }, "junk", null],
+      reply: { to: "x".repeat(300), text: "y".repeat(2000) },
+      me: ["eric", 3, "z".repeat(100), ...Array.from({ length: 20 }, () => "tok")],
+    }),
+  ).notes;
+  assert.equal(big.topics.length, 8);
+  assert.deepEqual([big.topics[0].title.length, big.topics[0].summary.length], [120, 400]);
+  assert.equal(big.decisions.length, 20);
+  assert.equal(big.decisions[0].at.length, 40);
+  assert.equal(big.actions.length, 20);
+  assert.equal(big.actions[0].who.length, 100);
+  assert.equal(big.questions.length, 2);
+  assert.equal(big.alerts.length, 20, "the newest 20, junk and unknown kinds dropped");
+  assert.equal(big.alerts[0].text.length, 400);
+  assert.deepEqual([big.reply.to.length, big.reply.text.length], [100, 500]);
+  assert.equal(big.me.length, 8);
+  assert.ok(big.me.every((t) => typeof t === "string" && t.length <= 40));
+  assert.equal(normalizeNotes(rawNotes({ reply: { to: "A", text: "  " } })).notes.reply, null);
+  assert.deepEqual(normalizeNotes({ v: 1, pid: 1 }).notes.topics, []);
+});
+
+test("notesFilePath: PI_MEETING_NOTES_FILE, else the canvas root", () => {
+  const saved = process.env.PI_MEETING_NOTES_FILE;
+  try {
+    delete process.env.PI_MEETING_NOTES_FILE;
+    assert.equal(notesFilePath("/x/canvas"), "/x/canvas/.meeting-notes.json");
+    process.env.PI_MEETING_NOTES_FILE = "/y/notes.json";
+    assert.equal(notesFilePath("/x/canvas"), "/y/notes.json");
+  } finally {
+    saved === undefined ? delete process.env.PI_MEETING_NOTES_FILE : (process.env.PI_MEETING_NOTES_FILE = saved);
+  }
+});
+
+test("MeetingFeed notes: used only for this meeting while its session lives, or once it ended", () => {
+  const f = fixture();
+  try {
+    const notesFile = join(f.root, "canvas", ".meeting-notes.json");
+    mkdirSync(join(f.root, "canvas"));
+    // Only the notes' session (pid 4242) can die here; the recorder (the state's pid) stays up.
+    let alive = true;
+    const feed = new MeetingFeed(f.state, { alive: (pid) => pid !== 4242 || alive, notesFile });
+    const put = (o) => writeFileSync(notesFile, JSON.stringify(rawNotes(o)));
+
+    // No state yet: nothing counts, whatever the file says.
+    put();
+    assert.equal(feed.poll().final, false);
+    assert.equal(feed.snapshot().notes, null);
+
+    f.writeState({ pid: 4243 });
+    assert.equal(feed.poll().final, true);
+    let snap = feed.snapshot();
+    assert.equal(snap.notes.topics[0].title, "Cert rotation");
+    assert.equal(JSON.stringify(snap).includes(f.root), false, "no paths in the page's view");
+    assert.deepEqual(feed.poll(), { final: false, live: false }, "unchanged: quiet");
+
+    // The summary: alert count, the newest three, Eric's open actions, questions, the reply.
+    put({ alerts: Array.from({ length: 5 }, (_, i) => ({ id: `a${i}`, kind: "name", who: "A", text: `t${i}`, at: "t" })) });
+    assert.equal(feed.poll().final, true, "a notes change counts as a final change");
+    const sum = feed.summary().notes;
+    assert.deepEqual([sum.alertCount, sum.lastAlertId, sum.alerts.map((a) => a.id), sum.ended], [5, "a4", ["a2", "a3", "a4"], false]);
+    assert.deepEqual(sum.actions.map((a) => a.what), ["own the canary move"], "only Eric's");
+    assert.deepEqual([sum.questions.length, sum.reply.to], [1, "Katherine"]);
+
+    // Another meeting's notes: ignored.
+    put({ meeting: { started_at: "2026-10-28T09:00:00Z", app_id: "teams", title: "Old" } });
+    assert.equal(feed.poll().final, true);
+    assert.equal(feed.snapshot().notes, null);
+    assert.equal(feed.summary().notes, null);
+
+    // Back to this one; then its session dies: stale, ignored.
+    put();
+    feed.poll();
+    assert.notEqual(feed.snapshot().notes, null);
+    alive = false;
+    assert.equal(feed.poll().final, true);
+    assert.equal(feed.snapshot().notes, null, "a stale notes pid isn't trusted");
+    assert.equal(feed.snapshot().state.recording, true, "while the recorder is still up");
+
+    // Ended notes are kept for the canvas even with the session gone.
+    put({ ended: true });
+    feed.poll();
+    assert.equal(feed.snapshot().notes.ended, true);
+    assert.equal(feed.summary().notes.ended, true);
+
+    // The file going away (the session shut down) takes the notes with it.
+    rmSync(notesFile);
+    assert.equal(feed.poll().final, true);
+    assert.equal(feed.snapshot().notes, null);
+
+    // Garbage in the file is just no notes.
+    writeFileSync(notesFile, "{ not json");
+    feed.poll();
+    assert.equal(feed.snapshot().notes, null);
+  } finally {
+    f.done();
+  }
+});
+
+test("MeetingFeed notes: a new meeting drops the old one's notes at once", () => {
+  const f = fixture();
+  try {
+    const notesFile = join(f.root, ".meeting-notes.json");
+    const feed = new MeetingFeed(f.state, { alive: () => true, notesFile });
+    f.writeState({});
+    writeFileSync(notesFile, JSON.stringify(rawNotes()));
+    feed.poll();
+    assert.equal(feed.snapshot().notes.topics.length, 1);
+    f.writeState({ started_at: "2026-10-28T16:00:00Z", jsonl: null });
+    assert.equal(feed.poll().final, true);
+    assert.equal(feed.snapshot().notes, null);
+    assert.equal(feed.summary().notes, null);
+    // Without a notes file configured nothing breaks.
+    const bare = new MeetingFeed(f.state, { alive: () => true });
+    bare.poll();
+    assert.equal(bare.snapshot().notes, null);
+  } finally {
+    f.done();
+  }
+});
+
+test("daemon: /api/meeting and a session's card carry the notes from PI_MEETING_NOTES_FILE", async () => {
+  const f = fixture();
+  const port = 22790 + Math.floor(Math.random() * 1000);
+  const daemon = fileURLToPath(new URL("../extensions/canvas/daemon.mjs", import.meta.url));
+  const notesFile = join(f.root, "notes.json");
+  const child = spawn(process.execPath, [daemon, "--port", String(port), "--root", join(f.root, "canvas"), "--omarchy", join(f.root, "none"), "--meeting", f.state], {
+    stdio: "ignore",
+    env: { ...process.env, PI_MEETING_NOTES_FILE: notesFile },
+  });
+  const get = (p) => fetch(`http://127.0.0.1:${port}${p}`);
+  try {
+    f.writeState({ pid: child.pid });
+    writeFileSync(notesFile, JSON.stringify(rawNotes({ pid: child.pid })));
+    let d;
+    for (let i = 0; i < 60; i++) {
+      d = await get("/api/meeting").then((r) => r.json(), () => null);
+      if (d?.notes) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(d.notes.topics[0].title, "Cert rotation");
+    assert.equal(d.notes.alerts.length, 2);
+    const card = await get("/api/s/nobody").then((r) => r.json());
+    assert.deepEqual([card.meeting.notes.alertCount, card.meeting.notes.actions.length], [2, 1]);
+  } finally {
+    child.kill();
+    f.done();
+  }
+});
+
 test("daemon: /api/meeting, /meeting and slide routes, served from the state folder", async () => {
   const f = fixture();
   const port = 21790 + Math.floor(Math.random() * 1000);
@@ -236,4 +429,36 @@ test("daemon: /api/meeting, /meeting and slide routes, served from the state fol
     child.kill();
     f.done();
   }
+});
+
+
+// ── the card (page.mjs renderMeeting), pulled out of the module and run in jsdom ──
+
+import { JSDOM } from "jsdom";
+
+test("meeting card: alerts and your action items on top, one link to /meeting", async () => {
+  const { h } = await import("../extensions/canvas/render.mjs");
+  const dom = new JSDOM("<!doctype html><body></body>");
+  after(() => dom.window.close());
+  globalThis.document = dom.window.document;
+  globalThis.Node = dom.window.Node;
+  const src = readFileSync(fileURLToPath(new URL("../extensions/canvas/page.mjs", import.meta.url)), "utf8");
+  const code = src.slice(src.indexOf("const meetPad"), src.indexOf("// The card's elapsed time ticks"));
+  const { renderMeeting, meetingLastAlert } = new Function("h", "plural", `${code}; return { renderMeeting, meetingLastAlert };`)(h, (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`);
+  const notes = { lastAlertId: "a2", alerts: [{ id: "a1", kind: "name", who: "Ada", text: "Eric?", at: "2026-10-28T14:00:00Z" }, { id: "a2", kind: "action", who: "Ada", text: "own it", at: "2026-10-28T14:05:00Z" }], actions: [{ what: "own it", mine: true }, { what: "not mine", mine: false }] };
+  const base = { id: "a00000000000", title: "Weekly Sync", app: "Teams", startedAt: new Date().toISOString(), recording: true, ended: false, people: 3, slides: 1, slide: { n: 1, thumb: true }, recent: [{ type: "caption", speaker: "Ada", text: "Hi" }], notes };
+
+  const live = renderMeeting(base);
+  assert.deepEqual([...live.querySelectorAll(".m-open")].map((a) => [a.textContent, a.getAttribute("href")]), [["Open the live view ↗", "/meeting"]]);
+  assert.deepEqual([...live.querySelectorAll(".m-alert")].map((a) => a.textContent.includes("own it")), [true, false], "newest first");
+  assert.deepEqual([...live.querySelectorAll(".m-todo li")].map((li) => li.textContent), ["own it"], "only your actions");
+  assert.equal(live.querySelector(".m-alerts"), live.children[2], "the alerts box sits right under the title");
+  assert.match(live.textContent, /Live/);
+
+  const ended = renderMeeting({ ...base, recording: false, ended: true, endedAt: new Date().toISOString(), duration: "0:10:00" });
+  assert.match(ended.querySelector(".m-status").textContent, /Ended/);
+  assert.equal(ended.querySelector(".m-open").textContent, "Open the transcript ↗");
+  assert.equal(renderMeeting({ ...base, notes: null }).querySelector(".m-alerts"), null);
+  assert.equal(meetingLastAlert({ data: { notes } }), "a2");
+  assert.equal(meetingLastAlert({ data: {} }), "");
 });

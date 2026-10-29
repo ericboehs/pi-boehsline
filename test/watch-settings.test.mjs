@@ -27,6 +27,15 @@ test("neutral defaults: no workspaces, no feed, no work route, no notes, nothing
 	assert.equal(watchSettings().dailyDir, "");
 	assert.deepEqual(meetingSettings().qmdCollections, []);
 	assert.equal(meetingSettings().owner, "", "no owner session until named");
+	assert.equal(meetingSettings().model, "github-copilot/claude-haiku-5.5", "the notes scout defaults to Haiku");
+	assert.equal("codeDir" in meetingSettings(), false, "/q research's settings are gone");
+	assert.equal("researchModel" in workSettings() || "ghHost" in workSettings(), false);
+});
+
+test("meeting.model: from settings, PI_MEETING_MODEL wins, trimmed", () => {
+	registerSource("me", { meeting: { model: "p/settings-model" } });
+	assert.equal(meetingSettings({}).model, "p/settings-model");
+	assert.equal(meetingSettings({ PI_MEETING_MODEL: " p/env-model " }).model, "p/env-model");
 });
 
 test("a package's settings apply at applySettings (session_start), not at import", () => {

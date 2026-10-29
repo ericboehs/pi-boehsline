@@ -2,6 +2,11 @@
 // written, with the shared screen's slides. The daemon (meeting-feed.mjs)
 // tails the files; this page asks /api/meeting for what's new on each
 // "meeting" event and appends it. Nothing here loads from the network.
+//
+// Beside the transcript sits the copilot's Notes panel (alerts, your action
+// items, decisions, topics, questions, a suggested reply), from the notes file
+// the daemon merges into /api/meeting. From 1400 px it is a third column; below
+// that a Transcript / Notes switch at the top of the column swaps them.
 
 const CSS = `
 :root { color-scheme: light dark; --bg:#f7f5f0; --card:#fff; --ink:#1c1b19; --dim:#8a8578; --line:#e6e1d6; --soft:#f0ece3; --accent:#b4541f; --ok:#1f7a52; --warn:#a86a00; --bad:#c0392b; --c1:#3b7dd8; --c2:#e0703a; --c3:#2f9e72; --c4:#c4475b; --c5:#8a63c9; --c6:#b8901c; --c7:#2e9bb0; --c8:#8c8577; }
@@ -64,9 +69,37 @@ body:not(.has-slides) .tx { max-width: 920px; margin: 0 auto; width: 100%; }
 .empty { margin: auto; text-align: center; color: var(--dim); max-width: 440px; padding: 40px 20px; }
 .empty h2 { color: var(--ink); font-size: 17px; font-weight: 600; margin: 0 0 6px; }
 .waiting { color: var(--dim); font-style: italic; padding: 16px 6px; }
+.row.me { background: color-mix(in srgb, var(--warn) 11%, transparent); box-shadow: inset 2px 0 0 color-mix(in srgb, var(--warn) 70%, transparent); }
+.tabs { flex: none; display: none; gap: 6px; padding: 8px 18px 0; }
+.tabs button { font: 500 12.5px/1 -apple-system, BlinkMacSystemFont, sans-serif; padding: 6px 11px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--dim); cursor: pointer; }
+.tabs button.on { color: var(--ink); border-color: var(--accent); }
+.tabs i { font-style: normal; font-weight: 600; margin-left: 5px; color: var(--warn); }
+.notes { flex: none; width: 340px; min-height: 0; display: none; flex-direction: column; border-left: 1px solid var(--line); background: var(--card); }
+body.has-notes .notes { display: flex; }
+body.has-notes:not(.has-slides) .tx { max-width: none; margin: 0; }
+.nbody { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 16px 18px; }
+.nbody h3 { margin: 16px 0 6px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+.nbody ul { margin: 0; padding-left: 18px; }
+.nbody li { margin: 3px 0; line-height: 1.4; }
+.nbody li small { color: var(--dim); }
+.nbody .none { color: var(--dim); font-style: italic; font-size: 13px; }
+.nbody .alerts { display: flex; flex-direction: column; gap: 5px; padding: 8px 10px; border-radius: 6px; background: color-mix(in srgb, var(--warn) 14%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); }
+.nbody .alert { line-height: 1.4; }
+.nbody .alert time { color: var(--dim); font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; margin-right: 6px; }
+.nbody .topic b { font-weight: 600; }
+.nbody .reply { padding: 8px 10px; border-radius: 6px; background: var(--soft); border-left: 3px solid var(--ok); line-height: 1.45; }
+.nbody .reply small { display: block; color: var(--dim); margin-bottom: 2px; }
+.nbody .foot { margin-top: 18px; color: var(--dim); font-size: 12px; }
 dialog { border: 0; padding: 0; background: transparent; max-width: 96vw; max-height: 96vh; }
 dialog::backdrop { background: rgb(0 0 0 / .8); }
 dialog img { display: block; max-width: 96vw; max-height: 96vh; }
+@media (max-width: 1399px) {
+  .notes { width: auto; flex: 2 1 0; border-left: 0; }
+  body.has-notes .notes { display: none; }
+  body.has-notes.view-notes .notes { display: flex; }
+  body.has-notes.view-notes .tx { display: none; }
+  body.has-notes .tabs { display: flex; }
+}
 @media (max-width: 900px) {
   main { flex-direction: column; }
   .stage { flex: none; max-height: 48vh; border-right: 0; border-bottom: 1px solid var(--line); }
@@ -118,6 +151,28 @@ const shownAgain = new Map(); // slide n → times it came back (revisits)
 let stick = true; // the transcript follows the bottom until you scroll up
 let lastSpeaker = null;
 let filter = "";
+let notes = null; // the copilot's notes, when it has some for this meeting
+
+// ── transcript / notes switch (below 1400 px; the CSS hides it above) ──
+const bars = [];
+function tabsBar() {
+  const mk = (v, label) => h("button", { type: "button", "data-v": v, onclick: () => showView(v) }, label, h("i", { hidden: true }));
+  const bar = h("div", { class: "tabs" }, mk("tx", "Transcript"), mk("notes", "Notes"));
+  bars.push(bar);
+  return bar;
+}
+function showView(v) {
+  document.body.classList.toggle("view-notes", v === "notes");
+  for (const bar of bars) for (const b of bar.children) b.classList.toggle("on", b.dataset.v === v);
+}
+function badge() {
+  const n = notes?.alerts?.length || 0;
+  for (const bar of bars) {
+    const i = bar.querySelector('[data-v="notes"] i');
+    i.hidden = !n;
+    i.textContent = n;
+  }
+}
 
 // ── layout ──
 const style = document.createElement("style");
@@ -137,6 +192,7 @@ const ui = {
   rows: h("div", { class: "rows" }),
   live: h("div", { class: "live" }),
   jump: h("button", { class: "jump", type: "button", hidden: true }, "↓ Jump to live"),
+  nbody: h("div", { class: "nbody" }),
   empty: h("div", { class: "empty", hidden: true }),
   dialog: h("dialog", {}, h("img", { alt: "" })),
 };
@@ -147,7 +203,8 @@ $app.append(
     "main",
     {},
     h("section", { class: "stage" }, h("div", { class: "slide" }, h("div", { class: "frame" }, ui.img), ui.cap), ui.strip),
-    h("section", { class: "tx" }, ui.scroll, ui.jump),
+    h("section", { class: "tx" }, tabsBar(), ui.scroll, ui.jump),
+    h("section", { class: "notes" }, tabsBar(), ui.nbody),
     ui.empty,
   ),
   ui.dialog,
@@ -191,6 +248,7 @@ function renderEmpty() {
   const none = !state;
   ui.empty.hidden = !none;
   document.querySelector("main .tx").hidden = none;
+  if (none) document.body.classList.remove("has-notes", "view-notes");
   document.body.classList.toggle("has-slides", !none && slides.length > 0);
   if (none) ui.empty.replaceChildren(h("h2", {}, "No meeting"), h("div", {}, "This page fills in by itself when meeting-capture starts a meeting."));
 }
@@ -260,6 +318,39 @@ ui.img.addEventListener("click", () => {
 });
 ui.dialog.addEventListener("click", () => ui.dialog.close());
 
+// ── your name in the transcript ──
+// Same rule as the copilot's: someone other than you says one of your name tokens as a whole word.
+const nameParts = (name) => new Set(String(name).replace(/\(.*?\)/g, " ").split(/[^\p{L}'-]+/u).map((x) => x.toLowerCase()).filter((x) => x.length >= 3));
+const escapeRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// A token another participant shares ("Eric" with an "Eric Smith" in the call) can't be you alone.
+let nameKey = "";
+let nameRes = [];
+function setNames() {
+  const me = notes?.me || [];
+  const others = (people?.people || []).map(nameParts).filter((sp) => !me.length || !me.every((t) => sp.has(t)));
+  const key = JSON.stringify([me, others.map((sp) => [...sp])]);
+  if (key === nameKey) return false;
+  nameKey = key;
+  nameRes = me.filter((t) => !others.some((sp) => sp.has(t))).map((t) => new RegExp(`(^|[^\\p{L}])${escapeRe(t)}($|[^\\p{L}])`, "iu"));
+  return true;
+}
+function saysMyName(speaker, text) {
+  if (!nameRes.length) return false;
+  const me = notes?.me || [];
+  const sp = nameParts(speaker);
+  if (me.every((t) => sp.has(t))) return false;
+  return nameRes.some((re) => re.test(text));
+}
+// Rows are marked once per name key: a new row when it arrives, every row only when who "me" is changes.
+function markMentions() {
+  const all = setNames();
+  for (const row of ui.rows.children) {
+    if (row.dataset.sp == null || (!all && row.dataset.mk === "1")) continue;
+    row.dataset.mk = "1";
+    row.classList.toggle("me", saysMyName(row.dataset.sp, row.dataset.tx || ""));
+  }
+}
+
 // ── transcript ──
 function rowFor(e) {
   const t = h("time", { datetime: e.ts }, clock(e.ts));
@@ -293,6 +384,11 @@ function appendEntries(list) {
     const row = rowFor(e);
     if (!row) continue;
     row.dataset.q = rowText(e);
+    if (e.type === "caption" || e.type === "chat") {
+      row.dataset.sp = e.speaker || "";
+      row.dataset.tx = e.text || "";
+      if (saysMyName(e.speaker || "", e.text || "")) row.classList.add("me");
+    }
     if (filter && !row.dataset.q.includes(filter)) row.hidden = true;
     frag.append(row);
   }
@@ -337,6 +433,31 @@ ui.search.addEventListener("input", () => {
   if (!filter) followBottom();
 });
 
+// ── notes panel ──
+const fmtAt = (iso) => (iso ? clock(iso).slice(0, 5) : "");
+const section = (title, ...kids) => [h("h3", {}, title), ...kids];
+function renderNotes() {
+  const n = notes;
+  // The panel (third column, or the Transcript / Notes switch) is there only when a copilot is writing notes.
+  const has = Boolean(state && n);
+  document.body.classList.toggle("has-notes", has);
+  if (!has) document.body.classList.remove("view-notes");
+  badge();
+  if (!has) return void ui.nbody.replaceChildren();
+  const alerts = [...n.alerts].reverse();
+  const mine = n.actions.filter((a) => a.mine);
+  const out = [];
+  out.push(...section(`Alerts${alerts.length ? ` · ${alerts.length}` : ""}`, alerts.length ? h("div", { class: "alerts" }, alerts.map((a) => h("div", { class: "alert" }, a.at ? h("time", {}, fmtAt(a.at)) : null, h("b", {}, a.kind === "action" ? "✅" : "🔔", a.who ? ` ${a.who}: ` : " "), a.text))) : h("div", { class: "none" }, "Nothing yet. A name said, or a new action on you.")));
+  out.push(...section("Your action items", mine.length ? h("ul", {}, mine.map((a) => h("li", {}, a.what, a.at ? h("small", {}, ` · ${fmtAt(a.at)}`) : null))) : h("div", { class: "none" }, "None")));
+  out.push(...section("Decisions", n.decisions.length ? h("ul", {}, n.decisions.map((d) => h("li", {}, d.text, d.at ? h("small", {}, ` · ${fmtAt(d.at)}`) : null))) : h("div", { class: "none" }, "None yet")));
+  out.push(...section("Topics", n.topics.length ? h("ul", {}, n.topics.map((t) => h("li", { class: "topic" }, h("b", {}, t.title), t.summary ? ` ${t.summary}` : ""))) : h("div", { class: "none" }, "None yet")));
+  if (n.questions.length) out.push(...section("Questions worth asking", h("ul", {}, n.questions.map((q) => h("li", {}, q.q, q.why ? h("small", {}, ` — ${q.why}`) : null)))));
+  out.push(...section("Suggested reply", n.reply ? h("div", { class: "reply" }, h("small", {}, `${n.reply.to ? `${n.reply.to} is waiting on you` : "Someone is waiting on you"}${n.reply.at ? ` · ${fmtAt(n.reply.at)}` : ""}`), n.reply.text) : h("div", { class: "none" }, "Nobody is waiting on you.")));
+  out.push(h("div", { class: "foot" }, `${n.ended ? "Final notes" : "Updated"} ${fmtAt(n.at)}${n.session ? ` · from the “${n.session}” session` : ""}`));
+  ui.nbody.replaceChildren(...out);
+}
+showView("tx");
+
 // ── data ──
 function apply(d) {
   if (d.id !== id || d.from !== entries.length) {
@@ -347,6 +468,7 @@ function apply(d) {
   state = d.state;
   slides = d.slides || [];
   people = d.people;
+  notes = d.notes || null;
   live = state?.recording ? d.live || [] : [];
   renderEmpty();
   renderSlides();
@@ -359,6 +481,8 @@ function apply(d) {
   if (state && !entries.length && !ui.rows.querySelector(".waiting")) ui.rows.append(h("div", { class: "waiting" }, state.recording ? "Waiting for the first caption…" : "No transcript was written."));
   renderLive();
   renderHeader();
+  renderNotes();
+  markMentions();
   followBottom();
 }
 

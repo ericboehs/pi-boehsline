@@ -155,7 +155,7 @@ export function canClaim(lock: Lock | null, me: Pick<Me, "pid" | "sessionId" | "
 const lockBody = (me: Me): string => `${JSON.stringify({ pid: me.pid, sessionId: me.sessionId, name: me.name, via: me.via, at: new Date().toISOString() } satisfies Lock)}\n`;
 
 /** Write `body` to `file` atomically (tmp + rename), mode 600; the tmp file never outlives a failure. */
-function writeAtomic(file: string, body: string): void {
+export function writeAtomic(file: string, body: string): void {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
 	try {

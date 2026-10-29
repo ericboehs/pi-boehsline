@@ -5,9 +5,7 @@
     "label": "Acme Copilot",
     "providers": ["github-copilot"],
     "models": ["github-copilot/claude-haiku-5.5"],
-    "researchModel": "github-copilot/claude-opus-5.5",
     "sensitive": "employee IDs, badge numbers",
-    "ghHost": "github.acme.example",
     "redact": [{ "pattern": "\\bEMP\\d{6}\\b", "flags": "g", "replace": "[EMP]" }]
   },
   "watch": {

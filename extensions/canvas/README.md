@@ -298,8 +298,14 @@ the review prompt — so a renderer never reaches for a page global.
   is following a meeting, a **Meeting** card (`auto-meeting`) sits at the top of every
   session's side panel: a green **Live** dot and ticking elapsed time, the title and
   app, people and slide counts, the newest slide's thumbnail and the last
-  four captions or chat lines. It stays for 15 minutes after the meeting
-  ends. **Open the live view** goes to `/meeting`. That page shows the shared screen's
+  four captions or chat lines. When the [meeting copilot](../opt-in/meeting/README.md)
+  is running in a pi session, its **alerts** (someone said your name, a new
+  action on you) sit at the top of the card in a warn-tinted box, newest first,
+  at most three with their time and who, then **Your action items**; the card
+  flashes when a new alert arrives (its id changes; other rewrites stay quiet). It
+  stays for 15 minutes after the meeting ends (the alerts and your action
+  items stay on it), then disappears. **Open the live view** (**Open the
+  transcript** once it has ended) goes to `/meeting`. That page shows the shared screen's
   current slide large, with a thumbnail strip, and the transcript beside it.
   The transcript has speaker colours, chat, people and slide markers, and
   the in-progress lines greyed at the bottom with a cursor. It follows the
@@ -309,14 +315,23 @@ the review prompt — so a renderer never reaches for a page global.
   click on the slide opens it full size. A `revisit` (the screen went back to
   a frame saved earlier) makes that slide current again, adds a "↺ Back to
   slide N" marker and marks its thumbnail ↺ (with a count past one); it adds
-  no thumbnail, and the slide count stays distinct frames. After the meeting `/meeting` keeps
-  the last one until the next starts.
+  no thumbnail, and the slide count stays distinct frames. A **Notes** panel
+  beside the transcript shows the copilot's alerts, your action items,
+  decisions, topics, questions (only if there are any) and the suggested reply;
+  from 1400 px wide it is a third column (about 340 px), narrower a
+  **Transcript / Notes** switch at the top of the column swaps them. Transcript
+  lines where someone else says your name get a subtle warn highlight. After
+  the meeting `/meeting` keeps the last one until the next starts.
   The daemon reads meeting-capture's files directly (the contract is
   meeting-capture's `docs/canvas-contract.md`): `state.json` in
   `MEETING_CAPTURE_STATE_DIR` (default `~/.local/state/meeting-capture`),
   `live.json`, the transcript `.jsonl` (tailed by byte offset; a partial line
   waits) and the slides folder's `index.jsonl`
-  ([`meeting-feed.mjs`](meeting-feed.mjs)). It polls with a few `stat`s
+  ([`meeting-feed.mjs`](meeting-feed.mjs)), plus the copilot's notes file,
+  `<root>/.meeting-notes.json` (`PI_MEETING_NOTES_FILE`), read when its stat
+  changes and used only while its `meeting.started_at` equals the live state's
+  and its pid is alive (or it says `ended`); a notes change is a card refresh
+  like a new caption. It polls with a few `stat`s
   every 250 ms during a meeting and every 2 s otherwise, and sends a
   `meeting` event on each change. `/meeting`
   ([`meeting-page.mjs`](meeting-page.mjs)) then fetches only the entries
