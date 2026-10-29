@@ -26,6 +26,7 @@ test("neutral defaults: no workspaces, no feed, no work route, no notes, nothing
 	assert.equal(watch.redact("EMP123456 and 555-12-3456"), "EMP123456 and 555-12-3456");
 	assert.equal(watchSettings().dailyDir, "");
 	assert.deepEqual(meetingSettings().qmdCollections, []);
+	assert.equal(meetingSettings().owner, "", "no owner session until named");
 });
 
 test("a package's settings apply at applySettings (session_start), not at import", () => {
@@ -50,6 +51,13 @@ test("env still wins over settings", () => {
 	assert.deepEqual(watchSettings(env).vips, [], "an empty env var clears the list");
 	assert.deepEqual(meetingSettings(env).qmdCollections, []);
 	assert.deepEqual(workSettings(env).models, ["p/m"], "specs need a provider");
+});
+
+test("meeting.owner: from settings, PI_MEETING_OWNER wins, trimmed", () => {
+	registerSource("me", { meeting: { owner: "earl" } });
+	assert.equal(meetingSettings({}).owner, "earl");
+	assert.equal(meetingSettings({ PI_MEETING_OWNER: " bob " }).owner, "bob");
+	assert.equal(meetingSettings({ PI_MEETING_OWNER: "" }).owner, "", "an empty env var clears it");
 });
 
 test("dailyDir: watch falls back to meeting's; ~ expands", () => {

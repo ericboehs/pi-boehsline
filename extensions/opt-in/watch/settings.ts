@@ -77,6 +77,8 @@ export interface MeetingSettings extends ConfigObject {
 	dailyDir: string;
 	/** Where your code lives, for /q research ("Code under <dir>: rg"); "" leaves the hint out. */
 	codeDir: string;
+	/** Session name (agent-link name) that runs the copilot on its own, e.g. "earl"; "" means none. */
+	owner: string;
 }
 
 export const WORK_DEFAULTS: WorkSettings = {
@@ -101,7 +103,7 @@ export const WATCH_DEFAULTS: WatchSettings = {
 	notifBin: "",
 };
 
-export const MEETING_DEFAULTS: MeetingSettings = { qmdCollections: [], dailyDir: "", codeDir: "" };
+export const MEETING_DEFAULTS: MeetingSettings = { qmdCollections: [], dailyDir: "", codeDir: "", owner: "" };
 
 const list = (raw: string) =>
 	raw
@@ -125,6 +127,7 @@ export function meetingSettings(env: NodeJS.ProcessEnv = process.env): MeetingSe
 		qmdCollections: env.PI_MEETING_QMD_COLLECTIONS !== undefined ? list(env.PI_MEETING_QMD_COLLECTIONS) : s.qmdCollections,
 		dailyDir: expandHome(env.PI_MEETING_DAILY_DIR ?? s.dailyDir),
 		codeDir: env.PI_MEETING_CODE_DIR ?? s.codeDir,
+		owner: (env.PI_MEETING_OWNER ?? s.owner).trim(),
 	};
 }
 

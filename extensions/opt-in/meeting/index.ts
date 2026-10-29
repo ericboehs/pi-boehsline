@@ -1,23 +1,50 @@
 /**
  * meeting.ts — live meeting copilot.
  *
- *   /meeting start [filter|path] [--model provider/id] [--replay [speed]]
+ *   /meeting watch [off]    arm this session: it takes over the copilot now, and
+ *                           runs every meeting that starts (off disarms)
+ *   /meeting replay [speed] [path] [--model provider/id]
+ *                           play a finished transcript back, for testing
  *   /meeting ask            check right now
  *   /meeting focus <text>   what you want out of this meeting (fed to the scout)
  *   /meeting list           every question in the widget (again to collapse)
  *   /meeting recap          post the recap so far and update the daily note
- *   /meeting stop
- *   /meeting                status
+ *   /meeting stop           stop this meeting (it won't restart)
+ *   /meeting                status: armed, owner setting, lock holder, live meeting
  *   /q3 [what to look for]  research Q3 with a subagent (/q 3, or /q to pick)
  *
- * Tails the live meeting-capture transcript (~/.local/share/meeting-capture/
- * *.jsonl, finished caption lines only) and, when enough new talk has piled up,
- * asks a small fast work model (work.models) for questions worth
- * asking out loud. No model is polled on a timer: the file is, and code decides
- * when a check is worth a call.
+ * Starts by itself. Every 2s each session checks meeting-capture's state.json
+ * ($MEETING_CAPTURE_STATE_DIR, default ~/.local/state/meeting-capture; see its
+ * docs/canvas-contract.md). A meeting is live when it isn't marked ended and
+ * the recorder's pid is alive. A session may run the copilot when it is
+ * eligible: armed with /meeting watch (saved in the session, so /reload and
+ * resume keep it; PI_MEETING_WATCH=1 also arms), or named like meeting.owner
+ * (its session name, case-insensitive; Eric's chief-of-staff session is
+ * "earl"). Several sessions run at once and exactly one may run the copilot,
+ * so it holds a lock, ~/.pi/agent/meeting-owner.json (PI_MEETING_LOCK):
+ * {pid, sessionId, name, via, at}. A session claims it when there is none, the
+ * holder's pid is dead, the holder is itself, or it is armed and the holder
+ * only matches the owner setting. /meeting watch overwrites it at once. A
+ * holder that finds the lock gone to someone else stops quietly ("Meeting
+ * copilot moved to <name>") and doesn't re-claim until the lock frees. The lock
+ * is created with O_EXCL when none exists; a takeover (dead or owner-held
+ * holder) writes it, waits a random 100-300 ms and starts only if it is still
+ * theirs. It is deleted on shutdown and on watch off. A meeting that ended never
+ * restarts (ended:true), and /meeting stop is remembered in
+ * ~/.pi/agent/meeting-stopped.json beside the lock (the last 5 started_at), so
+ * no session or /reload restarts it. A new meeting has a different started_at,
+ * and a recorder restart is a new meeting, so there is no wait for a reconnect.
  *
- * Meetings are work text, so only work models read them (watch/models.ts):
- * the scout, and /q research too. Any other model, from PI_MEETING_MODEL,
+ * Tails the transcript state.json names (finished caption lines only) and,
+ * when enough new talk has piled up, asks a small fast work model
+ * (work.models) for questions worth asking out loud. No model is polled on a
+ * timer: the file is, and code decides when a check is worth a call.
+ *
+ * Meetings are work text, so only work models run the scout and /q research
+ * (watch/models.ts). The `meeting` tool below is NOT limited that way: it hands
+ * the transcript and slide images to whatever model the session uses (Eric's
+ * choice), so only use it in a session whose model may read work text. Any
+ * other model for the scout, from PI_MEETING_MODEL,
  * --model or the session, is refused. With no work model, or while a call
  * fails, code rules carry on: being named and "any questions?" still show in
  * the widget, but no new questions appear. Each scout call stays under
@@ -52,8 +79,17 @@
  * Questions only leave the list when the scout sees them answered or asked;
  * the rest stay open and drop out of the compact view, not the list.
  *
- * When the recorder writes "stopped", the copilot waits 90s (with a countdown)
- * for a reconnect, which starts a new capture file, before it stops.
+ * Chat Q&A: the `meeting` tool answers "what did I miss in the last 10 min",
+ * "what did Amy say about the cert", "what's this slide about" from the session
+ * model, read-only, in any session (no lock needed):
+ *   action status | transcript | slide
+ *   minutes, since, until (HH:MM[:SS] in the meeting's own offset, or ISO), speaker, query, limit
+ *   slide (default: the one on screen; its OCR text and the jpg come back)
+ * It reads the live meeting, else the last one in state.json, and says which.
+ * While this session runs a live meeting, one line is added to the system
+ * prompt per turn ("A meeting is live: Weekly Sync (Microsoft Teams), 16 min
+ * in, slide 4 on screen. Use the meeting tool for anything about it."; the
+ * minutes round down to 5, "just started" under 5).
  *
  * Scout context: a fixed system prompt (cached) with ~/.pi/agent/meeting-context.md
  * (who you are), the tail of the previous transcript of the same meeting, and
@@ -63,13 +99,15 @@
  * transcript trails the room by a couple of utterances.
  *
  * Settings: Boehsline config blocks "meeting" and "work" (watch/settings.ts), e.g.
- *      "meeting": { "qmdCollections": ["notes", "team-docs"], "dailyDir": "~/Notes/daily", "codeDir": "~/src" }
+ *      "meeting": { "qmdCollections": ["notes", "team-docs"], "dailyDir": "~/Notes/daily", "codeDir": "~/src", "owner": "earl" }
  *      "work":    { "providers": [...], "models": [...], "researchModel": "...", "ghHost": "github.acme.com" }
  *
  * Env (overrides settings):
  *      PI_MEETING_MODEL=provider/<id>[,…] (work providers only)  PI_MEETING_REASONING=off|low|…
  *      PI_MEETING_RESEARCH_MODEL=provider/<id> (else the session model, if it's a work model)
- *      PI_MEETING_ME="First Last"  PI_MEETING_DIR  PI_MEETING_ABOUT=<file>
+ *      PI_MEETING_ME="First Last"  PI_MEETING_ABOUT=<file>
+ *      PI_MEETING_OWNER=<session name>  PI_MEETING_WATCH=1 (arm)  PI_MEETING_LOCK=<file>
+ *      MEETING_CAPTURE_STATE_DIR  PI_MEETING_DIR (where /meeting replay looks for a transcript)
  *      PI_MEETING_QMD_COLLECTIONS=notes,team-docs ("" disables)
  *      PI_MEETING_DAILY_DIR=~/Notes/daily ("" disables the daily-note recap)  PI_MEETING_CODE_DIR=~/src
  */
@@ -81,13 +119,60 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Api, AssistantMessage, Model, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { formatDimensionNote, resizeImage } from "@earendil-works/pi-coding-agent";
 import { type AutocompleteItem, Text, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Static, Type } from "typebox";
 import { applyWorkSettings, estTokens, isWorkModel, modelSpecs, PROMPT_MAX_TOKENS, WORK_LABEL, WORK_MODELS, WORK_RESEARCH_MODEL, workOnly } from "../watch/models.ts";
 import { MEETING_DEFAULTS, type MeetingSettings, meetingSettings, WORK_DEFAULTS, type WorkSettings, workSettings } from "../watch/settings.ts";
 import { optIn } from "../../../lib/opt-in.ts";
+import {
+	type CaptureState,
+	canClaim,
+	clock,
+	createLock,
+	currentSlide,
+	filterLive,
+	filterRecords,
+	formatLive,
+	formatRec,
+	formatStatus,
+	isLive,
+	isMine,
+	type LiveLine,
+	lastPeople,
+	lockPath,
+	markStopped,
+	type Me,
+	nameMatches,
+	ocrPath,
+	parseIndex,
+	parseLive,
+	parseRecord,
+	parseRecords,
+	pidAlive,
+	promptLine,
+	readLock,
+	readStopped,
+	type Rec,
+	releaseLock,
+	type SlideEntry,
+	slideCount,
+	slideFile,
+	slideTimes,
+	stateReader,
+	statePath,
+	statusReport,
+	truncateLines,
+	TOOL_LIMIT,
+	type Via,
+	writeLock,
+} from "./capture.ts";
+
+export * from "./capture.ts";
 
 // ── config ───────────────────────────────────────────────────────────────────
 
+/** Where /meeting replay looks for a transcript when given no path. */
 const DIR = process.env.PI_MEETING_DIR || path.join(os.homedir(), ".local/share/meeting-capture");
 const REASONING = process.env.PI_MEETING_REASONING || "low";
 // Settings resolve at session_start (applyMeetingSettings); see watch/settings.ts.
@@ -97,6 +182,7 @@ const ABOUT_FILE = process.env.PI_MEETING_ABOUT || path.join(os.homedir(), ".pi/
 let DAILY_DIR = MEETING_DEFAULTS.dailyDir;
 let GH_HOST = WORK_DEFAULTS.ghHost;
 let CODE_DIR = MEETING_DEFAULTS.codeDir;
+let OWNER = MEETING_DEFAULTS.owner;
 
 /** Refresh settings (and models.ts) from env + Boehsline config. */
 export function applyMeetingSettings(m: MeetingSettings = meetingSettings(), work: WorkSettings = workSettings()): void {
@@ -104,6 +190,7 @@ export function applyMeetingSettings(m: MeetingSettings = meetingSettings(), wor
 	DAILY_DIR = m.dailyDir;
 	GH_HOST = work.ghHost;
 	CODE_DIR = m.codeDir;
+	OWNER = m.owner;
 	applyWorkSettings(work);
 }
 /** Research subagents: the session model unless overridden, read-only tools, a hard time cap. */
@@ -122,11 +209,12 @@ const MAX_ADD = 1;
 const MAX_ADD_FIRST = 2;
 const EXPANDED_ROWS = 18;
 const POLL_MS = 1000;
+const STATE_POLL_MS = 2000;
+const IMAGE_MAX_BYTES = 4 * 1024 * 1024;
+const OCR_MAX_CHARS = 8000;
 const RENDER_MS = 10_000;
 const MAX_TRANSCRIPT_CHARS = 100_000;
 const PREV_TRANSCRIPT_CHARS = 16_000;
-export const RECONNECT_MS = 90_000;
-const LIVE_STALE_MS = 15 * 60_000;
 const CALL_TIMEOUT_MS = 60_000;
 const BACKGROUND_WAIT_MS = 10_000;
 const REPLY_TTL_MS = 3 * 60_000;
@@ -175,9 +263,6 @@ export function parseEvent(raw: string): MeetingEvent | null {
 			return null;
 	}
 }
-
-/** "HH:MM:SS" straight from the ISO string, so it stays in the meeting's local time. */
-export const clock = (ts: string) => /T(\d\d:\d\d:\d\d)/.exec(ts)?.[1] ?? "";
 
 export const formatLine = (l: { ts: string; speaker: string; text: string; chat: boolean }) =>
 	`[${clock(l.ts)}] ${l.chat ? "(chat) " : ""}${l.speaker}: ${l.text}`;
@@ -663,33 +748,31 @@ export function buildDigPrompt(d: DigInput): { system: string; task: string } {
 // ── args ─────────────────────────────────────────────────────────────────────
 
 export type Args = {
-	sub: "status" | "start" | "stop" | "ask" | "focus" | "list" | "recap";
-	target: string;
+	sub: "status" | "watch" | "replay" | "start" | "stop" | "ask" | "focus" | "list" | "recap" | "unknown";
+	target: string; // replay: the transcript path, "" for the newest
 	rest: string;
-	replay?: number;
-	model?: string;
-	removed?: string; // a flag that no longer exists, to say so
+	replay?: number; // replay speed
+	model?: string; // replay: the scout model
 };
 
 export function parseArgs(raw: string): Args {
 	const trimmed = raw.trim();
 	const first = trimmed.split(/\s+/)[0] ?? "";
-	const known = ["start", "stop", "ask", "focus", "status", "list", "recap"] as const;
+	const known = ["watch", "replay", "start", "stop", "ask", "focus", "status", "list", "recap"] as const;
 	const word = first === "expand" ? "list" : first;
-	const sub = (known as readonly string[]).includes(word) ? (word as Args["sub"]) : trimmed ? "start" : "status";
-	const rest = sub === "start" && first !== "start" ? trimmed : trimmed.slice(first.length).trim();
+	const sub = (known as readonly string[]).includes(word) ? (word as Args["sub"]) : trimmed ? "unknown" : "status";
+	const rest = trimmed.slice(first.length).trim();
 	const out: Args = { sub, target: "", rest };
-	if (sub !== "start") return out;
+	if (sub !== "replay") return out;
 	const tokens = rest.split(/\s+/).filter(Boolean);
 	const target: string[] = [];
+	out.replay = 10;
 	for (let i = 0; i < tokens.length; i++) {
 		const t = tokens[i]!;
-		if (t === "--wake") out.removed = t;
-		else if (t === "--model") out.model = tokens[++i];
-		else if (t === "--replay") {
-			const n = Number(tokens[i + 1]);
-			out.replay = Number.isFinite(n) && n > 0 ? (i++, n) : 10;
-		} else target.push(t);
+		const n = Number(t);
+		if (t === "--model") out.model = tokens[++i];
+		else if (target.length === 0 && Number.isFinite(n) && n > 0) out.replay = n;
+		else target.push(t);
 	}
 	out.target = target.join(" ").replace(/^~(?=\/|$)/, os.homedir());
 	return out;
@@ -700,7 +783,6 @@ export function parseArgs(raw: string): Args {
 export type WidgetView = {
 	phase: "waiting" | "live" | "ended";
 	title: string;
-	filter: string;
 	startedMs: number;
 	topic: string;
 	checks: number;
@@ -712,7 +794,7 @@ export type WidgetView = {
 	expanded: boolean;
 	reply: string;
 	replay: boolean;
-	endsAt: number; // when an ended call gives up on a reconnect (ms); 0 if not ended
+	endsAt: number; // when an ended call stops, if it is counting down (ms); 0 for none
 	alert?: string; // a cue said by code rules, when no scout could
 	rulesOnly?: boolean; // no work model: cues only, no questions
 };
@@ -732,7 +814,7 @@ export function widgetLines(v: WidgetView, theme: Pick<Theme, "fg">, width: numb
 	const dim = (s: string) => theme.fg("dim", s);
 	const fit = (s: string) => truncateToWidth(s, width);
 	if (v.phase === "waiting") {
-		return [fit(`${dim("◌")} ${dim(`meeting · waiting for a meeting${v.filter ? ` matching "${v.filter}"` : ""} · /meeting stop`)}`)];
+		return [fit(`${dim("◌")} ${dim(["meeting", v.title, "waiting for captions", "/meeting stop"].filter(Boolean).join(" · "))}`)];
 	}
 	const digging = v.questions.some((q) => q.dig?.state === "running");
 	const ended = v.replay
@@ -804,16 +886,27 @@ export function widgetLines(v: WidgetView, theme: Pick<Theme, "fg">, width: numb
 
 type Meeting = {
 	phase: WidgetView["phase"];
-	filter: string;
-	file: string; // current .jsonl, "" while waiting
-	waitSince: string; // filename stamp: only captures starting at/after this count
+	auto?: { startedAt: string; slidesDir: string | null; via: Via }; // started from state.json, not a replay
+	file: string; // current .jsonl, "" while waiting for captions
 	offset: number;
 	partial: string;
-	replay?: { speed: number; events: { at: number; ev: MeetingEvent }[]; next: number; t0: number; startedAt: number };
+	replay?: {
+		speed: number;
+		events: { at: number; ev: MeetingEvent }[];
+		next: number;
+		t0: number;
+		startedAt: number;
+		recs: Rec[]; // every record, for the meeting tool (it shows only what has played)
+		first: string; // ts of the first record
+		last: number; // ms of the last
+		slidesDir: string | null;
+	};
 	title: string;
 	app: string;
 	startedMs: number;
 	people: string[];
+	slides: number; // distinct slide events seen
+	slideOn?: number; // the slide on screen
 	lines: string[];
 	sentUpTo: number;
 	trig: TriggerState;
@@ -900,6 +993,24 @@ function main(pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let ticking = false;
 
+	// Auto start and ownership (see the header). `armed` is /meeting watch, saved
+	// in the session; PI_MEETING_WATCH=1 arms without saving.
+	let armed = false;
+	let holding = false; // this session has written the lock and not released it
+	let yielded = false; // the lock went to someone else: no re-claim until it frees
+	let stateTimer: ReturnType<typeof setInterval> | undefined;
+	let stateTicking = false;
+	/** Bumped on shutdown: an await that finds it changed belongs to a dead instance and must do nothing more. */
+	let gen = 0;
+	const readState = stateReader();
+	const doneStarts = new Set<string>(); // started_at of meetings that ended or were stopped
+	const ENTRY = "meeting-watch";
+	const envArmed = () => /^(1|true|yes|on)$/i.test(process.env.PI_MEETING_WATCH ?? "");
+	const isArmed = () => armed || envArmed();
+	const sessionName = () => pi.getSessionName?.();
+	const eligibleVia = (): Via | undefined => (isArmed() ? "watch" : nameMatches(OWNER, sessionName()) ? "owner" : undefined);
+	const lockMe = (via: Via): Me => ({ pid: process.pid, sessionId: ctxRef?.sessionManager?.getSessionId?.() ?? "", name: sessionName() ?? "", via });
+
 	type DigRun = { m: Meeting; id: number; proc: ChildProcess; cancelled: boolean };
 	const digRuns = new Set<DigRun>();
 	const digging = (m: Meeting) => m.questions.some((q) => q.dig?.state === "running");
@@ -918,15 +1029,33 @@ function main(pi: ExtensionAPI) {
 
 	// Timers outlive the command that started them, so they use the session's
 	// own context rather than a command context.
+	/** Whether /meeting watch was last on or off in this branch. */
+	function restoreArmed(ctx: ExtensionContext) {
+		armed = false;
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type === "custom" && entry.customType === ENTRY) armed = (entry.data as { armed?: boolean } | undefined)?.armed === true;
+		}
+	}
 	pi.on("session_start", (_e, ctx) => {
 		ctxRef = ctx;
 		applyMeetingSettings();
+		restoreArmed(ctx);
+		if (stateTimer) clearInterval(stateTimer);
+		stateTimer = setInterval(() => void stateTick(), STATE_POLL_MS);
+		stateTimer.unref?.();
+		void stateTick();
 	});
+	pi.on("session_tree", (_e, ctx) => restoreArmed(ctx));
 	pi.on("session_shutdown", () => {
+		gen++;
+		if (stateTimer) clearInterval(stateTimer);
+		stateTimer = undefined;
 		// Quitting mid-meeting still leaves the recap in the daily note.
 		if (st && !st.replay && st.questions.length) writeRecap(st);
+		if (st && !st.replay) pi.events.emit("meeting:state", { active: false, title: st.title });
 		teardown();
 		cancelDigs();
+		release();
 		ctxRef = undefined;
 	});
 	// watch.ts holds its digests during a live meeting; it asks when it starts.
@@ -956,10 +1085,12 @@ function main(pi: ExtensionAPI) {
 
 	// ── lifecycle ──
 
-	function teardown() {
+	/** `done`: this meeting is over, so its started_at never starts again. */
+	function teardown(done = true) {
 		if (timer) clearInterval(timer);
 		timer = undefined;
 		st?.abort?.abort();
+		if (st?.auto && done) doneStarts.add(st.auto.startedAt);
 		if (st) {
 			cancelDigs(st); // only /meeting stop gets here with research running; a natural end waits
 			last = st;
@@ -1017,12 +1148,21 @@ function main(pi: ExtensionAPI) {
 		const m = st;
 		if (!m) return;
 		if (!m.replay) pi.events.emit("meeting:state", { active: false, title: m.title });
+		if (reason === "/meeting stop" && m.auto) {
+			// Shared, so another session or a /reload doesn't start it again.
+			try {
+				markStopped(m.auto.startedAt);
+			} catch {
+				// this session still won't restart it: teardown remembers it
+			}
+		}
 		if (m.announced) {
 			postRecap(m, `Meeting copilot stopped (${reason}) · ${m.checks} checks · transcript: ${tilde(m.file.replace(/\.jsonl$/, ".txt"))}`);
 		} else if (ctxRef?.hasUI) {
 			ctxRef.ui.notify(`Meeting copilot stopped (${reason})`, "info");
 		}
-		teardown();
+		// Only an ended or stopped meeting is done; "watch off" / "no longer armed" can be armed again mid-meeting.
+		teardown(reason === "meeting ended" || reason === "/meeting stop");
 	}
 
 	function render(force = false) {
@@ -1037,7 +1177,6 @@ function main(pi: ExtensionAPI) {
 		const view: WidgetView = {
 			phase: m.phase,
 			title: m.title,
-			filter: m.filter,
 			startedMs: m.startedMs,
 			topic: m.topic,
 			checks: m.checks,
@@ -1049,7 +1188,7 @@ function main(pi: ExtensionAPI) {
 			expanded: m.expanded,
 			reply: m.reply,
 			replay: !!m.replay,
-			endsAt: m.phase === "ended" && !m.replay ? m.endedAt + RECONNECT_MS : 0,
+			endsAt: 0,
 			alert: m.alert,
 			rulesOnly: m.models.length === 0,
 		};
@@ -1071,8 +1210,7 @@ function main(pi: ExtensionAPI) {
 			if (ev.startedAt) m.startedMs = Date.parse(ev.startedAt) || m.startedMs;
 			if (ev.stopped) {
 				m.phase = "ended";
-				// An already-finished file: one look, then done, no reconnect wait.
-				m.endedAt = history ? now - RECONNECT_MS : now;
+				m.endedAt = now;
 			}
 			return;
 		}
@@ -1098,7 +1236,7 @@ function main(pi: ExtensionAPI) {
 		}
 	}
 
-	async function attach(file: string, history: boolean) {
+	async function attach(file: string, history: boolean, title = "") {
 		const m = st;
 		if (!m) return;
 		const continuing = m.file !== "" && meetingKey(m.file) === meetingKey(file);
@@ -1107,9 +1245,10 @@ function main(pi: ExtensionAPI) {
 		m.offset = 0;
 		m.partial = "";
 		m.phase = "live";
-		if (!continuing) m.title = meetingKey(file);
+		if (!continuing) m.title = title || meetingKey(file);
 		pi.events.emit("meeting:state", { active: true, title: m.title });
 		await pollFile(history); // reads the metadata line, so the title is real for qmd
+		if (st !== m) return; // stopped or shut down while reading
 		if (!continuing) m.backgroundReady = buildBackground(file);
 		if (!m.announced && st === m) {
 			m.announced = true;
@@ -1154,14 +1293,21 @@ function main(pi: ExtensionAPI) {
 		m.partial = parts.pop() ?? "";
 		const now = Date.now();
 		for (const raw of parts) {
-			const ev = raw.trim() ? parseEvent(raw) : null;
+			if (!raw.trim()) continue;
+			const ev = parseEvent(raw);
 			if (ev) ingest(ev, now, history);
+			else {
+				// Slides aren't scout input; they only feed the one prompt line.
+				const rec = parseRecord(raw);
+				if (rec?.kind === "slide") m.slides++;
+				if (rec?.kind === "slide" || rec?.kind === "revisit") m.slideOn = rec.slide;
+			}
 		}
 	}
 
-	async function listNames(): Promise<string[]> {
+	async function listNames(dir = DIR): Promise<string[]> {
 		try {
-			return await fs.promises.readdir(DIR);
+			return await fs.promises.readdir(dir);
 		} catch {
 			return [];
 		}
@@ -1170,18 +1316,20 @@ function main(pi: ExtensionAPI) {
 	async function buildBackground(file: string): Promise<void> {
 		const m = st;
 		if (!m) return;
+		// The transcript's own folder: earlier ones of the same meeting sit beside it.
+		const dir = path.dirname(file);
 		const [about, names] = await Promise.all([
 			fs.promises.readFile(ABOUT_FILE, "utf8").then((s) => s.slice(0, 4000), () => ""),
-			listNames(),
+			listNames(dir),
 		]);
 		const txts = await Promise.all(
 			names
 				.filter((n) => n.endsWith(".txt") && meetingKey(n) === meetingKey(file))
-				.map(async (name) => ({ name, size: (await fs.promises.stat(path.join(DIR, name)).catch(() => ({ size: 0 }))).size })),
+				.map(async (name) => ({ name, size: (await fs.promises.stat(path.join(dir, name)).catch(() => ({ size: 0 }))).size })),
 		);
 		const prev = previousTranscript(txts, path.basename(file));
 		const [prevText, notes] = await Promise.all([
-			prev ? readTail(path.join(DIR, prev), PREV_TRANSCRIPT_CHARS) : Promise.resolve(""),
+			prev ? readTail(path.join(dir, prev), PREV_TRANSCRIPT_CHARS) : Promise.resolve(""),
 			qmdNotes(m.title),
 		]);
 		if (st !== m) return;
@@ -1336,7 +1484,7 @@ function main(pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.notify(msg, level);
 		};
 		const m = st ?? last;
-		if (!m) return notify("No meeting to research. /meeting start", "warning");
+		if (!m) return notify("No meeting to research. /meeting watch arms this session", "warning");
 		const q = m.questions.find((x) => x.id === id);
 		if (!q) return notify(`No Q${id} in "${m.title}"`, "warning");
 		if (q.dig?.state === "running") return notify(`Already researching Q${id} (${mmssSince(q.dig.startedAt)})`);
@@ -1501,15 +1649,9 @@ function main(pi: ExtensionAPI) {
 					m.phase = "ended";
 					m.endedAt = now;
 				}
-			} else if (m.phase === "waiting") {
-				const found = pickStartedSince(await listNames(), m.waitSince, { filter: m.filter });
-				if (found) await attach(path.join(DIR, found), false);
-			} else {
+			} else if (m.file) {
+				// stateTick starts, attaches and ends a meeting; this only reads it.
 				await pollFile();
-				if (m.phase === "ended") {
-					const next = pickStartedSince(await listNames(), toStamp(m.endedAt - 60_000), { key: meetingKey(m.file) });
-					if (next && path.join(DIR, next) !== m.file) await attach(path.join(DIR, next), false);
-				}
 			}
 			if (st !== m) return;
 			if (!m.busy) {
@@ -1518,8 +1660,7 @@ function main(pi: ExtensionAPI) {
 					m.forceNext = false;
 					void check();
 				} else if (final && m.trig.unsent === 0 && !digging(m)) {
-					if (m.replay) return finish("replay finished");
-					if (now - m.endedAt > RECONNECT_MS) return finish("meeting ended");
+					return finish(m.replay ? "replay finished" : "meeting ended");
 				}
 			}
 			// While a call has ended or research runs, redraw every tick so the timers move.
@@ -1531,16 +1672,70 @@ function main(pi: ExtensionAPI) {
 		}
 	}
 
-	// ── command ──
+	// ── auto start and ownership ──
 
-	async function start(a: Args, ctx: ExtensionContext) {
+	/** Let go of the lock if this session holds it. */
+	function release() {
+		if (!holding) return;
+		holding = false;
+		releaseLock(lockMe("watch"));
+	}
+
+	/** The lock file exists with an mtime over 5 s old (or can't be stat'ed): a leftover, not a write in progress. */
+	function staleFile(): boolean {
+		try {
+			return Date.now() - fs.statSync(lockPath()).mtimeMs > 5000;
+		} catch {
+			return true;
+		}
+	}
+
+	/**
+	 * Take the lock. With none, create it exclusively (O_EXCL): the winner is
+	 * decided by the file system. Taking over a dead or owner-held lock can't be
+	 * exclusive, so write it (tmp + rename), wait a short random 100-300 ms and
+	 * read it back: if another session wrote after us, it is theirs and we don't
+	 * start. False if the lock isn't ours, or this instance shut down meanwhile.
+	 */
+	async function claim(via: Via): Promise<boolean> {
+		const me = lockMe(via);
+		const g = gen;
+		try {
+			if (!readLock()) {
+				if (createLock(me)) return (holding = true);
+				// Lost the create: the other session may be between creating the file and writing it.
+				// An unreadable file is only a takeover once it is stale.
+				if (!readLock() && !staleFile()) return false;
+			}
+			const now = readLock();
+			if (now && !canClaim(now, me)) return false; // someone created it between our read and our create
+			writeLock(me);
+		} catch {
+			return false;
+		}
+		await new Promise((r) => setTimeout(r, 100 + Math.random() * 200));
+		if (g !== gen) {
+			releaseLock(me); // shut down while waiting: don't leave our lock behind
+			return false;
+		}
+		return (holding = isMine(readLock(), me));
+	}
+
+	/** Stop without a recap or a message: the lock moved on, and the new owner takes it from here. */
+	function quietStop() {
+		const m = st;
+		if (!m) return;
+		if (!m.replay) pi.events.emit("meeting:state", { active: false, title: m.title });
+		teardown(false);
+	}
+
+	/** Scout models, who you are, and an empty meeting. */
+	async function newMeeting(ctx: ExtensionContext, modelArg?: string): Promise<Meeting> {
 		const notify = (msg: string, level: "info" | "warning" | "error" = "info") => {
 			if (ctx.hasUI) ctx.ui.notify(msg, level);
 		};
-		if (st) return notify("Meeting copilot is already running. /meeting stop first.", "warning");
-
 		const registry = ctx.modelRegistry;
-		const specs = a.model ? [a.model] : modelSpecs(process.env.PI_MEETING_MODEL);
+		const specs = modelArg ? [modelArg] : modelSpecs(process.env.PI_MEETING_MODEL);
 		const work = workOnly(specs.length ? specs : WORK_MODELS);
 		if (work.refused.length) notify(`Not ${WORK_LABEL}, so never given meeting text: ${work.refused.join(", ")}`, "warning");
 		const models = work.ok
@@ -1549,36 +1744,17 @@ function main(pi: ExtensionAPI) {
 		if (models.length === 0)
 			notify(`No ${WORK_LABEL} scout with credentials (${work.ok.join(", ") || "none given"}); cues by rule only, no new questions`, "warning");
 
-		const me = process.env.PI_MEETING_ME || (await run("git", ["config", "--global", "--includes", "user.name"], 3000)).trim();
-		const names = await listNames();
-		let file = "";
-		let live = false;
-		if (a.target && (a.target.includes("/") || a.target.endsWith(".jsonl"))) {
-			if (!fs.existsSync(a.target)) return notify(`No such file: ${a.target}`, "error");
-			file = path.resolve(a.target);
-		} else {
-			const newest = pickNewest(names, a.target);
-			if (newest) {
-				const full = path.join(DIR, newest);
-				const tail = await readTail(full, 4096);
-				const fresh = Date.now() - (await fs.promises.stat(full)).mtimeMs < LIVE_STALE_MS;
-				live = fresh && !tail.includes('"event":"stopped"');
-				if (live || a.replay) file = full;
-			}
-		}
-		if (a.replay && !file) return notify(`No transcript to replay${a.target ? ` matching "${a.target}"` : ""}`, "error");
-
-		st = {
+		const who = process.env.PI_MEETING_ME || (await run("git", ["config", "--global", "--includes", "user.name"], 3000)).trim();
+		return {
 			phase: "waiting",
-			filter: a.target,
 			file: "",
-			waitSince: toStamp(Date.now() - 60_000),
 			offset: 0,
 			partial: "",
 			title: "",
 			app: "",
 			startedMs: 0,
 			people: [],
+			slides: 0,
 			lines: [],
 			sentUpTo: 0,
 			trig: freshTrigger(),
@@ -1593,8 +1769,8 @@ function main(pi: ExtensionAPI) {
 			alert: "",
 			alertAt: 0,
 			focus: "",
-			me,
-			meTokens: nameTokens(me),
+			me: who,
+			meTokens: nameTokens(who),
 			models,
 			modelLabel: models.map((m) => m.name || m.id).join(" → ") || "rules only",
 			system: "",
@@ -1609,43 +1785,369 @@ function main(pi: ExtensionAPI) {
 			lastNotify: 0,
 			announced: false,
 		};
+	}
 
-		if (a.replay && file) {
-			const events: { at: number; ev: MeetingEvent }[] = [];
-			let at = 0;
-			for (const raw of (await fs.promises.readFile(file, "utf8")).split("\n")) {
-				const ev = raw.trim() ? parseEvent(raw) : null;
-				if (!ev) continue;
-				if (ev.kind === "line") at = Date.parse(ev.ts) || at;
-				if (ev.kind === "meta" && ev.stopped) continue;
-				events.push({ at, ev });
+	/** A live meeting from state.json, now that this session holds the lock. */
+	async function startAuto(s: CaptureState, via: Via, ctx: ExtensionContext) {
+		const g = gen;
+		const m = await newMeeting(ctx);
+		if (st) return; // a replay began while the scout was being set up
+		if (g !== gen || !holding) return; // shut down, or the lock was let go, while the scout was being set up
+		m.auto = { startedAt: s.startedAt, slidesDir: s.slidesDir, via };
+		m.title = s.title;
+		m.app = s.app;
+		m.startedMs = s.startedMs;
+		st = m;
+		timer = setInterval(() => void tick(), POLL_MS);
+		timer.unref?.();
+		if (s.jsonl) await attach(s.jsonl, true, s.title);
+		else if (ctx.hasUI) ctx.ui.notify(`Meeting copilot on "${s.title}": waiting for captions`);
+		if (g !== gen) return;
+		render(true);
+	}
+
+	/** Every 2s: the lock, then state.json. See the header for the rules. */
+	async function stateTick() {
+		if (stateTicking) return;
+		stateTicking = true;
+		const g = gen;
+		try {
+			const ctx = ctxRef;
+			if (!ctx) return;
+			const via = eligibleVia();
+			if (!via && !holding && !st?.auto) return;
+			if (!via) {
+				// No longer armed, and the name doesn't match: let go.
+				if (st?.auto) finish("no longer armed");
+				release();
+				return;
 			}
-			const t0 = events.find((e) => e.at > 0)?.at ?? 0;
-			for (const e of events) if (!e.at) e.at = t0;
-			st.file = file;
-			st.firstFile = file;
-			st.phase = "live";
-			st.title = meetingKey(file);
-			st.replay = { speed: a.replay, events, next: 0, t0, startedAt: Date.now() };
-			// Metadata first so the title is real before the background search runs.
-			while (st.replay.next < events.length && events[st.replay.next]!.ev.kind !== "line") ingest(events[st.replay.next++]!.ev, Date.now(), true);
-			st.startedMs = Date.now();
-			st.backgroundReady = buildBackground(file);
-			st.announced = true;
-			pi.sendMessage(
-				{
-					customType: MSG_TYPE,
-					content: `Meeting copilot replaying "${st.title}" at ${a.replay}× via ${st.modelLabel}. Transcript: ${file.replace(/\.jsonl$/, ".txt")}. These updates are context for later; they need no reply.`,
-					display: true,
-					details: { kind: "start", file, replay: a.replay },
-				},
-				{ triggerTurn: false },
-			);
-		} else if (file) {
-			await attach(file, true);
-		} else {
-			notify(`Meeting copilot waiting for a meeting${a.target ? ` matching "${a.target}"` : ""} to start`);
+			const lock = readLock();
+			const mine = isMine(lock, lockMe(via));
+			holding = mine; // the file says so, whoever wrote it
+			if (!lock || !pidAlive(lock.pid)) yielded = false;
+			const s = readState();
+			const live = isLive(s);
+			const m = st;
+			if (m?.auto) {
+				// The lock moved: stop at once, even in the ended phase, so a recap still
+				// waiting on its research digs is dropped (the new owner starts fresh). The
+				// other way round, a new started_at can't start until the old meeting's digs
+				// finish and tick() releases it.
+				if (!mine && !canClaim(lock, lockMe(via))) {
+					yielded = true;
+					holding = false;
+					if (ctx.hasUI) ctx.ui.notify(`Meeting copilot moved to ${lock?.name || `pid ${lock?.pid}`}`, "info");
+					return quietStop();
+				}
+				if (!mine) {
+					await claim(via);
+					if (g !== gen) return;
+					if (st !== m) return;
+				}
+				m.auto.via = via;
+				if (!live || s.startedAt !== m.auto.startedAt) {
+					// Over: tick() gives the leftover lines a last look, then finishes.
+					if (m.phase !== "ended") {
+						m.phase = "ended";
+						m.endedAt = Date.now();
+					}
+					return;
+				}
+				if (m.phase === "waiting" && s.jsonl) await attach(s.jsonl, true, s.title);
+				return;
+			}
+			if (m) return; // a replay
+			if (!live || yielded || doneStarts.has(s.startedAt) || readStopped().includes(s.startedAt)) return;
+			if (!mine) {
+				if (!canClaim(lock, lockMe(via))) return;
+				const won = await claim(via);
+				if (g !== gen || !won || !holding || st) return;
+			}
+			await startAuto(s, via, ctx);
+		} catch (e) {
+			if (st) st.error = String((e as Error)?.message ?? e).slice(0, 120);
+		} finally {
+			stateTicking = false;
 		}
+	}
+
+	// ── the meeting tool ──
+
+	/** What a tool call reads: the replay if one is playing, else state.json (live or the last one). */
+	type Source = {
+		title: string;
+		app: string;
+		startedAt: string;
+		startedMs: number;
+		jsonl: string | null;
+		slidesDir: string | null;
+		livePath: string | null;
+		live: boolean;
+		ended: boolean; // marked ended in state.json; else a dead recorder
+		endedAt: string;
+		replayNow?: number; // epoch ms the replay has reached
+		replayRecs?: Rec[];
+	};
+
+	function toolSource(): Source | undefined {
+		const m = st;
+		if (m?.replay) {
+			const r = m.replay;
+			const now = Math.min(r.t0 + (Date.now() - r.startedAt) * r.speed, r.last);
+			return {
+				title: m.title,
+				app: m.app,
+				startedAt: r.first,
+				startedMs: r.t0,
+				jsonl: m.file,
+				slidesDir: r.slidesDir,
+				livePath: null,
+				live: m.phase !== "ended",
+				ended: m.phase === "ended",
+				endedAt: "",
+				replayNow: now,
+				replayRecs: r.recs.filter((x) => !x.ms || x.ms <= now),
+			};
+		}
+		const s = readState();
+		if (!s) return undefined;
+		return {
+			title: s.title,
+			app: s.app,
+			startedAt: s.startedAt,
+			startedMs: s.startedMs,
+			jsonl: s.jsonl,
+			slidesDir: s.slidesDir,
+			livePath: s.livePath,
+			live: isLive(s),
+			ended: s.ended,
+			endedAt: s.endedAt,
+		};
+	}
+
+	const readIndex = async (src: Source): Promise<SlideEntry[]> => {
+		if (!src.slidesDir) return [];
+		const text = await fs.promises.readFile(path.join(src.slidesDir, "index.jsonl"), "utf8").catch(() => "");
+		const seen = src.replayNow;
+		return parseIndex(text).filter((e) => seen === undefined || !Date.parse(e.at) || Date.parse(e.at) <= seen);
+	};
+
+	const MeetingParams = Type.Object({
+		action: Type.Union([Type.Literal("status"), Type.Literal("transcript"), Type.Literal("slide")], {
+			description: "status: title, people, slides; transcript: what was said; slide: one slide's time, OCR text and image",
+		}),
+		minutes: Type.Optional(Type.Number({ description: "transcript: only the last N minutes" })),
+		since: Type.Optional(Type.String({ description: 'transcript: from this time, "HH:MM" or "HH:MM:SS" as the transcript shows them, or ISO' })),
+		until: Type.Optional(Type.String({ description: "transcript: up to this time, same formats" })),
+		speaker: Type.Optional(Type.String({ description: "transcript: only this person (case-insensitive part of the name, first name works)" })),
+		query: Type.Optional(Type.String({ description: "transcript: only lines with all these words (case-insensitive)" })),
+		limit: Type.Optional(Type.Number({ description: `transcript: most lines to return, newest kept (default ${TOOL_LIMIT})` })),
+		slide: Type.Optional(Type.Number({ description: "slide: the slide number (default: the one on screen)" })),
+	});
+
+	type ToolContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+	const result = (content: ToolContent[], details: Record<string, unknown>) => ({ content, details });
+
+	async function meetingTool(p: Static<typeof MeetingParams>) {
+		const src = toolSource();
+		if (!src) return result([{ type: "text", text: `No meeting-capture state at ${statePath()}: no meeting has been captured on this Mac yet.` }], { action: p.action, found: false });
+		const replaying = src.replayNow !== undefined;
+		const name = `${src.title || "untitled"}${src.app ? ` (${src.app})` : ""}`;
+		const note = replaying
+			? `This is a replay of ${name}, as far as it has played.`
+			: src.live
+				? ""
+				: `Nothing is live right now. This is the most recent meeting, ${name}, ${src.ended ? `which ended${src.endedAt ? ` at ${clock(src.endedAt) || src.endedAt}` : ""}` : "whose recorder stopped"}.`;
+		const out = (t: string, details: Record<string, unknown> = {}, extra: ToolContent[] = []) =>
+			result([{ type: "text", text: note ? `${note}\n\n${t}` : t }, ...extra], { action: p.action, live: src.live, ...details });
+		if (!src.jsonl && !src.replayRecs) return out(`${name} has no transcript yet: the first captions haven't been written.`);
+
+		let recs: Rec[];
+		try {
+			recs = src.replayRecs ?? parseRecords(await fs.promises.readFile(src.jsonl as string, "utf8"));
+		} catch (e) {
+			return out(`Couldn't read the transcript ${src.jsonl}: ${(e as Error).message}`);
+		}
+		const last = recs.at(-1)?.ms ?? 0;
+		const ref = replaying ? (src.replayNow as number) : src.live ? Date.now() : last || Date.now();
+		const slideOn = currentSlide(recs);
+
+		if (p.action === "status") {
+			const index = await readIndex(src);
+			const done = src.slidesDir ? index.filter((e) => fs.existsSync(ocrPath(src.slidesDir as string, e))).length : 0;
+			const end = !src.live && src.endedAt ? Date.parse(src.endedAt) || last : last;
+			return out(
+				formatStatus({
+					title: src.title,
+					app: src.app,
+					startedAt: src.startedAt,
+					elapsedMs: (src.live ? ref : end) - src.startedMs,
+					live: src.live,
+					endedAt: src.live ? undefined : src.endedAt,
+					people: lastPeople(recs),
+					slides: slideCount(recs),
+					slideOn,
+					ocr: src.slidesDir ? { done, total: index.length } : undefined,
+				}),
+			);
+		}
+
+		if (p.action === "transcript") {
+			let list: Rec[];
+			try {
+				list = filterRecords(recs, p, ref, src.startedMs, src.startedAt);
+			} catch (e) {
+				return out((e as Error).message);
+			}
+			let liveLines: LiveLine[] = [];
+			if (!p.until?.trim() && src.live && src.livePath) {
+				try {
+					liveLines = filterLive(parseLive(JSON.parse(await fs.promises.readFile(src.livePath, "utf8"))), p, src.startedMs, src.startedAt);
+				} catch {
+					// no live.json: nobody is mid-sentence
+				}
+			}
+			const lines = [...list.map(formatRec), ...liveLines.map(formatLive)];
+			if (lines.length === 0) return out("No transcript lines match.");
+			const { text: body } = truncateLines(lines, p.limit);
+			return out(`Meeting: ${name}${src.startedAt ? ` · started ${clock(src.startedAt)}` : ""} · ${lines.length} line${lines.length === 1 ? "" : "s"} match\n${body}`);
+		}
+
+		// slide
+		if (!src.slidesDir) return out("This meeting has no slides: capture ran without slides, or nothing capturable was shared.");
+		const index = await readIndex(src);
+		const n = p.slide ?? slideOn;
+		if (n === undefined) return out(index.length ? "No slide is on screen yet." : "No slides have been saved yet.");
+		const entry = index.find((e) => e.n === n);
+		if (!entry) return out(index.length ? `No slide ${n}. Saved slides: 1 to ${index.at(-1)?.n}.` : `No slide ${n}: none saved yet.`);
+		const times = slideTimes(recs, n);
+		const shown = times.first ? clock(times.first.ts) : clock(entry.at);
+		const again = times.again.map((r) => clock(r.ts)).filter(Boolean);
+		const file = slideFile(src.slidesDir, entry);
+		let ocr: string;
+		try {
+			const raw = (await fs.promises.readFile(ocrPath(src.slidesDir, entry), "utf8")).trim();
+			ocr = !raw ? "(OCR found no text)" : raw.length > OCR_MAX_CHARS ? `${raw.slice(0, OCR_MAX_CHARS)}\n[… cut]` : raw;
+		} catch {
+			ocr = "OCR not ready yet";
+		}
+		const head = [
+			`Slide ${n}${n === slideOn ? " (on screen now)" : ""} of ${index.length}: ${entry.file}${entry.width ? ` · ${entry.width}×${entry.height}` : ""}${entry.reason ? ` · ${entry.reason}` : ""}`,
+			`First shown at ${shown || "unknown"}${again.length ? `; back on screen at ${again.join(", ")}` : ""}`,
+			"",
+			"OCR text:",
+			ocr,
+		];
+		const size = await fs.promises.stat(file).then((s) => s.size, () => -1);
+		if (size < 0) return out([...head, "", "(image file is missing)"].join("\n"), { slide: n });
+		if (size > IMAGE_MAX_BYTES) return out([...head, "", `(image skipped: ${(size / 1048576).toFixed(1)} MB is over the ${IMAGE_MAX_BYTES / 1048576} MB limit)`].join("\n"), { slide: n });
+		// Same as the read tool: under the provider's size and pixel limits, and a note when scaled.
+		let pic: Awaited<ReturnType<typeof resizeImage>> = null;
+		try {
+			pic = await resizeImage(await fs.promises.readFile(file), "image/jpeg");
+		} catch {
+			// treated like an image that won't shrink
+		}
+		if (!pic) return out([...head, "", "(image omitted: could not be resized below the inline image size limit)"].join("\n"), { slide: n });
+		const dims = formatDimensionNote(pic);
+		return out(dims ? `${head.join("\n")}\n\n${dims}` : head.join("\n"), { slide: n }, [{ type: "image", data: pic.data, mimeType: pic.mimeType }]);
+	}
+
+	pi.registerTool({
+		name: "meeting",
+		label: "Meeting",
+		description:
+			"Read the meeting Eric is in (or the last one) from meeting-capture, read-only. action=status: title, people, slide count, the slide on screen. action=transcript: what was said, with optional minutes (last N min), since/until (HH:MM[:SS] as the transcript shows them, or ISO), speaker (part of a name), query (words that must all appear), limit; lines still being spoken come last. action=slide: one slide's time shown, OCR text and the image (default: the slide on screen). When nothing is live it reads the most recent meeting and says so.",
+		promptSnippet: "Read the live meeting: status, transcript (what was said, by time/speaker/words), or a slide with its OCR and image",
+		promptGuidelines: [
+			"Use meeting for anything about the meeting Eric is in or just left: what he missed, what someone said, what was decided, what a slide shows. Start with a narrow filter (minutes, speaker, query) rather than the whole transcript.",
+			"The meeting transcript is automatic speech recognition: names and technical terms are often misheard, so read through errors and never quote a garble as exact.",
+		],
+		parameters: MeetingParams,
+		annotations: { readOnlyHint: true },
+		async execute(_id, params) {
+			return meetingTool(params);
+		},
+	});
+
+	// One short line per turn while this session runs a meeting; nothing otherwise.
+	pi.on("before_agent_start", (event) => {
+		const sections = event.systemPromptOptions.sections;
+		const m = st;
+		if (!sections) return;
+		if (m && (m.replay ? m.phase !== "waiting" : m.auto && m.phase !== "ended")) {
+			const r = m.replay;
+			const elapsedMs = r ? Math.min(r.t0 + (Date.now() - r.startedAt) * r.speed, r.last) - r.t0 : Date.now() - m.startedMs;
+			sections.meeting = promptLine({ title: m.title, app: m.app, elapsedMs, slide: r ? undefined : m.slideOn, replay: !!r });
+		} else delete sections.meeting;
+	});
+
+	// ── command ──
+
+	/** A transcript for /meeting replay: a path, else the newest in PI_MEETING_DIR, else the last meeting's. */
+	async function replayFile(target: string): Promise<string> {
+		if (target && (target.includes("/") || target.endsWith(".jsonl"))) return fs.existsSync(target) ? path.resolve(target) : "";
+		const newest = pickNewest(await listNames(), target);
+		if (newest) return path.join(DIR, newest);
+		return target ? "" : (readState()?.jsonl ?? "");
+	}
+
+	async function startReplay(a: Args, ctx: ExtensionContext) {
+		const notify = (msg: string, level: "info" | "warning" | "error" = "info") => {
+			if (ctx.hasUI) ctx.ui.notify(msg, level);
+		};
+		if (st) return notify("Meeting copilot is already running. /meeting stop first.", "warning");
+		const file = await replayFile(a.target);
+		const speed = a.replay ?? 10;
+		if (!file || !fs.existsSync(file)) return notify(`No transcript to replay${a.target ? ` matching "${a.target}"` : ""}`, "error");
+
+		const m = await newMeeting(ctx, a.model);
+		if (st) return notify("Meeting copilot is already running. /meeting stop first.", "warning");
+		st = m;
+		const events: { at: number; ev: MeetingEvent }[] = [];
+		const body = await fs.promises.readFile(file, "utf8");
+		let at = 0;
+		for (const raw of body.split("\n")) {
+			const ev = raw.trim() ? parseEvent(raw) : null;
+			if (!ev) continue;
+			if (ev.kind === "line") at = Date.parse(ev.ts) || at;
+			if (ev.kind === "meta" && ev.stopped) continue;
+			events.push({ at, ev });
+		}
+		const t0 = events.find((e) => e.at > 0)?.at ?? 0;
+		for (const e of events) if (!e.at) e.at = t0;
+		const recs = parseRecords(body);
+		const slides = file.replace(/\.jsonl$/, ".slides");
+		m.file = file;
+		m.firstFile = file;
+		m.phase = "live";
+		m.title = meetingKey(file);
+		m.replay = {
+			speed,
+			events,
+			next: 0,
+			t0,
+			startedAt: Date.now(),
+			recs,
+			first: recs[0]?.ts ?? "",
+			last: recs.reduce((n, r) => Math.max(n, r.ms), t0),
+			slidesDir: fs.existsSync(slides) ? slides : null,
+		};
+		// Metadata first so the title is real before the background search runs.
+		while (m.replay.next < events.length && events[m.replay.next]!.ev.kind !== "line") ingest(events[m.replay.next++]!.ev, Date.now(), true);
+		m.startedMs = Date.now();
+		m.backgroundReady = buildBackground(file);
+		m.announced = true;
+		pi.sendMessage(
+			{
+				customType: MSG_TYPE,
+				content: `Meeting copilot replaying "${m.title}" at ${speed}× via ${m.modelLabel}. Transcript: ${file.replace(/\.jsonl$/, ".txt")}. These updates are context for later; they need no reply.`,
+				display: true,
+				details: { kind: "start", file, replay: speed },
+			},
+			{ triggerTurn: false },
+		);
 		timer = setInterval(() => void tick(), POLL_MS);
 		timer.unref?.();
 		render(true);
@@ -1655,12 +2157,13 @@ function main(pi: ExtensionAPI) {
 		description: "Live meeting copilot: suggested questions from the meeting-capture transcript",
 		getArgumentCompletions: (prefix: string): AutocompleteItem[] =>
 			[
-				{ value: "start", label: "start", description: "Attach to the live meeting, or wait for one: [filter|path] [--replay N]" },
+				{ value: "watch", label: "watch", description: "Arm this session to run the copilot for every meeting (watch off to disarm)" },
 				{ value: "ask", label: "ask", description: "Check for questions right now" },
 				{ value: "list", label: "list", description: "Show every question in the widget (again to collapse)" },
 				{ value: "recap", label: "recap", description: "Post the recap so far and update the daily note" },
 				{ value: "focus ", label: "focus", description: "Tell the scout what you want out of this meeting" },
-				{ value: "stop", label: "stop", description: "Stop the copilot" },
+				{ value: "stop", label: "stop", description: "Stop the copilot for this meeting" },
+				{ value: "replay", label: "replay", description: "Play back a finished transcript, to test: [speed] [path]" },
 			].filter((i) => i.value.startsWith(prefix)),
 		handler: async (raw, ctx) => {
 			ctxRef ??= ctx;
@@ -1668,35 +2171,83 @@ function main(pi: ExtensionAPI) {
 			const notify = (msg: string, level: "info" | "warning" = "info") => {
 				if (ctx.hasUI) ctx.ui.notify(msg, level);
 			};
+			const idle = "Meeting copilot isn't running. It starts by itself in an armed or owner session: /meeting watch";
 			switch (a.sub) {
+				case "watch": {
+					if (/^off$/i.test(a.rest)) {
+						armed = false;
+						pi.appendEntry(ENTRY, { armed: false });
+						release();
+						const still = eligibleVia();
+						if (st?.auto && !still) finish("watch off");
+						return void notify(
+							envArmed() ? "Watch off, but PI_MEETING_WATCH is set, so this session stays armed" : still ? "Watch off; this session still matches meeting.owner" : "Meeting watch off",
+						);
+					}
+					if (a.rest) return void notify("Usage: /meeting watch, or /meeting watch off", "warning");
+					armed = true;
+					yielded = false;
+					pi.appendEntry(ENTRY, { armed: true });
+					const before = readLock();
+					const taken = before && !isMine(before, lockMe("watch")) && pidAlive(before.pid) ? before : undefined;
+					try {
+						writeLock(lockMe("watch"));
+						holding = true;
+					} catch (e) {
+						return void notify(`Meeting watch: couldn't write the lock: ${(e as Error).message}`, "warning");
+					}
+					notify(`Meeting watch on: this session runs the copilot${taken ? `, taking over from ${taken.name || `pid ${taken.pid}`}` : ""}`);
+					return void stateTick();
+				}
+				case "replay":
+					return startReplay(a, ctx);
 				case "start":
-					if (a.removed) notify(`${a.removed} was removed: the suggested reply is in the widget and the session message`);
-					return start(a, ctx);
+					return void notify("Meetings start by themselves now: /meeting watch arms this session. To test, /meeting replay [speed] [path]", "warning");
+				case "unknown":
+					return void notify(`Unknown: /meeting ${raw.trim().split(/\s+/)[0]}. Try watch, replay, ask, focus, list, recap, stop`, "warning");
 				case "stop":
 					return st ? finish("/meeting stop") : void notify("Meeting copilot isn't running");
 				case "ask":
-					if (!st) return void notify("Meeting copilot isn't running. /meeting start", "warning");
+					if (!st) return void notify(idle, "warning");
 					if (st.lines.length === 0) return void notify("Nothing in the transcript yet");
 					st.forceNext = true;
 					return void tick();
 				case "focus":
-					if (!st) return void notify("Meeting copilot isn't running. /meeting start", "warning");
+					if (!st) return void notify(idle, "warning");
 					st.focus = a.rest;
 					return void notify(a.rest ? `Meeting focus: ${a.rest}` : "Meeting focus cleared");
 				case "list":
-					if (!st) return void notify("Meeting copilot isn't running. /meeting start", "warning");
+					if (!st) return void notify(idle, "warning");
 					st.expanded = !st.expanded;
 					return void render(true);
 				case "recap":
-					if (!st) return void notify("Meeting copilot isn't running. /meeting start", "warning");
+					if (!st) return void notify(idle, "warning");
 					return void postRecap(st, `Meeting copilot recap so far · ${st.title} · ${st.checks} checks`);
 				default: {
-					if (!st) return void notify("Meeting copilot is off. /meeting start [filter] [--replay N]");
-					const where = st.file ? path.basename(st.file) : `waiting${st.filter ? ` for "${st.filter}"` : ""}`;
-					const open = st.questions.filter((q) => q.status === "open").length;
-					return void notify(
-						`Meeting copilot: ${where} · ${st.phase} · ${st.lines.length} lines · ${st.checks} checks · ${open} open, ${st.questions.length - open} answered or asked · ${st.modelLabel}${st.error ? ` · error: ${st.error}` : ""}`,
-					);
+					const state = readState();
+					const lock = readLock();
+					const via = eligibleVia();
+					const lines = statusReport({
+						armed: isArmed(),
+						armedBy: armed ? "/meeting watch" : "PI_MEETING_WATCH",
+						owner: OWNER,
+						name: sessionName() ?? "",
+						lock,
+						lockAlive: !!lock && pidAlive(lock.pid),
+						mine: isMine(lock, lockMe(via ?? "watch")),
+						state,
+						stateLive: isLive(state),
+						nowMs: Date.now(),
+					});
+					if (!st) lines.push("Copilot: not running");
+					else {
+						const where = st.file ? path.basename(st.file) : "waiting for captions";
+						const open = st.questions.filter((q) => q.status === "open").length;
+						lines.push(
+							`Copilot: ${where} · ${st.phase}${st.replay ? " (replay)" : ""} · ${st.lines.length} lines · ${st.checks} checks · ${open} open, ${st.questions.length - open} answered or asked · ${st.modelLabel}${st.error ? ` · error: ${st.error}` : ""}`,
+						);
+					}
+					return void notify(lines.join("\n"));
 				}
 			}
 		},

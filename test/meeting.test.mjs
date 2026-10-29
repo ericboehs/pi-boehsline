@@ -8,7 +8,9 @@
 
 import "./helpers/acme-settings.mjs";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -19,33 +21,69 @@ import {
 	buildDigPrompt,
 	buildSystemPrompt,
 	buildUserPrompt,
+	canClaim,
 	clock,
+	createLock,
+	currentSlide,
 	dailyNoteName,
+	filterLive,
+	filterRecords,
 	formatLine,
+	formatLive,
+	formatRec,
+	formatStatus,
 	freshTrigger,
 	HOLD_MS,
 	isCandidate,
 	isInvite,
+	isLive,
+	isMine,
 	isMe,
+	isoOffsetMin,
+	lastPeople,
+	markStopped,
 	meetingKey,
 	mentionsMe,
+	nameMatches,
 	nameTokens,
+	ocrPath,
 	parseArgs,
 	parseDigArgs,
 	parseDigInput,
 	parseEvent,
+	parseIndex,
+	parseLive,
+	parseLock,
+	parseRecord,
+	parseRecords,
 	parseScoutReply,
+	parseState,
+	parseTimeSpec,
 	pickNewest,
 	pickShown,
 	pickStartedSince,
 	previousTranscript,
+	promptLine,
+	queryMatches,
+	readLock,
+	readStopped,
 	recapBlock,
 	recapBody,
 	recapMarker,
+	releaseLock,
+	roundedElapsed,
 	shouldFire,
+	slideCount,
+	slideTimes,
+	speakerMatches,
+	stateReader,
+	statusReport,
+	stoppedPath,
 	toStamp,
 	TRIGGER,
+	truncateLines,
 	upsertRecap,
+	writeLock,
 	widgetLines,
 } from "../extensions/opt-in/meeting/index.ts";
 
@@ -358,13 +396,14 @@ test("parses subcommands, flags and targets", () => {
 	assert.deepEqual(parseArgs(""), { sub: "status", target: "", rest: "" });
 	assert.equal(parseArgs("stop").sub, "stop");
 	assert.deepEqual(parseArgs("focus push for a cutover date"), { sub: "focus", target: "", rest: "push for a cutover date" });
-	const a = parseArgs("start core --wake --model inco/deepseek-v4.1-flash:fast --replay 20");
-	assert.deepEqual([a.sub, a.target, a.removed, a.model, a.replay], ["start", "core", "--wake", "inco/deepseek-v4.1-flash:fast", 20], "--wake is gone: noted, never part of the filter");
-	assert.equal("wake" in a, false);
-	assert.equal(parseArgs("start --replay").replay, 10);
-	assert.equal(parseArgs("start --replay core").target, "core");
-	assert.equal(parseArgs("core").sub, "start", "a bare filter means start");
-	assert.equal(parseArgs("start ~/x.jsonl").target, `${os.homedir()}/x.jsonl`);
+	assert.deepEqual(parseArgs("watch off"), { sub: "watch", target: "", rest: "off" });
+	const a = parseArgs("replay 20 ~/x.jsonl --model inco/deepseek-v4.1-flash:fast");
+	assert.deepEqual([a.sub, a.replay, a.target, a.model], ["replay", 20, `${os.homedir()}/x.jsonl`, "inco/deepseek-v4.1-flash:fast"]);
+	assert.equal(parseArgs("replay").replay, 10, "ten times speed unless told");
+	assert.equal(parseArgs("replay core").target, "core");
+	assert.equal(parseArgs("replay core").replay, 10);
+	assert.equal(parseArgs("start").sub, "start", "start is only a pointer to /meeting watch now");
+	assert.equal(parseArgs("core").sub, "unknown", "a bare word no longer starts anything");
 	assert.equal(parseArgs("list").sub, "list");
 	assert.equal(parseArgs("expand").sub, "list");
 	assert.equal(parseArgs("recap").sub, "recap");
@@ -514,7 +553,6 @@ test("two meetings stack under the heading; a note without one gets the section"
 const view = (overrides = {}) => ({
 	phase: "live",
 	title: "CORE Weekly Sync",
-	filter: "",
 	startedMs: 0,
 	topic: "runner migration",
 	checks: 3,
@@ -531,9 +569,8 @@ const view = (overrides = {}) => ({
 });
 
 test("waiting shows one line", () => {
-	assert.deepEqual(widgetLines(view({ phase: "waiting", filter: "core" }), plain, 120), [
-		'◌ meeting · waiting for a meeting matching "core" · /meeting stop',
-	]);
+	assert.deepEqual(widgetLines(view({ phase: "waiting", title: "Weekly Sync" }), plain, 120), ["◌ meeting · Weekly Sync · waiting for captions · /meeting stop"]);
+	assert.deepEqual(widgetLines(view({ phase: "waiting", title: "" }), plain, 120), ["◌ meeting · waiting for captions · /meeting stop"]);
 });
 
 test("live shows the header, the shown questions, what's hidden, and a reply", () => {
@@ -620,4 +657,356 @@ test("every widget line fits the width", () => {
 	assert.ok(lines.length > 2);
 	for (const l of lines) assert.ok(visibleWidth(l) <= 40, `too wide: ${JSON.stringify(l)}`);
 	assert.match(lines[0], /^◐ /);
+});
+
+// ── meeting-capture state and the owner lock ──
+
+const rawState = (over = {}) => ({
+	v: 1,
+	pid: 4242,
+	app: "Microsoft Teams",
+	app_id: "teams",
+	meeting: "Weekly Sync",
+	started_at: "2026-10-28T14:00:00-05:00",
+	jsonl: "/data/20261028_140000-teams-weekly-sync.jsonl",
+	txt: "/data/20261028_140000-teams-weekly-sync.txt",
+	slides_dir: "/data/20261028_140000-teams-weekly-sync.slides",
+	live: "/state/live.json",
+	ended: false,
+	...over,
+});
+
+test("state.json: only version 1 with a pid counts, nulls stay null", () => {
+	const s = parseState(rawState({ jsonl: null, txt: null, slides_dir: null }));
+	assert.equal(s.title, "Weekly Sync");
+	assert.equal(s.startedMs, Date.parse("2026-10-28T14:00:00-05:00"));
+	assert.deepEqual([s.jsonl, s.txt, s.slidesDir, s.ended], [null, null, null, false]);
+	assert.equal(parseState(rawState()).livePath, "/state/live.json");
+	assert.equal(parseState(rawState({ v: 2 })), null);
+	assert.equal(parseState(rawState({ pid: "x" })), null);
+	assert.equal(parseState(null), null);
+	assert.equal(parseState(rawState({ jsonl: "relative.jsonl" })).jsonl, null, "paths must be absolute");
+});
+
+test("a meeting is live when it isn't ended and its pid is alive", () => {
+	const alive = () => true;
+	const dead = () => false;
+	assert.equal(isLive(parseState(rawState()), alive), true);
+	assert.equal(isLive(parseState(rawState()), dead), false, "a dead pid mid-meeting is a crash");
+	assert.equal(isLive(parseState(rawState({ ended: true })), alive), false);
+	assert.equal(isLive(null, alive), false);
+});
+
+test("the state reader reparses only when the file changed", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-state-"));
+	const file = path.join(dir, "state.json");
+	try {
+		const read = stateReader(() => file);
+		assert.equal(read(), null, "no file yet");
+		fs.writeFileSync(file, JSON.stringify(rawState()));
+		const a = read();
+		assert.equal(a.title, "Weekly Sync");
+		assert.equal(read(), a, "same stat, same object: not reparsed");
+		fs.writeFileSync(file, JSON.stringify(rawState({ meeting: "Retro", ended: true })));
+		assert.equal(read().title, "Retro");
+		fs.writeFileSync(file, "{ half");
+		assert.equal(read(), null, "unreadable reads as nothing, not a crash");
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+const lock = (over = {}) => ({ pid: 100, sessionId: "a", name: "earl", via: "owner", at: "", ...over });
+
+test("canClaim: free, dead, mine, or watch over owner; never over a live watch or a second owner", () => {
+	const alive = () => true;
+	const dead = () => false;
+	const owner = { pid: 1, sessionId: "me", via: "owner" };
+	const watch = { pid: 1, sessionId: "me", via: "watch" };
+	assert.equal(canClaim(null, owner, alive), true, "no lock");
+	assert.equal(canClaim(lock(), owner, dead), true, "the holder is gone");
+	assert.equal(canClaim(lock({ pid: 1, sessionId: "me" }), owner, alive), true, "already mine");
+	assert.equal(canClaim(lock({ pid: 1, sessionId: "other" }), owner, alive), false, "same pid, another session, is not me");
+	assert.equal(canClaim(lock({ via: "owner" }), watch, alive), true, "watch beats owner");
+	assert.equal(canClaim(lock({ via: "watch" }), watch, alive), false, "a live watch holder keeps it");
+	assert.equal(canClaim(lock({ via: "watch" }), owner, alive), false, "owner never beats watch");
+	assert.equal(canClaim(lock({ via: "owner" }), owner, alive), false, "nor another owner");
+});
+
+test("the owner setting matches the session name, trimmed and case-insensitive, never empty", () => {
+	assert.equal(nameMatches("earl", "Earl"), true);
+	assert.equal(nameMatches(" earl ", "earl "), true);
+	assert.equal(nameMatches("earl", "earl2"), false);
+	assert.equal(nameMatches("", ""), false);
+	assert.equal(nameMatches("earl", undefined), false);
+});
+
+test("the lock is written atomically (mode 600), read back, and released only by its owner", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-lock-"));
+	const prev = process.env.PI_MEETING_LOCK;
+	process.env.PI_MEETING_LOCK = path.join(dir, "sub", "meeting-owner.json");
+	try {
+		assert.equal(readLock(), null);
+		const me = { pid: process.pid, sessionId: "s1", name: "earl", via: "owner" };
+		writeLock(me);
+		const l = readLock();
+		assert.deepEqual([l.pid, l.sessionId, l.name, l.via], [process.pid, "s1", "earl", "owner"]);
+		assert.ok(Date.parse(l.at) > 0);
+		assert.equal(fs.statSync(process.env.PI_MEETING_LOCK).mode & 0o777, 0o600);
+		assert.deepEqual(fs.readdirSync(path.join(dir, "sub")), ["meeting-owner.json"], "no temp file left");
+		assert.equal(isMine(l, me), true);
+		releaseLock({ pid: process.pid, sessionId: "someone-else" });
+		assert.ok(readLock(), "not mine: left alone");
+		releaseLock(me);
+		assert.equal(readLock(), null);
+		assert.equal(parseLock({ pid: "x" }), null);
+	} finally {
+		if (prev === undefined) delete process.env.PI_MEETING_LOCK;
+		else process.env.PI_MEETING_LOCK = prev;
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("the lock is created exclusively, and a failed write leaves no temp file", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-lock-"));
+	const prev = process.env.PI_MEETING_LOCK;
+	process.env.PI_MEETING_LOCK = path.join(dir, "meeting-owner.json");
+	try {
+		const a = { pid: process.pid, sessionId: "a", name: "a", via: "owner" };
+		const b = { pid: process.pid, sessionId: "b", name: "b", via: "watch" };
+		assert.equal(createLock(a), true);
+		assert.equal(createLock(b), false, "O_EXCL: the second one loses");
+		assert.equal(readLock().sessionId, "a");
+		assert.equal(fs.statSync(process.env.PI_MEETING_LOCK).mode & 0o777, 0o600);
+		fs.writeFileSync(process.env.PI_MEETING_LOCK, "");
+		assert.equal(createLock(b), false, "even an unreadable file is not created over");
+		writeLock(b);
+		assert.equal(readLock().sessionId, "b", "a takeover is a plain atomic write");
+
+		// rename fails (the target is a directory): the tmp file must not stay behind
+		fs.rmSync(process.env.PI_MEETING_LOCK);
+		fs.mkdirSync(process.env.PI_MEETING_LOCK);
+		assert.throws(() => writeLock(a));
+		assert.deepEqual(fs.readdirSync(dir), ["meeting-owner.json"]);
+	} finally {
+		if (prev === undefined) delete process.env.PI_MEETING_LOCK;
+		else process.env.PI_MEETING_LOCK = prev;
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("stopped meetings are kept beside the lock: mode 600, deduped, the last 5", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-stopped-"));
+	const prev = process.env.PI_MEETING_LOCK;
+	process.env.PI_MEETING_LOCK = path.join(dir, "sub", "meeting-owner.json");
+	try {
+		assert.equal(stoppedPath(), path.join(dir, "sub", "meeting-stopped.json"));
+		assert.deepEqual(readStopped(), []);
+		for (let i = 1; i <= 7; i++) markStopped(`2026-10-28T1${i}:00:00-05:00`);
+		markStopped("2026-10-28T17:00:00-05:00");
+		markStopped("");
+		assert.deepEqual(
+			readStopped(),
+			[3, 4, 5, 6, 7].map((i) => `2026-10-28T1${i}:00:00-05:00`),
+		);
+		assert.equal(fs.statSync(stoppedPath()).mode & 0o777, 0o600);
+		assert.deepEqual(fs.readdirSync(path.join(dir, "sub")), ["meeting-stopped.json"], "no temp file left");
+		fs.writeFileSync(stoppedPath(), "{not json");
+		assert.deepEqual(readStopped(), [], "a bad file reads as none");
+	} finally {
+		if (prev === undefined) delete process.env.PI_MEETING_LOCK;
+		else process.env.PI_MEETING_LOCK = prev;
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// ── the meeting tool's pure parts ──
+
+const J = (o) => JSON.stringify(o);
+const at = (hms, day = "28") => `2026-10-${day}T${hms}-05:00`;
+const transcript = [
+	J({ type: "metadata", meeting: "Weekly Sync", app: "Microsoft Teams" }),
+	J({ type: "caption", speaker: "Ada Lovelace", text: "Morning everyone.", ts: at("14:00:05") }),
+	J({ type: "people", count: 3, people: ["Ada Lovelace", "Smith, Amy (ORG)", "Alan Turing"], text: "3 in the meeting", ts: at("14:00:06") }),
+	J({ type: "slide", slide: 1, file: "/d/0001-140010.jpg", text: "x", ts: at("14:00:10") }),
+	J({ type: "caption", speaker: "Smith, Amy (ORG)", text: "The cert expires on Friday,\n so we rotate it.", ts: at("14:05:00") }),
+	J({ type: "chat", speaker: "Alan Turing", text: "Link to the CERT runbook?", ts: at("14:06:00") }),
+	J({ type: "slide", slide: 2, file: "/d/0002-141000.jpg", text: "x", ts: at("14:10:00") }),
+	J({ type: "caption", speaker: "Ada Lovelace", text: "Back to the first slide.", ts: at("14:12:00") }),
+	J({ type: "revisit", slide: 1, file: "/d/0001-140010.jpg", reason: "revisit", text: "x", ts: at("14:12:01") }),
+	J({ type: "caption", speaker: "   ", text: "   ", ts: at("14:12:02") }),
+	"not json",
+].join("\n");
+const recs = parseRecords(transcript);
+const startMs = Date.parse(at("14:00:00"));
+
+test("records parse, with chat, slides, revisits and people; the rest is dropped", () => {
+	assert.equal(recs.length, 8, "metadata, a blank caption and junk are gone");
+	assert.equal(parseRecord('{"type":"metadata"}'), null);
+	assert.equal(parseRecord('{"type":"slide","ts":"2026-10-28T14:00:00-05:00"}'), null, "a slide needs its number");
+	assert.equal(recs[3].text, "The cert expires on Friday, so we rotate it.", "whitespace collapses");
+	assert.deepEqual(recs.map((r) => r.kind), ["caption", "people", "slide", "caption", "chat", "slide", "caption", "revisit"]);
+});
+
+test("formatting: speaker lines, chat, slide and revisit markers, headcount", () => {
+	assert.deepEqual(recs.map(formatRec), [
+		"[14:00:05] Ada Lovelace: Morning everyone.",
+		"[14:00:06] 👥 3 in the meeting",
+		"[14:00:10] ▣ slide 1",
+		"[14:05:00] Smith, Amy (ORG): The cert expires on Friday, so we rotate it.",
+		"[14:06:00] (chat) Alan Turing: Link to the CERT runbook?",
+		"[14:10:00] ▣ slide 2",
+		"[14:12:00] Ada Lovelace: Back to the first slide.",
+		"[14:12:01] ↺ back to slide 1",
+	]);
+});
+
+test("the slide on screen is the last slide or revisit; revisits don't add slides", () => {
+	assert.equal(currentSlide(recs), 1, "the revisit put slide 1 back");
+	assert.equal(currentSlide(recs.slice(0, 6)), 2);
+	assert.equal(currentSlide(recs.slice(0, 1)), undefined);
+	assert.equal(slideCount(recs), 2);
+	assert.equal(lastPeople(recs).count, 3);
+	const t = slideTimes(recs, 1);
+	assert.equal(clock(t.first.ts), "14:00:10");
+	assert.deepEqual(t.again.map((r) => clock(r.ts)), ["14:12:01"]);
+});
+
+test("time specs: HH:MM, HH:MM:SS in the meeting's own offset on its day, or ISO; an end bound covers its minute", () => {
+	const startedAt = at("14:00:00");
+	assert.equal(parseTimeSpec("14:05", startMs, false, startedAt), Date.parse(at("14:05:00")));
+	assert.equal(parseTimeSpec("14:05:30", startMs, false, startedAt), Date.parse(at("14:05:30")));
+	assert.equal(parseTimeSpec("14:05", startMs, true, startedAt), Date.parse(at("14:05:59")) + 999);
+	assert.equal(parseTimeSpec("14:05:30", startMs, true, startedAt), Date.parse(at("14:05:30")));
+	assert.equal(parseTimeSpec("2026-10-28T14:05:00-05:00", startMs, false, startedAt), Date.parse("2026-10-28T14:05:00-05:00"));
+	assert.equal(parseTimeSpec("soon", startMs, false, startedAt), undefined);
+	assert.equal(parseTimeSpec("00:10", startMs, false, startedAt), Date.parse(at("00:10:00", "29")), "past midnight means the next day");
+});
+
+test("time specs follow the meeting's offset, not this machine's, and only roll over past 12 h before the start", () => {
+	assert.equal(isoOffsetMin("2026-10-28T14:00:00-05:00"), -300);
+	assert.equal(isoOffsetMin("2026-10-28T14:00:00+0530"), 330);
+	assert.equal(isoOffsetMin("2026-10-28T19:00:00Z"), 0);
+	assert.equal(isoOffsetMin("2026-10-28T14:00:00"), undefined);
+	for (const [startedAt, hms] of [
+		["2026-10-28T14:00:00+09:00", "14:10:00"],
+		["2026-10-28T14:00:00Z", "14:10:00"],
+		["2026-10-28T02:00:00-11:00", "02:10:00"],
+	]) {
+		const start = Date.parse(startedAt);
+		assert.equal(parseTimeSpec(hms.slice(0, 5), start, false, startedAt), Date.parse(startedAt.replace(/T..:..:../, `T${hms}`)), startedAt);
+	}
+	// 14:00 start: 13:50 is 10 min before it (same day), 01:00 is 13 h before (next day), 02:30 is 11.5 h before (same day).
+	const startedAt = "2026-10-28T14:00:00-05:00";
+	assert.equal(parseTimeSpec("13:50", startMs, false, startedAt), Date.parse("2026-10-28T13:50:00-05:00"));
+	assert.equal(parseTimeSpec("02:30", startMs, false, startedAt), Date.parse("2026-10-28T02:30:00-05:00"));
+	assert.equal(parseTimeSpec("01:00", startMs, false, startedAt), Date.parse("2026-10-29T01:00:00-05:00"));
+	// A meeting that crosses midnight in its own zone lands on the right day too.
+	const late = "2026-10-28T23:50:00+09:00";
+	assert.equal(parseTimeSpec("00:05", Date.parse(late), false, late), Date.parse("2026-10-29T00:05:00+09:00"));
+	// filters pass the offset along
+	const lines = [{ speaker: "A", text: "x", ts: "2026-10-28T14:10:00+09:00" }];
+	assert.equal(filterLive(lines, { since: "14:05" }, Date.parse("2026-10-28T14:00:00+09:00"), "2026-10-28T14:00:00+09:00").length, 1);
+	assert.equal(filterLive(lines, { since: "14:15" }, Date.parse("2026-10-28T14:00:00+09:00"), "2026-10-28T14:00:00+09:00").length, 0);
+});
+
+test("filters: minutes back from now, since/until, speaker (first name works), query words", () => {
+	const ref = Date.parse(at("14:12:30"));
+	const kinds = (f) => filterRecords(recs, f, ref, startMs, at("14:00:00")).map((r) => `${clock(r.ts)}`);
+	assert.deepEqual(kinds({ minutes: 3 }), ["14:10:00", "14:12:00", "14:12:01"], "the last 3 minutes, markers included");
+	assert.deepEqual(kinds({ since: "14:05", until: "14:06" }), ["14:05:00", "14:06:00"], "until covers its whole minute");
+	assert.deepEqual(kinds({ speaker: "amy" }), ["14:05:00"], "the first name finds 'Smith, Amy (ORG)'");
+	assert.deepEqual(kinds({ speaker: "ADA" }), ["14:00:05", "14:12:00"], "case-insensitive, markers dropped");
+	assert.deepEqual(kinds({ query: "cert friday" }), ["14:05:00"], "all words, any order");
+	assert.deepEqual(kinds({ query: "cert" }), ["14:05:00", "14:06:00"], "chat counts");
+	assert.deepEqual(kinds({ speaker: "amy", query: "runbook" }), []);
+	assert.equal(kinds({}).length, 8);
+	assert.throws(() => filterRecords(recs, { since: "whenever" }, ref, startMs), /Can't read since "whenever"/);
+	assert.equal(speakerMatches("Smith, Amy (ORG)", "Amy Smith"), true, "every word is a name part");
+	assert.equal(speakerMatches("Ada Lovelace", "amy"), false);
+	assert.equal(queryMatches("The Cert expires", "CERT  expires"), true);
+});
+
+test("a long transcript keeps its newest lines and says what was cut", () => {
+	const lines = Array.from({ length: 10 }, (_, i) => `line ${i}`);
+	assert.deepEqual(truncateLines(lines, 400).text.split("\n"), lines, "under the caps: untouched");
+	const byLimit = truncateLines(lines, 3);
+	assert.equal(byLimit.cut, 7);
+	assert.equal(byLimit.text, "[… 7 earlier lines cut, over 3 lines; narrow with minutes, since, until, speaker or query …]\nline 7\nline 8\nline 9");
+	const big = Array.from({ length: 50 }, (_, i) => `${i} ${"x".repeat(990)}`);
+	const byChars = truncateLines(big, 400, 16_000);
+	assert.ok(byChars.text.length < 16_300 && byChars.cut > 30, `${byChars.text.length} chars, ${byChars.cut} cut`);
+	assert.match(byChars.text, /^\[… \d+ earlier lines cut, over ~16k characters;/);
+	assert.match(byChars.text, /49 x+$/, "the newest line stays");
+	assert.equal(truncateLines(lines, 0).cut, 0, "limit 0 falls back to the default");
+});
+
+test("live lines are marked, and filter like the rest", () => {
+	const live = parseLive({ lines: [{ speaker: "Grace Hopper", text: " the deploy is  green ", ts: at("14:12:10") }, { speaker: "Ada Lovelace", text: "", ts: at("14:12:11") }] });
+	assert.equal(live.length, 1);
+	assert.equal(formatLive(live[0]), "[14:12:10] Grace Hopper: the deploy is green (still speaking)");
+	assert.equal(filterLive(live, { speaker: "grace", query: "deploy" }, startMs).length, 1);
+	assert.equal(filterLive(live, { speaker: "ada" }, startMs).length, 0);
+	assert.deepEqual(parseLive(null), []);
+});
+
+test("slide index and the OCR path beside the jpg", () => {
+	const idx = parseIndex(`${J({ n: 1, at: at("14:00:10"), file: "0001-140010.jpg", thumb: "0001-140010.thumb.jpg", reason: "first frame", width: 2880, height: 2560 })}\n{ half\n${J({ n: 2, at: at("14:10:00"), file: "/abs/../0002-141000.jpg" })}\n`);
+	assert.deepEqual(idx.map((e) => e.n), [1, 2], "a half-written line is skipped");
+	assert.equal(idx[0].width, 2880);
+	assert.equal(ocrPath("/d/x.slides", idx[0]), "/d/x.slides/0001-140010.txt");
+	assert.equal(ocrPath("/d/x.slides", idx[1]), "/d/x.slides/0002-141000.txt", "only the file name is used: no path tricks");
+});
+
+test("status text and the one-line system prompt", () => {
+	const text = formatStatus({
+		title: "Weekly Sync",
+		app: "Microsoft Teams",
+		startedAt: at("14:00:00"),
+		elapsedMs: 16 * 60_000,
+		live: true,
+		people: recs[1],
+		slides: 4,
+		slideOn: 2,
+		ocr: { done: 3, total: 4 },
+	});
+	assert.equal(
+		text,
+		[
+			"Meeting: Weekly Sync (Microsoft Teams)",
+			"State: live",
+			"Started: 14:00:00",
+			"Elapsed: 16 min",
+			"People: 3: Ada Lovelace, Smith, Amy (ORG), Alan Turing",
+			"Slides: 4, slide 2 on screen",
+			"OCR: 3 of 4 slides",
+		].join("\n"),
+	);
+	assert.match(formatStatus({ title: "T", app: "", startedAt: at("14:00:00"), elapsedMs: 3_900_000, live: false, endedAt: at("15:05:00"), slides: 0 }), /State: ended at 15:05:00\nStarted: 14:00:00\nRan: 1h05m\nPeople: not listed yet\nSlides: 0\nOCR: no slides directory/);
+	assert.equal(
+		promptLine({ title: "Weekly Sync", app: "Microsoft Teams", elapsedMs: 16 * 60_000 + 5000, slide: 4 }),
+		"A meeting is live: Weekly Sync (Microsoft Teams), 15 min in, slide 4 on screen. Use the meeting tool for anything about it.",
+	);
+	assert.equal(promptLine({ title: "Sync", app: "", elapsedMs: 0 }), "A meeting is live: Sync, just started. Use the meeting tool for anything about it.");
+	assert.deepEqual([0, 4 * 60_000 + 59_000, 5 * 60_000, 9 * 60_000 + 59_000, 10 * 60_000, 62 * 60_000, -5].map(roundedElapsed), ["just started", "just started", "5 min in", "5 min in", "10 min in", "60 min in", "just started"]);
+	assert.match(promptLine({ title: "Sync", app: "", elapsedMs: 0, replay: true }), /^A meeting replay is running: Sync/);
+});
+
+test("the /meeting status says armed, owner, lock holder and meeting", () => {
+	const state = parseState(rawState());
+	const base = { armed: false, armedBy: "", owner: "earl", name: "earl", lock: null, lockAlive: false, mine: false, state: null, stateLive: false, nowMs: startMs + 16 * 60_000 };
+	assert.deepEqual(statusReport(base), [
+		"Armed: no (/meeting watch arms this session)",
+		"Owner setting: earl (this session) · this session is earl",
+		"Lock: free",
+		"Meeting: none seen",
+	]);
+	assert.deepEqual(statusReport({ ...base, armed: true, armedBy: "/meeting watch", owner: "", name: "", lock: lock({ name: "bob", via: "watch", pid: 7 }), lockAlive: true, state, stateLive: true }), [
+		"Armed: yes (/meeting watch)",
+		"Owner setting: (none)",
+		"Lock: bob (via watch, pid 7)",
+		"Meeting: Weekly Sync (Microsoft Teams), live, 16 min in",
+	]);
+	assert.match(statusReport({ ...base, lock: lock(), mine: true, state: parseState(rawState({ ended: true, duration: "0:30:00" })) })[3], /^Meeting: none live; the last was Weekly Sync \(Microsoft Teams\), ended, 0:30:00$/);
+	assert.match(statusReport({ ...base, lock: lock(), lockAlive: false })[2], /^Lock: earl \(via owner, pid 100, gone\)$/);
 });
