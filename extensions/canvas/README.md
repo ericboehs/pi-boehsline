@@ -8,7 +8,9 @@ that is too wide or long for the terminal. One shared daemon
 sessions at `/`, and one page per session at `/s/<session-id>`. The page
 updates through server-sent events with no reload. Each row of the index
 shows the session's goal, its Now line and a one-line plain-text preview of
-the agent's last response. The card renderers (markdown, table, chart, stats, steps,
+the agent's last response. A **Simple / Detailed** switch in the index header
+(`v`, or `?view=simple`) trims each row to the name, the goal on one line,
+the state and the time; the choice is kept per browser. The card renderers (markdown, table, chart, stats, steps,
 timeline, json, code, tree, options, kanban, tracker, terminal, diff, mermaid)
 live in [`render.mjs`](render.mjs), which the page loads as
 `/assets/render.mjs`; botsun's chat bubbles use the same file. Their styles

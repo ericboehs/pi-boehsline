@@ -539,6 +539,13 @@ img.shot { display: block; max-width: 100%; margin: 0 auto; border-radius: 6px; 
 .waitchip.error { border-color: color-mix(in srgb, var(--bad) 55%, var(--line)); }
 .waitchip .nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .waitchip .st { color: var(--dim); white-space: nowrap; }
+/* Simple index: name, goal on one line, state and time. */
+.idx-simple .sessions .row { padding: 7px 14px; align-items: center; }
+.idx-simple .sessions .row .cwd, .idx-simple .sessions .row .nowline, .idx-simple .sessions .row .chips { display: none; }
+.idx-simple .sessions .row .line1 { display: inline; }
+.idx-simple .sessions .row .main { display: flex; gap: 10px; align-items: baseline; min-width: 0; }
+.idx-simple .sessions .row .goal { margin: 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dim); }
+.idx-simple .sessions .row .side { flex-direction: row; align-items: baseline; gap: 10px; }
 
 /* Cmd-K picker */
 .cmdk-back { position: fixed; inset: 0; z-index: 50; display: flex; justify-content: center; align-items: flex-start; padding-top: 12vh; background: color-mix(in srgb, #000 35%, transparent); }
@@ -4329,7 +4336,7 @@ async function indexView() {
       return;
     }
     const active = sessions.filter((s) => s.live);
-    tools.replaceChildren(...(active.some((s) => s.tmux) || followOn() ? [followButton()] : []), kbdButton());
+    tools.replaceChildren(viewToggle, ...(active.some((s) => s.tmux) || followOn() ? [followButton()] : []), kbdButton());
     const waiting = active.filter((s) => NEEDS_YOU.has(stateOf(s))).length;
     header.querySelector(".cwd").textContent = [plural(sessions.length, "session"), waiting ? `${waiting} waiting on you` : ""].filter(Boolean).join(" · ");
     if (!sessions.length) return groups.replaceChildren(h("section", { class: "card" }, h("div", { class: "bd empty" }, "No sessions yet. A session gets a page on its first status or section.")));
@@ -4348,6 +4355,28 @@ async function indexView() {
     for (const [day, list] of byDay) out.push(group(day, list));
     groups.replaceChildren(...out);
   }
+  // Simple / Detailed: how much each row shows, per browser. `v` flips it.
+  const VIEW_KEY = "canvas:index-view";
+  const simple = () => localStorage.getItem(VIEW_KEY) === "simple";
+  const applyView = () => $app.classList.toggle("idx-simple", simple());
+  const setView = (v) => {
+    try {
+      localStorage.setItem(VIEW_KEY, v);
+    } catch {}
+    applyView();
+    viewToggle.querySelectorAll(".seg").forEach((b) => b.classList.toggle("on", b.dataset.v === v));
+  };
+  const seg = (v, label) => h("button", { class: `seg${(v === "simple") === simple() ? " on" : ""}`, type: "button", "data-v": v, title: `${label} rows (v)`, onclick: () => setView(v) }, label);
+  const viewToggle = h("span", { class: "segs" }, seg("simple", "Simple"), seg("detailed", "Detailed"));
+  // ?view=simple|detailed sets it too (a bookmark, or a link from elsewhere).
+  const asked = new URLSearchParams(location.search).get("view");
+  if (asked === "simple" || asked === "detailed") setView(asked);
+  applyView();
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "v" || e.metaKey || e.ctrlKey || e.altKey || /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "") || document.activeElement?.isContentEditable) return;
+    setView(simple() ? "detailed" : "simple");
+  });
+
 
   await refresh();
   pageHooks.refresh = refresh;
