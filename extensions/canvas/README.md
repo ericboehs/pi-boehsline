@@ -299,8 +299,11 @@ the review prompt — so a renderer never reaches for a page global.
 - **Meeting.** While [meeting-capture](https://github.com/ericboehs/meeting-capture)
   is following a meeting, a **Meeting** card (`auto-meeting`) sits at the top of every
   session's side panel: a green **Live** dot and ticking elapsed time, the title and
-  app, people and slide counts, the newest slide's thumbnail and the last
-  four captions or chat lines. When the [meeting copilot](../opt-in/meeting/README.md)
+  app, people and slide counts, the newest slide's thumbnail and the latest
+  captions or chat lines, one block per speaker (four at most) under a short name
+  ("Compton, Tori K. (Acme Llc)" reads "Tori Compton"; the full name is the
+  tooltip), the in-progress line in italics, a long turn cut at its start, not
+  its end. When the [meeting copilot](../opt-in/meeting/README.md)
   is running in a pi session, its **alerts** (someone said your name, a new
   action on you) sit at the top of the card in a warn-tinted box, newest first,
   at most three with their time and who, then **Your action items**; the card
@@ -359,7 +362,9 @@ the review prompt — so a renderer never reaches for a page global.
   `<root>/.meeting-notes.json` (`PI_MEETING_NOTES_FILE`), read when its stat
   changes and used only while its `meeting.started_at` equals the live state's
   and its pid is alive (or it says `ended`); a notes change is a card refresh
-  like a new caption. It polls with a few `stat`s
+  like a new caption. The card's transcript tail polls
+  `/api/meeting?tail=1&since=<n>` on every meeting event (about every 300 ms),
+  which answers only `{id, from, total, entries, live}`. It polls with a few `stat`s
   every 250 ms during a meeting and every 2 s otherwise, and sends a
   `meeting` event on each change. `/meeting`
   ([`meeting-page.mjs`](meeting-page.mjs)) then fetches only the entries

@@ -173,9 +173,11 @@ dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: h
 .m-slide img { display: block; width: 100%; max-height: 160px; object-fit: contain; background: var(--soft); border-radius: 6px; }
 .m-slide span { position: absolute; left: 6px; bottom: 5px; font: 600 10.5px/1 ui-monospace, Menlo, monospace; color: #fff; background: rgb(0 0 0 / .55); padding: 2px 5px; border-radius: 3px; }
 .m-lines { display: flex; flex-direction: column; gap: 3px; }
-.m-line { line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.m-line { line-height: 1.4; display: block; }
 .m-line b { font-weight: 600; margin-right: 5px; }
 .m-line.chat { color: var(--dim); }
+.m-line.live { color: var(--dim); font-style: italic; }
+.m-line.live b { font-style: normal; }
 .m-wait { color: var(--dim); font-style: italic; }
 .m-alerts { display: flex; flex-direction: column; gap: 4px; padding: 7px 9px; border-radius: 6px; background: color-mix(in srgb, var(--warn) 14%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); }
 .m-alert { line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
@@ -2629,11 +2631,91 @@ function renderMeeting(m) {
   if (m.slide && m.id) {
     out.push(h("a", { class: "m-slide", href: "/meeting", target: "_blank", title: "Open the live view" }, h("img", { src: `/meeting/${encodeURIComponent(m.id)}/slide/${m.slide.n}${m.slide.thumb ? ".thumb" : ""}.jpg`, alt: `Slide ${m.slide.n}`, loading: "lazy" }), h("span", {}, `slide ${m.slide.n}`)));
   }
-  const lines = Array.isArray(m.lines) ? m.lines : [];
-  if (lines.length) out.push(h("div", { class: "m-lines" }, lines.map((e) => h("div", { class: `m-line${e.type === "chat" ? " chat" : ""}` }, e.speaker ? h("b", { style: `color:${meetColor(e.speaker)}` }, `${e.type === "chat" ? "(chat) " : ""}${e.speaker}`) : null, e.text))));
-  else out.push(h("div", { class: "m-wait" }, "Waiting for captions…"));
+  out.push(meetLines(seedMeetTail(m)));
   out.push(h("div", { class: "m-links" }, h("a", { class: "m-open", href: "/meeting", target: "_blank" }, "Open the live view ↗"), h("a", { class: "m-open", href: "/meetings", target: "_blank" }, "Previous meetings ↗")));
   return h("div", { class: "meet" }, out);
+}
+/** "Compton, Tori K. (Acme Llc)" → "Tori Compton"; "Ada B. Lovelace" → "Ada Lovelace". The card is narrow; /meeting keeps full names. */
+function meetName(s) {
+  const suffix = /^(?:Jr|Sr)\.?$|^(?:II|III|IV)$/i;
+  const title = /^(?:Dr|Mr|Mrs|Ms|Mx|Prof)\.?$/i;
+  let n = String(s || "").replace(/\s*[([][^)\]]*[)\]]\s*/g, " ").trim();
+  // "Smith, John, Jr." → "Smith, John": drop the suffix before reading the first comma as "Last, First".
+  n = n.split(",").map((p) => p.trim()).filter((p, i) => i === 0 || !suffix.test(p)).join(", ");
+  const comma = n.match(/^([^,]+),\s*(.+)$/);
+  if (comma) n = `${comma[2]} ${comma[1]}`;
+  const words = n.split(/\s+/).filter((w) => w && !/^[A-Za-z]\.?$/.test(w) && !title.test(w) && !suffix.test(w));
+  return (words.length > 1 ? `${words[0]} ${words[words.length - 1]}` : words[0]) || String(s || "");
+}
+/** Consecutive lines from one speaker (same kind) become one block, so a long talker's name shows once. Newest `max` blocks. */
+function meetBlocks(lines, max = 4) {
+  const out = [];
+  for (const e of lines) {
+    const last = out[out.length - 1];
+    const kind = e.type === "chat" ? "chat" : "caption";
+    if (last && last.speaker === (e.speaker || "") && last.kind === kind && last.live === Boolean(e.live)) last.text += ` ${e.text}`;
+    else if (last && last.speaker === (e.speaker || "") && last.kind === kind && e.live) out.push({ speaker: last.speaker, kind, live: true, text: e.text, cont: true });
+    else out.push({ speaker: e.speaker || "", kind, live: Boolean(e.live), text: e.text });
+  }
+  const tail = out.slice(-max);
+  if (tail[0]) tail[0].cont = false; // a cut that starts mid-turn still names its speaker
+  return tail;
+}
+// The card's transcript tail: seeded by each render, then kept current from /api/meeting (new entries + the in-progress
+// line) on every meeting event, so it moves with /meeting instead of waiting for a whole-page refresh.
+let meetTail = { id: "", total: 0, lines: [], live: [] };
+function seedMeetTail(m) {
+  const same = meetTail.id === m.id && meetTail.total >= (m.total ?? 0);
+  if (!same) meetTail = { id: m.id || "", total: m.total ?? 0, lines: Array.isArray(m.lines) ? m.lines.slice(-12) : [], live: Array.isArray(m.live) ? m.live : [] };
+  return meetTail;
+}
+/** The end of a long turn, not its start: the newest words are what you're catching up on. */
+const meetTailText = (s, max) => (s.length <= max ? s : `…${s.slice(-max).replace(/^\S*\s+/, "")}`);
+function meetLines(t) {
+  const lines = [...t.lines, ...t.live.map((l) => ({ ...l, type: "caption", live: true }))];
+  if (!lines.length) return h("div", { class: "m-lines m-wait" }, "Waiting for captions…");
+  const blocks = meetBlocks(lines);
+  return h(
+    "div",
+    { class: "m-lines" },
+    blocks.map((b, i) =>
+      h("div", { class: `m-line${b.kind === "chat" ? " chat" : ""}${b.live ? " live" : ""}`, title: b.speaker || null }, b.speaker && !b.cont ? h("b", { style: `color:${meetColor(b.speaker)}` }, `${b.kind === "chat" ? "(chat) " : ""}${meetName(b.speaker)}`) : null, meetTailText(b.text, i >= blocks.length - 2 ? 320 : 180)),
+    ),
+  );
+}
+let meetBusy = false;
+let meetAgain = false; // a poll was asked for while one was in flight: run once more when it ends
+async function pumpMeetTail() {
+  if (meetBusy) {
+    meetAgain = true;
+    return;
+  }
+  const el = document.querySelector(".meet .m-lines");
+  if (!el || !meetTail.id) return;
+  meetBusy = true;
+  const t = meetTail;
+  const since = t.total;
+  try {
+    // ?tail=1: only {id, from, total, entries, live}, not the slide list or notes.
+    const r = await fetch(`/api/meeting?tail=1&since=${since}&id=${encodeURIComponent(t.id)}`, { cache: "no-store" });
+    const d = await r.json();
+    // A render re-seeded the tail while this was in flight: the answer is for an older cursor.
+    if (meetTail !== t || t.total !== since) return void (meetAgain = true);
+    if (d.id !== t.id) return;
+    if (d.from !== since) t.lines = [];
+    t.lines = [...t.lines, ...(d.entries || []).filter((e) => e.type === "caption" || e.type === "chat")].slice(-12);
+    t.total = d.total ?? t.total;
+    t.live = Array.isArray(d.live) ? d.live : [];
+    const cur = document.querySelector(".meet .m-lines");
+    if (cur) cur.replaceWith(meetLines(t));
+  } catch {
+  } finally {
+    meetBusy = false;
+    if (meetAgain) {
+      meetAgain = false;
+      void pumpMeetTail();
+    }
+  }
 }
 // The card's elapsed time ticks without a rebuild.
 setInterval(() => {
@@ -3470,13 +3552,16 @@ async function sessionView(id) {
   const es = new EventSource("/api/events");
   es.addEventListener("system-theme", onSystemTheme);
   es.addEventListener("follow", onFollow);
-  // The Meeting card: a new caption, slide or state (not each live.json rewrite), at most every 2 s.
+  // The Meeting card: its transcript lines follow every meeting event (~300 ms, only what's new); the rest of the
+  // card (slide, alerts, state) rebuilds on a new caption, slide or state, at most every 2 s.
   let meetingTimer = 0;
+  let tailTimer = 0;
   es.addEventListener("meeting", (e) => {
     let d = {};
     try {
       d = JSON.parse(e.data);
     } catch {}
+    if (!tailTimer) tailTimer = setTimeout(() => ((tailTimer = 0), pumpMeetTail()), 300);
     if (!d.final || meetingTimer) return;
     meetingTimer = setTimeout(() => ((meetingTimer = 0), refresh()), 2000);
   });

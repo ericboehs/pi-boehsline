@@ -793,7 +793,10 @@ function handler(req, res) {
   // id: the meeting wanted (empty: the live one); cur: the id the page's cursor (since) belongs to.
   if (url.pathname === "/api/meeting") {
     const id = url.searchParams.get("id") || "";
-    return json(res, meeting.snapshot(Number(url.searchParams.get("since") || 0), id, url.searchParams.get("cur") ?? id));
+    const since = Number(url.searchParams.get("since") || 0);
+    const cur = url.searchParams.get("cur") ?? id;
+    // ?tail=1: the card's light poll, just {id, from, total, entries, live}.
+    return json(res, url.searchParams.get("tail") === "1" ? meeting.tailSnapshot(since, id, cur) : meeting.snapshot(since, id, cur));
   }
   if (url.pathname === "/api/meetings") {
     const offset = Math.max(0, Math.floor(Number(url.searchParams.get("offset"))) || 0);

@@ -1284,3 +1284,202 @@ test("meeting card: live links, just-ended expanded plus list, plain recent list
   assert.match(items[1].textContent, /^Standup.* · <1m$/);
   assert.equal(list.querySelector(".m-open").textContent, "View all ↗");
 });
+
+test("meeting card: short names, one block per speaker run, the in-progress line in italics", async () => {
+  const { h } = await import("../extensions/canvas/render.mjs");
+  const dom = new JSDOM("<!doctype html><body></body>");
+  windows.push(dom.window);
+  globalThis.document = dom.window.document;
+  globalThis.Node = dom.window.Node;
+  const src = pageSource("page.mjs");
+  const code = src.slice(src.indexOf("const meetPad"), src.indexOf("// The card's elapsed time ticks"));
+  const { renderMeeting, meetName } = new Function("h", "plural", `${code}; return { renderMeeting, meetName };`)(h, (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`);
+  assert.equal(meetName("Compton, Tori K. (governmentcio Llc)"), "Tori Compton");
+  assert.equal(meetName("Alex Teal"), "Alex Teal");
+  assert.equal(meetName("Ada B. Lovelace (ORG)"), "Ada Lovelace");
+  assert.equal(meetName("Grace"), "Grace");
+  const tori = "Compton, Tori K. (governmentcio Llc)";
+  const lines = [
+    { type: "caption", speaker: "Alex Teal", text: "One." },
+    { type: "caption", speaker: "Alex Teal", text: "Two." },
+    { type: "caption", speaker: tori, text: "Yeah." },
+    { type: "caption", speaker: tori, text: "At 1:35." },
+    { type: "chat", speaker: tori, text: "link?" },
+  ];
+  const card = renderMeeting({ kind: "live", id: "b1b1b1b1b1b1", title: "T", recording: true, startedAt: new Date().toISOString(), lines, live: [{ speaker: tori, text: "and then" }], total: 5, recent: [] });
+  const rows = [...card.querySelectorAll(".m-line")];
+  assert.deepEqual(rows.map((r) => [r.querySelector("b")?.textContent ?? "", r.className]), [["Alex Teal", "m-line"], ["Tori Compton", "m-line"], ["(chat) Tori Compton", "m-line chat"], ["Tori Compton", "m-line live"]]);
+  assert.equal(rows[0].textContent, "Alex TealOne. Two.");
+  assert.equal(rows[1].textContent, "Tori ComptonYeah. At 1:35.");
+  assert.equal(rows[1].getAttribute("title"), tori, "the full name on hover");
+  const long = Array.from({ length: 200 }, (_, i) => `w${i}`).join(" ");
+  const lc = renderMeeting({ kind: "live", id: "c1c1c1c1c1c1", title: "T", recording: true, startedAt: new Date().toISOString(), lines: [{ type: "caption", speaker: "Ada", text: long }], live: [], total: 1, recent: [] });
+  const txt = lc.querySelector(".m-line").textContent;
+  assert.match(txt, /^Ada…w\d+ .* w199$/, "a long turn keeps its end, not its start");
+});
+
+test("feed.tailSnapshot() and /api/meeting?tail=1: only id, from, total, entries and live", async () => {
+  const f = fixture();
+  const port = 23790 + Math.floor(Math.random() * 1000);
+  const daemon = fileURLToPath(new URL("../extensions/canvas/daemon.mjs", import.meta.url));
+  const child = spawn(process.execPath, [daemon, "--port", String(port), "--root", join(f.root, "canvas"), "--omarchy", join(f.root, "none"), "--meeting", f.state], { stdio: "ignore" });
+  const get = (p) => fetch(`http://127.0.0.1:${port}${p}`).then((r) => r.json());
+  try {
+    f.writeState({ pid: child.pid });
+    writeFileSync(f.jsonl, line({ type: "caption", speaker: "Ada", text: "One", ts: "t1" }) + line({ type: "caption", speaker: "Ada", text: "Two", ts: "t2" }));
+    writeFileSync(join(f.slides, "0001-140100.jpg"), "jpg");
+    appendFileSync(join(f.slides, "index.jsonl"), line({ n: 1, file: "0001-140100.jpg" }));
+    let full;
+    for (let i = 0; i < 60; i++) {
+      full = await get("/api/meeting").then((d) => d, () => null);
+      if (full?.total === 2) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(full.slides.length && full.state, "the full snapshot is as before");
+    const tail = await get(`/api/meeting?tail=1&since=1&id=${full.id}`);
+    assert.deepEqual(Object.keys(tail).sort(), ["entries", "from", "id", "live", "total"]);
+    assert.deepEqual([tail.id, tail.from, tail.total, tail.entries.map((e) => e.text)], [full.id, 1, 2, ["Two"]]);
+    assert.ok(JSON.stringify(tail).length < JSON.stringify(full).length);
+    // A cursor from another meeting starts over; a bad id is notFound-shaped but light too.
+    const other = await get("/api/meeting?tail=1&since=1&id=0123456789ab");
+    assert.deepEqual(Object.keys(other).sort(), ["entries", "from", "id", "live", "total"]);
+    assert.equal(other.id, "");
+    // The feed itself.
+    const feed = new MeetingFeed(f.state, { alive: () => true });
+    feed.poll();
+    assert.deepEqual(Object.keys(feed.tailSnapshot(0)).sort(), ["entries", "from", "id", "live", "total"]);
+  } finally {
+    child.kill();
+    f.done();
+  }
+});
+
+/** The card's code out of page.mjs, run against a jsdom document with a fake fetch. */
+async function cardPump() {
+  const { h } = await import("../extensions/canvas/render.mjs");
+  const dom = new JSDOM("<!doctype html><body></body>");
+  windows.push(dom.window);
+  globalThis.document = dom.window.document;
+  globalThis.Node = dom.window.Node;
+  const src = pageSource("page.mjs");
+  const code = src.slice(src.indexOf("const meetPad"), src.indexOf("// The card's elapsed time ticks"));
+  const asked = [];
+  const fetchFake = (url) =>
+    new Promise((resolve) => {
+      asked.push({ url: String(url), answer: (body) => resolve({ ok: true, json: async () => body }) });
+    });
+  const api = new Function("h", "plural", "fetch", `${code}; return { renderMeeting, pumpMeetTail, meetBlocks, meetName, getTail: () => meetTail };`)(h, (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`, fetchFake);
+  const mount = (m) => {
+    const card = api.renderMeeting({ kind: "live", id: "d1d1d1d1d1d1", title: "T", recording: true, startedAt: new Date().toISOString(), live: [], recent: [], ...m });
+    dom.window.document.body.replaceChildren(card);
+  };
+  const text = () => [...dom.window.document.querySelectorAll(".m-line")].map((e) => e.textContent).join(" | ");
+  return { ...api, asked, mount, text };
+}
+const capLine = (text, speaker = "Ada") => ({ type: "caption", speaker, text });
+
+test("card pump: an answer for an older cursor (a render re-seeded the tail meanwhile) is dropped, then the poll runs again from the new cursor", async () => {
+  const p = await cardPump();
+  p.mount({ total: 5, lines: [capLine("five")] });
+  const first = p.pumpMeetTail();
+  await tick(5);
+  assert.equal(p.asked.length, 1);
+  assert.match(p.asked[0].url, /^\/api\/meeting\?tail=1&since=5&id=d1d1d1d1d1d1$/);
+  // A refresh re-renders the card with a newer total while that poll is in flight.
+  p.mount({ total: 9, lines: [capLine("five"), capLine("nine", "Bo")] });
+  p.asked[0].answer({ id: "d1d1d1d1d1d1", from: 5, total: 7, entries: [capLine("seven")], live: [] });
+  await first;
+  await tick(5);
+  assert.equal(p.getTail().total, 9, "the total never moves backwards");
+  assert.equal(p.text().includes("seven"), false, "the stale lines are not shown");
+  assert.match(p.text(), /five/);
+  assert.match(p.text(), /nine/, "and the re-seeded lines were not cut down to the answer's");
+  // The poll came back by itself, from the new cursor.
+  assert.equal(p.asked.length, 2);
+  assert.match(p.asked[1].url, /since=9&/);
+  p.asked[1].answer({ id: "d1d1d1d1d1d1", from: 9, total: 10, entries: [capLine("ten", "Bo")], live: [] });
+  await tick(5);
+  assert.equal(p.getTail().total, 10);
+  assert.match(p.text(), /five.*nine.*ten|Ada.*five.*Bo.*nine ten/s);
+  assert.equal(p.getTail().lines.length, 3);
+});
+
+test("card pump: a poll asked for while one is in flight runs once more when it ends (no lost update), and a cursor mismatch resets the lines", async () => {
+  const p = await cardPump();
+  p.mount({ total: 2, lines: [capLine("one"), capLine("two")] });
+  const first = p.pumpMeetTail();
+  await tick(5);
+  await p.pumpMeetTail(); // busy: remembered, not dropped
+  await p.pumpMeetTail();
+  assert.equal(p.asked.length, 1, "one at a time");
+  p.asked[0].answer({ id: "d1d1d1d1d1d1", from: 2, total: 3, entries: [capLine("three")], live: [] });
+  await first;
+  await tick(5);
+  assert.equal(p.asked.length, 2, "the update that came in meanwhile gets its poll");
+  assert.match(p.asked[1].url, /since=3&/);
+  p.asked[1].answer({ id: "d1d1d1d1d1d1", from: 3, total: 4, entries: [capLine("four")], live: [{ speaker: "Ada", text: "and five" }] });
+  await tick(5);
+  assert.equal(p.asked.length, 2, "and only once");
+  assert.match(p.text(), /four/);
+  assert.match(p.text(), /and five/, "the in-progress line");
+  // The server started over (from 0, not the cursor): the old lines go, the answer's entries stay.
+  const again = p.pumpMeetTail();
+  await tick(5);
+  p.asked[2].answer({ id: "d1d1d1d1d1d1", from: 0, total: 2, entries: [capLine("alpha"), capLine("beta")], live: [] });
+  await again;
+  assert.deepEqual(p.getTail().lines.map((l) => l.text), ["alpha", "beta"]);
+  assert.equal(p.getTail().total, 2);
+});
+
+test("card: a cut that starts on the continuation of a live turn still names its speaker", async () => {
+  const p = await cardPump();
+  const blocks = p.meetBlocks([capLine("said so far"), { ...capLine("and going on"), live: true }], 1);
+  assert.deepEqual(blocks.map((b) => [b.speaker, b.live, b.cont]), [["Ada", true, false]]);
+  p.mount({ total: 2, lines: [capLine("said so far")], live: [{ speaker: "Ada", text: "and going on" }] });
+  assert.equal(p.text(), "Adasaid so far | and going on", "uncut, the continuation has no second name");
+});
+
+test("meetName: suffixes and titles are dropped before 'Last, First' is read; one word, emails and initials are kept", async () => {
+  const { meetName } = await cardPump();
+  assert.equal(meetName("Smith, John, Jr."), "John Smith");
+  assert.equal(meetName("Doe, Jane, III"), "Jane Doe");
+  assert.equal(meetName("Smith, John Jr."), "John Smith");
+  assert.equal(meetName("John Smith II"), "John Smith");
+  assert.equal(meetName("Dr. Jane Doe"), "Jane Doe");
+  assert.equal(meetName("Compton, Tori K. (governmentcio Llc)"), "Tori Compton");
+  assert.equal(meetName("Ada B. Lovelace (ORG)"), "Ada Lovelace");
+  assert.equal(meetName("Grace"), "Grace");
+  assert.equal(meetName("ada@example.com"), "ada@example.com");
+  assert.equal(meetName("Dr."), "Dr.");
+  assert.equal(meetName("Jr."), "Jr.", "only a suffix: nothing else to show");
+  assert.equal(meetName("Dr. Smith, John"), "John Smith");
+  assert.equal(meetName("Smith, Dr. John"), "John Smith");
+  assert.equal(meetName("Jane Q. Doe Jr."), "Jane Doe");
+  assert.equal(meetName("Dr. Jane Doe, Jr."), "Jane Doe");
+  assert.equal(meetName("Smith Jr., John"), "John Smith");
+  assert.equal(meetName("Sr. Jr. Dr. Who"), "Who");
+});
+
+test("card css: .m-line has one rule (the old line-clamp rule was dead)", () => {
+  const css = pageSource("page.mjs");
+  assert.equal(css.match(/^\.m-line \{/gm).length, 1);
+  assert.doesNotMatch(css, /\.m-line \{[^}]*line-clamp/);
+});
+
+test("feed.summary(): the newest 12 lines, the in-progress ones and the total; `at` stays put while nothing changes", () => {
+  const f = fixture();
+  try {
+    f.writeState({ pid: process.pid });
+    writeFileSync(f.jsonl, Array.from({ length: 15 }, (_, i) => line({ type: "caption", speaker: "Ada", text: `c${i}`, ts: `t${i}` })).join(""));
+    const feed = new MeetingFeed(f.state, { alive: () => true });
+    feed.poll();
+    const s = feed.summary();
+    assert.deepEqual(s.lines.map((e) => e.text), Array.from({ length: 12 }, (_, i) => `c${i + 3}`));
+    assert.deepEqual([s.total, s.live], [15, []]);
+    assert.equal(feed.summary().at, s.at, "asking again does not move `at`");
+    feed.poll();
+    assert.equal(feed.summary().at, s.at, "a quiet poll does not either");
+  } finally {
+    f.done();
+  }
+});

@@ -592,6 +592,12 @@ export class MeetingFeed {
     };
   }
 
+  /** The card's light poll (/api/meeting?tail=1): only the new entries and the in-progress lines, none of the slide list, notes or people. */
+  tailSnapshot(since = 0, id = "", cur = id) {
+    const { id: sid, from, total, entries, live } = this.snapshot(since, id, cur);
+    return { id: sid, from, total, entries, live };
+  }
+
   /** A past meeting for /meeting?id=: its whole transcript from the data folder (by id, never a client path), or notFound. */
   pastSnapshot(since, id, cur) {
     const p = this.loadPast(id);
@@ -636,7 +642,8 @@ export class MeetingFeed {
     // run out with no feed change) and what the list shows (new meetings, new ★ counts).
     const at = `${this.changedAt}|${kind}|${recent.map((e) => `${e.id}.${e.live ? 1 : 0}.${e.duration}.${e.notes?.mine ?? ""}`).join(",")}`;
     if (kind === "list") return recent.length ? { kind, id: "", recording: false, ended: false, recent, notes: null, at } : null;
-    const lines = this.entries.filter((e) => e.type === "caption" || e.type === "chat").slice(-4);
+    // Enough lines for four speaker blocks on the card; it tails /api/meeting from `total` on.
+    const lines = this.entries.filter((e) => e.type === "caption" || e.type === "chat").slice(-12);
     const last = this.current();
     const p = this.people();
     return {
@@ -655,6 +662,8 @@ export class MeetingFeed {
       slides: this.slides.length,
       slide: last ? { n: last.n, thumb: Boolean(last.thumb) } : null,
       lines,
+      live: this.live,
+      total: this.entries.length,
       recent,
       notes: this.notesSummary(),
       at,
