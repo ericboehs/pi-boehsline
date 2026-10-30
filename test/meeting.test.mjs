@@ -128,6 +128,7 @@ import {
 	normFailed,
 	ocrTimeout,
 } from "../extensions/opt-in/meeting/index.ts";
+import { clip } from "../extensions/opt-in/meeting/slides.ts";
 import { MEETING_DEFAULTS, meetingSettings } from "../extensions/opt-in/watch/settings.ts";
 
 import { estTokens, PROMPT_MAX_TOKENS } from "../extensions/opt-in/watch/models.ts";
@@ -1591,4 +1592,15 @@ test("the notes file and the archive say whether summaries run and which slides 
 		saved === undefined ? delete process.env.PI_MEETING_NOTES_FILE : (process.env.PI_MEETING_NOTES_FILE = saved);
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test("clip: cuts on a word boundary with an ellipsis, never mid-word", () => {
+	assert.equal(clip("  short   text ", 300), "short text");
+	assert.equal(clip(42, 10), "");
+	const s = "and that auto-scaling should have caught the surge before users noticed";
+	const c = clip(s, 30);
+	assert.ok(c.length <= 30, c);
+	assert.equal(c, "and that auto-scaling should\u2026");
+	assert.equal(clip("ends with a comma, then more words here", 20), "ends with a comma\u2026", "trailing punctuation dropped");
+	assert.equal(clip("x".repeat(50), 10), `${"x".repeat(9)}\u2026`, "one long word is cut hard");
 });

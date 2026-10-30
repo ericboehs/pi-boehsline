@@ -34,7 +34,15 @@ export const SLIDE_TRIES = 3;
 export const SLIDE_GAP_MS = 10_000;
 export const OCR_WAIT_MS = 90_000;
 
-const clip = (v: unknown, n: number) => (typeof v === "string" ? v.replace(/\s+/g, " ").trim().slice(0, n) : "");
+/** Collapse whitespace and cap at n chars; a cut lands on a word boundary and ends in "…", never mid-word. */
+export const clip = (v: unknown, n: number): string => {
+	if (typeof v !== "string") return "";
+	const s = v.replace(/\s+/g, " ").trim();
+	if (s.length <= n) return s;
+	const cut = s.slice(0, n - 1);
+	const sp = cut.lastIndexOf(" ");
+	return `${(sp > n * 0.6 ? cut.slice(0, sp) : cut).replace(/[\s,;:.–—-]+$/, "")}…`;
+};
 const rec = (v: unknown): Record<string, unknown> => (v && typeof v === "object" ? (v as Record<string, unknown>) : {});
 const strings = (v: unknown, max: number, n: number): string[] => {
 	const list = Array.isArray(v) ? v : typeof v === "string" ? [v] : [];

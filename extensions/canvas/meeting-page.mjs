@@ -97,8 +97,8 @@ body:not(.has-slides) .tx { max-width: 920px; margin: 0 auto; width: 100%; }
 .side { flex: none; width: 340px; min-height: 0; display: none; flex-direction: column; border-left: 1px solid var(--line); background: var(--card); }
 body.has-side .side { display: flex; }
 body.has-side:not(.has-slides) .tx { max-width: none; margin: 0; }
-.chat { flex: 0 0 40%; min-height: 0; display: flex; flex-direction: column; }
-body:not(.has-notes) .chat { flex: 1 1 0; }
+.chat { flex: 0 1 auto; max-height: 40%; min-height: 0; display: flex; flex-direction: column; } /* as tall as its messages, at most 40%: notes get the rest */
+body:not(.has-notes) .chat { flex: 1 1 0; max-height: none; }
 body:not(.has-chat) .chat { flex: none; }
 .chat-h { flex: none; display: flex; align-items: baseline; gap: 8px; padding: 8px 16px 2px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
 .chat-h small { font: 12px/1.3 -apple-system, BlinkMacSystemFont, sans-serif; text-transform: none; letter-spacing: 0; font-style: italic; font-weight: 400; }
@@ -115,7 +115,16 @@ body.has-notes .notes { display: flex; }
 .nbody .alerts { display: flex; flex-direction: column; gap: 5px; padding: 8px 10px; border-radius: 6px; background: color-mix(in srgb, var(--warn) 14%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); }
 .nbody .alert { line-height: 1.4; }
 .nbody .alert time { color: var(--dim); font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; margin-right: 6px; }
+.nbody .topic { cursor: pointer; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.nbody .topic.full { display: list-item; -webkit-line-clamp: unset; line-clamp: none; overflow: visible; }
+.nbody .topics { list-style: none; padding-left: 0; }
+.nbody .topics .topic { margin: 6px 0; }
 .nbody .topic b { font-weight: 600; }
+.nbody .alerts ul { list-style: none; padding-left: 0; margin: 0; display: flex; flex-direction: column; gap: 5px; }
+.nbody .more { all: unset; cursor: pointer; display: inline-block; margin-top: 4px; font-size: 12px; color: var(--accent); }
+.nbody .more:hover { text-decoration: underline; }
+.nbody li.fresh { animation: fresh 2.4s ease-out; border-radius: 4px; }
+@keyframes fresh { from { background: color-mix(in srgb, var(--accent) 28%, transparent); } to { background: transparent; } }
 .nbody .slidelist { list-style: none; padding-left: 0; }
 .nbody .slidelist button { all: unset; cursor: pointer; line-height: 1.4; }
 .nbody .slidelist button:hover { color: var(--accent); text-decoration: underline; }
@@ -131,7 +140,7 @@ dialog img { display: block; max-width: 96vw; max-height: 96vh; }
   body.has-side.view-chat .side, body.has-side.view-notes .side { display: flex; }
   body.has-side.view-chat .tx, body.has-side.view-notes .tx { display: none; }
   body.has-side .tabs { display: flex; }
-  .chat, body:not(.has-notes) .chat, body:not(.has-chat) .chat { flex: 1 1 0; }
+  .chat, body:not(.has-notes) .chat, body:not(.has-chat) .chat { flex: 1 1 0; max-height: none; }
   .chat-h { display: none; }
   .notes { border-top: 0; }
   body.view-notes .chat, body.view-chat .notes { display: none; }
@@ -619,25 +628,57 @@ ui.search.addEventListener("input", () => {
 // ── notes panel ──
 const fmtAt = (iso) => (iso ? clock(iso).slice(0, 5) : "");
 const section = (title, ...kids) => [h("h3", {}, title), ...kids];
+// Long lists show the newest few first; "Show all" opens the rest. Open lists and expanded topics survive re-renders.
+const NOTES_CAP = 3;
+const openLists = new Set();
+const openTopics = new Set();
+// Items seen in an earlier render: a new one flashes once. The first render marks everything seen, without a flash.
+const seenNotes = new Set();
+let notesPrimed = false;
+function newestList(key, items, item, empty, cls) {
+  if (!items.length) return [h("div", { class: "none" }, empty)];
+  const all = openLists.has(key);
+  const shown = all ? items : items.slice(0, NOTES_CAP);
+  const keyOf = (x) => `${key}\u0000${JSON.stringify(x)}`;
+  const out = [h("ul", cls ? { class: cls } : {}, shown.map((x) => {
+    const li = item(x);
+    if (notesPrimed && !seenNotes.has(keyOf(x))) li.classList.add("fresh");
+    return li;
+  }))];
+  for (const x of items) seenNotes.add(keyOf(x));
+  if (items.length > NOTES_CAP) out.push(h("button", { type: "button", class: "more", onclick: () => { all ? openLists.delete(key) : openLists.add(key); renderNotes(); } }, all ? "Show fewer" : `Show all ${items.length}`));
+  return out;
+}
+const topicItem = (t) => {
+  const li = h("li", { class: `topic${openTopics.has(t.title) ? " full" : ""}`, title: openTopics.has(t.title) ? "Shorten" : "Show the whole summary" }, h("b", {}, t.title), t.summary ? ` ${t.summary}` : "");
+  li.addEventListener("click", () => { openTopics.has(t.title) ? openTopics.delete(t.title) : openTopics.add(t.title); renderNotes(); });
+  return li;
+};
 function renderNotes() {
   const n = notes;
   // The panel (below the Chat box in the third column, or a tab) is there only when a copilot is writing notes.
   const has = Boolean(state && n);
   renderSide();
-  if (!has) return void ui.nbody.replaceChildren();
+  if (!has) {
+    seenNotes.clear();
+    notesPrimed = false;
+    return void ui.nbody.replaceChildren();
+  }
   const alerts = [...n.alerts].reverse();
-  const mine = n.actions.filter((a) => a.mine);
+  const mine = n.actions.filter((a) => a.mine).reverse();
+  const count = (title, xs) => `${title}${xs.length ? ` · ${xs.length}` : ""}`;
   const out = [];
-  out.push(...section(`Alerts${alerts.length ? ` · ${alerts.length}` : ""}`, alerts.length ? h("div", { class: "alerts" }, alerts.map((a) => h("div", { class: "alert" }, a.at ? h("time", {}, fmtAt(a.at)) : null, h("b", {}, a.kind === "action" ? "✅" : "🔔", a.who ? ` ${a.who}: ` : " "), a.text))) : h("div", { class: "none" }, "Nothing yet. A name said, or a new action on you.")));
-  out.push(...section("Your action items", mine.length ? h("ul", {}, mine.map((a) => h("li", {}, a.what, a.at ? h("small", {}, ` · ${fmtAt(a.at)}`) : null))) : h("div", { class: "none" }, "None")));
-  out.push(...section("Decisions", n.decisions.length ? h("ul", {}, n.decisions.map((d) => h("li", {}, d.text, d.at ? h("small", {}, ` · ${fmtAt(d.at)}`) : null))) : h("div", { class: "none" }, "None yet")));
-  out.push(...section("Topics", n.topics.length ? h("ul", {}, n.topics.map((t) => h("li", { class: "topic" }, h("b", {}, t.title), t.summary ? ` ${t.summary}` : ""))) : h("div", { class: "none" }, "None yet")));
+  out.push(...section(count("Alerts", alerts), ...(alerts.length ? [h("div", { class: "alerts" }, newestList("alerts", alerts, (a) => h("li", { class: "alert" }, a.at ? h("time", {}, fmtAt(a.at)) : null, h("b", {}, a.kind === "action" ? "✅" : "🔔", a.who ? ` ${a.who}: ` : " "), a.text), ""))] : [h("div", { class: "none" }, "Nothing yet. A name said, or a new action on you.")])));
+  out.push(...section(count("Your action items", mine), ...newestList("mine", mine, (a) => h("li", {}, a.what, a.at ? h("small", {}, ` · ${fmtAt(a.at)}`) : null), "None")));
+  out.push(...section(count("Decisions", n.decisions), ...newestList("decisions", [...n.decisions].reverse(), (d) => h("li", {}, d.text, d.at ? h("small", {}, ` · ${fmtAt(d.at)}`) : null), "None yet")));
+  out.push(...section(count("Topics", n.topics), ...newestList("topics", [...n.topics].reverse(), topicItem, "None yet", "topics")));
   const sums = Object.keys(summaries).map(Number).sort((a, b) => a - b);
   if (sums.length) out.push(...section("Slides", h("ul", { class: "slidelist" }, sums.map((k) => h("li", {}, h("button", { type: "button", title: "Show this slide", onclick: () => pickSlide(k) }, `${k}. ${summaries[k].title || summaries[k].what}`))))));
-  if (n.questions.length) out.push(...section("Questions worth asking", h("ul", {}, n.questions.map((q) => h("li", {}, q.q, q.why ? h("small", {}, ` — ${q.why}`) : null)))));
+  if (n.questions.length) out.push(...section("Questions worth asking", ...newestList("questions", [...n.questions].reverse(), (q) => h("li", {}, q.q, q.why ? h("small", {}, ` — ${q.why}`) : null), "")));
   out.push(...section("Suggested reply", n.reply ? h("div", { class: "reply" }, h("small", {}, `${n.reply.to ? `${n.reply.to} is waiting on you` : "Someone is waiting on you"}${n.reply.at ? ` · ${fmtAt(n.reply.at)}` : ""}`), n.reply.text) : h("div", { class: "none" }, "Nobody is waiting on you.")));
   out.push(h("div", { class: "foot" }, `${n.ended ? "Final notes" : "Updated"} ${fmtAt(n.at)}${n.session ? ` · from the “${n.session}” session` : ""}`));
   ui.nbody.replaceChildren(...out);
+  notesPrimed = true;
 }
 showView("tx");
 

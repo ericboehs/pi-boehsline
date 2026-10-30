@@ -21,7 +21,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { estTokens, PROMPT_MAX_TOKENS } from "../watch/models.ts";
 import { meetingId, writeAtomic } from "./capture.ts";
-import { normFailed, normSlides, type SlideSummary } from "./slides.ts";
+import { clip, normFailed, normSlides, type SlideSummary } from "./slides.ts";
 
 // ── the notes ────────────────────────────────────────────────────────────────
 
@@ -48,7 +48,6 @@ export type ScoutUpdate = {
 	reply: Reply | null;
 };
 
-const clip = (v: unknown, n: number) => (typeof v === "string" ? v.replace(/\s+/g, " ").trim().slice(0, n) : "");
 const truthy = (v: unknown) => v === true || /^(true|yes|y|1)$/i.test(String(v ?? ""));
 const rec = (v: unknown): Record<string, unknown> => (v && typeof v === "object" ? (v as Record<string, unknown>) : {});
 
@@ -218,7 +217,7 @@ export function buildSystemPrompt(me: string, meTokens: string[], about: string,
 		meTokens.length ? `\n${who} may be called ${meTokens.join(" or ")}. Speech recognition often garbles names; read through it.` : "",
 		"",
 		"The notes:",
-		`- "topics": what has been discussed, newest last, at most ${MAX_TOPICS}. Each is a short title and one sentence. Keep the earlier titles; fold new talk into the topic it belongs to.`,
+		`- "topics": what has been discussed, newest last, at most ${MAX_TOPICS}. Each is a short title and a summary of one or two short sentences, under 250 characters: the gist and the outcome, not a blow-by-blow. Keep the earlier titles; fold new talk into the topic it belongs to.`,
 		'- "decisions": things the group agreed, one line each.',
 		`- "actions": tasks someone took or was given: "who" does "what". "mine" is true only when the task is assigned to or taken by ${who}. "by" is who asked, when somebody other than the owner did; else "".`,
 		`- "questions": AT MOST ${MAX_QUESTIONS}, and usually none. Empty is the normal answer. Add one only when it is worth interrupting the meeting for: it pins down something left vague that matters (an owner, a date, a dependency, a risk, a decision nobody made) AND it is grounded in what ${who} is working on (the session digest, the about text, the slides). Never generic ("any blockers?", "what are the next steps?"), never something already asked or answered, never small talk. Short (under 25 words), plain, in ${who}'s voice. "why" is a fragment of at most 10 words.`,

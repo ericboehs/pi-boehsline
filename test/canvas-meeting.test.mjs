@@ -1438,9 +1438,9 @@ test("meeting page: no chat yet is one small line; #e<i> on a chat entry scrolls
   assert.equal(doc.querySelector('.tabs [data-v="notes"]').hidden, true);
 });
 
-test("meeting page: the chat box css: third column from 1400 px with chat at about 40%, a tab switch below", () => {
+test("meeting page: the chat box css: third column from 1400 px with chat as tall as its messages up to 40%, a tab switch below", () => {
   const css = pageSource("meeting-page.mjs");
-  assert.match(css, /\.chat \{ flex: 0 0 40%;/);
+  assert.match(css, /\.chat \{ flex: 0 1 auto; max-height: 40%;/);
   assert.match(css, /@media \(max-width: 1399px\) \{[^@]*view-chat/);
   assert.doesNotMatch(css, /innerHTML/);
 });
@@ -2079,4 +2079,41 @@ test("history: in a half-done scan a merged file is read before the fragments, a
   } finally {
     d.done();
   }
+});
+
+test("/meeting notes: newest first, capped at 3 with Show all, topics clamp, new items flash", async () => {
+  const dec = (k) => ({ text: `Decision ${k}`, at: `2026-10-28T14:0${k}:00Z` });
+  let notes = {
+    session: "earl", at: "2026-10-28T14:05:00Z", ended: false, me: [], alerts: [], questions: [], reply: null,
+    topics: [{ title: "Old topic", summary: "s1" }, { title: "Cert rotation", summary: "A long summary ".repeat(20) }],
+    decisions: [1, 2, 3, 4, 5].map(dec),
+    actions: [{ who: "Eric", what: "First", mine: true, at: "" }, { who: "Eric", what: "Second", mine: true, at: "" }],
+  };
+  const snap = () => ({ id: "m1", state: { recording: true, app: "Teams", meeting: "Sync", started_at: "2026-10-28T14:00:00Z" }, entries: [], total: 0, from: 0, slides: [], live: [], people: null, notes, summaries: {} });
+  const { doc, es } = await runPage("meeting-page.mjs", { url: "http://127.0.0.1:8790/meeting", api: () => snap() });
+  const sec = (title) => [...doc.querySelectorAll(".nbody h3")].find((e) => e.textContent.startsWith(title));
+  const list = (title) => { const ul = sec(title).nextElementSibling; return [...ul.querySelectorAll("li")].map((li) => li.firstChild.textContent); };
+  assert.equal(sec("Decisions").textContent, "Decisions · 5");
+  assert.deepEqual(list("Decisions"), ["Decision 5", "Decision 4", "Decision 3"], "newest first, three shown");
+  assert.deepEqual(list("Your action items"), ["Second", "First"]);
+  assert.deepEqual(list("Topics"), ["Cert rotation", "Old topic"]);
+  assert.equal(doc.querySelectorAll(".nbody li.fresh").length, 0, "nothing flashes on the first render");
+  const more = sec("Decisions").nextElementSibling.nextElementSibling;
+  assert.equal(more.textContent, "Show all 5");
+  more.click();
+  assert.deepEqual(list("Decisions"), ["Decision 5", "Decision 4", "Decision 3", "Decision 2", "Decision 1"]);
+  assert.equal(sec("Decisions").nextElementSibling.nextElementSibling.textContent, "Show fewer");
+  // A topic clamps to two lines until clicked; the choice survives re-renders.
+  const topic = () => sec("Topics").nextElementSibling.querySelector("li");
+  assert.equal(topic().classList.contains("full"), false);
+  topic().click();
+  assert.equal(topic().classList.contains("full"), true);
+  // A new decision arrives: it flashes, the old ones don't, and the list stays open.
+  notes = { ...notes, decisions: [...notes.decisions, dec(6)] };
+  es.meeting();
+  await tick();
+  assert.equal(list("Decisions")[0], "Decision 6");
+  assert.equal(list("Decisions").length, 6, "Show all stays open");
+  assert.deepEqual([...doc.querySelectorAll(".nbody li.fresh")].map((li) => li.firstChild.textContent), ["Decision 6"]);
+  assert.equal(topic().classList.contains("full"), true, "expanded topic stays expanded");
 });
