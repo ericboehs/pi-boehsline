@@ -1102,7 +1102,8 @@ test("slide summaries when a model fails: back off, retry, and give up on a slid
 		slide: (n, k) => (n === 3 ? { error: "429 rate limited" } : n === 2 && k === 0 ? { error: "overloaded" } : JSON.stringify({ title: `Title ${n}`, what: `What ${n}.`, why: "", points: [], numbers: [] })),
 	});
 	const s = w.session("solo", "solo-id", asked, { registry });
-	await s.command(`replay 1000 ${file}`);
+	// 300×: the backoffs scale with speed, so a slower replay leaves real headroom for a slow CI runner before the meeting ends.
+	await s.command(`replay 300 ${file}`);
 	await until(() => s.stopped(), "the replay to finish", 12000);
 	assert.deepEqual(registry.slideCalls().map((c) => c.slide), [3, 3, 3, 2, 2, 1], "slide 3 three tries then given up (no fourth), slide 2 retried once, slide 1 still got its turn");
 	const at = registry.slideCalls().map((c) => c.at);
