@@ -9,10 +9,11 @@
  * added to the manifest.
  */
 import assert from "node:assert/strict";
-import { globSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, globSync, mkdtempSync, readFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 
 // agent-link registers a peer and binds a socket under HOME on session_start;
 // keep that (and any config) out of the real home.
@@ -24,6 +25,25 @@ process.env.BOEHSLINE_CONFIG = join(home, "boehsline.json");
 // they are checked too.
 process.env.BOEHSLINE_ENABLE = "scheduler-tool";
 delete process.env.PI_SUBAGENT_CHILD;
+// canvas starts its daemon on session_start, detached. On the default port it
+// would replace the user's own canvas daemon (a different version) and outlive
+// the test, serving this temp home. Give it a free port and stop it afterwards.
+const freePort = await new Promise((resolve) => {
+	const srv = createServer().listen(0, "127.0.0.1", () => {
+		const { port } = srv.address();
+		srv.close(() => resolve(port));
+	});
+});
+process.env.PI_CANVAS_PORT = String(freePort);
+after(async () => {
+	// The daemon writes its pid once listening; give a just-spawned one a moment.
+	const pidFile = join(home, ".pi", "canvas", ".daemon.json");
+	for (let i = 0; i < 20 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 100));
+	try {
+		const { pid, port } = JSON.parse(readFileSync(pidFile, "utf8"));
+		if (port === freePort && Number.isInteger(pid)) process.kill(pid);
+	} catch {}
+});
 
 const root = new URL("..", import.meta.url).pathname;
 const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).pi.extensions;
