@@ -17,7 +17,7 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 | `prompt` / `prompt_end` | a dialog (`ask`, select, confirm, input, editor, custom) opens / closes | `kind`, `title` (≤ 500 chars) |
 | `stream` / `stream_end` | the reply as it's written / done | `text` |
 | `model` | `/model`, Ctrl+P, a thinking-level change | `model` (`{name, provider, id, thinking}`) |
-| `ask` / `ask_end` | the `ask` tool has a question open / it's answered | `ask` (`{id, questions}`) |
+| `ask` / `ask_end` | the `ask` tool has a question open / it's answered | `ask` (`{id, questions, sensitive?}`; `sensitive: true` marks a secret's approval, e.g. op-broker's, which only a signed `answer` can take) |
 | `commands` / `models` | after `/reload` (also in `hello`) | the phone's `/` list; the models its picker offers |
 | `stash` | the message stash changed (Ctrl+S, `/stash`, the phone; also in `hello`) | `stash` (`[{id, text, ts}]`, oldest first) |
 | `context` | after each run, after a compaction, after `/reload` | `context` (`{tokens, window, percent}`) |
@@ -37,7 +37,7 @@ Each session also listens on its own socket, `~/.local/state/botsun/owner/<pid>.
 | `say` | Eric's words as if typed (steering a running turn), with photos; files are saved to `~/.local/state/botsun/inbox/<pid>/` and named in the message |
 | `say_audio` | a call into the session: the transcribed words, signed over the audio with the call key. With `hold: true` they're verified and held (`{ok, held: id}`) instead of put in; with `proposal_sha256` the hash of an answer read back to him is signed with them |
 | `release` | `{ids, mode}` from the voice helper: held words go in as `queue` (a follow-up after the turn), `steer`, or `interrupt` (steer; abort the run first only when the released words themselves say stop, then send them once pi settles). It adds no words, so it isn't signed |
-| `confirm` | `{id, ask_id, answers}` from the voice helper: his held reply means yes to the answer read back on the call. Answers the open `ask` only when that utterance was signed with this answer's hash (`say_audio` with `proposal_sha256`, an extra line of the signed message) and its words don't say no (`saysNo`) |
+| `confirm` | `{id, ask_id, answers}` from the voice helper: his held reply means yes to the answer read back on the call. Answers the open `ask` only when that utterance was signed with this answer's hash (`say_audio` with `proposal_sha256`, an extra line of the signed message) and its words don't say no (`saysNo`). Never a `sensitive` prompt: "answer this one on the phone screen or the keyboard" |
 | `drop` / `call_end` | forget the held words named, or all of them |
 | `stop` | the phone's Stop button: ends the running turn (or a compaction) as Esc does; signed over `stop` with the decision key; `{ok, stopped}` |
 | `answer` | answers the open `ask` question; the tool takes it as if picked at the keyboard and closes its dialog |

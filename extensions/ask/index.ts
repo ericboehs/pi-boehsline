@@ -210,7 +210,7 @@ export default function ask(pi: ExtensionAPI) {
 		parameters: AskParams,
 		executionMode: "sequential",
 
-		async execute(_id, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<AskDetails>> {
+		async execute(_id, params, signal, _onUpdate, ctx): Promise<AgentToolResult<AskDetails>> {
 			let subs: SubQuestion[];
 			if (params.questions && params.questions.length > 0) {
 				subs = params.questions;
@@ -671,15 +671,31 @@ export default function ask(pi: ExtensionAPI) {
 
 			};
 			const remote = offerPrompt(subs.map((q) => ({ question: q.question, options: q.options, multiSelect: q.multiSelect })));
+			// The run's abort (Esc, or the phone's Stop → ctx.abort()) closes the dialog and the question.
+			let onAbort!: () => void;
+			const stopped = new Promise<"stopped">((resolve) => {
+				onAbort = () => {
+					abort.abort();
+					resolve("stopped");
+				};
+			});
+			if (signal?.aborted) onAbort();
+			else signal?.addEventListener("abort", onAbort, { once: true });
 			try {
 				const winner = await Promise.race([
 					local().then((result) => ({ result })),
 					remote.answered.then((answers) => ({ answers })),
+					stopped,
 				]);
+				if (winner === "stopped") {
+					const single = subs.length === 1;
+					return cancelled(single ? subs[0]!.question : `${subs.length} questions`, single ? subs[0]!.options.map((o) => o.label) : []);
+				}
 				if ("result" in winner) return winner.result;
 				abort.abort(); // close the dialog still open in the TUI
 				return remoteResult(subs, winner.answers, !(params.questions && params.questions.length > 0));
 			} finally {
+				signal?.removeEventListener("abort", onAbort);
 				remote.dispose();
 			}
 		},

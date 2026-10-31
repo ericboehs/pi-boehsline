@@ -8,7 +8,8 @@ descriptions, and a `Type something.` row that opens an input dialog for a free
 answer. `multiSelect: true` turns the rows into checkboxes (space/click
 toggles, `a` toggles all, enter submits with a live count); `questions: [...]`
 asks several questions sequentially in one call and keeps the transcript so far
-if one is cancelled midway.
+if one is cancelled midway. The run's abort (Esc, or the phone's Stop) cancels
+it and withdraws the question from the phone.
 
 Single-select reuses pi's `SelectList`, which already handles mouse
 press/click/wheel; the multi-select dialog renders its own rows and hit-tests

@@ -23,6 +23,11 @@ export interface RemoteAnswer {
 export interface RemotePrompt {
 	id: string;
 	questions: RemoteQuestion[];
+	/**
+	 * Guards a secret (op-broker's 1Password approval): only a device-signed screen tap or the
+	 * keyboard may answer it, never a spoken yes on a call.
+	 */
+	sensitive: boolean;
 	/** Delivers an answer; returns an error, or null once taken. */
 	answer(answers: RemoteAnswer[]): string | null;
 }
@@ -87,8 +92,13 @@ export function canonicalAnswer(id: string, answers: RemoteAnswer[]): string {
 	return [id, ...answers.map((a, i) => `q${i} ${a.picks.join(",")} ${sha256hex(a.text ?? "")}`)].join("\n");
 }
 
+export interface OfferOptions {
+	/** See RemotePrompt.sensitive. op-broker passes true for its approval card. */
+	sensitive?: boolean;
+}
+
 /** Offers questions for a remote answer. `answered` resolves once one is taken; dispose when done. */
-export function offerPrompt(questions: RemoteQuestion[]): { id: string; answered: Promise<RemoteAnswer[]>; dispose(): void } {
+export function offerPrompt(questions: RemoteQuestion[], opts: OfferOptions = {}): { id: string; answered: Promise<RemoteAnswer[]>; dispose(): void } {
 	const id = randomBytes(9).toString("base64url");
 	let resolve!: (a: RemoteAnswer[]) => void;
 	const answered = new Promise<RemoteAnswer[]>((r) => {
@@ -98,6 +108,7 @@ export function offerPrompt(questions: RemoteQuestion[]): { id: string; answered
 	b.prompts.set(id, {
 		id,
 		questions,
+		sensitive: opts.sensitive === true,
 		answer(answers) {
 			if (!b.prompts.has(id)) return "that question was already answered";
 			const bad = invalidAnswer(questions, answers);

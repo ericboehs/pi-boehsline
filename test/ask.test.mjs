@@ -406,6 +406,48 @@ test("a keyboard answer withdraws the question from the phone", async () => {
 	assert.equal(openPrompts().length, 0);
 });
 
+function hangingCtx(onClose) {
+	// A TUI dialog that only ends when done() is called (by the abort).
+	return {
+		hasUI: true,
+		mode: "tui",
+		ui: {
+			custom: (factory) => new Promise((resolve) => {
+				factory({ requestRender() {} }, { fg: (_c, t) => t, bold: (t) => t, bg: (_c, t) => t }, {}, (v) => { onClose(); resolve(v); });
+			}),
+			input: async () => undefined,
+			select: async () => undefined,
+		},
+	};
+}
+
+test("the run's abort (the phone's Stop) cancels the ask, closes the dialog and withdraws the question", async () => {
+	const { openPrompts } = await import("../lib/remote-prompts.ts");
+	let tool;
+	await askExtension({ registerTool: (def) => (tool = def) });
+	let closed = false;
+	const run = new AbortController();
+	const running = tool.execute("t1", { question: "Pizza?", options: [{ label: "Pepperoni" }] }, run.signal, undefined, hangingCtx(() => (closed = true)));
+	await new Promise((r) => setTimeout(r, 10));
+	assert.equal(openPrompts().length, 1);
+	run.abort();
+	const result = await Promise.race([running, new Promise((r) => setTimeout(() => r("hung"), 500))]);
+	assert.notEqual(result, "hung", "the tool returns once aborted");
+	assert.equal(result.content[0].text, "User cancelled");
+	assert.equal(result.details.cancelled, true);
+	assert.ok(closed, "the TUI dialog was closed");
+	assert.equal(openPrompts().length, 0, "the question is gone from the phone");
+
+	// Already aborted before it asked: nothing is left open.
+	const early = await Promise.race([
+		tool.execute("t2", { question: "Pizza?", options: [{ label: "Pepperoni" }] }, AbortSignal.abort(), undefined, hangingCtx(() => {})),
+		new Promise((r) => setTimeout(() => r("hung"), 500)),
+	]);
+	assert.notEqual(early, "hung", "an already-aborted ask returns at once");
+	assert.equal(early.details.cancelled, true);
+	assert.equal(openPrompts().length, 0);
+});
+
 test("formatAnswerLines leaves out the selected line for a typed-only answer", () => {
 	assert.deepEqual(formatAnswerLines(["A", "B"], [], ["Meet in the middle"]), ["User wrote: Meet in the middle"]);
 	assert.deepEqual(formatAnswerLines(["A", "B"], ["B"], ["more"]), ["User selected: 2. B", "User wrote: more"]);

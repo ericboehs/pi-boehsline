@@ -48,10 +48,10 @@ const ATTACH_MAX = 4;
 export const inboxDir = (): string => process.env.BOTSUN_OWNER_INBOX || join(homedir(), ".local", "state", "botsun", "inbox");
 const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/heic", "image/webp", "image/gif"]);
 const TEXT_MAX = 20_000;
-/** DER prefix that turns a 65-byte uncompressed P-256 point into an SPKI key. */
 /** Streaming text to Botsun: at most this often, and at most this much (the end is kept). */
 const STREAM_EVERY_MS = 250;
 const STREAM_MAX = 20_000;
+/** DER prefix that turns a 65-byte uncompressed P-256 point into an SPKI key. */
 const P256_SPKI = Buffer.from("3059301306072a8648ce3d020106082a8648ce3d030107034200", "hex");
 
 /**
@@ -117,6 +117,11 @@ const sha256hex = (data: string | Buffer): string => createHash("sha256").update
  */
 export function ownerMessage(deviceId: string, nonce: string, sessionId: string, text: string, images: Image[] = [],
 	files: File[] = []): Buffer {
+	const { decision, digest } = sayDigest(text, images, files);
+	return Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", sessionId, decision, digest].join("\n"), "utf8");
+}
+
+function sayDigest(text: string, images: Image[], files: File[]): { decision: string; digest: string } {
 	const textHash = sha256hex(Buffer.from(text, "utf8"));
 	let decision = "say";
 	let digest = textHash;
@@ -129,7 +134,7 @@ export function ownerMessage(deviceId: string, nonce: string, sessionId: string,
 		decision = "say_images";
 		digest = sha256hex([textHash, ...images.map((i) => sha256hex(Buffer.from(i.data, "base64")))].join("\n"));
 	}
-	return Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", sessionId, decision, digest].join("\n"), "utf8");
+	return { decision, digest };
 }
 
 function filesOf(raw: unknown): File[] | string {
@@ -195,11 +200,47 @@ function takeNonce(c: Conn, nonce: string): boolean {
 	return exp !== undefined && exp > now;
 }
 
+/**
+ * Unsigned, and the oldest is evicted past NONCES_MAX: any local process running as Eric can
+ * flood this to spend Botsun's nonce before it's used. Accepted: that's a same-user local DoS
+ * (it could kill pi as easily); the signed request just fails with "nonce is expired or used",
+ * and nothing can be forged with a nonce.
+ */
 function newNonce(c: Conn): string {
 	const nonce = randomBytes(24).toString("base64url");
 	c.nonces.set(nonce, Date.now() + NONCE_TTL_MS);
 	while (c.nonces.size > NONCES_MAX) c.nonces.delete(c.nonces.keys().next().value as string);
 	return nonce;
+}
+
+const deviceIdOf = (r: Record<string, unknown>): string =>
+	typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
+
+/**
+ * Checks a phone-signed request: its nonce (spent whatever happens next: one try per nonce), the
+ * paired device's key, and its signature over "botsun-decide-v1" … decision, digest(). Returns
+ * the error, or null when it verifies. kind "call": the phone's call key (T5).
+ */
+function verifyDevice(c: Conn, r: Record<string, unknown>, decision: string, digest: () => string,
+	kind: "decide" | "call" = "decide"): string | null {
+	const { nonce, signature } = r;
+	const deviceId = deviceIdOf(r);
+	if (typeof nonce !== "string" || typeof signature !== "string" || !/^\d{1,12}$/.test(deviceId)) return "bad request";
+	if (!c.sessionId) return "this session has no id yet";
+	if (!takeNonce(c, nonce)) return "nonce is expired or used";
+	let key: Buffer | null;
+	try {
+		key = deviceKey(deviceId, kind);
+	} catch (e) {
+		return (e as Error).message.startsWith("owner-keys") ? (e as Error).message : "no device keys";
+	}
+	if (!key) return "unknown device";
+	try {
+		const msg = Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, decision, digest()].join("\n"), "utf8");
+		const pub = createPublicKey({ key: Buffer.concat([P256_SPKI, key]), format: "der", type: "spki" });
+		if (verifySignature("sha256", msg, { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"))) return null;
+	} catch {}
+	return "signature does not verify";
 }
 
 /** One request line → one reply object. Exported for tests. */
@@ -226,8 +267,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	// Display only (a chip's mode, as a click on the footer flips it): not signed, nothing acts.
 	if (r.type === "footer_tap") return footerTap(String(r.chip ?? ""));
 	if (r.type !== "say") return { error: "unknown request" };
-	const { text, nonce, signature } = r;
-	const deviceId = typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
+	const { text } = r;
 	const images = imagesOf(r.images);
 	if (typeof images === "string") return { error: images };
 	const files = filesOf(r.files);
@@ -236,24 +276,9 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (typeof text !== "string" || text.length > TEXT_MAX || (!text.trim() && !images.length && !files.length)) {
 		return { error: "text must be 1 to 20000 characters (or attach something)" };
 	}
-	if (typeof nonce !== "string" || typeof signature !== "string" || !/^\d{1,12}$/.test(deviceId)) return { error: "bad request" };
-	if (!c.sessionId) return { error: "this session has no id yet" };
-	// The nonce is spent whatever happens next: one try per nonce.
-	if (!takeNonce(c, nonce)) return { error: "nonce is expired or used" };
-	let key: Buffer | null;
-	try {
-		key = deviceKey(deviceId);
-	} catch (e) {
-		return { error: (e as Error).message.startsWith("owner-keys") ? (e as Error).message : "no device keys" };
-	}
-	if (!key) return { error: "unknown device" };
-	let ok = false;
-	try {
-		const pub = createPublicKey({ key: Buffer.concat([P256_SPKI, key]), format: "der", type: "spki" });
-		ok = verifySignature("sha256", ownerMessage(deviceId, nonce, c.sessionId, text, images, files), { key: pub, dsaEncoding: "der" },
-			Buffer.from(signature, "base64"));
-	} catch {}
-	if (!ok) return { error: "signature does not verify" };
+	const say = sayDigest(text, images, files);
+	const denied = verifyDevice(c, r, say.decision, () => say.digest);
+	if (denied) return { error: denied };
 	let notes: string[];
 	try {
 		notes = saveFiles(files);
@@ -282,31 +307,14 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
  * audio (its sha256) and this session's nonce with its call key; the words go in as his.
  */
 function sayAudio(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
-	const { text, nonce, signature, wav_sha256: wav } = r;
-	const deviceId = typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
+	const { text, wav_sha256: wav } = r;
 	// A reply to a proposal on the call (an `ask` answer read back to him): its hash is signed too.
 	const proposal = typeof r.proposal_sha256 === "string" && /^[0-9a-f]{64}$/.test(r.proposal_sha256) ? r.proposal_sha256 : undefined;
 	if (r.proposal_sha256 !== undefined && !proposal) return { error: "bad request" };
 	if (typeof text !== "string" || !text.trim() || text.length > TEXT_MAX) return { error: "nothing was said" };
-	if (typeof nonce !== "string" || typeof signature !== "string" || typeof wav !== "string" || !/^[0-9a-f]{64}$/.test(wav) ||
-		!/^\d{1,12}$/.test(deviceId)) return { error: "bad request" };
-	if (!c.sessionId) return { error: "this session has no id yet" };
-	if (!takeNonce(c, nonce)) return { error: "nonce is expired or used" };
-	let key: Buffer | null;
-	try {
-		key = deviceKey(deviceId, "call");
-	} catch (e) {
-		return { error: (e as Error).message.startsWith("owner-keys") ? (e as Error).message : "no device keys" };
-	}
-	if (!key) return { error: "unknown device" };
-	let ok = false;
-	try {
-		const pub = createPublicKey({ key: Buffer.concat([P256_SPKI, key]), format: "der", type: "spki" });
-		const msg = Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, "say_audio", wav,
-			...(proposal ? [proposal] : [])].join("\n"), "utf8");
-		ok = verifySignature("sha256", msg, { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"));
-	} catch {}
-	if (!ok) return { error: "signature does not verify" };
+	if (typeof wav !== "string" || !/^[0-9a-f]{64}$/.test(wav)) return { error: "bad request" };
+	const denied = verifyDevice(c, r, "say_audio", () => [wav, ...(proposal ? [proposal] : [])].join("\n"), "call");
+	if (denied) return { error: denied };
 	if (r.hold === true) {
 		// Verified now, while the nonce is fresh; delivered only when the voice helper releases it.
 		const held = (c.held ??= new Map());
@@ -361,11 +369,6 @@ export function saysYes(text: string): boolean {
 	return /\b(yes|yeah|yep|yup|ya|sure|ok|okay|correct|right|confirm|confirmed|affirmative|absolutely|definitely|perfect|fine|sounds good|go ahead|go for it|do it|do that|send|send it|send that|that's it|that one|uh huh|uh-huh|mm-hmm|mhm|please do|you got it|ship it)\b/.test(t);
 }
 
-/**
- * The voice helper says his held reply means yes to the proposal it read back: answer the open
- * `ask` with it. The session checks on its own that his signed words carry this exact answer's
- * hash (canonicalAnswer) and don't say no; the helper can't write the yes, only point at it.
- */
 /** A reworded message is read back in full on the call: Botsun caps it at this too. */
 const PROPOSED_TEXT_MAX = 600;
 
@@ -375,9 +378,13 @@ export function proposalTextHash(text: string): string {
 }
 
 /**
+ * The voice helper says his held reply means yes to the proposal it read back: answer the open
+ * `ask` with it. The session checks on its own that his signed words carry this exact answer's
+ * hash (canonicalAnswer) and don't say no; the helper can't write the yes, only point at it.
+ *
  * Two kinds of proposal: an `ask` answer ({ask_id, answers}), or a message the helper reworded
  * from his words ({text, mode}: queue after the turn, or steer in as typed). Either way the
- * hash is recomputed here from what's about to go in.
+ * hash is recomputed here from what's about to go in. Never a sensitive prompt.
  */
 function confirmHeld(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
 	const { id, ask_id: askId, answers, text, mode } = r;
@@ -400,6 +407,9 @@ function confirmHeld(c: Conn, r: Record<string, unknown>): Record<string, unknow
 	c.held?.delete(id);
 	writeHeld(c);
 	if (digest !== h.proposal) return { error: `his yes was for a different ${isText ? "message" : "answer"}` };
+	const prompt = isText ? undefined : openPrompts().find((p) => p.id === askId);
+	// A secret's approval (op-broker) takes a device-signed tap or the keyboard, never a spoken yes.
+	if (prompt?.sensitive) return { error: "answer this one on the phone screen or the keyboard" };
 	if (saysNo(h.text)) return { error: "his words say no" };
 	if (!saysYes(h.text)) return { error: "his words don't say yes" };
 	if (isText) {
@@ -412,7 +422,6 @@ function confirmHeld(c: Conn, r: Record<string, unknown>): Record<string, unknow
 		debug(`owner confirm sent a reworded message (${text.length} chars, ${delivered})`);
 		return { ok: true, delivered };
 	}
-	const prompt = openPrompts().find((p) => p.id === askId);
 	if (!prompt) return { error: "that question was already answered" };
 	const error = prompt.answer(answers as never);
 	if (error) return { error };
@@ -474,29 +483,13 @@ function dropHeld(c: Conn, r: Record<string, unknown>): Record<string, unknown> 
  * prompt id and his picks (canonicalAnswer), checked here, then handed to the waiting tool.
  */
 function answerAsk(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
-	const { nonce, signature, ask_id: id, answers } = r;
-	const deviceId = typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
-	if (typeof nonce !== "string" || typeof signature !== "string" || typeof id !== "string" || !Array.isArray(answers) ||
-		!/^\d{1,12}$/.test(deviceId)) return { error: "bad request" };
-	if (!c.sessionId) return { error: "this session has no id yet" };
-	if (!takeNonce(c, nonce)) return { error: "nonce is expired or used" };
+	const { ask_id: id, answers } = r;
+	if (typeof id !== "string" || !Array.isArray(answers)) return { error: "bad request" };
+	const denied = verifyDevice(c, r, "answer", () => sha256hex(Buffer.from(canonicalAnswer(id, answers as never), "utf8")));
+	if (denied) return { error: denied };
+	// A sensitive prompt too: a screen tap is signed by the device, unlike a spoken yes.
 	const prompt = openPrompts().find((p) => p.id === id);
 	if (!prompt) return { error: "that question was already answered" };
-	let key: Buffer | null;
-	try {
-		key = deviceKey(deviceId);
-	} catch (e) {
-		return { error: (e as Error).message.startsWith("owner-keys") ? (e as Error).message : "no device keys" };
-	}
-	if (!key) return { error: "unknown device" };
-	let ok = false;
-	try {
-		const digest = sha256hex(Buffer.from(canonicalAnswer(id, answers as never), "utf8"));
-		const msg = Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, "answer", digest].join("\n"), "utf8");
-		const pub = createPublicKey({ key: Buffer.concat([P256_SPKI, key]), format: "der", type: "spki" });
-		ok = verifySignature("sha256", msg, { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"));
-	} catch {}
-	if (!ok) return { error: "signature does not verify" };
 	const error = prompt.answer(answers as never);
 	return error ? { error } : { ok: true };
 }
@@ -507,34 +500,18 @@ function answerAsk(c: Conn, r: Record<string, unknown>): Record<string, unknown>
  * "push\n<sha256(text)>", "take\n<id>" or "drop\n<id>".
  */
 function stashRequest(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
-	const { op, nonce, signature } = r;
-	const deviceId = typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
+	const { op } = r;
 	const text = typeof r.text === "string" ? r.text : "";
 	const id = typeof r.id === "string" ? r.id : "";
 	if (op !== "push" && op !== "take" && op !== "drop") return { error: "bad request" };
 	if (op === "push" && (!text.trim() || text.length > TEXT_MAX)) return { error: "nothing to stash" };
 	if (op !== "push" && !/^[\w-]{1,40}$/.test(id)) return { error: "bad request" };
-	if (typeof nonce !== "string" || typeof signature !== "string" || !/^\d{1,12}$/.test(deviceId)) return { error: "bad request" };
-	if (!c.sessionId) return { error: "this session has no id yet" };
-	if (!takeNonce(c, nonce)) return { error: "nonce is expired or used" };
-	let key: Buffer | null;
-	try {
-		key = deviceKey(deviceId);
-	} catch (e) {
-		return { error: (e as Error).message.startsWith("owner-keys") ? (e as Error).message : "no device keys" };
-	}
-	if (!key) return { error: "unknown device" };
 	const payload = op === "push" ? `push\n${sha256hex(Buffer.from(text, "utf8"))}` : `${op}\n${id}`;
-	let ok = false;
-	try {
-		const msg = Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, "stash",
-			sha256hex(Buffer.from(payload, "utf8"))].join("\n"), "utf8");
-		const pub = createPublicKey({ key: Buffer.concat([P256_SPKI, key]), format: "der", type: "spki" });
-		ok = verifySignature("sha256", msg, { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"));
-	} catch {}
-	if (!ok) return { error: "signature does not verify" };
-	if (op === "push") return { ok: true, id: pushStash(c.sessionId, text).id };
-	const entry = takeStash(c.sessionId, id);
+	const denied = verifyDevice(c, r, "stash", () => sha256hex(Buffer.from(payload, "utf8")));
+	if (denied) return { error: denied };
+	const sessionId = c.sessionId!; // verifyDevice refuses a session without one
+	if (op === "push") return { ok: true, id: pushStash(sessionId, text).id };
+	const entry = takeStash(sessionId, id);
 	if (!entry) return { error: "that stash is gone" };
 	return op === "take" ? { ok: true, text: entry.text } : { ok: true };
 }
@@ -544,26 +521,8 @@ function stashRequest(c: Conn, r: Record<string, unknown>): Record<string, unkno
  * "stop" (this session's nonce makes each one single-use).
  */
 function stopRequest(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
-	const { nonce, signature } = r;
-	const deviceId = typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
-	if (typeof nonce !== "string" || typeof signature !== "string" || !/^\d{1,12}$/.test(deviceId)) return { error: "bad request" };
-	if (!c.sessionId) return { error: "this session has no id yet" };
-	if (!takeNonce(c, nonce)) return { error: "nonce is expired or used" };
-	let key: Buffer | null;
-	try {
-		key = deviceKey(deviceId);
-	} catch (e) {
-		return { error: (e as Error).message.startsWith("owner-keys") ? (e as Error).message : "no device keys" };
-	}
-	if (!key) return { error: "unknown device" };
-	let ok = false;
-	try {
-		const msg = Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, "stop",
-			sha256hex(Buffer.from("stop", "utf8"))].join("\n"), "utf8");
-		const pub = createPublicKey({ key: Buffer.concat([P256_SPKI, key]), format: "der", type: "spki" });
-		ok = verifySignature("sha256", msg, { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"));
-	} catch {}
-	if (!ok) return { error: "signature does not verify" };
+	const denied = verifyDevice(c, r, "stop", () => sha256hex(Buffer.from("stop", "utf8")));
+	if (denied) return { error: denied };
 	if (!c.stop) return { error: "this session can't stop from the phone yet; run /reload" };
 	return { ok: true, stopped: c.stop() === "stopped" };
 }
@@ -658,11 +617,14 @@ export function stashLine(c: Pick<Conn, "sessionId">): { id: string; text: strin
 	return stashStack(c.sessionId).slice(-50).map((e) => ({ id: e.id, text: e.text.slice(0, STASH_TEXT_MAX), ts: e.ts }));
 }
 
-/** The newest question a tool (ask) has open, as Botsun shows it; null when none. */
-function askLine(): { id: string; questions: RemotePrompt["questions"] } | null {
+/**
+ * The newest question a tool (ask) has open, as Botsun shows it; null when none. sensitive: a
+ * secret's approval, which the call can't confirm (Botsun drops keys it doesn't know).
+ */
+function askLine(): { id: string; questions: RemotePrompt["questions"]; sensitive?: true } | null {
 	const open = openPrompts();
 	const p = open[open.length - 1];
-	return p ? { id: p.id, questions: p.questions } : null;
+	return p ? { id: p.id, questions: p.questions, ...(p.sensitive ? { sensitive: true as const } : {}) } : null;
 }
 
 const retryBase = (): number => {

@@ -896,3 +896,76 @@ test("drop forgets the ids given; call_end forgets them all", async () => {
 	assert.match((await ask({ type: "release", ids: [b.held, c.held], mode: "steer" })).error, /^not waiting/);
 	assert.equal(m.sent.length, 0);
 });
+
+test("a sensitive prompt is flagged to Botsun and refuses a spoken yes, not a signed tap", async () => {
+	const { offerPrompt, canonicalAnswer } = await import("../lib/remote-prompts.ts");
+	const decide = phoneKey();
+	const call = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: { 7: decide.raw.toString("base64") }, call_devices: { 7: call.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)) && srv.types().includes("hello"));
+	const askFor = (id) => srv.lines.find((l) => l.type === "ask" && l.ask.id === id)?.ask;
+	const plain = offerPrompt([{ question: "Pizza?", options: [{ label: "Pepperoni" }] }]);
+	await until(() => askFor(plain.id));
+	assert.equal("sensitive" in askFor(plain.id), false);
+	plain.dispose();
+	const offered = offerPrompt([{ question: "Allow the read?", options: [{ label: "Allow" }, { label: "Deny" }] }], { sensitive: true });
+	await until(() => askFor(offered.id));
+	assert.equal(askFor(offered.id).sensitive, true);
+
+	const allow = [{ picks: [0] }];
+	const sha = createHash("sha256").update(canonicalAnswer(offered.id, allow)).digest("hex");
+	const wav = createHash("sha256").update("RIFF…audio").digest("hex");
+	let { nonce } = await ask({ type: "nonce" });
+	const spoken = ["botsun-decide-v1", "7", nonce, "session", "sid-a", "say_audio", wav, sha].join("\n");
+	const sig = cryptoSign("sha256", Buffer.from(spoken), { key: call.privateKey, dsaEncoding: "der" }).toString("base64");
+	const held = await ask({ type: "say_audio", text: "yes", nonce, device_id: 7, wav_sha256: wav, signature: sig, hold: true, proposal_sha256: sha });
+	assert.ok(held.held);
+	const confirm = () => ask({ type: "confirm", id: held.held, ask_id: offered.id, answers: allow });
+	assert.equal((await confirm()).error, "answer this one on the phone screen or the keyboard");
+	assert.equal((await confirm()).error, `not waiting: ${held.held}`, "spent");
+
+	({ nonce } = await ask({ type: "nonce" }));
+	const msg = ["botsun-decide-v1", "7", nonce, "session", "sid-a", "answer", sha].join("\n");
+	const signature = cryptoSign("sha256", Buffer.from(msg), { key: decide.privateKey, dsaEncoding: "der" }).toString("base64");
+	assert.deepEqual(await ask({ type: "answer", ask_id: offered.id, answers: allow, nonce, device_id: 7, signature }), { ok: true });
+	assert.deepEqual(await offered.answered, allow);
+	assert.equal(m.sent.length, 0);
+	offered.dispose();
+});
+
+test("every signed request type refuses alike: bad request, used nonce, unknown device, loose key file, bad signature", async () => {
+	const decide = phoneKey();
+	const call = phoneKey();
+	const keys = (mode = 0o600) => {
+		writeFileSync(keysFile, JSON.stringify({ devices: { 7: decide.raw.toString("base64") }, call_devices: { 7: call.raw.toString("base64") } }));
+		chmodSync(keysFile, mode);
+	};
+	keys();
+	await owner();
+	const bodies = {
+		say: { type: "say", text: "hi" },
+		say_audio: { type: "say_audio", text: "hi", wav_sha256: "a".repeat(64) },
+		answer: { type: "answer", ask_id: "nope", answers: [] },
+		stash: { type: "stash", op: "drop", id: "x1" },
+		stop: { type: "stop" },
+	};
+	for (const [name, body] of Object.entries(bodies)) {
+		assert.equal((await ask({ ...body, nonce: "n", device_id: "x", signature: "s" })).error, "bad request", name);
+		assert.equal((await ask({ ...body, nonce: "n", device_id: 7 })).error, "bad request", `${name}: no signature`);
+		assert.equal((await ask({ ...body, nonce: "unissued", device_id: 7, signature: "s" })).error, "nonce is expired or used", name);
+		let { nonce } = await ask({ type: "nonce" });
+		assert.equal((await ask({ ...body, nonce, device_id: 8, signature: "s" })).error, "unknown device", name);
+		assert.equal((await ask({ ...body, nonce, device_id: 7, signature: "s" })).error, "nonce is expired or used", `${name}: spent on a failure`);
+		({ nonce } = await ask({ type: "nonce" }));
+		assert.equal((await ask({ ...body, nonce, device_id: 7, signature: "AAAA" })).error, "signature does not verify", name);
+		keys(0o666);
+		({ nonce } = await ask({ type: "nonce" }));
+		assert.match((await ask({ ...body, nonce, device_id: 7, signature: "s" })).error, /^owner-keys\.json must be/, name);
+		keys();
+	}
+});
