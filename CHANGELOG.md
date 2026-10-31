@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- image-prune: saved images (`~/.pi/agent/tmp/image-prune/`) are owner-only (files 0600, folder 0700) and no longer kept forever: each session start deletes ones older than 7 days and keeps at most the newest 200.
+- auto-bundle: the detached rebuild gets the lock, log, script path and version as positional arguments instead of `JSON.stringify` spliced into shell text, so a `$`, backtick or quote in a path or version is never run.
+- stash: a session's entry is deleted from the shared store when its stack empties, and creating one drops other sessions' empty ones, so a long-lived process no longer keeps an entry per session it saw.
 - provider-usage: an idle Claude 5h window no longer looks like a missing one. Anthropic returns `resets_at: null` while `five_hour` has no active usage, and the chip needs a reset to show elapsed/total, so the window was dropped silently; the code now says why.
 
 - compaction: a model whose thinking map has no `off` level (Copilot Sonnet 5.5) gets low-effort adaptive thinking instead of `thinking: disabled`, which the API rejects. Opus 5.5 is unchanged. Models with `off: null` other than Opus 5.5 still fall back to pi.
@@ -28,6 +31,8 @@
 
 ### Changed
 
+- auto-bundle is now an opt-in extension (`/boehsline enable auto-bundle`), split out of the footer because it depends on a personal `~/bin/pi-bundle`. Behaviour when enabled is unchanged; it listens for the footer's version checks, which the footer now announces on `pi.events` as `boehsline:pi-version`, so it adds no `mise which pi` spawns. Without it enabled nothing re-runs pi-bundle.
+- footer: drop the redundant `updateTimerStarted` flag; the update poll checks its own timer (pi rebinds extensions on every session switch).
 - footer: OpenCode Go's provider chip reads `oc` (was `ocg`).
 - provider-usage: drop the claude-bridge driver and its chip. It read Claude Code's own Keychain/OAuth credential to show the same windows `claude-window` already shows from pi's Anthropic login (`/login` → Anthropic).
 - provider-usage: Claude reads the response's `limits[]` instead of inferring spans from `five_hour`/`seven_day`. Each meter names its own `kind`, `group`, `percent`, `severity`, and `resets_at`, so a new meter (Opus, Sonnet, cowork) needs no code, and only a meter with no reset is dropped. `is_active` flags which window is currently enforced, not whether it has usage — Anthropic reports `weekly_all` with `is_active: false` at 33% used — so it never gates rendering. A response where every meter lacks a reset reports `idle` instead of failing the fetch.

@@ -50,7 +50,7 @@
 
 import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { appendFile, readFile, readlink, realpath, writeFile, access, stat, lstat, constants } from "node:fs/promises";
+import { appendFile, readFile, readlink, realpath, writeFile, access, lstat, constants } from "node:fs/promises";
 import { homedir, loadavg } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { onFooterTap, publishFooter } from "../../lib/footer-snapshot.ts";
@@ -101,12 +101,23 @@ const PEER_SETTLE_DELAYS_MS = [300, 1_000, 3_000, 8_000];
 /** How often to re-read pi's on-disk version looking for an upgrade while running. */
 const UPDATE_TTL_MS = 30_000;
 
-/** Where the background bundle rebuild appends its output. */
-const AUTO_BUNDLE_LOG = "auto-bundle.log";
-/** Concurrent detections across pi instances serialize on this lock directory. */
-const AUTO_BUNDLE_LOCK = "pi-bundle.lock";
-/** A lock older than this is stale (a crashed run never cleaned up) and gets stolen. */
-const AUTO_BUNDLE_LOCK_STALE_MIN = 10;
+/**
+ * Emitted on pi.events after every on-disk version check, so an opt-in (the
+ * auto-bundle extension) can act on an upgrade without resolving pi's install
+ * again. Payload: PiVersionEvent.
+ */
+export const PI_VERSION_EVENT = "boehsline:pi-version";
+
+export interface PiVersionEvent {
+  /** The version on disk now ("" when it could not be read). */
+  version: string;
+  /** The version this process booted with. */
+  bootVersion: string;
+  /** Whether `version` differs from the previous check. */
+  changed: boolean;
+  /** The active install's package.json, or null when none resolved. */
+  pkgJson: string | null;
+}
 
 /** Statuses rendered inline in the main line (in this order) instead of the status row. */
 const INLINE_STATUS_KEYS = ["codex-window", "copilot-window", "grok-window", "cerebras-window", "claude-window", "opencode-go-window"] as const;
@@ -1136,11 +1147,17 @@ class UpdateCheckCache {
   private fetchedAt = 0;
   private inFlight = false;
 
+  /** Hears every on-disk check (see PI_VERSION_EVENT). */
+  private readonly onCheck: (event: PiVersionEvent) => void;
+
+  constructor(onCheck: (event: PiVersionEvent) => void = () => {}) {
+    this.onCheck = onCheck;
+  }
+
   async init(): Promise<void> {
     // On a fresh launch the version on disk is the one we just started, so
-    // skip the `mise which pi` spawns that would confirm it (three per launch
-    // counting read() and bundleIsStale(), ~10ms of main-thread spawn cost
-    // each). The first disk check then runs one TTL later. After a /reload
+    // skip the `mise which pi` spawns that would confirm it (~10ms of
+    // main-thread spawn cost each). The first disk check then runs one TTL later. After a /reload
     // (the extension loads again in the same process) an update may have
     // landed in the meantime, so check right away.
     const stash = globalThis as { __piFooterLoaded?: boolean };
@@ -1172,23 +1189,21 @@ class UpdateCheckCache {
   private async refresh(requestRender: () => void): Promise<void> {
     this.inFlight = true;
     let next = this.current;
+    let pkgJson: string | null = null;
     try {
-      next = (await piVersion()) || this.current;
+      const install = await piInstall();
+      pkgJson = install.pkgJson;
+      next = install.version || this.current;
     } finally {
       this.inFlight = false;
     }
     const changed = this.current !== next;
     this.current = next;
     this.fetchedAt = Date.now();
-    if (changed && next !== this.bootVersion) {
-      void rebuildBundle(next).catch(() => {});
-    } else if (!changed && next && (await bundleIsStale())) {
-      // Version-change detection alone misses the states that leave every
-      // launch on dist/cli.js: the rebuild that fired mid-npm-install stamped
-      // a bundle older than the finished package.json, and a pi launched after
-      // its own upgrade seeded `current` with the new version so `changed` is
-      // never true. One refresh TTL later this branch re-bundles anyway.
-      void rebuildBundle(next).catch(() => {});
+    try {
+      this.onCheck({ version: next, bootVersion: this.bootVersion, changed, pkgJson });
+    } catch {
+      // A listener's bug must not break the update notice.
     }
     if (changed) requestRender();
   }
@@ -1766,116 +1781,23 @@ async function piPackageJsonPath(): Promise<string | null> {
   return (await isPiPackageJson(global)) ? global : null;
 }
 
+/** The active install's package.json and the version it names ("" when unreadable). */
+async function piInstall(): Promise<{ pkgJson: string | null; version: string }> {
+  let pkgJson: string | null = null;
+  try {
+    pkgJson = await piPackageJsonPath();
+    if (!pkgJson) return { pkgJson, version: "" };
+    const pkg: unknown = JSON.parse(await readFile(pkgJson, "utf8"));
+    const version = (pkg as { version?: unknown } | null)?.version;
+    return { pkgJson, version: typeof version === "string" ? version : "" };
+  } catch {
+    return { pkgJson, version: "" };
+  }
+}
+
 /** pi's own version, for correlating a regression with an upgrade. */
 async function piVersion(): Promise<string> {
-  try {
-    const file = await piPackageJsonPath();
-    if (!file) return "";
-    const pkg: unknown = JSON.parse(await readFile(file, "utf8"));
-    const version = (pkg as { version?: unknown } | null)?.version;
-    return typeof version === "string" ? version : "";
-  } catch {
-    return "";
-  }
-}
-
-/** ~/bin/pi-bundle (bin/ is symlinked there), or null when it's not installed. */
-async function piBundleScript(): Promise<string | null> {
-  const candidate = join(homedir(), "bin", "pi-bundle");
-  try {
-    await access(candidate, constants.X_OK);
-    return candidate;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * True when dist/bundle.mjs is older than package.json — the state pi-launch
- * reads as "fall back to dist/cli.js", ~115ms slower on every launch. Beyond a
- * simply forgotten re-bundle this catches the npm-upgrade race: an old running
- * pi fires the auto-rebuild while npm is mid-install, the bundle gets stamped
- * before package.json's final mtime, and no later launch can ever see a
- * version transition to retrigger the rebuild (the Aug 31 regression sat like
- * that for days).
- */
-async function bundleIsStale(): Promise<boolean> {
-  try {
-    const pkgJson = await piPackageJsonPath();
-    if (!pkgJson) return false;
-    // A missing dist/bundle.mjs is expected, not stale, when pi ships its own.
-    if (await shipsOwnBundle(pkgJson)) return false;
-    const bundle = join(dirname(pkgJson), "dist", "bundle.mjs");
-    const [pkgStat, bundleStat] = await Promise.all([
-      stat(pkgJson),
-      stat(bundle).catch(() => null),
-    ]);
-    return bundleStat === null || pkgStat.mtimeMs > bundleStat.mtimeMs;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Since pi 0.85 upstream ships dist/bundle/cli.js, and pi-bundle builds
- * nothing when it exists. A source checkout (the pi fork) has it after
- * `npm run build` too.
- */
-export async function shipsOwnBundle(pkgJson: string): Promise<boolean> {
-  return stat(join(dirname(pkgJson), "dist", "bundle", "cli.js")).then(() => true, () => false);
-}
-
-/**
- * A pi update leaves dist/bundle.mjs stale and the bin at stock cli.js, so
- * every launch runs ~115ms slower until someone re-runs pi-bundle. This footer
- * is already the first to know about an update — so let it kick off the
- * rebuild in a detached background process.
- *
- * Runs once per detected version (globalThis guard survives /reload), honors
- * PI_NO_AUTO_BUNDLE=1, serializes concurrent detections from other pi
- * instances on a lock directory, and appends everything to auto-bundle.log.
- * The staleness check in UpdateCheckCache.refresh() reuses this for the case
- * where the version never transitioned but the bundle is already outdated.
- */
-async function rebuildBundle(version: string): Promise<void> {
-  const stash = globalThis as { __piFooterAutoBundleFor?: string };
-  if (stash.__piFooterAutoBundleFor === version) return;
-  stash.__piFooterAutoBundleFor = version;
-  if (process.env.PI_NO_AUTO_BUNDLE) return;
-
-  // Nothing to build when pi ships its own bundle. Spawning pi-bundle anyway
-  // only logs a failure: run through ~/.pi/agent/bin/pi, the fork has no
-  // install beside its bin for pi-bundle to find.
-  const pkgJson = await piPackageJsonPath();
-  if (pkgJson && (await shipsOwnBundle(pkgJson))) return;
-
-  const script = await piBundleScript();
-  if (!script) return;
-
-  const dir = agentDir();
-  // Redirect by path, not by inherited fd: Node opens files with O_CLOEXEC,
-  // so fd numbers from this process don't exist in the detached child.
-  const logPath = join(dir, AUTO_BUNDLE_LOG);
-  const lockPath = join(dir, AUTO_BUNDLE_LOCK);
-  const sh = [
-    `lock=${JSON.stringify(lockPath)}`,
-    `log=${JSON.stringify(logPath)}`,
-    `if ! mkdir "$lock" 2>/dev/null; then`,
-    `  if [ -z "$(find "$lock" -maxdepth 0 -mmin -${AUTO_BUNDLE_LOCK_STALE_MIN} 2>/dev/null)" ]; then`,
-    `    rm -rf "$lock" && mkdir "$lock" || exit 0`,
-    `  else`,
-    `    exit 0`,
-    `  fi`,
-    `fi`,
-    `trap 'rm -rf "$lock"' EXIT`,
-    `echo "=== auto-rebuild for ${version} at $(date) (pid $$)" >> "$log"`,
-    `${JSON.stringify(script)} >> "$log" 2>&1`,
-  ].join("\n");
-  const child = spawn("/bin/sh", ["-c", sh], {
-    detached: true,
-    stdio: ["ignore", "ignore", "ignore"],
-  });
-  child.unref();
+  return (await piInstall()).version;
 }
 
 /**
@@ -2180,7 +2102,7 @@ function renderWindowUsage(value: string, compact: boolean, showPace = false): s
 export default function footerExtension(pi: ExtensionAPI): void {
   const git = new GitStatusCache(pi);
   const peer = new PeerNameCache();
-  const update = new UpdateCheckCache();
+  const update = new UpdateCheckCache((event) => pi.events.emit(PI_VERSION_EVENT, event));
   const updateReady = update.init().catch(() => {});
   let enabled = true;
   let bypassed = false;
@@ -2191,7 +2113,6 @@ export default function footerExtension(pi: ExtensionAPI): void {
   let coldStart = false;
   let bootMs: number | undefined;
   let bootCleared = false;
-  let updateTimerStarted = false;
   let updateTimer: ReturnType<typeof setInterval> | undefined;
   /** Dir chip shows the full ~/path instead of the basename when true. */
   let showFullPath = false;
@@ -3557,9 +3478,10 @@ export default function footerExtension(pi: ExtensionAPI): void {
     }
     // Renders are event-driven, so an idle session would never re-read the
     // version; poll so a pi upgrade surfaces like Claude's update notice.
-    // session_start also fires on session switches — only start one timer.
-    if (!updateTimerStarted) {
-      updateTimerStarted = true;
+    // pi rebinds extensions on every session switch (session_shutdown clears
+    // the timer for the old instance), so this instance starts one; the check
+    // only keeps a repeated session_start from stacking intervals.
+    if (updateTimer === undefined) {
       updateTimer = setInterval(() => {
         update.reload(() => repaint?.());
       }, UPDATE_TTL_MS);

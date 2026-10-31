@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { drafts, saveImage, shrinkContent, status } from "../extensions/opt-in/image-prune/index.ts";
+import { capSaved, drafts, saveImage, shrinkContent, status } from "../extensions/opt-in/image-prune/index.ts";
 import {
 	base64Bytes,
 	decodedBytes,
@@ -197,6 +197,55 @@ test("saveImage: content-addressed file under the save dir", () => {
 	assert.ok(existsSync(path));
 });
 
+test("saveImage: owner-only folder and files (screenshots can hold anything)", () => {
+	const dir = join(mkdtempSync(join(tmpdir(), "image-prune-mode-")), "saved");
+	const path = saveImage({ type: "image", data: Buffer.from("secret").toString("base64"), mimeType: "image/png" }, dir);
+	assert.equal(statSync(dir).mode & 0o777, 0o700);
+	assert.equal(statSync(path).mode & 0o777, 0o600);
+});
+
+test("capSaved: drops files past 7 days, keeps the newest N, tightens modes", () => {
+	const dir = mkdtempSync(join(tmpdir(), "image-prune-cap-"));
+	const now = Date.now();
+	const day = 24 * 60 * 60 * 1000;
+	const make = (name, ageMs) => {
+		const p = join(dir, name);
+		writeFileSync(p, name, { mode: 0o644 });
+		utimesSync(p, (now - ageMs) / 1000, (now - ageMs) / 1000);
+	};
+	make("old.png", 8 * day);
+	for (let i = 0; i < 5; i++) make(`n${i}.png`, i * 60_000);
+	assert.equal(capSaved(dir, now, 7 * day, 3), 3, "old.png plus the two oldest past the cap");
+	assert.deepEqual(readdirSync(dir).sort(), ["n0.png", "n1.png", "n2.png"]);
+	assert.equal(statSync(dir).mode & 0o777, 0o700);
+	for (const name of readdirSync(dir)) assert.equal(statSync(join(dir, name)).mode & 0o777, 0o600);
+	// Defaults: 7 days, 200 files.
+	make("stale.png", 7 * day + 60_000);
+	assert.equal(capSaved(dir, now), 1);
+	assert.equal(capSaved(join(dir, "missing")), 0, "no folder yet is fine");
+});
+
+test("session_start caps the save folder", async () => {
+	const { stubPi } = await import("./helpers/stub-pi.mjs");
+	process.env.BOEHSLINE_CONFIG = join(mkdtempSync(join(tmpdir(), "image-prune-cfg-")), "none.json");
+	process.env.BOEHSLINE_ENABLE = "image-prune";
+	process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "image-prune-agent-"));
+	try {
+		const mod = await import(`../extensions/opt-in/image-prune/index.ts?cap=${Math.random()}`);
+		const dir = mod.saveDir();
+		const old = saveImage({ type: "image", data: Buffer.from("old").toString("base64"), mimeType: "image/png" }, dir);
+		const t = (Date.now() - 8 * 24 * 60 * 60 * 1000) / 1000;
+		utimesSync(old, t, t);
+		const s = stubPi();
+		await mod.default(s.pi);
+		await s.fire("session_start", { reason: "startup" }, {});
+		assert.equal(existsSync(old), false);
+	} finally {
+		delete process.env.BOEHSLINE_ENABLE;
+		delete process.env.PI_CODING_AGENT_DIR;
+	}
+});
+
 test("status: what /image-prune shows", () => {
 	const entries = [user(image(2048)), user(text("a")), user(text("b"))];
 	const out = status({ sessionManager: { buildSessionProjection: () => ({ entries }) } }, SETTINGS);
@@ -215,7 +264,7 @@ test("end to end: turn_end drafts apply through pi's SessionManager and drop the
 		const { default: ext } = await import(`../extensions/opt-in/image-prune/index.ts?e2e=${Math.random()}`);
 		const s = stubPi();
 		await ext(s.pi);
-		assert.deepEqual(s.names(), ["command:image-prune", "on:tool_result", "on:turn_end"]);
+		assert.deepEqual(s.names(), ["command:image-prune", "on:session_start", "on:tool_result", "on:turn_end"]);
 
 		const sm = SessionManager.inMemory("/tmp");
 		const ts = Date.now();

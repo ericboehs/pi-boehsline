@@ -21,7 +21,7 @@ Images in user messages (pastes) aren't touched here; reading them with the read
 ```
 
 - The entry's text, role and metadata stay; only its images change. User messages, tool results (error results too) and extension messages with images are all covered.
-- A read tool result points at the file it read. A pasted or tool-made image has no file, so it's saved first to `~/.pi/agent/tmp/image-prune/<sha256>.<ext>`.
+- A read tool result points at the file it read. A pasted or tool-made image has no file, so it's saved first to `~/.pi/agent/tmp/image-prune/<sha256>.<ext>` (owner-only: files 0600, folder 0700). Each session start deletes saved images older than 7 days and keeps at most the newest 200, so a note in an old session can name a file that's gone.
 - One batch, only past the threshold. Each change to earlier context rewrites the prompt cache from that point, so pruning one image per turn would cost more than it saves. After a batch the visible images are well under the threshold, so it doesn't fire again until more pile up. It also waits while the prunable images are under a quarter of the threshold, so recent images alone don't cause an edit every turn.
 - The edits are `context_edit` entries in the session: later requests share a stable prefix, the transcript and `/tree` still show the images, and branching back before the edit brings them back. It goes by pi's session projection, so nothing before the latest compaction's kept boundary is touched.
 - It doesn't start another request; the edits apply to the next one.

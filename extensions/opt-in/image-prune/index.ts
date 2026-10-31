@@ -18,7 +18,7 @@
 // turn. No `continue`: the edits simply apply to the next request.
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import {
@@ -53,19 +53,59 @@ export function saveDir(env: NodeJS.ProcessEnv = process.env): string {
 	return join(env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "tmp", NAME);
 }
 
-/** Write the image under saveDir, named by content hash so a re-save is a no-op. */
+/** Write the image under saveDir, named by content hash so a re-save is a no-op. Owner-only: screenshots can hold anything. */
 export function saveImage(img: ImageBlock, dir = saveDir()): string | undefined {
 	try {
 		const bytes = Buffer.from(img.data, "base64");
 		const path = join(dir, `${createHash("sha256").update(bytes).digest("hex").slice(0, 16)}.${extensionFor(img.mimeType)}`);
 		if (!existsSync(path)) {
-			mkdirSync(dir, { recursive: true });
-			writeFileSync(path, bytes);
+			mkdirSync(dir, { recursive: true, mode: 0o700 });
+			writeFileSync(path, bytes, { mode: 0o600 });
 		}
 		return path;
 	} catch {
 		return undefined;
 	}
+}
+
+/** Saved images older than this go at session start. */
+export const SAVED_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+/** At most this many saved images are kept (the newest). */
+export const SAVED_MAX_FILES = 200;
+
+/**
+ * Keep saveDir bounded: drop files older than SAVED_MAX_AGE_MS, then all but
+ * the newest SAVED_MAX_FILES, and tighten modes left by older versions (dir
+ * 0700, files 0600). A note in an old session may then name a file that's
+ * gone; the read tool just reports it missing. Returns how many were removed.
+ */
+export function capSaved(dir = saveDir(), now = Date.now(), maxAgeMs = SAVED_MAX_AGE_MS, maxFiles = SAVED_MAX_FILES): number {
+	let names: string[];
+	try {
+		names = readdirSync(dir);
+		chmodSync(dir, 0o700);
+	} catch {
+		return 0;
+	}
+	const files: { path: string; mtime: number }[] = [];
+	for (const name of names) {
+		const path = join(dir, name);
+		try {
+			const st = lstatSync(path);
+			if (st.isFile()) files.push({ path, mtime: st.mtimeMs });
+		} catch {}
+	}
+	files.sort((a, b) => b.mtime - a.mtime);
+	let removed = 0;
+	for (const [i, f] of files.entries()) {
+		try {
+			if (i >= maxFiles || now - f.mtime > maxAgeMs) {
+				unlinkSync(f.path);
+				removed++;
+			} else chmodSync(f.path, 0o600);
+		} catch {}
+	}
+	return removed;
 }
 
 /** The read tool's path for a one-image result, if that file is still an image on disk. */
@@ -145,6 +185,11 @@ function main(pi: ExtensionAPI) {
 	// `/image-prune now` can't append entries itself (commands have no way to);
 	// it arms a forced batch for the next turn_end.
 	let forceNext = false;
+
+	// Saved images would otherwise pile up forever; trim them once per session.
+	pi.on("session_start", () => {
+		capSaved();
+	});
 
 	pi.on("tool_result", async (event) => {
 		const s = settings();

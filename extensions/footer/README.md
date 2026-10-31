@@ -154,13 +154,10 @@ It also watches
 pi's on-disk version: when an install lands while instances are running — via
 `pi update`, `npm i -g`, anything — each running footer shows a green, right-aligned
 "Update installed v0.52.1 → v0.53.0 · Restart to update" line above the prompt
-within ~30s, like Claude Code.
-
-If you keep a `~/bin/pi-bundle` (a script that prebuilds pi into one file for
-faster launches), the same detection runs it in a detached background process,
-since an update leaves the bundle stale. Concurrent pi instances serialize on a
-lock directory; output lands in `~/.pi/agent/auto-bundle.log`. Without the
-script this does nothing; `PI_NO_AUTO_BUNDLE=1` opts out.
+within ~30s, like Claude Code. Each check is also emitted on `pi.events` as
+`boehsline:pi-version` (`{ version, bootVersion, changed, pkgJson }`); the
+opt-in [auto-bundle](../opt-in/auto-bundle/README.md) uses it to re-run
+`~/bin/pi-bundle` after an update.
 
 ## Boot timing
 

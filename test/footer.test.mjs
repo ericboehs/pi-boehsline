@@ -24,7 +24,7 @@ afterEach(async () => {
 import { VERSION as RUNNING_PI_VERSION } from "@earendil-works/pi-coding-agent";
 import footer, {
   CHIP_MODES,
-  shipsOwnBundle,
+  PI_VERSION_EVENT,
   viewConfig,
   alarmStatuses,
   contextAboveThreshold,
@@ -176,12 +176,9 @@ async function mount(overrides = {}) {
   const previousEntry = process.argv[1];
   const previousExecPath = process.execPath;
   const previousPath = process.env.PATH;
-  const previousNoAutoBundle = process.env.PI_NO_AUTO_BUNDLE;
   if (overrides.updateInstalled) {
     const root = mkdtempSync(path.join(tmpdir(), "footer-pi-version-"));
     const { to, layout = "argv" } = overrides.updateInstalled;
-    // An update would otherwise spawn the real ~/bin/pi-bundle.
-    process.env.PI_NO_AUTO_BUNDLE = "1";
     // No real pi or mise: only what each layout puts on PATH (git stays reachable).
     const isolatedPath = (...dirs) => [...dirs, "/usr/bin", "/bin"].join(":");
     const pkgJson = (version) => JSON.stringify({ name: "@earendil-works/pi-coding-agent", version });
@@ -260,6 +257,7 @@ async function mount(overrides = {}) {
   }
   shutdowns.push(() => pi.handlers.session_shutdown?.({}, ctx));
   try {
+    overrides.beforeLoad?.(pi);
     footer(pi);
     await pi.handlers.session_start(overrides.sessionStart ?? {}, ctx);
   } finally {
@@ -267,8 +265,6 @@ async function mount(overrides = {}) {
     process.execPath = previousExecPath;
     if (overrides.updateInstalled) {
       process.env.PATH = previousPath;
-      if (previousNoAutoBundle === undefined) delete process.env.PI_NO_AUTO_BUNDLE;
-      else process.env.PI_NO_AUTO_BUNDLE = previousNoAutoBundle;
     }
   }
 
@@ -1534,16 +1530,64 @@ for (const [layout, why] of [
   });
 }
 
-test("auto-bundle skips a pi that ships dist/bundle/cli.js, such as a built fork", async () => {
-  // Spawning pi-bundle for these only logged "no pi install found next to
-  // ~/.pi/agent/bin" on every version change.
-  const root = mkdtempSync(path.join(tmpdir(), "footer-own-bundle-"));
-  const pkg = path.join(root, "package.json");
-  writeFileSync(pkg, JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "1.4.0" }));
-  assert.equal(await shipsOwnBundle(pkg), false);
-  mkdirSync(path.join(root, "dist", "bundle"), { recursive: true });
-  writeFileSync(path.join(root, "dist", "bundle", "cli.js"), "");
-  assert.equal(await shipsOwnBundle(pkg), true);
+test("each version check is announced on pi.events for the auto-bundle opt-in", async () => {
+  const checks = [];
+  const ui = await mount({
+    updateInstalled: { to: "99.0.0", layout: "path" },
+    beforeLoad: (pi) => pi.events.on(PI_VERSION_EVENT, (event) => checks.push(event)),
+  });
+  // mount() restores argv/PATH; point the check at a fresh install (found
+  // from argv, no mise spawn) while it runs.
+  const root = mkdtempSync(path.join(tmpdir(), "footer-event-"));
+  const entry = path.join(root, "dist", "bundle", "cli.js");
+  mkdirSync(path.dirname(entry), { recursive: true });
+  writeFileSync(entry, "");
+  writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "98.0.0" }));
+  const previousEntry = process.argv[1];
+  process.argv[1] = entry;
+  try {
+    ui.widgets.find(({ key }) => key === "footer-update").content({ requestRender: () => {} }).render(80);
+    for (let i = 0; i < 100 && !checks.some((c) => c.version === "98.0.0"); i++) await new Promise((r) => setTimeout(r, 20));
+  } finally {
+    process.argv[1] = previousEntry;
+  }
+  assert.equal(PI_VERSION_EVENT, "boehsline:pi-version");
+  const check = checks.find((c) => c.version === "98.0.0");
+  assert.ok(check, JSON.stringify(checks));
+  assert.equal(check.bootVersion, RUNNING_PI_VERSION);
+  assert.equal(check.changed, true, "99.0.0 → 98.0.0");
+  assert.equal(check.pkgJson, path.join(realpathSync(root), "package.json"));
+});
+
+test("the footer no longer spawns pi-bundle itself", () => {
+  const source = readFileSync(new URL("../extensions/footer/index.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /pi-bundle|rebuildBundle|AUTO_BUNDLE/);
+});
+
+test("a repeated session_start starts one update poll, and shutdown stops it", async () => {
+  const realSet = globalThis.setInterval;
+  const realClear = globalThis.clearInterval;
+  const live = new Set();
+  globalThis.setInterval = (fn, ms, ...rest) => {
+    const handle = realSet(fn, ms, ...rest);
+    if (ms === 30_000) live.add(handle);
+    return handle;
+  };
+  globalThis.clearInterval = (handle) => {
+    live.delete(handle);
+    return realClear(handle);
+  };
+  try {
+    const ui = await mount();
+    assert.equal(live.size, 1);
+    await ui.startSession({ reason: "startup" });
+    assert.equal(live.size, 1, "no second interval");
+    await ui.fire("session_shutdown", {});
+    assert.equal(live.size, 0);
+  } finally {
+    globalThis.setInterval = realSet;
+    globalThis.clearInterval = realClear;
+  }
 });
 
 test("update notice shows both versions in a right-aligned widget above the prompt", async () => {
