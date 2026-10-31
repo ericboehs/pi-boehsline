@@ -303,7 +303,8 @@ test("the extension: a card in the session, then the daemon's value through the 
 	await ext(stub.pi);
 	const picks = [];
 	const titles = [];
-	const { ctx, notes } = stubCtx({ mode: "tui", ui: { notify: (t, l) => notes.push([l, t]), select: async (title, options) => (titles.push([title, options]), picks.shift()) } });
+	const keyboard = async (title, options) => (titles.push([title, options]), picks.shift());
+	const { ctx, notes } = stubCtx({ mode: "tui", ui: { notify: (t, l) => notes.push([l, t]), select: keyboard } });
 	await stub.fire("session_start", {}, ctx);
 	const sock = process.env.PI_OP_BROKER_SOCK;
 	assert.ok(sock?.endsWith(`s-${process.pid}.sock`));
@@ -327,6 +328,33 @@ test("the extension: a card in the session, then the daemon's value through the 
 	assert.equal(denied.code, 1);
 	assert.equal(calls(fake).filter((c) => c.includes("Rubygems")).length, 0, "a denied read never reaches op");
 
+	// From the phone: the card is a remote prompt (as botsun-owner sees it); its answer closes the TUI card.
+	const { openPrompts } = await import(join(import.meta.dirname, "..", "lib", "remote-prompts.ts"));
+	let tuiClosed = false;
+	ctx.ui.select = (title, options, { signal }) => (titles.push([title, options]), new Promise((r) => signal.addEventListener("abort", () => ((tuiClosed = true), r(undefined)))));
+	const fromPhone = runShim(["item", "get", "Rubygems", "--otp", "--vault", "Personal"], env);
+	await until(() => openPrompts().length === 1);
+	const [prompt] = openPrompts();
+	assert.match(prompt.questions[0].question, /^🔑 1Password: Rubygems · one-time code \(Personal\)\nfor: /);
+	assert.deepEqual(prompt.questions[0].options.map((o) => o.label), ["Allow once", "Allow for 1 hour", "Allow for 8 hours", "Deny"]);
+	assert.equal(prompt.answer([{ picks: [0] }]), null);
+	assert.deepEqual(await fromPhone, { code: 0, stdout: "123456\n", stderr: "" });
+	assert.ok(tuiClosed, "the phone's answer closed the TUI card");
+	assert.equal(openPrompts().length, 0);
+
+	// The keyboard answers first: the phone's copy goes away.
+	ctx.ui.select = async () => "Deny";
+	assert.equal((await runShim(["item", "get", "Rubygems", "--otp", "--vault", "Personal"], env)).code, 1);
+	assert.equal(openPrompts().length, 0, "the phone's card closed too");
+
+	// Free text from the phone (no pick) is a deny.
+	ctx.ui.select = (t, o, { signal }) => new Promise((r) => signal.addEventListener("abort", () => r(undefined)));
+	const typed = runShim(["item", "get", "Rubygems", "--otp", "--vault", "Personal"], env);
+	await until(() => openPrompts().length === 1);
+	openPrompts()[0].answer([{ picks: [], text: "sure" }]);
+	assert.equal((await typed).code, 1);
+	ctx.ui.select = keyboard; // back to the keyboard's picks
+
 	await stub.commands.get("op-broker").handler("", ctx);
 	assert.match(notes.at(-1)[1], /daemon: running, unlocked for default account\ngrant: personal \/ github · 60 min left/);
 	await stub.fire("session_shutdown", {}, ctx);
@@ -337,5 +365,14 @@ test("the extension: a card in the session, then the daemon's value through the 
 	picks.push("Deny");
 	assert.equal((await runShim(["read", "op://Personal/GitHub/token"], { PI_OP_BROKER_SOCK: process.env.PI_OP_BROKER_SOCK, PATH: process.env.PATH })).code, 1,
 		"a new session starts with no grants");
+	assert.match(titles.at(-1)[0], /GitHub · token/, "asked at the keyboard");
+	assert.equal(openPrompts().length, 0);
+
+	// The session ends with a card up (one that ignores its signal): closed, on the phone too, and a deny.
+	ctx.ui.select = () => new Promise(() => {});
+	const orphan = runShim(["item", "get", "Rubygems", "--otp"], { PI_OP_BROKER_SOCK: process.env.PI_OP_BROKER_SOCK, PATH: process.env.PATH });
+	await until(() => openPrompts().length === 1);
 	await stub.fire("session_shutdown", {}, ctx);
+	assert.equal(openPrompts().length, 0);
+	assert.equal((await orphan).code, 1);
 });

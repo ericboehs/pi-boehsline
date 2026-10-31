@@ -19,6 +19,7 @@ import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { optIn } from "../../../lib/opt-in.ts";
+import { offerPrompt } from "../../../lib/remote-prompts.ts";
 import { Broker, CHOICES, type Decision, type OpRequest, type Reply } from "./broker.ts";
 
 // The real path: the shim compares PATH entries by real path, so a symlinked install can't loop.
@@ -104,17 +105,34 @@ export default optIn("op-broker", "1Password reads for agents: an approval card 
 	let ctxRef: ExtensionContext | undefined;
 	let server: Server | undefined;
 	let sockPath: string | undefined;
+	const openCards = new Set<AbortController>(); // closed with the session
 
+	// The card is also offered as a remote prompt, so botsun-owner can put it on the phone, where
+	// the answer is signed by the device and checked again here. Whichever answers first wins and
+	// the other closes; free text (no pick) is a deny.
 	const ask = async (title: string): Promise<Decision | undefined> => {
 		const ctx = ctxRef;
 		if (!ctx?.hasUI) return undefined;
+		const labels = CHOICES.map(([label]) => label);
 		const ctl = new AbortController();
+		openCards.add(ctl);
 		const timer = setTimeout(() => ctl.abort(), CARD_MS);
+		const remote = offerPrompt([{ question: title, options: labels.map((label) => ({ label })) }]);
+		const closed = new Promise<undefined>((r) => ctl.signal.addEventListener("abort", () => r(undefined), { once: true }));
 		try {
-			const pick = await ctx.ui.select(title, CHOICES.map(([label]) => label), { signal: ctl.signal });
-			return CHOICES.find(([label]) => label === pick)?.[1];
+			return await Promise.race([
+				closed, // timed out, or the session ended: a deny
+				ctx.ui.select(title, labels, { signal: ctl.signal }).then((pick) => CHOICES.find(([label]) => label === pick)?.[1]),
+				remote.answered.then((answers) => {
+					const pick = answers[0]?.picks[0];
+					return pick === undefined ? "deny" : CHOICES[pick]?.[1];
+				}),
+			]);
 		} finally {
+			ctl.abort(); // closes the TUI card if the phone answered
+			openCards.delete(ctl);
 			clearTimeout(timer);
+			remote.dispose();
 		}
 	};
 
@@ -171,6 +189,7 @@ export default optIn("op-broker", "1Password reads for agents: an approval card 
 
 	function close() {
 		broker.revoke(); // grants belong to this session: not to the next one after /new, /resume or /fork
+		for (const ctl of openCards) ctl.abort(); // and its open cards close, on the phone too
 		server?.close();
 		server = undefined;
 		if (sockPath && existsSync(sockPath)) {

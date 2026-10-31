@@ -26,6 +26,8 @@ for: bash -c gh auth login --with-token
 - **The daemon.** One per user, started on demand inside a pseudo-terminal of its own (`script`). The 1Password CLI authorizes a terminal, so the first approved read pops **one** Touch ID, and every later read from any session goes through it. It stays warm with `op whoami` every 4 minutes (whoami never prompts) until 1Password's 12-hour limit or the app locks. Unlocked and unused for 30 minutes, it exits.
 - **Values** go from `op` to the daemon to the shim's stdout, and nowhere else: not to a file, the log (`~/.local/state/pi-op-broker/daemon.log` names items, never values), or the session's own state.
 
+**From the phone (with Botsun's botsun-owner):** the card is offered the way `ask` questions are, so it shows in the session on the phone and pushes after 20 seconds unanswered. The phone's answer is signed by the device and checked again in the session. Whichever answers first, keyboard or phone, wins, and the other card closes.
+
 `/op-broker` shows the daemon's state and this session's grants. `/op-broker revoke` drops this session's grants, and `/op-broker stop` stops the daemon (1Password access goes with it).
 
 ## The risk you're accepting
