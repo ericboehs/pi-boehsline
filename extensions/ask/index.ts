@@ -27,6 +27,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { offerPrompt, type RemoteAnswer } from "../../lib/remote-prompts.ts";
 
 const CUSTOM_VALUE = "__custom__";
 
@@ -165,6 +166,40 @@ function cancelled(question: string, options: string[]): { content: { type: "tex
 	};
 }
 
+/** An answer from the phone, as the same result the TUI would have returned. Pure for tests. */
+export function remoteResult(subs: SubQuestion[], answers: RemoteAnswer[], single: boolean): AgentToolResult<AskDetails> {
+	const results: QuestionResult[] = subs.map((q, i) => ({
+		question: q.question,
+		options: q.options.map((o) => o.label),
+		answers: answers[i]!.picks.map((p) => q.options[p]!.label),
+		custom: answers[i]!.text ? [answers[i]!.text!] : [],
+	}));
+	if (single) {
+		const q = results[0]!;
+		if (!subs[0]!.multiSelect && q.answers.length === 0 && q.custom.length > 0) {
+			return {
+				content: [{ type: "text", text: `User wrote: ${q.custom[0]}` }],
+				details: { question: q.question, options: q.options, answers: [], custom: q.custom, cancelled: false },
+			};
+		}
+		return {
+			content: [{ type: "text", text: formatAnswerLines(q.options, q.answers, q.custom).join("\n") }],
+			details: { question: q.question, options: q.options, answers: q.answers, custom: q.custom, cancelled: false },
+		};
+	}
+	return {
+		content: [{ type: "text", text: results.flatMap((q, i) => [`Q${i + 1}: ${q.question}`, ...formatAnswerLines(q.options, q.answers, q.custom)]).join("\n") }],
+		details: {
+			question: `${subs.length} questions`,
+			options: [],
+			answers: results.flatMap((q) => q.answers),
+			custom: results.flatMap((q) => q.custom),
+			cancelled: false,
+			byQuestion: results,
+		},
+	};
+}
+
 export default function ask(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ask",
@@ -202,416 +237,450 @@ export default function ask(pi: ExtensionAPI) {
 				};
 			}
 
-			/** Split picked item-values into option answers + optional free text. Null = nothing left. */
-			const resolveCustom = async (
-				options: SubQuestion["options"],
-				values: string[],
-			): Promise<{ answers: string[]; custom: string[] } | null> => {
-				const answers: string[] = [];
-				let wantCustom = false;
-				for (const v of values) {
-					if (v === CUSTOM_VALUE) wantCustom = true;
-					else {
-						const label = options[Number(v)]?.label;
-						if (label !== undefined) answers.push(label);
+			// The phone can answer too (botsun-owner): the TUI and a remote answer race, and the
+			// loser is closed. Every dialog below goes through `ui`, which one abort closes.
+			const abort = new AbortController();
+			const ui = {
+				// Once the phone has answered, the flow winds down without opening anything new.
+				select: (title: string, options: string[]) =>
+					abort.signal.aborted ? Promise.resolve(undefined) : ctx.ui.select(title, options, { signal: abort.signal }),
+				input: (title: string, placeholder?: string) =>
+					abort.signal.aborted ? Promise.resolve(undefined) : ctx.ui.input(title, placeholder, { signal: abort.signal }),
+				custom: <T,>(factory: Parameters<typeof ctx.ui.custom<T>>[0], options?: Parameters<typeof ctx.ui.custom<T>>[1]) =>
+					abort.signal.aborted ? Promise.resolve(undefined as T) : ctx.ui.custom<T>((tui, theme, kb, done) => {
+						const close = () => done(undefined as T);
+						abort.signal.addEventListener("abort", close, { once: true });
+						return factory(tui, theme, kb, (value: T) => {
+							abort.signal.removeEventListener("abort", close);
+							done(value);
+						});
+					}, options),
+			};
+			const local = async (): Promise<AgentToolResult<AskDetails>> => {
+				/** Split picked item-values into option answers + optional free text. Null = nothing left. */
+				const resolveCustom = async (
+					options: SubQuestion["options"],
+					values: string[],
+				): Promise<{ answers: string[]; custom: string[] } | null> => {
+					const answers: string[] = [];
+					let wantCustom = false;
+					for (const v of values) {
+						if (v === CUSTOM_VALUE) wantCustom = true;
+						else {
+							const label = options[Number(v)]?.label;
+							if (label !== undefined) answers.push(label);
+						}
 					}
-				}
-				const custom: string[] = [];
-				if (wantCustom) {
-					const text = await ctx.ui.input("Custom answer:");
-					if (text) custom.push(text);
-				}
-				if (answers.length === 0 && custom.length === 0) return null;
-				return { answers, custom };
-			};
+					const custom: string[] = [];
+					if (wantCustom) {
+						const text = await ui.input("Custom answer:");
+						if (text) custom.push(text);
+					}
+					if (answers.length === 0 && custom.length === 0) return null;
+					return { answers, custom };
+				};
 
-			const pickSingle = async (
-				question: string,
-				items: SelectItem[],
-				nav?: { canGoBack?: boolean; canGoForward?: boolean; progress?: string; initialValue?: string },
-			): Promise<string | typeof BACK | typeof FORWARD | undefined> => {
-				if (ctx.mode === "tui") {
-					// Custom renderer instead of SelectList: SelectList truncates
-					// long labels/descriptions to one line; this wraps them.
-					return ctx.ui.custom<string | typeof BACK | typeof FORWARD | undefined>((tui, theme, _kb, done) => {
-						let cursor = (() => {
-							if (nav?.initialValue === undefined) return 0;
-							const found = items.findIndex((i) => i.value === nav.initialValue);
-							return found >= 0 ? found : 0;
-						})();
-						let cached: string[] | undefined;
-						let zones: Array<{ index: number; start: number; end: number }> = [];
+				const pickSingle = async (
+					question: string,
+					items: SelectItem[],
+					nav?: { canGoBack?: boolean; canGoForward?: boolean; progress?: string; initialValue?: string },
+				): Promise<string | typeof BACK | typeof FORWARD | undefined> => {
+					if (ctx.mode === "tui") {
+						// Custom renderer instead of SelectList: SelectList truncates
+						// long labels/descriptions to one line; this wraps them.
+						return ui.custom<string | typeof BACK | typeof FORWARD | undefined>((tui, theme, _kb, done) => {
+							let cursor = (() => {
+								if (nav?.initialValue === undefined) return 0;
+								const found = items.findIndex((i) => i.value === nav.initialValue);
+								return found >= 0 ? found : 0;
+							})();
+							let cached: string[] | undefined;
+							let zones: Array<{ index: number; start: number; end: number }> = [];
 
-						const refresh = () => {
-							cached = undefined;
-							tui.requestRender();
-						};
-						const pick = (i: number) => done(items[i]!.value);
-
-						function handleInput(data: string) {
-							if (nav?.canGoBack && (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left))) {
-								done(BACK);
-								return;
-							}
-							if (nav?.canGoForward && matchesKey(data, Key.right)) {
-								done(FORWARD);
-								return;
-							}
-							if (matchesKey(data, Key.up)) {
-								cursor = (cursor - 1 + items.length) % items.length;
-								refresh();
-								return;
-							}
-							if (matchesKey(data, Key.down)) {
-								cursor = (cursor + 1) % items.length;
-								refresh();
-								return;
-							}
-							if (matchesKey(data, Key.enter)) {
-								pick(cursor);
-								return;
-							}
-							if (matchesKey(data, Key.escape)) {
-								done(undefined);
-								return;
-							}
-							if (data.length === 1 && data >= "1" && data <= "9") {
-								const idx = Number(data) - 1;
-								if (idx < items.length) pick(idx);
-							}
-						}
-
-						function render(width: number): string[] {
-							if (cached) return cached;
-							const w = Math.max(1, width);
-							zones = [];
-							const lines: string[] = [];
-							lines.push(theme.fg("accent", "─".repeat(w)));
-							if (nav?.progress) pushWrapped(lines, " ", theme.fg("dim", nav.progress), w);
-							pushWrapped(lines, " ", theme.fg("text", question), w);
-							lines.push("");
-							items.forEach((item, i) => {
-								const start = lines.length;
-								const mark = i === cursor ? theme.fg("accent", "→ ") : "  ";
-								const color = i === cursor ? "accent" : "text";
-								pushWrapped(lines, mark, theme.fg(color, item.label), w);
-								if (item.description) pushWrapped(lines, "     ", theme.fg("muted", item.description), w);
-								zones.push({ index: i, start, end: lines.length });
-							});
-							if (nav?.canGoBack) {
-								const backStart = lines.length;
-								pushWrapped(lines, "  ", theme.fg("dim", "← Back"), w);
-								zones.push({ index: BACK_ZONE, start: backStart, end: lines.length });
-							}
-							if (nav?.canGoForward) {
-								const fwdStart = lines.length;
-								pushWrapped(lines, "  ", theme.fg("dim", "Forward →"), w);
-								zones.push({ index: FORWARD_ZONE, start: fwdStart, end: lines.length });
-							}
-							lines.push("");
-							const backHint = nav?.canGoBack ? " • shift+tab/← back" : "";
-							const fwdHint = nav?.canGoForward ? " • → forward" : "";
-							pushWrapped(lines, " ", theme.fg("dim", `↑↓/click select • 1-9 quick pick • enter confirm • esc cancel${backHint}${fwdHint}`), w);
-							lines.push(theme.fg("accent", "─".repeat(w)));
-							cached = lines;
-							return lines;
-						}
-
-						return {
-							render,
-							invalidate: () => {
+							const refresh = () => {
 								cached = undefined;
-							},
-							handleInput,
-							// Click selects immediately (matches SelectList's click = select + confirm).
-							handleMouse: (event: any) => {
-								if (event?.type !== "click" || event?.button !== "left") return undefined;
-								const hit = zones.find((z) => event.y >= z.start && event.y < z.end);
-								if (!hit) return undefined;
-								if (hit.index === BACK_ZONE) {
+								tui.requestRender();
+							};
+							const pick = (i: number) => done(items[i]!.value);
+
+							function handleInput(data: string) {
+								if (nav?.canGoBack && (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left))) {
 									done(BACK);
-									return { handled: true };
+									return;
 								}
-								if (hit.index === FORWARD_ZONE) {
+								if (nav?.canGoForward && matchesKey(data, Key.right)) {
 									done(FORWARD);
-									return { handled: true };
+									return;
 								}
-								pick(hit.index);
-								return { handled: true };
-							},
-						};
-					});
-				}
-				// RPC: dialog protocol (custom() is TUI-only and returns undefined).
-				const display = items.map((i) => formatRpcLabel(i.label, i.description));
-				const picked = await ctx.ui.select(question, display);
-				if (picked === undefined) return undefined;
-				const idx = display.findIndex((d) => d === picked);
-				return idx >= 0 ? items[idx]!.value : undefined;
-			};
+								if (matchesKey(data, Key.up)) {
+									cursor = (cursor - 1 + items.length) % items.length;
+									refresh();
+									return;
+								}
+								if (matchesKey(data, Key.down)) {
+									cursor = (cursor + 1) % items.length;
+									refresh();
+									return;
+								}
+								if (matchesKey(data, Key.enter)) {
+									pick(cursor);
+									return;
+								}
+								if (matchesKey(data, Key.escape)) {
+									done(undefined);
+									return;
+								}
+								if (data.length === 1 && data >= "1" && data <= "9") {
+									const idx = Number(data) - 1;
+									if (idx < items.length) pick(idx);
+								}
+							}
 
-			const pickMulti = async (
-				question: string,
-				items: SelectItem[],
-				nav?: { canGoBack?: boolean; canGoForward?: boolean; progress?: string; initialValues?: string[] },
-			): Promise<string[] | typeof BACK | typeof FORWARD | null> => {
-				if (ctx.mode === "tui") {
-					const res = await ctx.ui.custom<{ values: string[] } | typeof BACK | typeof FORWARD | null>((tui, theme, _kb, done) => {
-						let cursor = (() => {
-							if (!nav?.initialValues?.length) return 0;
-							const found = items.findIndex((i) => i.value === nav.initialValues![0]);
-							return found >= 0 ? found : 0;
-						})();
-						const checked = new Set<number>((() => {
-							if (!nav?.initialValues) return [];
-							const idxs: number[] = [];
-							for (const v of nav.initialValues) {
-								const found = items.findIndex((i) => i.value === v);
-								if (found >= 0) idxs.push(found);
-							}
-							return idxs;
-						})());
-						let hint: string | null = null;
-						let cached: string[] | undefined;
-						let zones: Array<{ index: number; start: number; end: number }> = [];
-
-						const refresh = () => {
-							cached = undefined;
-							tui.requestRender();
-						};
-						const toggle = (i: number) => {
-							if (checked.has(i)) checked.delete(i);
-							else checked.add(i);
-							hint = null;
-							refresh();
-						};
-						const submit = () => {
-							if (checked.size === 0) {
-								hint = "Select at least one option (space/click), or Esc to cancel";
-								refresh();
-								return;
-							}
-							done({ values: [...checked].sort((a, b) => a - b).map((i) => items[i]!.value) });
-						};
-
-						function handleInput(data: string) {
-							if (nav?.canGoBack && (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left))) {
-								done(BACK);
-								return;
-							}
-							if (nav?.canGoForward && matchesKey(data, Key.right)) {
-								done(FORWARD);
-								return;
-							}
-							if (matchesKey(data, Key.up)) {
-								cursor = (cursor - 1 + items.length) % items.length;
-								hint = null;
-								refresh();
-								return;
-							}
-							if (matchesKey(data, Key.down)) {
-								cursor = (cursor + 1) % items.length;
-								hint = null;
-								refresh();
-								return;
-							}
-							if (matchesKey(data, Key.enter)) {
-								submit();
-								return;
-							}
-							if (matchesKey(data, Key.escape)) {
-								done(null);
-								return;
-							}
-							if (matchesKey(data, Key.space)) {
-								toggle(cursor);
-								return;
-							}
-							if (data.length === 1 && data >= "1" && data <= "9") {
-								const idx = Number(data) - 1;
-								if (idx < items.length) toggle(idx);
-								return;
-							}
-							if (data === "a") {
-								if (checked.size === items.length) checked.clear();
-								else items.forEach((_, i) => checked.add(i));
-								hint = null;
-								refresh();
-							}
-						}
-
-						function render(width: number): string[] {
-							if (cached) return cached;
-							const w = Math.max(1, width);
-							zones = [];
-							const lines: string[] = [];
-							lines.push(theme.fg("accent", "─".repeat(w)));
-							if (nav?.progress) pushWrapped(lines, " ", theme.fg("dim", nav.progress), w);
-							pushWrapped(lines, " ", theme.fg("text", question), w);
-							lines.push("");
-							items.forEach((item, i) => {
-								const start = lines.length;
-								const box = checked.has(i) ? "[x]" : "[ ]";
-								const mark = i === cursor ? theme.fg("accent", "> ") : "  ";
-								const color = i === cursor ? "accent" : "text";
-								pushWrapped(lines, mark, `${theme.fg(color, box)} ${theme.fg(color, item.label)}`, w);
-								if (item.description) pushWrapped(lines, "      ", theme.fg("muted", item.description), w);
-								zones.push({ index: i, start, end: lines.length });
-							});
-							if (nav?.canGoBack) {
-								const backStart = lines.length;
-								pushWrapped(lines, "  ", theme.fg("dim", "← Back"), w);
-								zones.push({ index: BACK_ZONE, start: backStart, end: lines.length });
-							}
-							if (nav?.canGoForward) {
-								const fwdStart = lines.length;
-								pushWrapped(lines, "  ", theme.fg("dim", "Forward →"), w);
-								zones.push({ index: FORWARD_ZONE, start: fwdStart, end: lines.length });
-							}
-							lines.push("");
-							if (hint) pushWrapped(lines, " ", theme.fg("warning", hint), w);
-							else {
-								const sel = checked.size > 0 ? ` • ${checked.size} selected` : "";
+							function render(width: number): string[] {
+								if (cached) return cached;
+								const w = Math.max(1, width);
+								zones = [];
+								const lines: string[] = [];
+								lines.push(theme.fg("accent", "─".repeat(w)));
+								if (nav?.progress) pushWrapped(lines, " ", theme.fg("dim", nav.progress), w);
+								pushWrapped(lines, " ", theme.fg("text", question), w);
+								lines.push("");
+								items.forEach((item, i) => {
+									const start = lines.length;
+									const mark = i === cursor ? theme.fg("accent", "→ ") : "  ";
+									const color = i === cursor ? "accent" : "text";
+									pushWrapped(lines, mark, theme.fg(color, item.label), w);
+									if (item.description) pushWrapped(lines, "     ", theme.fg("muted", item.description), w);
+									zones.push({ index: i, start, end: lines.length });
+								});
+								if (nav?.canGoBack) {
+									const backStart = lines.length;
+									pushWrapped(lines, "  ", theme.fg("dim", "← Back"), w);
+									zones.push({ index: BACK_ZONE, start: backStart, end: lines.length });
+								}
+								if (nav?.canGoForward) {
+									const fwdStart = lines.length;
+									pushWrapped(lines, "  ", theme.fg("dim", "Forward →"), w);
+									zones.push({ index: FORWARD_ZONE, start: fwdStart, end: lines.length });
+								}
+								lines.push("");
 								const backHint = nav?.canGoBack ? " • shift+tab/← back" : "";
 								const fwdHint = nav?.canGoForward ? " • → forward" : "";
-								pushWrapped(lines, " ", theme.fg("dim", `↑↓ move • space/click toggle • a all • enter done${sel} • esc cancel${backHint}${fwdHint}`), w);
+								pushWrapped(lines, " ", theme.fg("dim", `↑↓/click select • 1-9 quick pick • enter confirm • esc cancel${backHint}${fwdHint}`), w);
+								lines.push(theme.fg("accent", "─".repeat(w)));
+								cached = lines;
+								return lines;
 							}
-							lines.push(theme.fg("accent", "─".repeat(w)));
-							cached = lines;
-							return lines;
-						}
 
-						return {
-							render,
-							invalidate: () => {
+							return {
+								render,
+								invalidate: () => {
+									cached = undefined;
+								},
+								handleInput,
+								// Click selects immediately (matches SelectList's click = select + confirm).
+								handleMouse: (event: any) => {
+									if (event?.type !== "click" || event?.button !== "left") return undefined;
+									const hit = zones.find((z) => event.y >= z.start && event.y < z.end);
+									if (!hit) return undefined;
+									if (hit.index === BACK_ZONE) {
+										done(BACK);
+										return { handled: true };
+									}
+									if (hit.index === FORWARD_ZONE) {
+										done(FORWARD);
+										return { handled: true };
+									}
+									pick(hit.index);
+									return { handled: true };
+								},
+							};
+						});
+					}
+					// RPC: dialog protocol (custom() is TUI-only and returns undefined).
+					const display = items.map((i) => formatRpcLabel(i.label, i.description));
+					const picked = await ui.select(question, display);
+					if (picked === undefined) return undefined;
+					const idx = display.findIndex((d) => d === picked);
+					return idx >= 0 ? items[idx]!.value : undefined;
+				};
+
+				const pickMulti = async (
+					question: string,
+					items: SelectItem[],
+					nav?: { canGoBack?: boolean; canGoForward?: boolean; progress?: string; initialValues?: string[] },
+				): Promise<string[] | typeof BACK | typeof FORWARD | null> => {
+					if (ctx.mode === "tui") {
+						const res = await ui.custom<{ values: string[] } | typeof BACK | typeof FORWARD | null>((tui, theme, _kb, done) => {
+							let cursor = (() => {
+								if (!nav?.initialValues?.length) return 0;
+								const found = items.findIndex((i) => i.value === nav.initialValues![0]);
+								return found >= 0 ? found : 0;
+							})();
+							const checked = new Set<number>((() => {
+								if (!nav?.initialValues) return [];
+								const idxs: number[] = [];
+								for (const v of nav.initialValues) {
+									const found = items.findIndex((i) => i.value === v);
+									if (found >= 0) idxs.push(found);
+								}
+								return idxs;
+							})());
+							let hint: string | null = null;
+							let cached: string[] | undefined;
+							let zones: Array<{ index: number; start: number; end: number }> = [];
+
+							const refresh = () => {
 								cached = undefined;
-							},
-							handleInput,
-							// Click-only toggle so transcript drag-select keeps working.
-							handleMouse: (event: any) => {
-								if (event?.type !== "click" || event?.button !== "left") return undefined;
-								const hit = zones.find((z) => event.y >= z.start && event.y < z.end);
-								if (!hit) return undefined;
-								if (hit.index === BACK_ZONE) {
+								tui.requestRender();
+							};
+							const toggle = (i: number) => {
+								if (checked.has(i)) checked.delete(i);
+								else checked.add(i);
+								hint = null;
+								refresh();
+							};
+							const submit = () => {
+								if (checked.size === 0) {
+									hint = "Select at least one option (space/click), or Esc to cancel";
+									refresh();
+									return;
+								}
+								done({ values: [...checked].sort((a, b) => a - b).map((i) => items[i]!.value) });
+							};
+
+							function handleInput(data: string) {
+								if (nav?.canGoBack && (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left))) {
 									done(BACK);
-									return { handled: true };
+									return;
 								}
-								if (hit.index === FORWARD_ZONE) {
+								if (nav?.canGoForward && matchesKey(data, Key.right)) {
 									done(FORWARD);
-									return { handled: true };
+									return;
 								}
-								toggle(hit.index);
-								return { handled: true };
-							},
+								if (matchesKey(data, Key.up)) {
+									cursor = (cursor - 1 + items.length) % items.length;
+									hint = null;
+									refresh();
+									return;
+								}
+								if (matchesKey(data, Key.down)) {
+									cursor = (cursor + 1) % items.length;
+									hint = null;
+									refresh();
+									return;
+								}
+								if (matchesKey(data, Key.enter)) {
+									submit();
+									return;
+								}
+								if (matchesKey(data, Key.escape)) {
+									done(null);
+									return;
+								}
+								if (matchesKey(data, Key.space)) {
+									toggle(cursor);
+									return;
+								}
+								if (data.length === 1 && data >= "1" && data <= "9") {
+									const idx = Number(data) - 1;
+									if (idx < items.length) toggle(idx);
+									return;
+								}
+								if (data === "a") {
+									if (checked.size === items.length) checked.clear();
+									else items.forEach((_, i) => checked.add(i));
+									hint = null;
+									refresh();
+								}
+							}
+
+							function render(width: number): string[] {
+								if (cached) return cached;
+								const w = Math.max(1, width);
+								zones = [];
+								const lines: string[] = [];
+								lines.push(theme.fg("accent", "─".repeat(w)));
+								if (nav?.progress) pushWrapped(lines, " ", theme.fg("dim", nav.progress), w);
+								pushWrapped(lines, " ", theme.fg("text", question), w);
+								lines.push("");
+								items.forEach((item, i) => {
+									const start = lines.length;
+									const box = checked.has(i) ? "[x]" : "[ ]";
+									const mark = i === cursor ? theme.fg("accent", "> ") : "  ";
+									const color = i === cursor ? "accent" : "text";
+									pushWrapped(lines, mark, `${theme.fg(color, box)} ${theme.fg(color, item.label)}`, w);
+									if (item.description) pushWrapped(lines, "      ", theme.fg("muted", item.description), w);
+									zones.push({ index: i, start, end: lines.length });
+								});
+								if (nav?.canGoBack) {
+									const backStart = lines.length;
+									pushWrapped(lines, "  ", theme.fg("dim", "← Back"), w);
+									zones.push({ index: BACK_ZONE, start: backStart, end: lines.length });
+								}
+								if (nav?.canGoForward) {
+									const fwdStart = lines.length;
+									pushWrapped(lines, "  ", theme.fg("dim", "Forward →"), w);
+									zones.push({ index: FORWARD_ZONE, start: fwdStart, end: lines.length });
+								}
+								lines.push("");
+								if (hint) pushWrapped(lines, " ", theme.fg("warning", hint), w);
+								else {
+									const sel = checked.size > 0 ? ` • ${checked.size} selected` : "";
+									const backHint = nav?.canGoBack ? " • shift+tab/← back" : "";
+									const fwdHint = nav?.canGoForward ? " • → forward" : "";
+									pushWrapped(lines, " ", theme.fg("dim", `↑↓ move • space/click toggle • a all • enter done${sel} • esc cancel${backHint}${fwdHint}`), w);
+								}
+								lines.push(theme.fg("accent", "─".repeat(w)));
+								cached = lines;
+								return lines;
+							}
+
+							return {
+								render,
+								invalidate: () => {
+									cached = undefined;
+								},
+								handleInput,
+								// Click-only toggle so transcript drag-select keeps working.
+								handleMouse: (event: any) => {
+									if (event?.type !== "click" || event?.button !== "left") return undefined;
+									const hit = zones.find((z) => event.y >= z.start && event.y < z.end);
+									if (!hit) return undefined;
+									if (hit.index === BACK_ZONE) {
+										done(BACK);
+										return { handled: true };
+									}
+									if (hit.index === FORWARD_ZONE) {
+										done(FORWARD);
+										return { handled: true };
+									}
+									toggle(hit.index);
+									return { handled: true };
+								},
+							};
+						});
+						if (res === BACK) return BACK;
+						if (res === FORWARD) return FORWARD;
+						if (res === null || res === undefined) return null;
+						return res.values;
+					}
+					// RPC: one input round-trip, comma-separated numbers.
+					const raw = await ui.input(question, "e.g. 1,3");
+					if (!raw) return null;
+					const picks = parseMultiPicks(raw, items.length);
+					if (picks.length === 0) return null;
+					return picks.map((n) => items[n - 1]!.value);
+				};
+
+
+				// ---------- single question (unchanged behavior) ----------
+				if (subs.length === 1) {
+					const sub = subs[0]!;
+					const labels = sub.options.map((o) => o.label);
+					const items = buildItems(sub.options);
+					const values = sub.multiSelect ? await pickMulti(sub.question, items) : [await pickSingle(sub.question, items)];
+					// No nav is passed in the single-question flow, so BACK/FORWARD
+					// cannot occur; the symbol guard just satisfies the pickers' type.
+					if (values === null || typeof values === "symbol" || values[0] === undefined) return cancelled(sub.question, labels);
+					const resolved = await resolveCustom(sub.options, values as string[]);
+					if (resolved === null) return cancelled(sub.question, labels);
+					if (!sub.multiSelect && resolved.custom.length > 0) {
+						return {
+							content: [{ type: "text", text: `User wrote: ${resolved.custom[0]}` }],
+							details: { question: sub.question, options: labels, answers: [], custom: resolved.custom, cancelled: false } as AskDetails,
 						};
-					});
-					if (res === BACK) return BACK;
-					if (res === FORWARD) return FORWARD;
-					if (res === null || res === undefined) return null;
-					return res.values;
-				}
-				// RPC: one input round-trip, comma-separated numbers.
-				const raw = await ctx.ui.input(question, "e.g. 1,3");
-				if (!raw) return null;
-				const picks = parseMultiPicks(raw, items.length);
-				if (picks.length === 0) return null;
-				return picks.map((n) => items[n - 1]!.value);
-			};
-
-
-			// ---------- single question (unchanged behavior) ----------
-			if (subs.length === 1) {
-				const sub = subs[0]!;
-				const labels = sub.options.map((o) => o.label);
-				const items = buildItems(sub.options);
-				const values = sub.multiSelect ? await pickMulti(sub.question, items) : [await pickSingle(sub.question, items)];
-				// No nav is passed in the single-question flow, so BACK/FORWARD
-				// cannot occur; the symbol guard just satisfies the pickers' type.
-				if (values === null || typeof values === "symbol" || values[0] === undefined) return cancelled(sub.question, labels);
-				const resolved = await resolveCustom(sub.options, values as string[]);
-				if (resolved === null) return cancelled(sub.question, labels);
-				if (!sub.multiSelect && resolved.custom.length > 0) {
+					}
 					return {
-						content: [{ type: "text", text: `User wrote: ${resolved.custom[0]}` }],
-						details: { question: sub.question, options: labels, answers: [], custom: resolved.custom, cancelled: false } as AskDetails,
+						content: [{ type: "text", text: formatAnswerLines(labels, resolved.answers, resolved.custom).join("\n") }],
+						details: { question: sub.question, options: labels, answers: resolved.answers, custom: resolved.custom, cancelled: false } as AskDetails,
 					};
 				}
-				return {
-					content: [{ type: "text", text: formatAnswerLines(labels, resolved.answers, resolved.custom).join("\n") }],
-					details: { question: sub.question, options: labels, answers: resolved.answers, custom: resolved.custom, cancelled: false } as AskDetails,
-				};
-			}
 
-			// ---------- batch: several questions, one call ----------
-			// Index loop (not for..of) so shift+tab/← steps back and → steps
-			// forward (keeping the stored answer) when revisiting.
-			// Later answers are kept for pre-fill but excluded from cancel
-			// output via slice(0, i); re-answering overwrites by index.
-			// Custom free text can't pre-fill ctx.ui.input, so revisiting a
-			// question with a previous custom answer re-prompts for it.
-			const answered: (QuestionResult | undefined)[] = new Array(subs.length);
-			const answeredPrefix = (end: number): QuestionResult[] =>
-				answered.slice(0, end).filter((q): q is QuestionResult => q !== undefined);
-			const cancelBatch = (end: number): { content: { type: "text"; text: string }[]; details: AskDetails } => {
-				const prefix = answeredPrefix(end);
-				return {
-					content: [{ type: "text", text: [...prefix.flatMap((q, i) => [`Q${i + 1}: ${q.question}`, ...formatAnswerLines(q.options, q.answers, q.custom)]), "User cancelled (remaining questions skipped)"].join("\n") }],
-					details: { question: `${subs.length} questions`, options: [], answers: [], custom: [], cancelled: true, byQuestion: prefix } as AskDetails,
+				// ---------- batch: several questions, one call ----------
+				// Index loop (not for..of) so shift+tab/← steps back and → steps
+				// forward (keeping the stored answer) when revisiting.
+				// Later answers are kept for pre-fill but excluded from cancel
+				// output via slice(0, i); re-answering overwrites by index.
+				// Custom free text can't pre-fill ui.input, so revisiting a
+				// question with a previous custom answer re-prompts for it.
+				const answered: (QuestionResult | undefined)[] = new Array(subs.length);
+				const answeredPrefix = (end: number): QuestionResult[] =>
+					answered.slice(0, end).filter((q): q is QuestionResult => q !== undefined);
+				const cancelBatch = (end: number): { content: { type: "text"; text: string }[]; details: AskDetails } => {
+					const prefix = answeredPrefix(end);
+					return {
+						content: [{ type: "text", text: [...prefix.flatMap((q, i) => [`Q${i + 1}: ${q.question}`, ...formatAnswerLines(q.options, q.answers, q.custom)]), "User cancelled (remaining questions skipped)"].join("\n") }],
+						details: { question: `${subs.length} questions`, options: [], answers: [], custom: [], cancelled: true, byQuestion: prefix } as AskDetails,
+					};
 				};
-			};
-			let i = 0;
-			while (i < subs.length) {
-				const sub = subs[i]!;
-				const progress = `Q${i + 1}/${subs.length}`;
-				const labels = sub.options.map((o) => o.label);
-				const items = buildItems(sub.options);
-				const prev = answered[i];
-				const nav = { canGoBack: i > 0, canGoForward: prev !== undefined && i < subs.length - 1, progress };
-				let values: string[];
-				if (sub.multiSelect) {
-					const initialValues = prev ? initialMultiValues(sub.options, prev.answers) : undefined;
-					const picked = await pickMulti(sub.question, items, { ...nav, initialValues });
-					if (picked === BACK) {
-						i--;
-						continue;
+				let i = 0;
+				while (i < subs.length) {
+					const sub = subs[i]!;
+					const progress = `Q${i + 1}/${subs.length}`;
+					const labels = sub.options.map((o) => o.label);
+					const items = buildItems(sub.options);
+					const prev = answered[i];
+					const nav = { canGoBack: i > 0, canGoForward: prev !== undefined && i < subs.length - 1, progress };
+					let values: string[];
+					if (sub.multiSelect) {
+						const initialValues = prev ? initialMultiValues(sub.options, prev.answers) : undefined;
+						const picked = await pickMulti(sub.question, items, { ...nav, initialValues });
+						if (picked === BACK) {
+							i--;
+							continue;
+						}
+						if (picked === FORWARD) {
+							i++;
+							continue;
+						}
+						if (picked === null) return cancelBatch(i);
+						values = picked;
+					} else {
+						const initialValue = prev ? initialSingleValue(sub.options, prev.answers) : undefined;
+						const picked = await pickSingle(sub.question, items, { ...nav, initialValue });
+						if (picked === BACK) {
+							i--;
+							continue;
+						}
+						if (picked === FORWARD) {
+							i++;
+							continue;
+						}
+						if (picked === undefined) return cancelBatch(i);
+						values = [picked];
 					}
-					if (picked === FORWARD) {
-						i++;
-						continue;
-					}
-					if (picked === null) return cancelBatch(i);
-					values = picked;
-				} else {
-					const initialValue = prev ? initialSingleValue(sub.options, prev.answers) : undefined;
-					const picked = await pickSingle(sub.question, items, { ...nav, initialValue });
-					if (picked === BACK) {
-						i--;
-						continue;
-					}
-					if (picked === FORWARD) {
-						i++;
-						continue;
-					}
-					if (picked === undefined) return cancelBatch(i);
-					values = [picked];
+					const resolved = await resolveCustom(sub.options, values);
+					if (resolved === null) return cancelBatch(i);
+					answered[i] = { question: sub.question, options: labels, answers: resolved.answers, custom: resolved.custom };
+					i++;
 				}
-				const resolved = await resolveCustom(sub.options, values);
-				if (resolved === null) return cancelBatch(i);
-				answered[i] = { question: sub.question, options: labels, answers: resolved.answers, custom: resolved.custom };
-				i++;
-			}
-			const byQuestion = answered as QuestionResult[];
-			return {
-				content: [{ type: "text", text: byQuestion.flatMap((q, i) => [`Q${i + 1}: ${q.question}`, ...formatAnswerLines(q.options, q.answers, q.custom)]).join("\n") }],
-				details: {
-					question: `${subs.length} questions`,
-					options: [],
-					answers: byQuestion.flatMap((q) => q.answers),
-					custom: byQuestion.flatMap((q) => q.custom),
-					cancelled: false,
-					byQuestion,
-				} as AskDetails,
+				const byQuestion = answered as QuestionResult[];
+				return {
+					content: [{ type: "text", text: byQuestion.flatMap((q, i) => [`Q${i + 1}: ${q.question}`, ...formatAnswerLines(q.options, q.answers, q.custom)]).join("\n") }],
+					details: {
+						question: `${subs.length} questions`,
+						options: [],
+						answers: byQuestion.flatMap((q) => q.answers),
+						custom: byQuestion.flatMap((q) => q.custom),
+						cancelled: false,
+						byQuestion,
+					} as AskDetails,
+				};
+
 			};
+			const remote = offerPrompt(subs.map((q) => ({ question: q.question, options: q.options, multiSelect: q.multiSelect })));
+			try {
+				const winner = await Promise.race([
+					local().then((result) => ({ result })),
+					remote.answered.then((answers) => ({ answers })),
+				]);
+				if ("result" in winner) return winner.result;
+				abort.abort(); // close the dialog still open in the TUI
+				return remoteResult(subs, winner.answers, !(params.questions && params.questions.length > 0));
+			} finally {
+				remote.dispose();
+			}
 		},
 
 		renderCall(args, theme, _context) {

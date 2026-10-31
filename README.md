@@ -51,6 +51,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | Extension | What it does | Adds |
 |---|---|---|
 | [approval-guardian](extensions/opt-in/approval-guardian/README.md) | Fail-closed gate: a reviewer model checks risky tool calls | `/approval-guardian` |
+| [botsun-owner](extensions/opt-in/botsun-owner/README.md) | Puts this session on the phone through Botsun: status, replies, `ask` answers, slash commands, model picks, all signed |  |
 | [image-prune](extensions/opt-in/image-prune/README.md) | Shrinks big tool result images on arrival, and swaps old images for a note with their path past a size threshold | `/image-prune` |
 | [watch](extensions/opt-in/watch/README.md) | Slack, bot feed and notification watcher with digests and drafts | `/watch`, `watch_items` tool |
 | [meeting](extensions/opt-in/meeting/README.md) | Live meeting copilot: rolling notes, name and action alerts, slide summaries, and chat answers, from the transcript | `/meeting` |

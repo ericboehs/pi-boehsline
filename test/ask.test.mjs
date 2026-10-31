@@ -369,3 +369,42 @@ function drive(factory) {
 	});
 	return { comp, done: () => result, wasDone: () => called };
 }
+
+test("an answer from the phone wins the race, closes the TUI dialog, and reads like a keypress", async () => {
+	const { openPrompts } = await import("../lib/remote-prompts.ts");
+	let tool;
+	await askExtension({ registerTool: (def) => (tool = def) });
+	let closed = false;
+	// A TUI dialog that only ends when done() is called (here: by the abort the phone's answer fires).
+	const ctx = {
+		hasUI: true,
+		mode: "tui",
+		ui: {
+			custom: (factory) => new Promise((resolve) => {
+				factory({ requestRender() {} }, { fg: (_c, t) => t, bold: (t) => t, bg: (_c, t) => t }, {}, (v) => { closed = true; resolve(v); });
+			}),
+			input: async () => undefined,
+			select: async () => undefined,
+		},
+	};
+	const running = tool.execute("t1", { question: "Pizza?", options: [{ label: "Pepperoni" }, { label: "Mushrooms" }] }, undefined, undefined, ctx);
+	await new Promise((r) => setTimeout(r, 10));
+	const [prompt] = openPrompts();
+	assert.equal(prompt.questions[0].question, "Pizza?");
+	assert.equal(prompt.answer([{ picks: [0, 1] }]), "one answer for a single-choice question");
+	assert.equal(prompt.answer([{ picks: [1] }]), null);
+	const result = await running;
+	assert.equal(result.content[0].text, "User selected: 2. Mushrooms");
+	assert.ok(closed, "the TUI dialog was closed");
+	assert.equal(openPrompts().length, 0, "the question is gone once answered");
+});
+
+test("a keyboard answer withdraws the question from the phone", async () => {
+	const { openPrompts } = await import("../lib/remote-prompts.ts");
+	let tool;
+	await askExtension({ registerTool: (def) => (tool = def) });
+	const ctx = { hasUI: true, mode: "rpc", ui: { select: async () => "1. Pepperoni", input: async () => undefined } };
+	const result = await tool.execute("t1", { question: "Pizza?", options: [{ label: "Pepperoni" }, { label: "Mushrooms" }] }, undefined, undefined, ctx);
+	assert.equal(result.content[0].text, "User selected: 1. Pepperoni");
+	assert.equal(openPrompts().length, 0);
+});

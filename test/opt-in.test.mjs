@@ -8,7 +8,7 @@ import { optIns } from "../lib/config.ts";
 // Point the user file somewhere empty so Eric's real config can't leak in.
 process.env.BOEHSLINE_CONFIG = join(mkdtempSync(join(tmpdir(), "boehsline-")), "none.json");
 
-const OPT_INS = ["approval-guardian", "image-prune", "meeting", "omlx", "sc", "tmux-attention", "update", "watch", "wiki-session-log"];
+const OPT_INS = ["approval-guardian", "image-prune", "meeting", "omlx", "sc", "tmux-attention", "botsun-owner", "update", "watch", "wiki-session-log"];
 
 /** A pi stub that records every registration. */
 function recorder() {
