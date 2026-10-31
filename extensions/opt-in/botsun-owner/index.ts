@@ -13,7 +13,7 @@
 // lib/signing-v2.ts) are both taken, and each device's key is pinned on first
 // use (pins.ts): a changed key, or a new device once one is pinned, needs a
 // yes at the keyboard. A device's first verified v2 request ratchets it: v1
-// from it is refused after that (recorded in pins.json too). A sensitive
+// from it is refused after that (recorded in sign-versions.json, next to pins.json). A sensitive
 // prompt takes only a v2 answer.
 //
 // Best effort throughout: a missing socket or a refused connection is normal
@@ -30,7 +30,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { optIn } from "../../../lib/opt-in.ts";
 import { canonicalAnswer, canonicalAnswerV2, invalidAnswer, onPromptsChange, openPrompts, type RemotePrompt } from "../../../lib/remote-prompts.ts";
 import { messageV2, validScope } from "../../../lib/signing-v2.ts";
-import { checkPin, pin, ratchet, shortFingerprint, signVersionOf, type KeyKind } from "./pins.ts";
+import { checkPin, isPinsError, pin, ratchet, shortFingerprint, signVersionOf, type KeyKind } from "./pins.ts";
 import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
 
@@ -103,7 +103,7 @@ interface Conn {
 	/** Stops the running turn as Esc does: "stopped", or "idle" when nothing is running. */
 	stop?: () => string;
 	/** A call's verified words, held until the voice helper releases them (session-voice plan). */
-	held?: Map<string, { text: string; at: number; proposal?: string; sigV?: 1 | 2 }>;
+	held?: Map<string, { text: string; at: number; proposal?: string; sigV?: 1 | 2; deviceId?: string }>;
 	/** The keyboard's yes/no (ctx.ui.confirm), for pinning a device whose key changed or that's new. */
 	confirm?: (title: string, message: string) => Promise<boolean>;
 	/** Pin confirms open now (kind:device; at most one), so retries and minted keys don't stack dialogs. */
@@ -293,7 +293,7 @@ function verifyDevice(c: Conn, r: Record<string, unknown>, spec: SignSpec, keyKi
 		try {
 			if (signVersionOf(deviceId) === 2) return V1_REFUSED;
 		} catch (e) {
-			return (e as Error).message.startsWith("device pins") ? (e as Error).message : "couldn't read the device pins";
+			return isPinsError(e) ? (e as Error).message : "couldn't read the device's signing version";
 		}
 	}
 	const pinCheck = checkPin(keyKind, deviceId, key);
@@ -305,8 +305,7 @@ function verifyDevice(c: Conn, r: Record<string, unknown>, spec: SignSpec, keyKi
 		try {
 			ratchet(deviceId);
 		} catch (e) {
-			const msg = (e as Error).message;
-			return msg.startsWith("device pins file") || msg.startsWith("device pins dir") ? msg : "couldn't record the device's signing version";
+			return isPinsError(e) ? (e as Error).message : "couldn't record the device's signing version";
 		}
 	}
 	return null;
@@ -460,7 +459,8 @@ function sayAudio(c: Conn, r: Record<string, unknown>): Record<string, unknown> 
 		if (held.size >= HELD_MAX) return { error: "too many words are waiting; release or drop some" };
 		const id = randomBytes(6).toString("hex");
 		// A v2-signed utterance carries a v2 proposal hash (canonicalAnswerV2 for an ask).
-		held.set(id, { text, at: Date.now(), ...(proposal ? { proposal, sigV: sigVersion(r) ?? 1 } : {}) });
+		// The device too: a v1 reply held before the device ratcheted isn't confirmed after (confirmHeld).
+		held.set(id, { text, at: Date.now(), ...(proposal ? { proposal, sigV: sigVersion(r) ?? 1, deviceId: deviceIdOf(r) } : {}) });
 		writeHeld(c);
 		debug(`owner say_audio held (${text.length} chars)`);
 		return { ok: true, held: id };
@@ -550,6 +550,14 @@ function confirmHeld(c: Conn, r: Record<string, unknown>): Record<string, unknow
 	// Whatever happens next, these words are spent: a failed confirm never leaves them to retry.
 	c.held?.delete(id);
 	writeHeld(c);
+	// The ratchet, again: v1 words held from before the device's first v2 don't count after it.
+	if (h.sigV !== 2) {
+		try {
+			if (!h.deviceId || signVersionOf(h.deviceId) === 2) return { error: V1_REFUSED };
+		} catch (e) {
+			return { error: isPinsError(e) ? (e as Error).message : "couldn't read the device's signing version" };
+		}
+	}
 	if (v2 && !prompt) return { error: "that question was already answered" };
 	if (digest !== h.proposal) return { error: `his yes was for a different ${isText ? "message" : "answer"}` };
 	// A secret's approval (op-broker) takes a device-signed tap or the keyboard, never a spoken yes.

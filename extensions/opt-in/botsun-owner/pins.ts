@@ -12,11 +12,13 @@
  * 0700 dir of Eric's, written atomically (temp file + rename) under an O_EXCL lock file so two
  * pi processes don't lose each other's pins. Decision and call keys are pinned apart.
  *
- * Signing ratchet: the same file records, per device id, that the device has signed v2
- * ("botsun-sign-v2"): the first v2 request that verifies (and passes the pin) records
- * sign_version 2 under sign_versions, shared by the device's decision and call keys. From then on
- * a v1 request from that device is refused, so a compromised Botsun can't downgrade it to v1
- * (whose ask answers don't cover the question text). Deleting pins.json resets pins and ratchets.
+ * Signing ratchet: sign-versions.json, next to pins.json (same dir, same lock, same strictness),
+ * records per device id that the device has signed v2 ("botsun-sign-v2"): the first v2 request
+ * that verifies (and passes the pin) records sign_version 2, shared by the device's decision and
+ * call keys. From then on a v1 request from that device is refused, so a compromised Botsun can't
+ * downgrade it to v1 (whose ask answers don't cover the question text). It's a file of its own so
+ * a pi session still running the pins.ts from before the ratchet (which rewrites pins.json with
+ * only the sections it knows) can't clear it. Deleting sign-versions.json resets the ratchets.
  *
  * What this can't do: anything running as Eric's user can rewrite pins.json (or this file).
  */
@@ -32,6 +34,7 @@ export type KeyKind = "decide" | "call";
 
 export const pinDir = (): string => process.env.BOTSUN_OWNER_PIN_DIR || join(homedir(), ".local", "state", "pi-botsun-owner");
 export const pinPath = (): string => join(pinDir(), "pins.json");
+export const signVersionsPath = (): string => join(pinDir(), "sign-versions.json");
 const lockPath = (): string => join(pinDir(), "pins.lock");
 
 /** A lock file older than this is a crashed writer's: it's broken. */
@@ -47,17 +50,16 @@ export const shortFingerprint = (fp: string): string => fp.slice(0, 16).match(/.
 
 interface PinEntry { sha256: string; at: string }
 interface RatchetEntry { sign_version: 2; at: string }
-interface PinFile {
+interface PinFile { version: 1; devices: Record<string, PinEntry>; call_devices: Record<string, PinEntry> }
+interface SignVersionsFile {
 	version: 1;
-	devices: Record<string, PinEntry>;
-	call_devices: Record<string, PinEntry>;
 	/** device id → the signing version it has moved to (only 2 so far): v1 from it is refused. */
 	sign_versions: Record<string, RatchetEntry>;
 }
 
 const section = (kind: KeyKind): "devices" | "call_devices" => (kind === "call" ? "call_devices" : "devices");
 const otherSection = (kind: KeyKind): "devices" | "call_devices" => (kind === "call" ? "devices" : "call_devices");
-const empty = (): PinFile => ({ version: 1, devices: {}, call_devices: {}, sign_versions: {} });
+const empty = (): PinFile => ({ version: 1, devices: {}, call_devices: {} });
 const myUid = (): number | null => (typeof process.getuid === "function" ? process.getuid() : null);
 
 /**
@@ -83,7 +85,13 @@ function checkDir(create: boolean): boolean {
 	return true;
 }
 
-const malformed = (): Error => new Error("device pins file is malformed");
+/** The two files: what their errors call them. Every error starts "device pins" (see isPinsError). */
+const PINS = "device pins file";
+const SIGN_VERSIONS = "device pins sign-versions file";
+const malformed = (what = PINS): Error => new Error(`${what} is malformed`);
+
+/** One of this module's own errors about the pin dir or files (shown as is), not an I/O one. */
+export const isPinsError = (e: unknown): boolean => /^device pins (dir|file|sign-versions file) /.test((e as Error)?.message ?? "");
 
 /** One section of the file: every entry must be a pin, or the whole file is refused (never "not pinned"). */
 function pick(o: unknown): Record<string, PinEntry> {
@@ -102,24 +110,27 @@ function pick(o: unknown): Record<string, PinEntry> {
 function pickRatchets(o: unknown): Record<string, RatchetEntry> {
 	const out: Record<string, RatchetEntry> = {};
 	if (o === undefined) return out;
-	if (!o || typeof o !== "object" || Array.isArray(o)) throw malformed();
+	if (!o || typeof o !== "object" || Array.isArray(o)) throw malformed(SIGN_VERSIONS);
 	for (const [id, e] of Object.entries(o as Record<string, unknown>)) {
-		if (!e || typeof e !== "object" || (e as RatchetEntry).sign_version !== 2) throw malformed();
+		if (!e || typeof e !== "object" || (e as RatchetEntry).sign_version !== 2) throw malformed(SIGN_VERSIONS);
 		out[id] = { sign_version: 2, at: String((e as RatchetEntry).at ?? "") };
 	}
 	return out;
 }
 
-/** The pin file, or an empty one when there is none. Throws on a file others could have written, or a malformed one. */
-export function readPins(): PinFile {
-	if (!checkDir(false)) return empty();
+/**
+ * One of the files as a JSON object, or null when there is none. Throws on a file others could
+ * have written, or a malformed one.
+ */
+function readStrict(path: string, what: string): Record<string, unknown> | null {
+	if (!checkDir(false)) return null;
 	let fd: number;
 	try {
-		fd = openSync(pinPath(), constants.O_RDONLY | constants.O_NOFOLLOW);
+		fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
 	} catch (e) {
 		const code = (e as NodeJS.ErrnoException).code;
-		if (code === "ENOENT") return empty();
-		if (code === "ELOOP") throw new Error("device pins file must be a regular 0600 file of Eric's");
+		if (code === "ENOENT") return null;
+		if (code === "ELOOP") throw new Error(`${what} must be a regular 0600 file of Eric's`);
 		throw e;
 	}
 	let text: string;
@@ -127,7 +138,7 @@ export function readPins(): PinFile {
 		const st = fstatSync(fd);
 		const uid = myUid();
 		if (!st.isFile() || (st.mode & 0o077) !== 0 || (uid !== null && st.uid !== uid)) {
-			throw new Error("device pins file must be a regular 0600 file of Eric's");
+			throw new Error(`${what} must be a regular 0600 file of Eric's`);
 		}
 		text = readFileSync(fd, "utf8");
 	} finally {
@@ -137,30 +148,44 @@ export function readPins(): PinFile {
 	try {
 		raw = JSON.parse(text);
 	} catch {
-		throw malformed();
+		throw malformed(what);
 	}
-	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw malformed();
-	const r = raw as Record<string, unknown>;
-	return { version: 1, devices: pick(r.devices), call_devices: pick(r.call_devices), sign_versions: pickRatchets(r.sign_versions) };
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw malformed(what);
+	return raw as Record<string, unknown>;
 }
 
-function writePins(file: PinFile): void {
+/** The pin file, or an empty one when there is none. Throws on a file others could have written, or a malformed one. */
+export function readPins(): PinFile {
+	const r = readStrict(pinPath(), PINS);
+	return r ? { version: 1, devices: pick(r.devices), call_devices: pick(r.call_devices) } : empty();
+}
+
+/** The ratchet file, or an empty one when there is none. Throws like readPins. */
+function readSignVersions(): SignVersionsFile {
+	const r = readStrict(signVersionsPath(), SIGN_VERSIONS);
+	return { version: 1, sign_versions: r ? pickRatchets(r.sign_versions) : {} };
+}
+
+/** Writes one of the files atomically: a 0600 temp file, then a rename over it. */
+function writeAtomic(path: string, data: unknown): void {
 	const dir = pinDir();
 	const tmp = join(dir, `.pins.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
 	try {
 		const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
 		try {
-			writeSync(fd, `${JSON.stringify(file, null, 2)}\n`);
+			writeSync(fd, `${JSON.stringify(data, null, 2)}\n`);
 			fsyncSync(fd);
 		} finally {
 			closeSync(fd);
 		}
-		renameSync(tmp, pinPath());
+		renameSync(tmp, path);
 	} catch (e) {
 		try { unlinkSync(tmp); } catch {}
 		throw e;
 	}
 }
+
+const writePins = (file: PinFile): void => writeAtomic(pinPath(), file);
 
 /**
  * Breaks a lock file judged stale, whose contents were seen. Moved aside first, so only one waiter
@@ -293,10 +318,9 @@ export function checkPin(kind: KeyKind, deviceId: string, raw: Buffer): PinCheck
 	}
 }
 
-/** The signing version a device has ratcheted to (2), or 1 when none. Throws on an unreadable pin file. */
+/** The signing version a device has ratcheted to (2), or 1 when none. Throws on an unreadable sign-versions file. */
 export function signVersionOf(deviceId: string): 1 | 2 {
-	const file = readPins();
-	return Object.hasOwn(file.sign_versions, deviceId) ? 2 : 1;
+	return Object.hasOwn(readSignVersions().sign_versions, deviceId) ? 2 : 1;
 }
 
 /**
@@ -306,9 +330,9 @@ export function signVersionOf(deviceId: string): 1 | 2 {
 export function ratchet(deviceId: string): void {
 	if (signVersionOf(deviceId) === 2) return;
 	withLock(() => {
-		const file = readPins();
+		const file = readSignVersions();
 		if (Object.hasOwn(file.sign_versions, deviceId)) return;
 		file.sign_versions[deviceId] = { sign_version: 2, at: new Date().toISOString() };
-		writePins(file);
+		writeAtomic(signVersionsPath(), file);
 	});
 }
