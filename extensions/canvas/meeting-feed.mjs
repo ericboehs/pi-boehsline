@@ -26,7 +26,8 @@
 // without a trailing -ax, else the file name's token (teams|zoom|meet|slack;
 // older names have none); a <base>-merged.jsonl hides the fragments it lists
 // (merged_from) and takes their slides, numbered consecutively in fragment order;
-// a title like "Meeting join…" is replaced by the file name's slug; files under
+// a title like "Meeting join…" is replaced by the shared window's title (the
+// "Shared content | <meeting>" line atop a slide's OCR), else the file name's slug; files under
 // 300 bytes and the Slack notification captures are not meetings.
 //
 // Nothing here touches the network or copies a file: the daemon serves slides
@@ -35,7 +36,7 @@
 import { createHash } from "node:crypto";
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 export const MEETING_STATE_DIR = resolve(process.env.MEETING_CAPTURE_STATE_DIR || join(homedir(), ".local", "state", "meeting-capture"));
 
@@ -312,6 +313,7 @@ const ID_RE = /^[0-9a-f]{12}$/;
 const FILE_RE = /^(\d{8})_(\d{6})-(.+)\.jsonl$/;
 const APP_TOKENS = new Set(["teams", "zoom", "meet", "slack"]);
 const MIN_BYTES = 300; // a smaller file is a stub, not a meeting
+const SHARED_TITLE_MS = 5_000;
 const NOISE_RE = /-slack-notifications(-|\.)/;
 const FRAGMENT_RE = /^\d{8}_\d{6}-[\w.-]+$/;
 
@@ -348,11 +350,40 @@ function slugTitle(slug) {
   return t.charAt(0).toUpperCase() + t.slice(1);
 }
 
-/** The title shown: the metadata's meeting unless it is empty or junk ("Meeting join…"), then the slug. */
-function titleOf(meta, name) {
-  const t = str(meta?.meeting, 300).trim();
-  return t && !/^Meeting join/i.test(t) ? t : slugTitle(name[4]) || t;
+/** Empty or "Meeting join…": what meeting-capture records before Teams shows the meeting's real name. */
+export const isJunkTitle = (t) => !String(t ?? "").trim() || /^\s*meeting join/i.test(t);
+
+/** The shared window's title from OCR text whose first line is Teams' "Shared content | <meeting>" bar, else "". */
+export function sharedTitle(text) {
+  const line = String(text ?? "").replace(/\r/g, "").split("\n").find((l) => l.trim()) ?? "";
+  return /^\s*Shared content\s*\|\s*(.+?)\s*$/i.exec(line)?.[1]?.slice(0, 300) ?? "";
 }
+
+/** The shared window's title from the OCR of the newest slides (up to 3, each { file, dir? }), "" without one. Reads at most 1 KB a slide. */
+function sharedTitleFrom(slides, slidesDir) {
+  for (const s of slides.slice(-3).reverse()) {
+    const dir = s.dir || slidesDir;
+    if (!dir || !s.file) continue;
+    let t = "";
+    try {
+      t = readRange(join(dir, s.file.replace(/\.jpg$/, ".txt")), 0, 1024).toString("utf8");
+    } catch {}
+    const title = sharedTitle(t);
+    if (title) return title;
+  }
+  return "";
+}
+
+/** The title shown: the recorded one unless it is empty or junk ("Meeting join…"), then the shared window's title, then the file name's slug, else the recorded one. */
+export function displayTitle(raw, { shared = "", slug = "" } = {}) {
+  const t = String(raw ?? "").trim();
+  if (!isJunkTitle(t)) return t;
+  if (shared && !isJunkTitle(shared)) return shared;
+  const s = slugTitle(slug);
+  return s && !isJunkTitle(s) ? s : t;
+}
+/** The slug of a capture file's path ("" when the name isn't one). */
+const slugOf = (path) => (path ? splitName(basename(path))?.[4] ?? "" : "");
 const pad2 = (n) => String(n).padStart(2, "0");
 /** "1:02:03" from milliseconds, "" for nonsense. */
 const hms = (ms) => {
@@ -502,7 +533,7 @@ function parseMeetingFile(path, name, size = 0) {
     slidesDir,
     app: str(meta?.app, 80),
     appId,
-    title: titleOf(meta, name),
+    title: displayTitle(meta?.meeting, { shared: isJunkTitle(str(meta?.meeting, 300)) ? sharedTitleFrom(slideIndex, slidesDir) : "", slug: name[4] }),
     startedAt,
     startedMs,
     endedAt,
@@ -562,6 +593,9 @@ export class MeetingFeed {
     this.rawNotes = null; // the file as read: { pid, startedAt, notes }
     this.notes = null; // what counts: it names this meeting and its session is there, or it ended
     this.state = null;
+    this.rawState = null; // parsed state.json as written; state is the same with the shown title
+    this.shared = ""; // the live meeting's shared window title, from slide OCR
+    this.sharedAt = 0;
     this.id = "";
     this.entries = [];
     this.slides = [];
@@ -588,9 +622,12 @@ export class MeetingFeed {
         mtimeMs = statSync(statePath).mtimeMs;
       } catch {}
       const next = parseState(raw, { mtimeMs, alive: this.alive });
-      if (JSON.stringify(next) !== JSON.stringify(this.state)) {
+      if (JSON.stringify(next) !== JSON.stringify(this.rawState)) {
+        this.rawState = next;
         const id = meetingId(next);
         if (id !== this.id) {
+          this.shared = "";
+          this.sharedAt = 0;
           this.entries = [];
           this.slides = [];
           this.live = [];
@@ -599,7 +636,8 @@ export class MeetingFeed {
           this.sigs.live = "";
           this.sigs.index = "";
         }
-        this.state = next;
+        // state.title is what the pages show; rawState keeps what meeting-capture wrote.
+        this.state = next && { ...next, title: displayTitle(next.title, { shared: this.shared, slug: slugOf(next.jsonl) }) };
         this.id = id;
         if (next?.jsonl) this.lastDataDir = dirname(next.jsonl);
         final = true;
@@ -632,6 +670,17 @@ export class MeetingFeed {
           if (i >= 0) this.slides[i] = s;
           else this.slides.push(s);
         }
+        final = true;
+      }
+    }
+
+    // "Meeting join…": look for the shared window's title atop the newest slides' OCR, at most every 5 s (the OCR lands a few seconds after its slide).
+    if (st.slidesDir && this.slides.length && !this.shared && isJunkTitle(this.rawState?.title) && this.now() - this.sharedAt >= SHARED_TITLE_MS) {
+      this.sharedAt = this.now();
+      const t = sharedTitleFrom([...this.slides].sort((a, b) => a.n - b.n), st.slidesDir);
+      if (t) {
+        this.shared = t;
+        this.state = { ...this.state, title: displayTitle(this.rawState.title, { shared: t, slug: slugOf(this.rawState.jsonl) }) };
         final = true;
       }
     }

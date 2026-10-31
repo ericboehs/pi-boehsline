@@ -132,7 +132,14 @@ export function cleanOcr(text: string, max = SLIDE_OCR_MAX): string {
 	return t.length > max ? `${t.slice(0, max)}\n[… cut]` : t;
 }
 
-export type OcrWait = { text: string; state: "ready" | "empty" | "timeout" | "aborted" };
+/** The shared window's title from OCR text whose first line is Teams' "Shared content | <meeting>" bar, else "". */
+export function sharedTitle(text: string): string {
+	const line = text.replace(/\r/g, "").split("\n").find((l) => l.trim()) ?? "";
+	return /^\s*Shared content\s*\|\s*(.+?)\s*$/i.exec(line)?.[1]?.slice(0, 300) ?? "";
+}
+
+/** `shared`: the window title cleanOcr dropped (see sharedTitle), "" without one. */
+export type OcrWait = { text: string; state: "ready" | "empty" | "timeout" | "aborted"; shared?: string };
 
 /**
  * Wait for meeting-capture's OCR file. `read` gives null while the file is
@@ -154,7 +161,8 @@ export async function waitForOcr(
 		const raw = await read();
 		if (raw !== null) {
 			const text = cleanOcr(raw);
-			return text ? { text, state: "ready" } : { text: "", state: "empty" };
+			const shared = sharedTitle(raw);
+			return { text, state: text ? "ready" : "empty", ...(shared ? { shared } : {}) };
 		}
 		if ((typeof o.noWait === "function" ? o.noWait() : o.noWait) || now() - t0 >= timeoutMs) return { text: "", state: "timeout" };
 		await sleep(Math.min(pollMs, Math.max(1, timeoutMs - (now() - t0))));

@@ -489,6 +489,32 @@ export function parseIndex(text: string): SlideEntry[] {
 
 export const slideFile = (dir: string, e: Pick<SlideEntry, "file">) => path.join(dir, path.basename(e.file));
 
+// ── titles ───────────────────────────────────────────────────────────────────
+
+/** Empty or "Meeting join…": what meeting-capture records before Teams shows the meeting's real name. */
+export const isJunkTitle = (t: string) => !t.trim() || /^\s*meeting join/i.test(t);
+
+/** A capture file's name as a title: "20261029_070321-teams-weekly-sync-merged.jsonl" reads "Weekly sync" (stamp, app and -merged dropped). */
+export function fileTitle(file: string): string {
+	const t = path
+		.basename(file)
+		.replace(/\.(jsonl|txt)$/, "")
+		.replace(/^\d{8}_\d{6}-/, "")
+		.replace(/^(teams|zoom|meet|slack)-/i, "")
+		.replace(/-merged$/, "")
+		.replace(/-/g, " ")
+		.trim();
+	return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+/** The title to show: the recorded one unless it is junk, then the shared window's title (from slide OCR), then the file name, else the recorded one after all. */
+export function bestTitle(raw: string, o: { shared?: string; file?: string } = {}): string {
+	if (!isJunkTitle(raw)) return raw;
+	if (o.shared && !isJunkTitle(o.shared)) return o.shared;
+	const f = o.file ? fileTitle(o.file) : "";
+	return f && !isJunkTitle(f) ? f : raw;
+}
+
 /** The OCR text sits beside the jpg: 0003-141210.jpg → 0003-141210.txt. */
 export const ocrPath = (dir: string, e: Pick<SlideEntry, "file">) => slideFile(dir, e).replace(/\.jpe?g$/i, ".txt");
 
@@ -561,8 +587,8 @@ export function statusReport(i: {
 	const meeting = !s
 		? "none seen"
 		: i.stateLive
-			? `${s.title || "untitled"}${s.app ? ` (${s.app})` : ""}, live, ${elapsedLabel(i.nowMs - s.startedMs)} in`
-			: `none live; the last was ${s.title || "untitled"}${s.app ? ` (${s.app})` : ""}, ${s.ended ? `ended${s.duration ? `, ${s.duration}` : ""}` : "its recorder is gone"}`;
+			? `${bestTitle(s.title, { file: s.jsonl ?? "" }) || "untitled"}${s.app ? ` (${s.app})` : ""}, live, ${elapsedLabel(i.nowMs - s.startedMs)} in`
+			: `none live; the last was ${bestTitle(s.title, { file: s.jsonl ?? "" }) || "untitled"}${s.app ? ` (${s.app})` : ""}, ${s.ended ? `ended${s.duration ? `, ${s.duration}` : ""}` : "its recorder is gone"}`;
 	return [
 		`Armed: ${i.armed ? `yes (${i.armedBy})` : "no (/meeting watch arms this session)"}`,
 		`Owner setting: ${i.owner ? `${i.owner}${nameMatches(i.owner, i.name) ? " (this session)" : ""}` : "(none)"}${i.name ? ` · this session is ${i.name}` : ""}`,

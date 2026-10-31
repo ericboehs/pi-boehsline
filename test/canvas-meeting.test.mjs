@@ -13,7 +13,7 @@ import { join } from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { CARD_AFTER_END_MS, JsonlTail, MeetingFeed, meetingDataDir, meetingId, normalizeLive, normalizeNotes, normalizeRecord, normalizeSlide, notesDirPath, notesFilePath, parseState } from "../extensions/canvas/meeting-feed.mjs";
+import { CARD_AFTER_END_MS, displayTitle, isJunkTitle, JsonlTail, MeetingFeed, meetingDataDir, meetingId, normalizeLive, normalizeNotes, normalizeRecord, normalizeSlide, notesDirPath, notesFilePath, parseState, sharedTitle } from "../extensions/canvas/meeting-feed.mjs";
 
 // No test reads the real meeting-capture folder: this one is empty (a feed or daemon asked for a dir overrides it).
 process.env.MEETING_CAPTURE_DATA_DIR = mkdtempSync(join(tmpdir(), "canvas-meeting-empty-"));
@@ -2116,4 +2116,64 @@ test("/meeting notes: newest first, capped at 3 with Show all, topics clamp, new
   assert.equal(list("Decisions").length, 6, "Show all stays open");
   assert.deepEqual([...doc.querySelectorAll(".nbody li.fresh")].map((li) => li.firstChild.textContent), ["Decision 6"]);
   assert.equal(topic().classList.contains("full"), true, "expanded topic stays expanded");
+});
+
+test("titles: junk is empty or 'Meeting join…'; the shared window's title wins, then the slug", () => {
+  assert.deepEqual(["", "  ", "Meeting join  meeting", "meeting join - 1234", "Weekly Sync"].map(isJunkTitle), [true, true, true, true, false]);
+  assert.equal(sharedTitle("Shared content | 2026 VA Daily IT Stand-Up Briefing\nCIO Standup"), "2026 VA Daily IT Stand-Up Briefing");
+  assert.equal(sharedTitle("\n  shared content |  Platform Sync  \n"), "Platform Sync");
+  assert.equal(sharedTitle("CIO Standup\nShared content | not first"), "", "only the first line");
+  assert.equal(displayTitle("Weekly Sync", { shared: "Other", slug: "x" }), "Weekly Sync");
+  assert.equal(displayTitle("Meeting join  meeting", { shared: "Daily Stand-Up", slug: "meeting-join-meeting" }), "Daily Stand-Up");
+  assert.equal(displayTitle("Meeting join  meeting", { slug: "platform-weekly-sync" }), "Platform weekly sync");
+  assert.equal(displayTitle("Meeting join  meeting", { shared: "Meeting join", slug: "meeting-join-meeting" }), "Meeting join  meeting".trim(), "all junk: what was recorded");
+});
+
+test("live title: 'Meeting join…' becomes the shared window's title once a slide's OCR shows it, else the file name's slug", () => {
+  const f = fixture();
+  try {
+    let now = Date.parse("2026-10-30T07:05:00Z");
+    const feed = new MeetingFeed(f.state, { alive: () => true, now: () => now });
+    const jsonl = join(f.root, "data", "20261030_070210-teams-cio-standup.jsonl");
+    writeFileSync(jsonl, line({ type: "caption", speaker: "Ada", text: "hi", ts: "t" }));
+    f.writeState({ meeting: "Meeting join  meeting", jsonl });
+    feed.poll();
+    assert.equal(feed.summary().title, "Cio standup", "no slide yet: the slug");
+    assert.equal(feed.snapshot().state.title, "Cio standup");
+    writeFileSync(join(f.slides, "0001-070500.jpg"), "jpg");
+    appendFileSync(join(f.slides, "index.jsonl"), line({ n: 1, file: "0001-070500.jpg" }));
+    feed.poll();
+    assert.equal(feed.summary().title, "Cio standup", "no OCR yet");
+    writeFileSync(join(f.slides, "0001-070500.txt"), "Shared content | 2026 VA Daily IT Stand-Up Briefing\nCIO Standup Briefing");
+    feed.poll();
+    assert.equal(feed.summary().title, "Cio standup", "rechecked at most every 5 s");
+    now += 5_000;
+    feed.poll();
+    assert.equal(feed.summary().title, "2026 VA Daily IT Stand-Up Briefing");
+    assert.equal(feed.snapshot().state.title, "2026 VA Daily IT Stand-Up Briefing");
+    // state.json rewritten (still junk): the shared title stays.
+    f.writeState({ meeting: "Meeting join  meeting", jsonl, ended: true, ended_at: "2026-10-30T07:30:00Z" });
+    feed.poll();
+    assert.equal(feed.summary().title, "2026 VA Daily IT Stand-Up Briefing");
+  } finally {
+    f.done();
+  }
+});
+
+test("history title: a junk title takes the shared window's title from the slides' OCR before the slug", () => {
+  const d = dataFeed();
+  try {
+    const t = (hms) => `2026-10-31T${hms}Z`;
+    const name = "20261031_090000-teams-meeting-join-meeting";
+    rawMeeting(d.dir, `${name}.jsonl`, [{ type: "metadata", app: "Teams", app_id: "teams", meeting: "Meeting join  meeting", recorded_at: t("09:00:00") }, cap(t("09:00:05"))]);
+    const sd = join(d.dir, `${name}.slides`);
+    mkdirSync(sd);
+    writeFileSync(join(sd, "index.jsonl"), line({ n: 1, file: "0001-090100.jpg" }) + line({ n: 2, file: "0002-090200.jpg" }));
+    writeFileSync(join(sd, "0001-090100.txt"), "Shared content | Platform Weekly Sync\nAgenda");
+    writeFileSync(join(sd, "0002-090200.txt"), "");
+    rawMeeting(d.dir, "20261031_100000-teams-meeting-join-meeting.jsonl", [{ type: "metadata", app: "Teams", app_id: "teams", meeting: "Meeting join  meeting", recorded_at: t("10:00:00") }, cap(t("10:00:05"))]);
+    assert.deepEqual(d.feed.history().map((m) => m.title), ["Meeting join  meeting", "Platform Weekly Sync"], "no slides and a junk slug: as recorded");
+  } finally {
+    d.done();
+  }
 });

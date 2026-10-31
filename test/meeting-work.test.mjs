@@ -234,7 +234,7 @@ function world(t, { owner = "earl" } = {}) {
 		lockPath,
 		lock: () => JSON.parse(fs.readFileSync(lockPath, "utf8")),
 		/** A finished-or-running capture: captions, chat, people, 3 slides, a revisit. Returns the state record. */
-		capture(over = {}, { startedAt = Date.now() - 16 * 60_000, name = "weekly-sync" } = {}) {
+		capture(over = {}, { startedAt = Date.now() - 16 * 60_000, name = "weekly-sync", title = "Weekly Sync" } = {}) {
 			const base = path.join(root, "data", `20261028_140000-teams-${name}`);
 			const slides = `${base}.slides`;
 			fs.mkdirSync(slides, { recursive: true });
@@ -251,7 +251,7 @@ function world(t, { owner = "earl" } = {}) {
 			fs.writeFileSync(
 				`${base}.jsonl`,
 				[
-					{ type: "metadata", meeting: "Weekly Sync", app: "Microsoft Teams", meeting_started_at: at(0) },
+					{ type: "metadata", meeting: title, app: "Microsoft Teams", meeting_started_at: at(0) },
 					{ type: "caption", speaker: "Ada Lovelace", text: "Morning everyone, let's start.", ts: at(0.5) },
 					{ type: "people", count: 3, people: ["Ada Lovelace", "Smith, Amy (ORG)", "Alan Turing"], ts: at(0.6) },
 					{ type: "slide", slide: 1, file: "0001-140100.jpg", ts: at(1) },
@@ -1299,4 +1299,19 @@ test("the notes file says whether slide summaries run: off by setting, or withou
 		assert.deepEqual(file.slidesFailed, []);
 		delete process.env.PI_MEETING_SLIDES;
 	}
+});
+
+test("a 'Meeting join…' title: the copilot takes the shared window's title from the slides' OCR, else the file name", async (t) => {
+	const w = world(t);
+	const junk = "Meeting join  meeting";
+	const state = w.capture({ meeting: junk }, { name: "meeting-join-meeting", title: junk });
+	fs.writeFileSync(path.join(state.slides_dir, "0002-141000.txt"), "Shared content | Platform Weekly Sync\nCert rotation plan\n");
+	const earl = w.session("earl");
+	await earl.fire("session_start");
+	await until(() => earl.started() === 1, "the copilot to start");
+	await until(() => earl.emits.some(([n, d]) => n === "meeting:state" && d.active && d.title === "Platform Weekly Sync"), "the shared title");
+	assert.equal(earl.emits.some(([n, d]) => n === "meeting:state" && d.title === junk), false, "the junk title never shows");
+	assert.match(await earl.toolText({ action: "status" }), /Platform Weekly Sync/);
+	assert.match(earl.sent.find((m) => /^Meeting copilot on "/.test(m.content)).content, /^Meeting copilot on "Platform Weekly Sync"/);
+	await earl.fire("session_shutdown");
 });

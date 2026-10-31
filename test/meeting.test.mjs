@@ -128,7 +128,8 @@ import {
 	normFailed,
 	ocrTimeout,
 } from "../extensions/opt-in/meeting/index.ts";
-import { clip } from "../extensions/opt-in/meeting/slides.ts";
+import { clip, sharedTitle } from "../extensions/opt-in/meeting/slides.ts";
+import { bestTitle, fileTitle, isJunkTitle } from "../extensions/opt-in/meeting/capture.ts";
 import { MEETING_DEFAULTS, meetingSettings } from "../extensions/opt-in/watch/settings.ts";
 
 import { estTokens, PROMPT_MAX_TOKENS } from "../extensions/opt-in/watch/models.ts";
@@ -1339,12 +1340,12 @@ test("waiting for the OCR: missing waits, 0 bytes is no text, a timeout goes on 
 	// Missing twice, then there.
 	let calls = 0;
 	const late = await waitForOcr(async () => (++calls < 3 ? null : "Shared content | Teams\nHello"), { sleep, now });
-	assert.deepEqual(late, { text: "Hello", state: "ready" });
+	assert.deepEqual(late, { text: "Hello", state: "ready", shared: "Teams" }, "the window title is dropped from the text and handed back");
 	assert.deepEqual(sleeps, [1000, 1000]);
 	// 0 bytes: complete, no text, no waiting.
 	sleeps.length = 0;
 	assert.deepEqual(await waitForOcr(async () => "", { sleep, now }), { text: "", state: "empty" });
-	assert.deepEqual(await waitForOcr(async () => "Shared content | Window title only\n", { sleep, now }), { text: "", state: "empty" });
+	assert.deepEqual(await waitForOcr(async () => "Shared content | Window title only\n", { sleep, now }), { text: "", state: "empty", shared: "Window title only" });
 	assert.deepEqual(sleeps, []);
 	// Never written: 90 s, then the image alone.
 	t = 0;
@@ -1603,4 +1604,17 @@ test("clip: cuts on a word boundary with an ellipsis, never mid-word", () => {
 	assert.equal(c, "and that auto-scaling should\u2026");
 	assert.equal(clip("ends with a comma, then more words here", 20), "ends with a comma\u2026", "trailing punctuation dropped");
 	assert.equal(clip("x".repeat(50), 10), `${"x".repeat(9)}\u2026`, "one long word is cut hard");
+});
+
+test("copilot titles: 'Meeting join…' gives way to the shared window's title, then the file name", () => {
+	assert.equal(isJunkTitle("Meeting join  meeting"), true);
+	assert.equal(isJunkTitle("Weekly Sync"), false);
+	assert.equal(fileTitle("/d/20261029_070321-teams-2026-va-daily-it-stand-up-briefing-merged.jsonl"), "2026 va daily it stand up briefing");
+	assert.equal(fileTitle("20261029_070321-weekly-sync.jsonl"), "Weekly sync", "older names have no app token");
+	assert.equal(bestTitle("Weekly Sync", { shared: "x", file: "y" }), "Weekly Sync");
+	assert.equal(bestTitle("Meeting join  meeting", { shared: "2026 VA Daily IT Stand-Up Briefing", file: "/d/20261030_070210-teams-meeting-join-meeting.jsonl" }), "2026 VA Daily IT Stand-Up Briefing");
+	assert.equal(bestTitle("Meeting join  meeting", { file: "/d/20261030_070210-teams-cio-standup.jsonl" }), "Cio standup");
+	assert.equal(bestTitle("Meeting join  meeting", { file: "/d/20261030_070210-teams-meeting-join-meeting.jsonl" }), "Meeting join  meeting", "all junk: as recorded");
+	assert.equal(sharedTitle("Shared content | Platform Sync\nAgenda"), "Platform Sync");
+	assert.equal(sharedTitle("Agenda"), "");
 });

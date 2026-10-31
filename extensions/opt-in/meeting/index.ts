@@ -162,6 +162,8 @@ import {
 	isLive,
 	isMine,
 	type LiveLine,
+	bestTitle,
+	isJunkTitle,
 	lastPeople,
 	lockPath,
 	markStopped,
@@ -238,6 +240,7 @@ import {
 	formatSlideSummary,
 	nearbyLines,
 	newSlideWork,
+	sharedTitle,
 	markSlideDone,
 	noteSlideCall,
 	ocrTimeout,
@@ -517,7 +520,9 @@ type Meeting = {
 		last: number; // ms of the last
 		slidesDir: string | null;
 	};
-	title: string;
+	title: string; // shown: rawTitle unless junk ("Meeting join…"), see bestTitle
+	rawTitle: string; // what meeting-capture recorded
+	sharedTitle: string; // the shared window's title from a slide's OCR, "" until one is seen
 	app: string;
 	startedMs: number;
 	people: string[];
@@ -584,6 +589,16 @@ async function readTail(file: string, max: number): Promise<string> {
 	} catch {
 		return "";
 	}
+}
+
+/** The shared window's title from the OCR of the newest slides already shown (up to 3), "" without one. */
+async function sharedTitleOf(slidesDir: string): Promise<string> {
+	const index = parseIndex(await fs.promises.readFile(path.join(slidesDir, "index.jsonl"), "utf8").catch(() => ""));
+	for (const e of index.slice(-3).reverse()) {
+		const t = sharedTitle(await fs.promises.readFile(ocrPath(slidesDir, e), "utf8").catch(() => ""));
+		if (t) return t;
+	}
+	return "";
 }
 
 async function qmdNotes(title: string): Promise<string> {
@@ -842,7 +857,10 @@ function main(pi: ExtensionAPI) {
 		const m = st;
 		if (!m) return;
 		if (ev.kind === "meta") {
-			if (ev.title) m.title = ev.title;
+			if (ev.title) {
+				m.rawTitle = ev.title;
+				retitle(m);
+			}
 			if (ev.app) m.app = ev.app;
 			if (ev.startedAt) m.startedMs = Date.parse(ev.startedAt) || m.startedMs;
 			if (ev.stopped) {
@@ -902,6 +920,11 @@ function main(pi: ExtensionAPI) {
 		render(true);
 	}
 
+	/** The shown title from what is known: recorded, shared window, file name (see bestTitle). */
+	function retitle(m: Meeting) {
+		m.title = bestTitle(m.rawTitle, { shared: m.sharedTitle, file: m.file || m.firstFile });
+	}
+
 	async function attach(file: string, history: boolean, title = "") {
 		const m = st;
 		if (!m) return;
@@ -911,7 +934,11 @@ function main(pi: ExtensionAPI) {
 		m.offset = 0;
 		m.partial = "";
 		m.phase = "live";
-		if (!continuing) m.title = title || meetingKey(file);
+		if (!continuing) {
+			m.rawTitle = title;
+			retitle(m);
+			if (!m.title) m.title = meetingKey(file);
+		}
 		pi.events.emit("meeting:state", { active: true, title: m.title });
 		await pollFile(history); // reads the metadata line, so the title is real for qmd
 		if (st !== m) return; // stopped or shut down while reading
@@ -1203,6 +1230,13 @@ function main(pi: ExtensionAPI) {
 			noWait: () => m.phase === "ended",
 		});
 		if (ocr.state === "aborted" || st !== m) return;
+		if (ocr.shared && !m.sharedTitle) {
+			// Teams' "Shared content | <meeting>" bar: the real name when meeting-capture only had "Meeting join…".
+			m.sharedTitle = ocr.shared;
+			const was = m.title;
+			retitle(m);
+			if (m.title !== was && !m.replay) pi.events.emit("meeting:state", { active: true, title: m.title });
+		}
 		const file = slideFile(dir, entry);
 		const size = await fs.promises.stat(file).then((s) => s.size, () => -1);
 		if (size < 0) throw new Error("the slide image is missing");
@@ -1398,6 +1432,8 @@ function main(pi: ExtensionAPI) {
 			offset: 0,
 			partial: "",
 			title: "",
+			rawTitle: "",
+			sharedTitle: "",
 			app: "",
 			startedMs: 0,
 			people: [],
@@ -1445,7 +1481,10 @@ function main(pi: ExtensionAPI) {
 		if (st) return; // a replay began while the scout was being set up
 		if (g !== gen || !holding) return; // shut down, or the lock was let go, while the scout was being set up
 		m.auto = { startedAt: s.startedAt, slidesDir: s.slidesDir, appId: s.appId, via };
-		m.title = s.title;
+		m.rawTitle = s.title;
+		m.title = bestTitle(s.title, { file: s.jsonl ?? "" });
+		if (isJunkTitle(s.title) && s.slidesDir) m.sharedTitle = await sharedTitleOf(s.slidesDir);
+		if (m.sharedTitle) m.title = bestTitle(s.title, { shared: m.sharedTitle, file: s.jsonl ?? "" });
 		m.app = s.app;
 		m.startedMs = s.startedMs;
 		// After a /reload, /resume or /fork, pick the notes up where the last instance left them: no re-alerting for what it already said.
@@ -1467,7 +1506,7 @@ function main(pi: ExtensionAPI) {
 		timer = setInterval(() => void tick(), POLL_MS);
 		timer.unref?.();
 		if (s.jsonl) await attach(s.jsonl, true, s.title);
-		else if (ctx.hasUI) ctx.ui.notify(`Meeting copilot on "${s.title}": waiting for captions`);
+		else if (ctx.hasUI) ctx.ui.notify(`Meeting copilot on "${m.title}": waiting for captions`);
 		if (g !== gen) return;
 		render(true);
 	}
@@ -1581,7 +1620,7 @@ function main(pi: ExtensionAPI) {
 		const s = readState();
 		if (!s) return undefined;
 		return {
-			title: s.title,
+			title: bestTitle(s.title, { shared: st && st.auto?.startedAt === s.startedAt ? st.sharedTitle : "", file: s.jsonl ?? "" }),
 			app: s.app,
 			startedAt: s.startedAt,
 			startedMs: s.startedMs,
