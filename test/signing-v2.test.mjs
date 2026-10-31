@@ -12,7 +12,7 @@ import { digestHex, fieldsPayload, messageV2 } from "../lib/signing-v2.ts";
 
 const FIXTURE = new URL("./fixtures/signing-v2.json", import.meta.url);
 /** sha256 of the fixture as copied from Botsun; a change here means re-copying it on purpose. */
-const FIXTURE_SHA256 = "d348f488163ee98f213f0c9ececc57456e3bc05daaf8689e9b77e6abc5ecce8d";
+const FIXTURE_SHA256 = "69b760e5b74b5e97383b0990bde5fb0b0ae714fdd61ea1aa8ba5e3366122d32b";
 const BOTSUN_FIXTURE = "/Users/ericboehs/Code/github.com/ericboehs/botsun/test/fixtures/signing-v2.json";
 const P256_SPKI = Buffer.from("3059301306072a8648ce3d020106082a8648ce3d030107034200", "hex");
 
@@ -43,7 +43,7 @@ function payloadOf(v) {
 
 test("every vector: payload, digest and message match Ruby's, and the signature verifies", () => {
 	assert.equal(fixture.version, 2);
-	assert.equal(fixture.vectors.length, 13);
+	assert.equal(fixture.vectors.length, 22);
 	for (const v of fixture.vectors) {
 		const payload = payloadOf(v);
 		if ("expect_payload_b64" in v) assert.equal(Buffer.from(payload).toString("base64"), v.expect_payload_b64, v.name);
