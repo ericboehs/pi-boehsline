@@ -836,6 +836,32 @@ test("a yes on the call answers the ask only with the read-back answer's hash, a
 	offered.dispose();
 });
 
+test("a reworded message goes in only with his signed yes to that exact text", async () => {
+	const { proposalTextHash } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const { m, hold, busy } = await heldCall();
+	assert.ok((await ask({ type: "nonce" })).features.includes("confirm_text"));
+	const text = "Run the tests, then lint the changed files.";
+	const sha = proposalTextHash(text);
+	const confirm = (id, t = text, mode = "steer") => ask({ type: "confirm", id, text: t, mode });
+
+	const swapped = await hold("yeah send it", sha);
+	assert.equal((await confirm(swapped.held, "Delete the branch.")).error, "his yes was for a different message");
+	const hmm = await hold("hmm", sha);
+	assert.equal((await confirm(hmm.held)).error, "his words don't say yes");
+	assert.equal((await confirm((await hold("sure", sha)).held, text, "interrupt")).error, "bad request", "never a stop");
+	const long = "x".repeat(601);
+	assert.equal((await confirm((await hold("sure", proposalTextHash(long))).held, long)).error, "bad request", "no longer than Botsun reads back");
+	assert.equal(m.sent.length, 0);
+	busy(true);
+	const yes = await hold("yeah send it", sha);
+	assert.deepEqual(await confirm(yes.held), { ok: true, delivered: "steer" });
+	assert.deepEqual(m.sent.at(-1), { content: text, options: { deliverAs: "steer" } });
+	const later = await hold("yep", sha);
+	assert.deepEqual(await confirm(later.held, text, "queue"), { ok: true, delivered: "queue" });
+	assert.deepEqual(m.sent.at(-1).options, { deliverAs: "followUp" });
+	assert.notEqual(proposalTextHash("x"), createHash("sha256").update("x").digest("hex"), "its own namespace");
+});
+
 test("saysNo leans to no, and saysYes takes a short yes in so many words", async () => {
 	const { saysNo, saysYes } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
 	for (const t of ["no", "No, the other one", "nope", "wait", "don't", "dont", "not that", "I'm not sure", "cancel it", "hold on", "never mind",

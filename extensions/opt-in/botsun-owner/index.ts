@@ -213,7 +213,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 			try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 		})();
 		return { nonce: newNonce(c), session_id: c.sessionId,
-			features: ["say", "images", "files", "say_audio", "hold", "stop", "confirm", "stream", "ask", ...(hasStash ? ["stash"] : [])] };
+			features: ["say", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", ...(hasStash ? ["stash"] : [])] };
 	}
 	if (r.type === "say_audio") return sayAudio(c, r);
 	if (r.type === "release") return releaseHeld(c, r);
@@ -366,25 +366,52 @@ export function saysYes(text: string): boolean {
  * `ask` with it. The session checks on its own that his signed words carry this exact answer's
  * hash (canonicalAnswer) and don't say no; the helper can't write the yes, only point at it.
  */
+/** A reworded message is read back in full on the call: Botsun caps it at this too. */
+const PROPOSED_TEXT_MAX = 600;
+
+/** What a reworded message's read-back is signed over: its own namespace, never an ask answer's. */
+export function proposalTextHash(text: string): string {
+	return sha256hex(Buffer.from(`botsun-propose-text-v1\n${text}`, "utf8"));
+}
+
+/**
+ * Two kinds of proposal: an `ask` answer ({ask_id, answers}), or a message the helper reworded
+ * from his words ({text, mode}: queue after the turn, or steer in as typed). Either way the
+ * hash is recomputed here from what's about to go in.
+ */
 function confirmHeld(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
-	const { id, ask_id: askId, answers } = r;
-	if (typeof id !== "string" || typeof askId !== "string" || !Array.isArray(answers)) return { error: "bad request" };
+	const { id, ask_id: askId, answers, text, mode } = r;
+	const isText = typeof text === "string";
+	if (typeof id !== "string") return { error: "bad request" };
+	if (isText ? !text.trim() || [...text].length > PROPOSED_TEXT_MAX || (mode !== "queue" && mode !== "steer")
+		: typeof askId !== "string" || !Array.isArray(answers)) return { error: "bad request" };
+	if (isText && !c.deliver) return { error: "this session can't take released words yet; run /reload" };
 	pruneHeld(c);
 	const h = c.held?.get(id);
 	if (!h) return { error: `not waiting: ${id}` };
 	if (!h.proposal) return { error: "his words weren't a reply to a proposal" };
 	let digest: string;
 	try {
-		digest = sha256hex(Buffer.from(canonicalAnswer(askId, answers as never), "utf8"));
+		digest = isText ? proposalTextHash(text) : sha256hex(Buffer.from(canonicalAnswer(askId as string, answers as never), "utf8"));
 	} catch {
 		return { error: "bad request" };
 	}
 	// Whatever happens next, these words are spent: a failed confirm never leaves them to retry.
 	c.held?.delete(id);
 	writeHeld(c);
-	if (digest !== h.proposal) return { error: "his yes was for a different answer" };
+	if (digest !== h.proposal) return { error: `his yes was for a different ${isText ? "message" : "answer"}` };
 	if (saysNo(h.text)) return { error: "his words say no" };
 	if (!saysYes(h.text)) return { error: "his words don't say yes" };
+	if (isText) {
+		let delivered: string;
+		try {
+			delivered = c.deliver!(text, mode as "queue" | "steer");
+		} catch {
+			return { error: "couldn't put it in" };
+		}
+		debug(`owner confirm sent a reworded message (${text.length} chars, ${delivered})`);
+		return { ok: true, delivered };
+	}
 	const prompt = openPrompts().find((p) => p.id === askId);
 	if (!prompt) return { error: "that question was already answered" };
 	const error = prompt.answer(answers as never);
