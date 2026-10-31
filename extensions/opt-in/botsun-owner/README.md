@@ -24,6 +24,7 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 | `footer` | the footer's chips changed (at most once a second) | `footer` (`[{id, segments: [{text, fg?, dim?}]}]`, from `lib/footer-snapshot.ts`) |
 | `compacting` | a compaction starts (`/compact` or pi's own) / ends or fails | `reason` (`manual`, `threshold`, `overflow`; `null` when it ends) |
 | `bypass` | the approval guardian's bypass turns on or off | `active` |
+| `held` | call words held, released or dropped | `held` (`[{id, chars, at}]`: no text) |
 | `session` | `/new`, `/resume`, `/fork`: same pid, new transcript | `session_file`, `session_id`, `cwd` |
 | `bye` | pi quits | |
 
@@ -34,7 +35,9 @@ Each session also listens on its own socket, `~/.local/state/botsun/owner/<pid>.
 | request | does |
 |---|---|
 | `say` | Eric's words as if typed (steering a running turn), with photos; files are saved to `~/.local/state/botsun/inbox/<pid>/` and named in the message |
-| `say_audio` | a call into the session: the transcribed words, signed over the audio with the call key |
+| `say_audio` | a call into the session: the transcribed words, signed over the audio with the call key. With `hold: true` they're verified and held (`{ok, held: id}`) instead of put in |
+| `release` | `{ids, mode}` from the voice helper: held words go in as `queue` (a follow-up after the turn), `steer`, or `interrupt` (steer; abort the run first only when the released words themselves say stop, then send them once pi settles). It adds no words, so it isn't signed |
+| `drop` / `call_end` | forget the held words named, or all of them |
 | `answer` | answers the open `ask` question; the tool takes it as if picked at the keyboard and closes its dialog |
 | `stash` | the message stash (with the stash extension): `push` a draft, `take` one back to the phone, `drop` one; signed over `push\n<sha256(text)>`, `take\n<id>` or `drop\n<id>` |
 | `footer_tap` | flips a display chip (`dir`, `context`, `cost`, `usage`, `rate`, `timers`) as a click on the footer does, and answers with the new row; display only, so not signed |

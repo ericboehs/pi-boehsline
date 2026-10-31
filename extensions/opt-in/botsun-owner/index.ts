@@ -90,6 +90,10 @@ interface Conn {
 	command?: (text: string, busy: boolean) => string | null | undefined;
 	/** The commands the phone can run here, for its "/" list; read lazily. */
 	commands?: () => PhoneCommand[];
+	/** Delivers released call words: queued after the turn, steered in, or stopping the run first. */
+	deliver?: (text: string, mode: "queue" | "steer" | "stop") => string;
+	/** A call's verified words, held until the voice helper releases them (session-voice plan). */
+	held?: Map<string, { text: string; at: number }>;
 }
 
 const store = globalThis as unknown as { [STORE]?: Conn };
@@ -207,9 +211,12 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 			try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 		})();
 		return { nonce: newNonce(c), session_id: c.sessionId,
-			features: ["say", "images", "files", "say_audio", "stream", "ask", ...(hasStash ? ["stash"] : [])] };
+			features: ["say", "images", "files", "say_audio", "hold", "stream", "ask", ...(hasStash ? ["stash"] : [])] };
 	}
 	if (r.type === "say_audio") return sayAudio(c, r);
+	if (r.type === "release") return releaseHeld(c, r);
+	if (r.type === "drop") return dropHeld(c, r);
+	if (r.type === "call_end") return dropHeld(c, {});
 	if (r.type === "answer") return answerAsk(c, r);
 	if (r.type === "stash") return stashRequest(c, r);
 	// Display only (a chip's mode, as a click on the footer flips it): not signed, nothing acts.
@@ -292,9 +299,87 @@ function sayAudio(c: Conn, r: Record<string, unknown>): Record<string, unknown> 
 		ok = verifySignature("sha256", msg, { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"));
 	} catch {}
 	if (!ok) return { error: "signature does not verify" };
+	if (r.hold === true) {
+		// Verified now, while the nonce is fresh; delivered only when the voice helper releases it.
+		const held = (c.held ??= new Map());
+		pruneHeld(c);
+		if (held.size >= HELD_MAX) return { error: "too many words are waiting; release or drop some" };
+		const id = randomBytes(6).toString("hex");
+		held.set(id, { text, at: Date.now() });
+		writeHeld(c);
+		debug(`owner say_audio held (${text.length} chars)`);
+		return { ok: true, held: id };
+	}
 	c.inject(text, c.busy);
 	debug(`owner say_audio accepted (${text.length} chars)`);
 	return { ok: true, delivered: c.busy ? "steer" : "prompt" };
+}
+
+const HELD_MAX = 20;
+const HELD_TTL_MS = 15 * 60_000;
+
+/**
+ * One utterance of Eric's asking to stop what's running: a short one that leads with the word
+ * ("stop", "ok stop the build", "wait, cancel that"), not one that mentions it ("add a cancel
+ * button", "don't stop", "can't stop thinking about it"). Only this lets a release abort: the
+ * helper's judgment alone never does.
+ */
+export function saysStop(text: string): boolean {
+	const t = text.toLowerCase().replace(/[’']/g, "'").replace(/[^a-z' ]+/g, " ").trim();
+	const words = t.split(/\s+/).filter(Boolean);
+	if (!words.length || words.length > 8) return false;
+	if (/^(?:(?:ok|okay|hey|wait|no|please|hold on|actually|pi)\s+)*(?:stop|cancel|abort|halt)\b/.test(t)) return true;
+	// "make it stop", "tell it to stop": only that short, so "make it stop retrying the spec" isn't one.
+	return words.length <= 4 && /^(?:please\s+)?(?:make it|tell it to)\s+(?:stop|cancel|abort|halt)\b/.test(t);
+}
+
+function pruneHeld(c: Conn): void {
+	const now = Date.now();
+	for (const [id, h] of c.held ?? []) if (now - h.at > HELD_TTL_MS) c.held?.delete(id);
+}
+
+function writeHeld(c: Conn): void {
+	// Ids, sizes and times only: Botsun has the words already, from its own transcription.
+	const held = [...(c.held ?? new Map()).entries()].map(([id, h]) => ({ id, chars: h.text.length, at: new Date(h.at).toISOString() }));
+	try { write(c, "held", { held }); } catch {}
+}
+
+/**
+ * The voice helper says when and how held words go in. It can't add any: the ids name words
+ * this session verified itself. queue: after the turn. steer: into it. interrupt: steer, or
+ * stop the run first when the released words themselves say stop.
+ */
+function releaseHeld(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const { ids, mode } = r;
+	if (!Array.isArray(ids) || !ids.length || ids.length > HELD_MAX || !ids.every((i) => typeof i === "string")) return { error: "bad request" };
+	if (mode !== "queue" && mode !== "steer" && mode !== "interrupt") return { error: "mode must be queue, steer or interrupt" };
+	pruneHeld(c);
+	const missing = (ids as string[]).filter((i) => !c.held?.has(i));
+	if (missing.length) return { error: `not waiting: ${missing.join(", ")}` };
+	if (!c.deliver) return { error: "this session can't take released words yet; run /reload" };
+	const texts = (ids as string[]).map((i) => c.held?.get(i)?.text ?? "");
+	const text = texts.join("\n\n");
+	// Stop only when one of his utterances, on its own, says stop.
+	const how = mode === "queue" ? "queue" : mode === "interrupt" && texts.some(saysStop) ? "stop" : "steer";
+	let delivered: string;
+	try {
+		delivered = c.deliver(text, how);
+	} catch {
+		return { error: "couldn't put them in; they're still waiting" };
+	}
+	for (const i of ids as string[]) c.held?.delete(i); // gone only once they went in
+	writeHeld(c);
+	debug(`owner release ${ids.length} held (${how})`);
+	return { ok: true, delivered };
+}
+
+/** Forgets held words: the ids given, or all of them (a call ending). */
+function dropHeld(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const ids = Array.isArray(r.ids) ? r.ids.filter((i): i is string => typeof i === "string") : null;
+	if (ids) for (const i of ids) c.held?.delete(i);
+	else c.held?.clear();
+	writeHeld(c);
+	return { ok: true };
 }
 
 /**
@@ -746,6 +831,8 @@ function main(pi: ExtensionAPI): void {
 
 	let conn: Conn | undefined;
 	let held: Array<string | UserContent[]> = [];
+	// Words a stop released: sent once the aborted run has settled, as if typed after Esc.
+	let afterStop: string[] = [];
 
 	// The guardian's bypass, as it announces it (on start and on each change): the phone shows it.
 	pi.events?.on(GUARDIAN_BYPASS_STATE_EVENT, (state: unknown) => {
@@ -764,6 +851,26 @@ function main(pi: ExtensionAPI): void {
 			if (compacting) held.push(content);
 			else pi.sendUserMessage(content, busy ? { deliverAs: "steer" } : undefined);
 		};
+		// Released call words. queue: a follow-up once the turn ends (a prompt when idle). steer: as a
+		// typed message would. stop: abort the run, like Esc, then send them once pi settles.
+		const deliver = (text: string, mode: "queue" | "steer" | "stop"): string => {
+			const idle = ctx.isIdle();
+			if (mode === "steer" || compacting) {
+				inject(text, !idle);
+				return compacting ? "held" : idle ? "prompt" : "steer";
+			}
+			if (idle) {
+				pi.sendUserMessage(text);
+				return "prompt";
+			}
+			if (mode === "queue") {
+				pi.sendUserMessage(text, { deliverAs: "followUp" });
+				return "queue";
+			}
+			afterStop.push(text);
+			ctx.abort();
+			return "stopped";
+		};
 		const command = (text: string, busy: boolean) =>
 			compacting && /^\//.test(text.trim()) && !/^\/(model|thinking|name|bypass)\b/.test(text.trim()) ? "wait for the compaction to finish" : runCommand(pi, ctx, text, busy);
 		const commands = () => phoneCommands(pi);
@@ -777,6 +884,7 @@ function main(pi: ExtensionAPI): void {
 			conn = prev;
 			conn.sessionName = sessionName;
 			conn.inject = inject;
+			conn.deliver = deliver;
 			conn.command = command;
 			conn.commands = commands;
 			conn.models = models;
@@ -808,7 +916,7 @@ function main(pi: ExtensionAPI): void {
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
 			busy: false, prompt: null, promptDepth: 0, sessionName, ...info,
-			nonces: new Map(), inject, command, commands, models, context, model: modelOf(ctx),
+			nonces: new Map(), inject, deliver, command, commands, models, context, model: modelOf(ctx),
 		};
 		store[STORE] = conn;
 		connect(conn);
@@ -907,6 +1015,15 @@ function main(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_settled", () => {
+		if (afterStop.length) {
+			// As if typed after Esc; through inject, so a compaction starting now still holds them.
+			const text = afterStop.join("\n\n");
+			afterStop = [];
+			try {
+				if (conn && !conn.closed) conn.inject(text, false);
+				else pi.sendUserMessage(text);
+			} catch {}
+		}
 		if (!conn || conn.closed || !conn.busy) return;
 		conn.busy = false;
 		write(conn, "idle");

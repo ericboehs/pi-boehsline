@@ -721,3 +721,82 @@ test("bypass: the phone hears the guardian's state, and a signed /bypass flips i
 	assert.deepEqual(asked, [true]);
 	assert.equal(m.sent.length, 0, "nothing went to the model");
 });
+
+// Session voice, phase 1: a call's words are verified on arrival, held, and released by the helper.
+async function heldCall() {
+	const call = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: {}, call_devices: { 7: call.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	const m = await owner();
+	let idle = true;
+	let aborts = 0;
+	m.ctx.isIdle = () => idle;
+	m.ctx.abort = () => aborts++;
+	const wav = createHash("sha256").update("RIFF…audio").digest("hex");
+	const hold = async (text) => {
+		const { nonce } = await ask({ type: "nonce" });
+		const signature = cryptoSign("sha256", Buffer.from(["botsun-decide-v1", "7", nonce, "session", "sid-a", "say_audio", wav].join("\n")),
+			{ key: call.privateKey, dsaEncoding: "der" }).toString("base64");
+		return ask({ type: "say_audio", text, nonce, device_id: 7, wav_sha256: wav, signature, hold: true });
+	};
+	return { m, hold, busy: (b) => (idle = !b), aborts: () => aborts };
+}
+
+test("held call words go in only when released: queued after the turn, or steered in", async () => {
+	const { m, hold, busy } = await heldCall();
+	assert.ok((await ask({ type: "nonce" })).features.includes("hold"));
+	const a = await hold("run the tests");
+	const b = await hold("and then lint");
+	assert.match(a.held, /^[0-9a-f]{12}$/);
+	assert.equal(m.sent.length, 0, "held, not put in");
+	busy(true);
+	assert.deepEqual(await ask({ type: "release", ids: [a.held, b.held], mode: "queue" }), { ok: true, delivered: "queue" });
+	assert.deepEqual(m.sent.at(-1), { content: "run the tests\n\nand then lint", options: { deliverAs: "followUp" } });
+	assert.equal((await ask({ type: "release", ids: [a.held], mode: "queue" })).error, `not waiting: ${a.held}`, "each goes in once");
+	const c = await hold("use the staging config");
+	assert.deepEqual(await ask({ type: "release", ids: [c.held], mode: "steer" }), { ok: true, delivered: "steer" });
+	assert.deepEqual(m.sent.at(-1).options, { deliverAs: "steer" });
+	assert.equal((await ask({ type: "release", ids: ["nope"], mode: "sideways" })).error, "mode must be queue, steer or interrupt");
+});
+
+test("interrupt stops the run only when Eric's own words say stop", async () => {
+	const { m, hold, busy, aborts } = await heldCall();
+	busy(true);
+	const look = await hold("look at the failing spec instead");
+	assert.deepEqual(await ask({ type: "release", ids: [look.held], mode: "interrupt" }), { ok: true, delivered: "steer" });
+	assert.equal(aborts(), 0, "the helper's judgment alone never aborts");
+	const button = await hold("add a cancel button");
+	assert.deepEqual(await ask({ type: "release", ids: [button.held], mode: "interrupt" }), { ok: true, delivered: "steer" });
+	assert.equal(aborts(), 0, "mentioning cancel isn't asking to stop");
+	const stop = await hold("stop, that's the wrong branch");
+	assert.deepEqual(await ask({ type: "release", ids: [stop.held], mode: "interrupt" }), { ok: true, delivered: "stopped" });
+	assert.equal(aborts(), 1);
+	const before = m.sent.length;
+	busy(false);
+	await m.fire("agent_settled");
+	assert.equal(m.sent.length, before + 1, "sent once the aborted run settled");
+	assert.deepEqual(m.sent.at(-1), { content: "stop, that's the wrong branch", options: undefined });
+});
+
+test("saysStop: stop words, not their negations or lookalikes", async () => {
+	const { saysStop } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	for (const t of ["stop", "Stop!", "cancel that", "abort it", "halt", "ok stop the build", "wait, cancel that", "stop, that's the wrong branch", "make it stop", "tell it to stop"]) {
+		assert.equal(saysStop(t), true, t);
+	}
+	for (const t of ["don't stop", "do not cancel it", "never stop", "unstoppable", "the bus stops here", "keep going", "no need to stop",
+		"add a cancel button", "the halt flag is wrong", "can't stop thinking about it", "make it stop retrying the spec", "please make it stop retrying the flaky spec when the network is down"]) {
+		assert.equal(saysStop(t), false, t);
+	}
+});
+
+test("drop forgets the ids given; call_end forgets them all", async () => {
+	const { m, hold } = await heldCall();
+	const a = await hold("one");
+	const b = await hold("two");
+	const c = await hold("three");
+	assert.deepEqual(await ask({ type: "drop", ids: [a.held] }), { ok: true });
+	assert.equal((await ask({ type: "release", ids: [a.held], mode: "steer" })).error, `not waiting: ${a.held}`);
+	assert.deepEqual(await ask({ type: "call_end" }), { ok: true });
+	assert.match((await ask({ type: "release", ids: [b.held, c.held], mode: "steer" })).error, /^not waiting/);
+	assert.equal(m.sent.length, 0);
+});
