@@ -42,10 +42,7 @@ test("parseMultiPicks tolerates separators and garbage", () => {
 
 test("formatAnswerLines numbers picks and appends free text", () => {
 	assert.deepEqual(formatAnswerLines(["A", "B", "C"], ["A", "C"], []), ["User selected: 1. A, 3. C"]);
-	assert.deepEqual(formatAnswerLines(["A", "B"], [], ["moldy cheese"]), [
-		"User selected: ",
-		"User wrote: moldy cheese",
-	]);
+	assert.deepEqual(formatAnswerLines(["A", "B"], [], ["moldy cheese"]), ["User wrote: moldy cheese"]);
 });
 
 test("initialSingle/MultiValues maps prior labels back to item values", () => {
@@ -407,4 +404,9 @@ test("a keyboard answer withdraws the question from the phone", async () => {
 	const result = await tool.execute("t1", { question: "Pizza?", options: [{ label: "Pepperoni" }, { label: "Mushrooms" }] }, undefined, undefined, ctx);
 	assert.equal(result.content[0].text, "User selected: 1. Pepperoni");
 	assert.equal(openPrompts().length, 0);
+});
+
+test("formatAnswerLines leaves out the selected line for a typed-only answer", () => {
+	assert.deepEqual(formatAnswerLines(["A", "B"], [], ["Meet in the middle"]), ["User wrote: Meet in the middle"]);
+	assert.deepEqual(formatAnswerLines(["A", "B"], ["B"], ["more"]), ["User selected: 2. B", "User wrote: more"]);
 });

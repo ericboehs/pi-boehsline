@@ -114,7 +114,8 @@ export function formatRpcLabel(label: string, description?: string): string {
 /** "User selected: …" plus "User wrote: …" lines. Pure for tests. */
 export function formatAnswerLines(labels: string[], answers: string[], custom: string[]): string[] {
 	const picked = answers.map((a) => `${labels.indexOf(a) + 1}. ${a}`).join(", ");
-	const lines = [`User selected: ${picked}`];
+	// A typed-only answer has no picks: no empty "User selected:" line before it.
+	const lines = answers.length > 0 || custom.length === 0 ? [`User selected: ${picked}`] : [];
 	for (const c of custom) lines.push(`User wrote: ${c}`);
 	return lines;
 }
