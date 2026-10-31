@@ -323,3 +323,45 @@ ol.tline { list-style: none; margin: 0; padding: 0; }
 @media (prefers-color-scheme: dark) { :root { --t0:#6b675e; --t1:#ef6f5e; --t2:#5cc495; --t3:#e2b257; --t4:#6ea3ec; --t5:#c792ea; --t6:#5cc3d3; --t7:#d6d3cc; --t8:#8a8578; --t9:#ff8a7a; --t10:#7ad9ab; --t11:#f0cc70; --t12:#8fbaf2; --t13:#d8aaf2; --t14:#7ad4e2; --t15:#ffffff; } }
 .mmd { overflow-x: auto; text-align: center; }
 .mmd svg { max-width: 100%; height: auto; }
+
+/* pipeline (renderPipeline): a metro map, scrolled or wrapped into rows; the stage chips below it. */
+.pipe-head { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; margin-bottom: 6px; }
+.pipe-now { font-size: 12.5px; color: var(--dim); }
+.pipe-now.p-back { color: var(--warn); } .pipe-now.p-failed { color: var(--bad); } .pipe-now.p-active { color: var(--c1); }
+.pipe-legend { margin-left: auto; display: flex; gap: 12px; font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dim); }
+.pipe-legend i { display: inline-block; width: 16px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; background: currentColor; }
+.pipe-legend .p-active i { background: var(--c1); } .pipe-legend .p-back i { background: var(--warn); } .pipe-legend .p-done i { background: var(--ok); } .pipe-legend .p-failed i { background: var(--bad); }
+.pipe-wrap { overflow-x: auto; overscroll-behavior-x: contain; margin: 0 -4px; padding-bottom: 10px; }
+.pipe-svg { display: block; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.pipe-svg .band { fill: var(--accent); opacity: 0; transition: opacity 0.5s; }
+.pipe-svg .band.on { opacity: 0.09; transition: none; }
+.pipe-svg .lane-box { fill: var(--soft); }
+.pipe-svg .lane-l { font: 600 9.5px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.08em; fill: var(--dim); }
+.pipe-edges path { fill: none; stroke: var(--line); stroke-width: 3; stroke-linecap: round; }
+.pipe-edges path.on { stroke: var(--c1); }
+.pipe-svg .ring { fill: var(--card); stroke-width: 3; }
+.pipe-svg .p-todo .ring, .pipe-svg .p-skipped .ring { stroke-width: 2; }
+.pipe-svg .p-skipped .ring { stroke-dasharray: 3 3; }
+.pipe-svg .pulse-ring { fill: none; stroke-width: 2; transform-box: fill-box; transform-origin: center; animation: pipe-pulse 1.6s ease-out infinite; }
+@keyframes pipe-pulse { from { transform: scale(1); opacity: 0.7; } to { transform: scale(1.9); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .pipe-svg .pulse-ring { animation: none; opacity: 0.35; transform: scale(1.4); } }
+.pipe-svg .pl { font-size: 12.5px; font-weight: 600; fill: var(--ink); }
+.pipe-svg .pn { font-size: 11px; fill: var(--dim); }
+.pipe-svg .pb { font: 600 10.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.pipe-svg .loop { fill: none; stroke: var(--warn); stroke-width: 3; stroke-linecap: round; }
+.pipe-svg .loop-l { font-size: 11.5px; font-weight: 600; fill: var(--warn); }
+.pipe-svg .loop-pill { fill: var(--card); stroke: var(--warn); stroke-width: 1.2; }
+.pipe-svg .loop-n { font: 10.5px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--warn); }
+.pipe-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.pipe-chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 999px; padding: 3px 10px 3px 4px; font-size: 12px; cursor: pointer; }
+.pipe-chip:hover { border-color: var(--dim); }
+.pipe-chip .num { width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; font: 600 10.5px/1 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--soft); color: var(--dim); }
+.pipe-chip.p-done .num { background: var(--ok); color: var(--card); }
+.pipe-chip.p-active .num { background: var(--c1); color: var(--card); }
+.pipe-chip.p-back .num { background: var(--warn); color: var(--card); }
+.pipe-chip.p-failed .num { background: var(--bad); color: var(--card); }
+.pipe-chip.p-todo, .pipe-chip.p-skipped { color: var(--dim); }
+.pipe-chip.now { border-color: var(--c1); box-shadow: 0 0 0 1px var(--c1); }
+.pipe-chip.now.p-back { border-color: var(--warn); box-shadow: 0 0 0 1px var(--warn); }
+.pipe-chip.now.p-failed { border-color: var(--bad); box-shadow: 0 0 0 1px var(--bad); }
+.pipe-detail { display: none; }

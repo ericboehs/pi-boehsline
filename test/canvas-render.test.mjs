@@ -8,6 +8,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { readFileSync } from "node:fs";
+
 import { JSDOM } from "jsdom";
 
 import * as render from "../extensions/canvas/render.mjs";
@@ -21,6 +23,8 @@ globalThis.NodeFilter = dom.window.NodeFilter; // markRanges walks text nodes
 globalThis.getSelection = () => "";
 // renderTerminal scrolls a running body into view one frame later (a browser global).
 globalThis.requestAnimationFrame = (fn) => fn();
+// renderPipeline measures text on a canvas; jsdom has none, so it falls back to a guess.
+dom.window.HTMLCanvasElement.prototype.getContext = () => null;
 // renderChart sizes itself from its container; jsdom never lays out, so it needs a stub.
 globalThis.ResizeObserver = class {
   observe() {}
@@ -56,6 +60,11 @@ test("render.mjs exports the shared renderers, with no DOM at import time", () =
     "renderKanban",
     "renderTracker",
     "renderTerminal",
+    "renderPipeline",
+    "pipelineNow",
+    "pipelineChips",
+    "pipelineRunning",
+    "stageStatus",
     "renderDiff",
     "renderMermaid",
     "parsePatch",
@@ -861,4 +870,81 @@ test("renderMermaid asks the host for mermaid and draws, or reports the failure"
   await render.renderMermaid(bad, "nope", { loadMermaid: () => Promise.reject(new Error("no script")) });
   assert.equal(text(bad.querySelector(".err")), "mermaid: no script");
   assert.equal(bad.querySelector("pre").textContent, "nope");
+});
+
+// ── pipeline ──
+
+const PIPE_SPEC = {
+  title: "Ship <b>it</b>",
+  stages: [
+    { label: "Intake", note: "T-1", status: "done", lanes: [] },
+    { label: "Design", lanes: [{ steps: [{ label: "Architect", status: "done" }, { label: "Critic", status: "back", badge: "6/10" }] }], loop: { label: "revise", note: "round 2" } },
+    { label: "Build", lanes: [{ label: "Package 1", steps: [{ label: "Impl", status: "active", note: "<i>markup</i>" }] }, { label: "Package 2", steps: [{ label: "Test", status: "failed" }] }] },
+    { label: "Ship", lanes: [] },
+  ],
+};
+
+test("renderPipeline draws stages, lanes, statuses and a loop, with spec text as text", () => {
+  const el = render.renderPipeline(PIPE_SPEC);
+  assert.equal(el.className, "pipe");
+  const map = el.querySelector("svg.pipe-svg");
+  assert.ok(map, "the map");
+  assert.equal(map.getAttribute("aria-label"), "Ship <b>it</b>");
+  assert.equal(el.querySelectorAll(".band").length, 4, "a band per stage");
+  assert.equal(el.querySelectorAll(".lane-box").length, 2, "a box per labelled lane");
+  assert.deepEqual([...el.querySelectorAll(".lane-l")].map(text), ["PACKAGE 1", "PACKAGE 2"]);
+  // Steps are coloured by their status; a stage's chip by what its steps add up to.
+  for (const st of ["done", "back", "active", "failed", "todo"]) assert.ok(el.querySelector(`.pnode.p-${st}`), `a ${st} node`);
+  assert.deepEqual([...el.querySelectorAll(".pipe-chip")].map((c) => c.className.match(/p-(\w+)/)[1]), ["done", "back", "failed", "todo"]);
+  assert.ok(el.querySelector(".pipe-chip.now.p-failed"), "the chip where work is stuck is marked");
+  assert.equal(text(el.querySelector(".pipe-now")), "Build › Package 2 › Test: failed");
+  // The loop: an arc, its label and its note pill.
+  assert.ok(el.querySelector(".pipe-loops path.loop"));
+  assert.equal(text(el.querySelector(".loop-l")), "revise");
+  assert.equal(text(el.querySelector(".loop-n")), "round 2");
+  assert.ok(el.querySelector(".loop-pill"));
+  assert.ok(el.querySelector(".pipe-edges path.on"), "reached stretches of line are lit");
+  // DOM-safe: spec strings never become markup.
+  assert.equal(el.querySelector("i:not(.pipe-legend i), b:not(.pipe-head > b)"), null);
+  assert.ok([...el.querySelectorAll(".pn")].some((n) => text(n).startsWith("<i>")), "the note shows as text");
+  assert.equal(text(el.querySelector(".pipe-head > b")), "Ship <b>it</b>");
+  // A chip spells out its stage (narrow screens).
+  el.querySelector(".pipe-chip").dispatchEvent(new window.Event("click"));
+  assert.equal(text(el.querySelector(".pipe-detail")), "Intake: approved · T-1");
+});
+
+test("renderPipeline wraps into rows when its card is narrow", () => {
+  const el = render.renderPipeline(PIPE_SPEC);
+  const wrap = el.querySelector(".pipe-wrap");
+  const before = el.querySelector("svg.pipe-svg");
+  Object.defineProperty(wrap, "clientWidth", { value: 360 });
+  wrap.relayout();
+  const after = el.querySelector("svg.pipe-svg");
+  assert.notEqual(after, before, "redrawn");
+  assert.match(after.getAttribute("style"), /width:360px/);
+  const height = (s) => Number(s.getAttribute("viewBox").split(" ")[3]);
+  assert.ok(height(after) > height(before), "taller: more than one row");
+});
+
+test("pipeline status helpers: stageStatus, pipelineNow, pipelineRunning", () => {
+  assert.equal(render.stageStatus({ lanes: [{ steps: [{ status: "done" }, { status: "skipped" }] }] }), "done");
+  assert.equal(render.stageStatus({ lanes: [{ steps: [{ status: "done" }, { status: "todo" }] }] }), "active");
+  assert.equal(render.stageStatus({ status: "back", lanes: [] }), "back");
+  assert.equal(render.pipelineRunning(PIPE_SPEC), true);
+  const done = { stages: [{ label: "A", status: "done", lanes: [] }] };
+  assert.equal(render.pipelineRunning(done), false);
+  assert.deepEqual(render.pipelineNow(done), { stage: 0, status: "done", text: "All stages done" });
+});
+
+test("the page draws pipelines with render.mjs's renderer, styled by render.css", () => {
+  const read = (f) => readFileSync(new URL(`../extensions/canvas/${f}`, import.meta.url), "utf8");
+  const page = read("page.mjs");
+  const css = read("render.css");
+  assert.match(page, /import \{[^}]*\brenderPipeline\b[^}]*\} from "\/assets\/render\.mjs"/);
+  assert.match(page, /case "pipeline":\n\s*return renderPipeline\(/);
+  assert.doesNotMatch(page, /function (renderPipeline|stageStatus|pipelineNow|pipelineChips)\b/, "no copy of its own");
+  for (const rule of [".pipe-svg .ring", ".pipe-chip.now", ".pipe-edges path.on", ".pipe-svg .loop"]) {
+    assert.ok(css.includes(`${rule} {`), `render.css styles ${rule}`);
+    assert.ok(!page.includes(`${rule} {`), `page.mjs leaves ${rule} to render.css`);
+  }
 });
