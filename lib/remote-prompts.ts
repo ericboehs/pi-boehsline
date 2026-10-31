@@ -7,6 +7,7 @@
  * (an open question from before a reload is gone with its tool call anyway).
  */
 import { createHash, randomBytes } from "node:crypto";
+import { validScope } from "./signing-v2.ts";
 
 export interface RemoteQuestion {
 	question: string;
@@ -90,6 +91,39 @@ const sha256hex = (s: string): string => createHash("sha256").update(s, "utf8").
  */
 export function canonicalAnswer(id: string, answers: RemoteAnswer[]): string {
 	return [id, ...answers.map((a, i) => `q${i} ${a.picks.join(",")} ${sha256hex(a.text ?? "")}`)].join("\n");
+}
+
+export const ANSWER_V2_MAGIC = "botsun-answer-v2";
+
+/**
+ * What a v2 signature covers (botsun-sign-v2's payload for an answer): the prompt id, then per
+ * question i, in order, the question as this prompt asked it, its options, and the answer:
+ *
+ *   botsun-answer-v2
+ *   <ask_id>
+ *   q<i> <sha(question)> <0|1 multiSelect>
+ *   o<i>.<j> <sha(label)> <sha(description or "")>
+ *   a<i> <picks comma-joined> <sha(text or "")>
+ *
+ * Built from the prompt's OWN questions, so a yes can't be carried over to a reworded question.
+ * Throws on an id that isn't a valid scope, a count mismatch, or a non-integer pick.
+ */
+export function canonicalAnswerV2(id: string, questions: RemoteQuestion[], answers: RemoteAnswer[]): string {
+	if (!validScope(id)) throw new Error(`bad ask id: ${JSON.stringify(id)}`);
+	if (!Array.isArray(answers) || answers.length !== questions.length) throw new Error("one answer per question");
+	const lines = [ANSWER_V2_MAGIC, id];
+	questions.forEach((q, i) => {
+		lines.push(`q${i} ${sha256hex(String(q.question ?? ""))} ${q.multiSelect ? 1 : 0}`);
+		(q.options ?? []).forEach((o, j) => {
+			lines.push(`o${i}.${j} ${sha256hex(String(o.label ?? ""))} ${sha256hex(String(o.description ?? ""))}`);
+		});
+		const a = answers[i];
+		const picks = a?.picks ?? [];
+		if (!Array.isArray(picks) || !picks.every((p) => Number.isInteger(p))) throw new Error("bad picks");
+		if (a?.text !== undefined && a.text !== null && typeof a.text !== "string") throw new Error("bad text");
+		lines.push(`a${i} ${picks.join(",")} ${sha256hex(a?.text ?? "")}`);
+	});
+	return lines.join("\n");
 }
 
 export interface OfferOptions {

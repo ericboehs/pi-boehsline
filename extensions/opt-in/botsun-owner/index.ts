@@ -9,6 +9,10 @@
 // checks the signature itself against the paired devices' public keys
 // (owner-keys.json, written by Botsun) before the text goes in as Eric's own
 // message. A stolen Botsun token or a peer agent can't speak as Eric here.
+// Signing v1 ("botsun-decide-v1") and v2 ("botsun-sign-v2", sig_v: 2;
+// lib/signing-v2.ts) are both taken, and each device's key is pinned on first
+// use (pins.ts): a changed key, or a new device once one is pinned, needs a
+// yes at the keyboard.
 //
 // Best effort throughout: a missing socket or a refused connection is normal
 // (Botsun not running), so it retries quietly with backoff and never logs
@@ -22,7 +26,9 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { optIn } from "../../../lib/opt-in.ts";
-import { canonicalAnswer, onPromptsChange, openPrompts, type RemotePrompt } from "../../../lib/remote-prompts.ts";
+import { canonicalAnswer, canonicalAnswerV2, invalidAnswer, onPromptsChange, openPrompts, type RemotePrompt } from "../../../lib/remote-prompts.ts";
+import { messageV2, validScope } from "../../../lib/signing-v2.ts";
+import { checkPin, pin, shortFingerprint, type KeyKind } from "./pins.ts";
 import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
 
@@ -95,7 +101,17 @@ interface Conn {
 	/** Stops the running turn as Esc does: "stopped", or "idle" when nothing is running. */
 	stop?: () => string;
 	/** A call's verified words, held until the voice helper releases them (session-voice plan). */
-	held?: Map<string, { text: string; at: number; proposal?: string }>;
+	held?: Map<string, { text: string; at: number; proposal?: string; sigV?: 1 | 2 }>;
+	/** The keyboard's yes/no (ctx.ui.confirm), for pinning a device whose key changed or that's new. */
+	confirm?: (title: string, message: string) => Promise<boolean>;
+	/** Pin confirms open now (kind:device; at most one), so retries and minted keys don't stack dialogs. */
+	pinPrompts?: Set<string>;
+	/** kind:device → until (ms): refused without a dialog after a no at the keyboard. */
+	pinCooldown?: Map<string, number>;
+	/** Until (ms): no pin dialog at all, for any device, after any no at the keyboard. */
+	pinQuietUntil?: number;
+	/** When each recent pin dialog opened (ms), for the cap of PIN_DIALOG_MAX per PIN_DIALOG_WINDOW_MS. */
+	pinDialogs?: number[];
 }
 
 const store = globalThis as unknown as { [STORE]?: Conn };
@@ -121,20 +137,28 @@ export function ownerMessage(deviceId: string, nonce: string, sessionId: string,
 	return Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", sessionId, decision, digest].join("\n"), "utf8");
 }
 
-function sayDigest(text: string, images: Image[], files: File[]): { decision: string; digest: string } {
+/**
+ * v1: decision and digest. v2: the same decision, over a payload: text only is
+ * "botsun-propose-text-v1\n<text>" (as Botsun's vectors); with photos or files, the lines v1
+ * hashes (sha256(text), then one per photo / file).
+ */
+function sayDigest(text: string, images: Image[], files: File[]): { decision: string; digest: string; payload: string } {
 	const textHash = sha256hex(Buffer.from(text, "utf8"));
 	let decision = "say";
 	let digest = textHash;
+	let payload = `botsun-propose-text-v1\n${text}`;
 	if (files.length) {
 		// "say_attach": sha256(text), then "image <sha256>" per photo, "file <sha256(name)> <sha256(data)>" per file.
 		decision = "say_attach";
-		digest = sha256hex([textHash, ...images.map((i) => `image ${sha256hex(Buffer.from(i.data, "base64"))}`),
-			...files.map((f) => `file ${sha256hex(Buffer.from(f.name, "utf8"))} ${sha256hex(Buffer.from(f.data, "base64"))}`)].join("\n"));
+		payload = [textHash, ...images.map((i) => `image ${sha256hex(Buffer.from(i.data, "base64"))}`),
+			...files.map((f) => `file ${sha256hex(Buffer.from(f.name, "utf8"))} ${sha256hex(Buffer.from(f.data, "base64"))}`)].join("\n");
+		digest = sha256hex(payload);
 	} else if (images.length) {
 		decision = "say_images";
-		digest = sha256hex([textHash, ...images.map((i) => sha256hex(Buffer.from(i.data, "base64")))].join("\n"));
+		payload = [textHash, ...images.map((i) => sha256hex(Buffer.from(i.data, "base64")))].join("\n");
+		digest = sha256hex(payload);
 	}
-	return { decision, digest };
+	return { decision, digest, payload };
 }
 
 function filesOf(raw: unknown): File[] | string {
@@ -216,31 +240,116 @@ function newNonce(c: Conn): string {
 const deviceIdOf = (r: Record<string, unknown>): string =>
 	typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
 
+/** The signing version a request says it was signed with: absent or 1 = v1, 2 = v2, else null. */
+export function sigVersion(r: Record<string, unknown>): 1 | 2 | null {
+	if (r.sig_v === undefined || r.sig_v === 1) return 1;
+	return r.sig_v === 2 ? 2 : null;
+}
+
+/**
+ * What a request is signed over. v1: "botsun-decide-v1" … "session", session id, decision,
+ * digest(). v2 (sig_v: 2): "botsun-sign-v2" … kind, scope = the session id, decision,
+ * sha256(payload()).
+ */
+interface SignSpec {
+	decision: string;
+	digest: () => string;
+	v2: { kind: string; decision: string; payload: () => string | Buffer };
+}
+
 /**
  * Checks a phone-signed request: its nonce (spent whatever happens next: one try per nonce), the
- * paired device's key, and its signature over "botsun-decide-v1" … decision, digest(). Returns
- * the error, or null when it verifies. kind "call": the phone's call key (T5).
+ * paired device's key, its signature (v1 or v2, per sig_v), and the device's key pin (pins.ts).
+ * Returns the error, or null when it verifies. keyKind "call": the phone's call key (T5).
  */
-function verifyDevice(c: Conn, r: Record<string, unknown>, decision: string, digest: () => string,
-	kind: "decide" | "call" = "decide"): string | null {
+function verifyDevice(c: Conn, r: Record<string, unknown>, spec: SignSpec, keyKind: KeyKind = "decide"): string | null {
 	const { nonce, signature } = r;
 	const deviceId = deviceIdOf(r);
-	if (typeof nonce !== "string" || typeof signature !== "string" || !/^\d{1,12}$/.test(deviceId)) return "bad request";
+	const v = sigVersion(r);
+	if (typeof nonce !== "string" || typeof signature !== "string" || !/^\d{1,12}$/.test(deviceId) || !v) return "bad request";
 	if (!c.sessionId) return "this session has no id yet";
 	if (!takeNonce(c, nonce)) return "nonce is expired or used";
 	let key: Buffer | null;
 	try {
-		key = deviceKey(deviceId, kind);
+		key = deviceKey(deviceId, keyKind);
 	} catch (e) {
 		return (e as Error).message.startsWith("owner-keys") ? (e as Error).message : "no device keys";
 	}
 	if (!key) return "unknown device";
+	if (v === 2 && !validScope(c.sessionId)) return "this session's id can't be signed (v2)";
+	let verified = false;
 	try {
-		const msg = Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, decision, digest()].join("\n"), "utf8");
+		const text = v === 2
+			? messageV2({ deviceId, nonce, kind: spec.v2.kind, scope: c.sessionId, decision: spec.v2.decision, payload: spec.v2.payload() })
+			: ["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, spec.decision, spec.digest()].join("\n");
 		const pub = createPublicKey({ key: Buffer.concat([P256_SPKI, key]), format: "der", type: "spki" });
-		if (verifySignature("sha256", msg, { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"))) return null;
+		verified = verifySignature("sha256", Buffer.from(text, "utf8"), { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"));
 	} catch {}
-	return "signature does not verify";
+	if (!verified) return "signature does not verify";
+	const pinCheck = checkPin(keyKind, deviceId, key);
+	if (pinCheck.ok) return null;
+	if (pinCheck.ask) askPin(c, keyKind, deviceId, pinCheck.ask);
+	return pinCheck.error;
+}
+
+/** After a no at the keyboard, that device's key kind is refused without asking for this long. */
+export const PIN_COOLDOWN_MS = 10 * 60_000;
+/** After any no at the keyboard, no pin dialog opens at all (any device) for this long. */
+export const PIN_QUIET_MS = 2 * 60_000;
+/** At most this many pin dialogs open per PIN_DIALOG_WINDOW_MS, across devices; more are refused without one. */
+export const PIN_DIALOG_MAX = 3;
+export const PIN_DIALOG_WINDOW_MS = 10 * 60_000;
+
+/**
+ * A verified request came with a key this session hasn't pinned for its device (a changed key, or
+ * a new device once others are pinned): ask at the keyboard (never the phone) whether to trust it.
+ * Only that yes pins, and only from the pin shown (or none) to the key shown; the request itself
+ * stays refused either way. One dialog at a time across devices, keyed by kind:device (not the
+ * key, so minting keys can't stack dialogs); after a no, that kind:device is refused without a
+ * dialog for PIN_COOLDOWN_MS, and every other one for PIN_QUIET_MS; and at most PIN_DIALOG_MAX
+ * dialogs open per PIN_DIALOG_WINDOW_MS, so one after another can't wear Eric down into a yes.
+ */
+function askPin(c: Conn, kind: KeyKind, deviceId: string, ask: { pinned: string | null; offered: string }): void {
+	const open = (c.pinPrompts ??= new Set());
+	const cooldown = (c.pinCooldown ??= new Map());
+	const id = `${kind}:${deviceId}`;
+	const now = Date.now();
+	for (const [k, until] of cooldown) if (until <= now) cooldown.delete(k);
+	const shown = (c.pinDialogs = (c.pinDialogs ?? []).filter((t) => now - t < PIN_DIALOG_WINDOW_MS));
+	if (!c.confirm || open.size > 0 || cooldown.has(id) || now < (c.pinQuietUntil ?? 0) || shown.length >= PIN_DIALOG_MAX) return;
+	open.add(id);
+	shown.push(now);
+	const which = kind === "call" ? "call key" : "key";
+	const title = ask.pinned
+		? `Botsun: phone device ${deviceId}'s ${which} changed`
+		: `Botsun: new phone device ${deviceId} (${which})`;
+	const message = (ask.pinned
+		? [
+			`A request was signed by a different ${which} for paired device ${deviceId} than the one this session pinned.`,
+			`Pinned: ${shortFingerprint(ask.pinned)}`,
+			`New:    ${shortFingerprint(ask.offered)}`,
+			"Trust the new key? Say yes only if you just re-paired this phone.",
+		]
+		: [
+			`A request was signed by device ${deviceId}, which this session hasn't pinned a ${which} for (other devices are pinned).`,
+			`Device: ${deviceId}`,
+			`Kind:   ${kind === "call" ? "call" : "decision"} key`,
+			`Key:    ${shortFingerprint(ask.offered)}`,
+			"Trust this device? Say yes only if you just paired this phone.",
+		]).join("\n");
+	const confirm = c.confirm;
+	Promise.resolve()
+		.then(() => confirm(title, message))
+		.then((yes) => {
+			if (yes) pin(kind, deviceId, ask.offered, ask.pinned);
+			else {
+				cooldown.set(id, Date.now() + PIN_COOLDOWN_MS);
+				c.pinQuietUntil = Date.now() + PIN_QUIET_MS;
+			}
+			debug(`owner device ${deviceId} ${which} ${ask.pinned ? "re-pin" : "new pin"} ${yes ? "accepted" : "refused"} at the keyboard`);
+		})
+		.catch(() => {})
+		.finally(() => open.delete(id));
 }
 
 /** One request line → one reply object. Exported for tests. */
@@ -254,7 +363,8 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 			try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 		})();
 		return { nonce: newNonce(c), session_id: c.sessionId,
-			features: ["say", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", ...(hasStash ? ["stash"] : [])] };
+			features: ["say", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "ask_v2",
+				...(hasStash ? ["stash"] : [])] };
 	}
 	if (r.type === "say_audio") return sayAudio(c, r);
 	if (r.type === "release") return releaseHeld(c, r);
@@ -277,7 +387,8 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 		return { error: "text must be 1 to 20000 characters (or attach something)" };
 	}
 	const say = sayDigest(text, images, files);
-	const denied = verifyDevice(c, r, say.decision, () => say.digest);
+	const denied = verifyDevice(c, r, { decision: say.decision, digest: () => say.digest,
+		v2: { kind: "session", decision: say.decision, payload: () => say.payload } });
 	if (denied) return { error: denied };
 	let notes: string[];
 	try {
@@ -313,7 +424,9 @@ function sayAudio(c: Conn, r: Record<string, unknown>): Record<string, unknown> 
 	if (r.proposal_sha256 !== undefined && !proposal) return { error: "bad request" };
 	if (typeof text !== "string" || !text.trim() || text.length > TEXT_MAX) return { error: "nothing was said" };
 	if (typeof wav !== "string" || !/^[0-9a-f]{64}$/.test(wav)) return { error: "bad request" };
-	const denied = verifyDevice(c, r, "say_audio", () => [wav, ...(proposal ? [proposal] : [])].join("\n"), "call");
+	// v1's digest line is the audio hash (and the proposal's, a line more) as is; v2 hashes them.
+	const lines = () => [wav, ...(proposal ? [proposal] : [])].join("\n");
+	const denied = verifyDevice(c, r, { decision: "say_audio", digest: lines, v2: { kind: "session", decision: "say_audio", payload: lines } }, "call");
 	if (denied) return { error: denied };
 	if (r.hold === true) {
 		// Verified now, while the nonce is fresh; delivered only when the voice helper releases it.
@@ -321,7 +434,8 @@ function sayAudio(c: Conn, r: Record<string, unknown>): Record<string, unknown> 
 		pruneHeld(c);
 		if (held.size >= HELD_MAX) return { error: "too many words are waiting; release or drop some" };
 		const id = randomBytes(6).toString("hex");
-		held.set(id, { text, at: Date.now(), ...(proposal ? { proposal } : {}) });
+		// A v2-signed utterance carries a v2 proposal hash (canonicalAnswerV2 for an ask).
+		held.set(id, { text, at: Date.now(), ...(proposal ? { proposal, sigV: sigVersion(r) ?? 1 } : {}) });
 		writeHeld(c);
 		debug(`owner say_audio held (${text.length} chars)`);
 		return { ok: true, held: id };
@@ -397,17 +511,22 @@ function confirmHeld(c: Conn, r: Record<string, unknown>): Record<string, unknow
 	const h = c.held?.get(id);
 	if (!h) return { error: `not waiting: ${id}` };
 	if (!h.proposal) return { error: "his words weren't a reply to a proposal" };
-	let digest: string;
+	// v2: the answer's hash covers the prompt's own questions, so find the prompt first.
+	const prompt = isText ? undefined : openPrompts().find((p) => p.id === askId);
+	const v2 = !isText && h.sigV === 2;
+	let digest: string | null = null;
 	try {
-		digest = isText ? proposalTextHash(text) : sha256hex(Buffer.from(canonicalAnswer(askId as string, answers as never), "utf8"));
+		if (isText) digest = proposalTextHash(text);
+		else if (!v2) digest = sha256hex(Buffer.from(canonicalAnswer(askId as string, answers as never), "utf8"));
+		else if (prompt) digest = sha256hex(Buffer.from(canonicalAnswerV2(prompt.id, prompt.questions, answers as never), "utf8"));
 	} catch {
 		return { error: "bad request" };
 	}
 	// Whatever happens next, these words are spent: a failed confirm never leaves them to retry.
 	c.held?.delete(id);
 	writeHeld(c);
+	if (v2 && !prompt) return { error: "that question was already answered" };
 	if (digest !== h.proposal) return { error: `his yes was for a different ${isText ? "message" : "answer"}` };
-	const prompt = isText ? undefined : openPrompts().find((p) => p.id === askId);
 	// A secret's approval (op-broker) takes a device-signed tap or the keyboard, never a spoken yes.
 	if (prompt?.sensitive) return { error: "answer this one on the phone screen or the keyboard" };
 	if (saysNo(h.text)) return { error: "his words say no" };
@@ -480,15 +599,31 @@ function dropHeld(c: Conn, r: Record<string, unknown>): Record<string, unknown> 
 
 /**
  * T3: Eric answers an `ask` question from the phone. Signed with the decision key over the
- * prompt id and his picks (canonicalAnswer), checked here, then handed to the waiting tool.
+ * prompt id and his picks (v1: canonicalAnswer; v2: canonicalAnswerV2 over the prompt's own
+ * questions too), checked here, then handed to the waiting tool.
  */
 function answerAsk(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
 	const { ask_id: id, answers } = r;
 	if (typeof id !== "string" || !Array.isArray(answers)) return { error: "bad request" };
-	const denied = verifyDevice(c, r, "answer", () => sha256hex(Buffer.from(canonicalAnswer(id, answers as never), "utf8")));
+	// v2 signs the questions as asked, so the prompt is looked up before the digest is built.
+	const prompt = openPrompts().find((p) => p.id === id);
+	if (sigVersion(r) === 2) {
+		// Refused before verifyDevice: spend the nonce anyway (one try per nonce, as there).
+		const spend = (error: string) => {
+			if (typeof r.nonce === "string") takeNonce(c, r.nonce);
+			return { error };
+		};
+		if (!prompt) return spend("that question was already answered");
+		const bad = invalidAnswer(prompt.questions, answers);
+		if (bad) return spend(bad);
+	}
+	const denied = verifyDevice(c, r, {
+		decision: "answer",
+		digest: () => sha256hex(Buffer.from(canonicalAnswer(id, answers as never), "utf8")),
+		v2: { kind: "answer", decision: "answer", payload: () => canonicalAnswerV2(prompt!.id, prompt!.questions, answers as never) },
+	});
 	if (denied) return { error: denied };
 	// A sensitive prompt too: a screen tap is signed by the device, unlike a spoken yes.
-	const prompt = openPrompts().find((p) => p.id === id);
 	if (!prompt) return { error: "that question was already answered" };
 	const error = prompt.answer(answers as never);
 	return error ? { error } : { ok: true };
@@ -507,7 +642,8 @@ function stashRequest(c: Conn, r: Record<string, unknown>): Record<string, unkno
 	if (op === "push" && (!text.trim() || text.length > TEXT_MAX)) return { error: "nothing to stash" };
 	if (op !== "push" && !/^[\w-]{1,40}$/.test(id)) return { error: "bad request" };
 	const payload = op === "push" ? `push\n${sha256hex(Buffer.from(text, "utf8"))}` : `${op}\n${id}`;
-	const denied = verifyDevice(c, r, "stash", () => sha256hex(Buffer.from(payload, "utf8")));
+	const denied = verifyDevice(c, r, { decision: "stash", digest: () => sha256hex(Buffer.from(payload, "utf8")),
+		v2: { kind: "session", decision: "stash", payload: () => payload } });
 	if (denied) return { error: denied };
 	const sessionId = c.sessionId!; // verifyDevice refuses a session without one
 	if (op === "push") return { ok: true, id: pushStash(sessionId, text).id };
@@ -521,7 +657,8 @@ function stashRequest(c: Conn, r: Record<string, unknown>): Record<string, unkno
  * "stop" (this session's nonce makes each one single-use).
  */
 function stopRequest(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
-	const denied = verifyDevice(c, r, "stop", () => sha256hex(Buffer.from("stop", "utf8")));
+	const denied = verifyDevice(c, r, { decision: "stop", digest: () => sha256hex(Buffer.from("stop", "utf8")),
+		v2: { kind: "session", decision: "stop", payload: () => "stop" } });
 	if (denied) return { error: denied };
 	if (!c.stop) return { error: "this session can't stop from the phone yet; run /reload" };
 	return { ok: true, stopped: c.stop() === "stopped" };
@@ -960,6 +1097,8 @@ function main(pi: ExtensionAPI): void {
 		const commands = () => phoneCommands(pi);
 		const models = () => phoneModels(ctx);
 		const context = () => phoneContext(ctx);
+		// The keyboard's yes/no, for pinning a changed key or a new device (never answerable remotely).
+		const confirm = typeof ctx.ui?.confirm === "function" ? (title: string, message: string) => ctx.ui.confirm(title, message) : undefined;
 		const prev = store[STORE];
 		if (prev && !prev.closed) {
 			// Same pid, new extension instance: reuse the connection.
@@ -974,6 +1113,7 @@ function main(pi: ExtensionAPI): void {
 			conn.commands = commands;
 			conn.models = models;
 			conn.context = context;
+			conn.confirm = confirm;
 			// A connection made by an older version of this extension (T1, before /reload) has
 			// no nonce map or owner socket yet: upgrade it in place.
 			conn.nonces ??= new Map();
@@ -1001,7 +1141,7 @@ function main(pi: ExtensionAPI): void {
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
 			busy: false, prompt: null, promptDepth: 0, sessionName, ...info,
-			nonces: new Map(), inject, deliver, stop, command, commands, models, context, model: modelOf(ctx),
+			nonces: new Map(), inject, deliver, stop, command, commands, models, context, confirm, model: modelOf(ctx),
 		};
 		store[STORE] = conn;
 		connect(conn);
