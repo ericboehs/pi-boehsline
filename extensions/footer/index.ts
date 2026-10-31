@@ -53,6 +53,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { appendFile, readFile, readlink, realpath, writeFile, access, stat, lstat, constants } from "node:fs/promises";
 import { homedir, loadavg } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
+import { onFooterTap, publishFooter } from "../../lib/footer-snapshot.ts";
 
 import {
   CustomEditor,
@@ -2361,6 +2362,16 @@ export default function footerExtension(pi: ExtensionAPI): void {
   }
 
   /** Run a chip's click action, from the footer or the editor's top border. */
+  // A tap on the phone's chip row (botsun-owner): the display toggles only, as clicks would.
+  onFooterTap((id) => {
+    const action = ({ dir: "dir", context: "context", cost: "cost", usage: "providerUsage", rate: "rate", timers: "timers" } as const)[
+      id as "dir" | "context" | "cost" | "usage" | "rate" | "timers"
+    ];
+    if (!action) return false;
+    runChipAction(action, false);
+    return true;
+  });
+
   function runChipAction(action: FooterClickAction, shift: boolean): void {
     if (action === "model") queueModelCycle();
     else if (action === "thinking") cycleThinkingForward();
@@ -2867,6 +2878,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
           }
           parts.push({ id, text: part, width: partWidth, zones });
         }
+        // The real chips (not /footer's preview) for other extensions: botsun-owner's phone row.
+        if (!previewChip) publishFooter(parts.map((p) => ({ id: p.id, text: p.text })));
         return { parts, samples, statuses, previewStyle, placeholder };
       };
       borderParts = () => (enabled && shown().placement?.includes(" border") ? collect().parts : []);

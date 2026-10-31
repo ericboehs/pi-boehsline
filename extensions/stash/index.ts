@@ -26,40 +26,18 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { newStashId, onStashChange, stashChanged, stashStack, type StashEntry } from "../../lib/stash-store.ts";
 
 const WIDGET_KEY = "message-stash";
-const STORE_KEY = "__piMessageStash";
 /** Full-text preview lines for the selected stash in the panel. */
 const PREVIEW_LINES = 8;
 
-interface StashEntry {
-  id: string;
-  text: string;
-  ts: number;
-}
-
-type StashStore = Map<string, StashEntry[]>;
-
-function store(): StashStore {
-  const root = globalThis as typeof globalThis & { [STORE_KEY]?: StashStore };
-  root[STORE_KEY] ??= new Map();
-  return root[STORE_KEY];
-}
-
+/** The session's stack (lib/stash-store.ts: shared with botsun-owner, survives /reload). */
 function stackFor(ctx: ExtensionContext): StashEntry[] {
-  const id = ctx.sessionManager.getSessionId();
-  const stacks = store();
-  let stack = stacks.get(id);
-  if (!stack) {
-    stack = [];
-    stacks.set(id, stack);
-  }
-  return stack;
+  return stashStack(ctx.sessionManager.getSessionId());
 }
 
-function newId(): string {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
+const newId = newStashId;
 
 function age(ts: number): string {
   const seconds = Math.max(0, Math.round((Date.now() - ts) / 1000));
@@ -226,7 +204,25 @@ export default function stash(pi: ExtensionAPI) {
   // Re-entrancy guard: a click while the manager is already open is swallowed.
   let managerOpen = false;
 
+  // After a change made here: redraw, and tell the store's listeners (botsun-owner, the phone).
   const updateWidget = (ctx: ExtensionContext, stack: StashEntry[]) => {
+    renderWidget(ctx, stack);
+    try { stashChanged(ctx.sessionManager.getSessionId()); } catch {}
+  };
+
+  // A change made elsewhere (the phone): redraw only. Subscribed per session_start.
+  let stopListening: (() => void) | undefined;
+  const listen = () => {
+    stopListening?.();
+    stopListening = onStashChange((sessionId) => {
+      const live = liveCtx;
+      try {
+        if (live?.hasUI && live.sessionManager.getSessionId() === sessionId) renderWidget(live, stackFor(live));
+      } catch {}
+    });
+  };
+
+  const renderWidget = (ctx: ExtensionContext, stack: StashEntry[]) => {
     if (!ctx.hasUI) return;
     liveCtx = ctx;
     if (stack.length === 0) {
@@ -350,7 +346,8 @@ export default function stash(pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async (_event, ctx) => {
-    updateWidget(ctx, stackFor(ctx));
+    listen();
+    renderWidget(ctx, stackFor(ctx));
   });
 
   pi.registerShortcut("ctrl+s", {
@@ -385,6 +382,8 @@ export default function stash(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    stopListening?.();
+    stopListening = undefined;
     if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
   });
 

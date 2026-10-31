@@ -23,6 +23,8 @@ import { basename, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { optIn } from "../../../lib/opt-in.ts";
 import { canonicalAnswer, onPromptsChange, openPrompts, type RemotePrompt } from "../../../lib/remote-prompts.ts";
+import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
+import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
 
 type PromptKind = "select" | "confirm" | "input" | "editor" | "custom";
 interface Prompt { kind: PromptKind; title: string }
@@ -77,6 +79,8 @@ interface Conn {
 	model: { name: string; provider: string; id?: string; thinking?: string } | null;
 	/** The models the phone's picker offers; read lazily. */
 	models?: () => PhoneModel[];
+	/** Context use now ({tokens, window, percent}); read lazily. */
+	context?: () => PhoneContext | null;
 	/** The owner socket (T2) and its outstanding nonces (value: expiry ms). */
 	server?: Server;
 	nonces: Map<string, number>;
@@ -193,16 +197,23 @@ function newNonce(c: Conn): string {
 }
 
 /** One request line → one reply object. Exported for tests. */
-export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknown> {
+export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknown> | Promise<Record<string, unknown>> {
 	if (!req || typeof req !== "object") return { error: "bad request" };
 	const r = req as Record<string, unknown>;
 	if (r.type === "nonce") {
 		if (!c.sessionId) return { error: "this session has no id yet" };
 		// What this version takes, so Botsun can say "reload it" instead of a failed signature.
-		return { nonce: newNonce(c), session_id: c.sessionId, features: ["say", "images", "files", "say_audio", "stream", "ask"] };
+		const hasStash = (() => {
+			try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
+		})();
+		return { nonce: newNonce(c), session_id: c.sessionId,
+			features: ["say", "images", "files", "say_audio", "stream", "ask", ...(hasStash ? ["stash"] : [])] };
 	}
 	if (r.type === "say_audio") return sayAudio(c, r);
 	if (r.type === "answer") return answerAsk(c, r);
+	if (r.type === "stash") return stashRequest(c, r);
+	// Display only (a chip's mode, as a click on the footer flips it): not signed, nothing acts.
+	if (r.type === "footer_tap") return footerTap(String(r.chip ?? ""));
 	if (r.type !== "say") return { error: "unknown request" };
 	const { text, nonce, signature } = r;
 	const deviceId = typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
@@ -318,6 +329,44 @@ function answerAsk(c: Conn, r: Record<string, unknown>): Record<string, unknown>
 	return error ? { error } : { ok: true };
 }
 
+/**
+ * The phone works with this session's message stash (the stash extension's stack): push a draft,
+ * take one back into its message box, or drop one. Signed with the decision key over
+ * "push\n<sha256(text)>", "take\n<id>" or "drop\n<id>".
+ */
+function stashRequest(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const { op, nonce, signature } = r;
+	const deviceId = typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
+	const text = typeof r.text === "string" ? r.text : "";
+	const id = typeof r.id === "string" ? r.id : "";
+	if (op !== "push" && op !== "take" && op !== "drop") return { error: "bad request" };
+	if (op === "push" && (!text.trim() || text.length > TEXT_MAX)) return { error: "nothing to stash" };
+	if (op !== "push" && !/^[\w-]{1,40}$/.test(id)) return { error: "bad request" };
+	if (typeof nonce !== "string" || typeof signature !== "string" || !/^\d{1,12}$/.test(deviceId)) return { error: "bad request" };
+	if (!c.sessionId) return { error: "this session has no id yet" };
+	if (!takeNonce(c, nonce)) return { error: "nonce is expired or used" };
+	let key: Buffer | null;
+	try {
+		key = deviceKey(deviceId);
+	} catch (e) {
+		return { error: (e as Error).message.startsWith("owner-keys") ? (e as Error).message : "no device keys" };
+	}
+	if (!key) return { error: "unknown device" };
+	const payload = op === "push" ? `push\n${sha256hex(Buffer.from(text, "utf8"))}` : `${op}\n${id}`;
+	let ok = false;
+	try {
+		const msg = Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, "stash",
+			sha256hex(Buffer.from(payload, "utf8"))].join("\n"), "utf8");
+		const pub = createPublicKey({ key: Buffer.concat([P256_SPKI, key]), format: "der", type: "spki" });
+		ok = verifySignature("sha256", msg, { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"));
+	} catch {}
+	if (!ok) return { error: "signature does not verify" };
+	if (op === "push") return { ok: true, id: pushStash(c.sessionId, text).id };
+	const entry = takeStash(c.sessionId, id);
+	if (!entry) return { error: "that stash is gone" };
+	return op === "take" ? { ok: true, text: entry.text } : { ok: true };
+}
+
 function listenOwner(c: Conn): void {
 	if (c.server || c.closed) return;
 	const path = ownerSock();
@@ -343,13 +392,15 @@ function listenOwner(c: Conn): void {
 			done = true;
 			const all = Buffer.concat(chunks);
 			const line = all.subarray(0, all.indexOf(10)).toString("utf8");
-			let reply: Record<string, unknown>;
+			let reply: Record<string, unknown> | Promise<Record<string, unknown>>;
 			try {
 				reply = handleOwnerRequest(c, JSON.parse(line));
 			} catch {
 				reply = { error: "bad request" };
 			}
-			sock.end(`${JSON.stringify(reply)}\n`);
+			Promise.resolve(reply)
+				.catch(() => ({ error: "bad request" }))
+				.then((r) => sock.end(`${JSON.stringify(r)}\n`));
 		});
 		sock.on("error", () => {});
 	});
@@ -368,6 +419,42 @@ function closeOwner(c: Conn): void {
 	if (!server) return;
 	try { server.close(); } catch {}
 	try { unlinkSync(ownerSock()); } catch {}
+}
+
+/** The footer chips the phone shows (Eric's pick): no model, provider or name, which it has. */
+const PHONE_FOOTER = new Set(["dir", "worktree", "git", "context", "cost", "usage", "rate", "timers"]);
+
+/** The footer's chips as painted (footer.json order and modes), for the phone's chip row. */
+export function footerLine(): FooterChip[] {
+	return latestFooter()
+		.filter((c) => PHONE_FOOTER.has(c.id))
+		.slice(0, 16)
+		.map((c) => ({ id: c.id, segments: c.segments.slice(0, 12).map((s) => ({ ...s, text: s.text.slice(0, 80) })) }));
+}
+
+/**
+ * A chip tap: the footer flips it and repaints; the reply waits for that repaint (briefly) and
+ * carries the new row, so the phone shows it at once instead of on the next throttled send.
+ */
+function footerTap(chip: string): Record<string, unknown> | Promise<Record<string, unknown>> {
+	if (!tapFooter(chip)) return { error: "that chip doesn't flip" };
+	return new Promise((resolve) => {
+		const done = () => {
+			clearTimeout(timer);
+			stop();
+			resolve({ ok: true, footer: footerLine() });
+		};
+		const stop = onFooterChange(done);
+		const timer = setTimeout(done, 400);
+	});
+}
+
+const STASH_TEXT_MAX = 4000;
+
+/** The session's message stash as the phone shows it (oldest first, the top last). */
+export function stashLine(c: Pick<Conn, "sessionId">): { id: string; text: string; ts: number }[] {
+	if (!c.sessionId) return [];
+	return stashStack(c.sessionId).slice(-50).map((e) => ({ id: e.id, text: e.text.slice(0, STASH_TEXT_MAX), ts: e.ts }));
 }
 
 /** The newest question a tool (ask) has open, as Botsun shows it; null when none. */
@@ -408,6 +495,14 @@ function write(c: Conn, type: string, extra: Record<string, unknown> = {}): void
 	try { c.sock.write(`${line}\n`); } catch {}
 }
 
+// A compaction under way (its reason): pi refuses a prompt mid-compaction, so the phone's words
+// wait for it to end (held in main), and the phone shows it.
+let compacting: string | null = null;
+// Whether the approval guardian is bypassed (its state event), for the phone's red title.
+let bypassed = false;
+const GUARDIAN_BYPASS_STATE_EVENT = "approval-guardian:temporary-bypass-state";
+const GUARDIAN_BYPASS_CONTROL_EVENT = "approval-guardian:set-temporary-bypass";
+
 function sendHello(c: Conn): void {
 	write(c, "hello", {
 		cwd: c.cwd,
@@ -422,6 +517,13 @@ function sendHello(c: Conn): void {
 		})(),
 		models: (() => {
 			try { return c.models?.() ?? []; } catch { return []; }
+		})(),
+		stash: stashLine(c),
+		footer: footerLine(),
+		compacting,
+		bypass: bypassed,
+		context: (() => {
+			try { return c.context?.() ?? null; } catch { return null; }
 		})(),
 	});
 }
@@ -573,6 +675,14 @@ function runCommand(pi: ExtensionAPI, ctx: ExtensionContext, text: string, busy:
 		pi.setSessionName(args.slice(0, 200));
 		return null;
 	}
+	if (name === "bypass") {
+		// Signed like every phone command (the say path checks it first); the guardian's own
+		// control event, not quiet, so the terminal shows its warning. Mid-turn is fine.
+		if (args !== "on" && args !== "off") return "say /bypass on or /bypass off";
+		const request = { active: args === "on", quiet: false, handled: false };
+		pi.events?.emit(GUARDIAN_BYPASS_CONTROL_EVENT, request);
+		return request.handled ? null : "no approval guardian here to bypass";
+	}
 	if (BUILTINS.has(name)) return `/${name} only works at the keyboard`;
 	if (pi.getCommands().some((c) => c.name === name)) {
 		if (busy) return wait;
@@ -580,6 +690,19 @@ function runCommand(pi: ExtensionAPI, ctx: ExtensionContext, text: string, busy:
 		return null;
 	}
 	return undefined; // not a command pi knows: plain text, as typing it would send
+}
+
+export interface PhoneContext {
+	tokens: number | null;
+	window: number;
+	percent: number | null;
+}
+
+/** pi's context use, for the phone's info sheet; null when pi has no model yet. */
+export function phoneContext(ctx: Pick<ExtensionContext, "getContextUsage">): PhoneContext | null {
+	const u = ctx.getContextUsage();
+	if (!u || !Number.isFinite(u.contextWindow) || u.contextWindow <= 0) return null;
+	return { tokens: u.tokens ?? null, window: u.contextWindow, percent: u.percent == null ? null : Math.round(u.percent) };
 }
 
 export interface PhoneModel {
@@ -622,6 +745,13 @@ function main(pi: ExtensionAPI): void {
 	if (process.env.PI_SUBAGENT_CHILD === "1") return;
 
 	let conn: Conn | undefined;
+	let held: Array<string | UserContent[]> = [];
+
+	// The guardian's bypass, as it announces it (on start and on each change): the phone shows it.
+	pi.events?.on(GUARDIAN_BYPASS_STATE_EVENT, (state: unknown) => {
+		bypassed = (state as { active?: unknown } | undefined)?.active === true;
+		if (conn && !conn.closed) try { write(conn, "bypass", { active: bypassed }); } catch {}
+	});
 
 	pi.on("session_start", (_event, ctx) => {
 		// Interactive TUI only: print/json have no UI, and Botsun drives its own
@@ -630,11 +760,15 @@ function main(pi: ExtensionAPI): void {
 		const info = sessionInfo(ctx);
 		const sessionName = () => pi.getSessionName();
 		// Eric's own words, as if typed: steer into a running turn, else start one.
-		const inject = (content: string | UserContent[], busy: boolean) =>
-			pi.sendUserMessage(content, busy ? { deliverAs: "steer" } : undefined);
-		const command = (text: string, busy: boolean) => runCommand(pi, ctx, text, busy);
+		const inject = (content: string | UserContent[], busy: boolean) => {
+			if (compacting) held.push(content);
+			else pi.sendUserMessage(content, busy ? { deliverAs: "steer" } : undefined);
+		};
+		const command = (text: string, busy: boolean) =>
+			compacting && /^\//.test(text.trim()) && !/^\/(model|thinking|name|bypass)\b/.test(text.trim()) ? "wait for the compaction to finish" : runCommand(pi, ctx, text, busy);
 		const commands = () => phoneCommands(pi);
 		const models = () => phoneModels(ctx);
+		const context = () => phoneContext(ctx);
 		const prev = store[STORE];
 		if (prev && !prev.closed) {
 			// Same pid, new extension instance: reuse the connection.
@@ -646,6 +780,7 @@ function main(pi: ExtensionAPI): void {
 			conn.command = command;
 			conn.commands = commands;
 			conn.models = models;
+			conn.context = context;
 			// A connection made by an older version of this extension (T1, before /reload) has
 			// no nonce map or owner socket yet: upgrade it in place.
 			conn.nonces ??= new Map();
@@ -662,6 +797,9 @@ function main(pi: ExtensionAPI): void {
 			// A reload may have added or dropped commands: the phone's "/" list follows.
 			try { write(conn, "commands", { commands: commands() }); } catch {}
 			try { write(conn, "models", { models: models() }); } catch {}
+			// And what the phone shows from hello: context use and the stash, fresh, not after the next run.
+			write(conn, "context", { context: (() => { try { return context(); } catch { return null; } })() });
+			write(conn, "stash", { stash: stashLine(conn) });
 			// A replaced session isn't running or waiting on anything.
 			if (conn.busy) { conn.busy = false; write(conn, "idle"); }
 			if (conn.prompt) { conn.prompt = null; conn.promptDepth = 0; write(conn, "prompt_end"); }
@@ -670,7 +808,7 @@ function main(pi: ExtensionAPI): void {
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
 			busy: false, prompt: null, promptDepth: 0, sessionName, ...info,
-			nonces: new Map(), inject, command, commands, models, model: modelOf(ctx),
+			nonces: new Map(), inject, command, commands, models, context, model: modelOf(ctx),
 		};
 		store[STORE] = conn;
 		connect(conn);
@@ -735,7 +873,32 @@ function main(pi: ExtensionAPI): void {
 		write(conn, ask ? "ask" : "ask_end", ask ? { ask } : {});
 	};
 	const stopAsk = onPromptsChange(reportAsk);
-	pi.on("session_shutdown", () => stopAsk());
+	// The message stash follows Ctrl+S and /stash here, and the phone's own pushes and takes.
+	const stopStash = onStashChange((sessionId) => {
+		if (conn && !conn.closed && sessionId === conn.sessionId) write(conn, "stash", { stash: stashLine(conn) });
+	});
+	// The footer's chips, at most once a second (it repaints while a reply streams).
+	let footerTimer: ReturnType<typeof setTimeout> | undefined;
+	let lastFooter = "";
+	const stopFooter = onFooterChange(() => {
+		if (footerTimer) return;
+		footerTimer = setTimeout(() => {
+			footerTimer = undefined;
+			if (!conn || conn.closed) return;
+			const footer = footerLine();
+			const key = JSON.stringify(footer);
+			if (key === lastFooter) return;
+			lastFooter = key;
+			write(conn, "footer", { footer });
+		}, 1_000);
+		footerTimer.unref?.();
+	});
+	pi.on("session_shutdown", () => {
+		stopAsk();
+		stopStash();
+		stopFooter();
+		clearTimeout(footerTimer);
+	});
 
 	pi.on("agent_start", () => {
 		if (!conn || conn.closed || conn.busy) return;
@@ -747,7 +910,36 @@ function main(pi: ExtensionAPI): void {
 		if (!conn || conn.closed || !conn.busy) return;
 		conn.busy = false;
 		write(conn, "idle");
+		reportContext();
 	});
+
+	// Context use for the phone's info sheet: after each run, and after a compaction.
+	const reportContext = () => {
+		if (!conn || conn.closed) return;
+		try { write(conn, "context", { context: conn.context?.() ?? null }); } catch {}
+	};
+	// Compaction, /compact's or pi's own: the phone shows it, and holds what Eric sends meanwhile.
+	pi.on("session_before_compact", (event) => {
+		compacting = String((event as { reason?: string }).reason ?? "manual");
+		if (conn && !conn.closed) try { write(conn, "compacting", { reason: compacting }); } catch {}
+		return undefined; // never cancels or changes it
+	});
+	const endCompaction = (ctx: ExtensionContext) => {
+		if (!compacting) return;
+		compacting = null;
+		if (conn && !conn.closed) try { write(conn, "compacting", { reason: null }); } catch {}
+		const out = held;
+		held = [];
+		out.forEach((content, i) => {
+			const options = i > 0 ? { deliverAs: "followUp" as const } : ctx.isIdle() ? undefined : { deliverAs: "steer" as const };
+			try { pi.sendUserMessage(content, options); } catch {}
+		});
+	};
+	pi.on("session_compact", (_event, ctx) => {
+		endCompaction(ctx);
+		reportContext();
+	});
+	pi.on("session_compact_failed", (_event, ctx) => endCompaction(ctx));
 
 	pi.on("ui_prompt_start", (event) => {
 		if (!conn || conn.closed) return;

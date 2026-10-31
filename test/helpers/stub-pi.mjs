@@ -9,6 +9,7 @@ export function stubPi() {
 	const providers = new Map();
 	const renderers = new Map();
 	const sent = [];
+	const listeners = {};
 	const pi = {
 		on: (event, fn) => handlers.set(event, [...(handlers.get(event) ?? []), fn]),
 		registerCommand: (name, options) => commands.set(name, options),
@@ -20,7 +21,13 @@ export function stubPi() {
 		sendUserMessage: async (content, options) => sent.push({ content, options }),
 		sendMessage: (message) => sent.push({ message }),
 		exec: async () => ({ stdout: "", stderr: "", code: 1 }),
-		events: { on: () => () => {}, emit: () => {} },
+		events: {
+			on: (name, fn) => {
+				(listeners[name] ??= []).push(fn);
+				return () => (listeners[name] = listeners[name].filter((f) => f !== fn));
+			},
+			emit: (name, data) => (listeners[name] ?? []).forEach((fn) => fn(data)),
+		},
 	};
 	const names = () => [
 		...[...handlers.keys()].map((e) => `on:${e}`),

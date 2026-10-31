@@ -12,13 +12,18 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 
 | type | when | extra fields |
 |---|---|---|
-| `hello` | on every (re)connect | `cwd`, `session_file`, `session_id`, `busy`, `prompt`, `model`, `ask`, `commands`, `models` |
+| `hello` | on every (re)connect | `cwd`, `session_file`, `session_id`, `busy`, `prompt`, `model`, `ask`, `commands`, `models`, `stash`, `footer`, `context`, `compacting`, `bypass` |
 | `busy` / `idle` | a run starts / pi has settled | |
 | `prompt` / `prompt_end` | a dialog (`ask`, select, confirm, input, editor, custom) opens / closes | `kind`, `title` (≤ 500 chars) |
 | `stream` / `stream_end` | the reply as it's written / done | `text` |
 | `model` | `/model`, Ctrl+P, a thinking-level change | `model` (`{name, provider, id, thinking}`) |
 | `ask` / `ask_end` | the `ask` tool has a question open / it's answered | `ask` (`{id, questions}`) |
 | `commands` / `models` | after `/reload` (also in `hello`) | the phone's `/` list; the models its picker offers |
+| `stash` | the message stash changed (Ctrl+S, `/stash`, the phone; also in `hello`) | `stash` (`[{id, text, ts}]`, oldest first) |
+| `context` | after each run, after a compaction, after `/reload` | `context` (`{tokens, window, percent}`) |
+| `footer` | the footer's chips changed (at most once a second) | `footer` (`[{id, segments: [{text, fg?, dim?}]}]`, from `lib/footer-snapshot.ts`) |
+| `compacting` | a compaction starts (`/compact` or pi's own) / ends or fails | `reason` (`manual`, `threshold`, `overflow`; `null` when it ends) |
+| `bypass` | the approval guardian's bypass turns on or off | `active` |
 | `session` | `/new`, `/resume`, `/fork`: same pid, new transcript | `session_file`, `session_id`, `cwd` |
 | `bye` | pi quits | |
 
@@ -31,8 +36,12 @@ Each session also listens on its own socket, `~/.local/state/botsun/owner/<pid>.
 | `say` | Eric's words as if typed (steering a running turn), with photos; files are saved to `~/.local/state/botsun/inbox/<pid>/` and named in the message |
 | `say_audio` | a call into the session: the transcribed words, signed over the audio with the call key |
 | `answer` | answers the open `ask` question; the tool takes it as if picked at the keyboard and closes its dialog |
+| `stash` | the message stash (with the stash extension): `push` a draft, `take` one back to the phone, `drop` one; signed over `push\n<sha256(text)>`, `take\n<id>` or `drop\n<id>` |
+| `footer_tap` | flips a display chip (`dir`, `context`, `cost`, `usage`, `rate`, `timers`) as a click on the footer does, and answers with the new row; display only, so not signed |
 
-**Slash commands in `say`:** extension commands, prompt templates and skills run as typed; `/compact [notes]`, `/model <name>`, `/thinking <level>` and `/name <name>` are rebuilt on the extension API; other built-ins answer "only works at the keyboard". A path like `/Users/…` or an unknown `/word` goes in as text.
+**Slash commands in `say`:** extension commands, prompt templates and skills run as typed; `/compact [notes]`, `/model <name>`, `/thinking <level>` and `/name <name>` are rebuilt on the extension API; `/bypass on|off` turns the approval guardian's bypass on or off through its control event (the terminal shows its warning), mid-turn too; other built-ins answer "only works at the keyboard". A path like `/Users/…` or an unknown `/word` goes in as text.
+
+**During a compaction** pi refuses a prompt, so words from the phone are held and sent once it ends (or fails); slash commands that would start a turn answer "wait for the compaction to finish".
 
 ## Notes
 

@@ -165,7 +165,7 @@ test("session change keeps the connection and sends a session line", async () =>
 	});
 	await b.fire("session_start", { reason: "new" });
 	await until(() => srv.lines.length >= 2);
-	assert.deepEqual(srv.types(), ["hello", "session"]);
+	assert.deepEqual(srv.types(), ["hello", "session", "context", "stash"]);
 	assert.equal(srv.lines[1].session_file, "/tmp/sessions/b.jsonl");
 	assert.equal(srv.lines[1].session_id, "sid-b");
 	assert.equal(srv.lines[1].cwd, "/tmp/work/proj");
@@ -586,6 +586,7 @@ test("hello lists the commands the phone can run; a reload sends the list again"
 	m.pi.getCommands = () => [{ name: "deploy", source: "prompt" }];
 	await m.fire("session_start", { reason: "reload" });
 	await until(() => srv.types().includes("commands"));
+	await until(() => srv.types().includes("context") && srv.types().includes("stash"));
 	assert.deepEqual(srv.lines.find((l) => l.type === "commands").commands.map((c) => c.name).slice(4), ["deploy"]);
 });
 
@@ -604,4 +605,119 @@ test("hello carries the model id and the models the phone's picker offers", asyn
 	const hello = srv.lines.find((l) => l.type === "hello");
 	assert.equal(hello.model.id, "claude-opus-5-5");
 	assert.deepEqual(hello.models.map((x) => [x.id, x.reasoning]), [["claude-opus-5-5", true], ["claude-haiku-4-5", false]]);
+});
+
+test("the phone pushes, takes and drops the session's message stash, signed", async () => {
+	const { stashStack, pushStash } = await import("../lib/stash-store.ts");
+	stashStack("sid-a").length = 0;
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	m.pi.getCommands = () => [{ name: "stash", source: "extension" }];
+	pushStash("sid-a", "typed at the keyboard");
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)) && srv.types().includes("hello"));
+	assert.deepEqual(srv.lines.find((l) => l.type === "hello").stash.map((e) => e.text), ["typed at the keyboard"]);
+
+	const sign = (nonce, payload) => {
+		const digest = createHash("sha256").update(payload).digest("hex");
+		const msg = ["botsun-decide-v1", "7", nonce, "session", "sid-a", "stash", digest].join("\n");
+		return cryptoSign("sha256", Buffer.from(msg), { key: key.privateKey, dsaEncoding: "der" }).toString("base64");
+	};
+	const hex = (t) => createHash("sha256").update(t).digest("hex");
+	let { nonce, features } = await ask({ type: "nonce" });
+	assert.ok(features.includes("stash"));
+	let res = await ask({ type: "stash", op: "push", text: "from the phone", nonce, device_id: 7, signature: sign(nonce, `push\n${hex("other")}`) });
+	assert.equal(res.error, "signature does not verify");
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "stash", op: "push", text: "from the phone", nonce, device_id: 7, signature: sign(nonce, `push\n${hex("from the phone")}`) });
+	assert.equal(res.ok, true);
+	await until(() => srv.lines.some((l) => l.type === "stash" && l.stash.length === 2));
+	const [first, second] = stashStack("sid-a");
+	assert.equal(second.text, "from the phone");
+
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "stash", op: "take", id: first.id, nonce, device_id: 7, signature: sign(nonce, `take\n${first.id}`) });
+	assert.deepEqual(res, { ok: true, text: "typed at the keyboard" });
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "stash", op: "drop", id: second.id, nonce, device_id: 7, signature: sign(nonce, `drop\n${second.id}`) });
+	assert.deepEqual(res, { ok: true });
+	assert.equal(stashStack("sid-a").length, 0);
+	await until(() => srv.lines.at(-1).type === "stash" && srv.lines.at(-1).stash.length === 0);
+});
+
+test("context use goes in hello and after each run", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	let tokens = 12_000;
+	const m = await mount({ ctx: { getContextUsage: () => ({ tokens, contextWindow: 200_000, percent: (tokens / 200_000) * 100 }) } });
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	assert.deepEqual(srv.lines.find((l) => l.type === "hello").context, { tokens: 12_000, window: 200_000, percent: 6 });
+	tokens = 50_000;
+	await m.fire("agent_start", {});
+	await m.fire("agent_settled", {});
+	await until(() => srv.types().includes("context"));
+	assert.deepEqual(srv.lines.find((l) => l.type === "context").context, { tokens: 50_000, window: 200_000, percent: 25 });
+});
+
+test("the footer's chips go to the phone, only the ones it shows, at most once a second", async () => {
+	const { publishFooter } = await import("../lib/footer-snapshot.ts");
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	publishFooter([{ id: "dir", text: "botsun" }, { id: "model", text: "opus" }, { id: "context", text: "\x1b[32m42k\x1b[0m/1m" }]);
+	const m = await mount();
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	assert.deepEqual(srv.lines.find((l) => l.type === "hello").footer.map((c) => c.id), ["dir", "context"]);
+	publishFooter([{ id: "dir", text: "botsun" }, { id: "git", text: "main*" }]);
+	await until(() => srv.types().includes("footer"), 3000);
+	assert.deepEqual(srv.lines.find((l) => l.type === "footer").footer.map((c) => c.id), ["dir", "git"]);
+});
+
+test("a chip tap from the phone flips the footer's display, display chips only", async () => {
+	const { onFooterTap, publishFooter } = await import("../lib/footer-snapshot.ts");
+	const tapped = [];
+	// The footer flips the chip and repaints: the reply waits for that and carries the new row.
+	const stop = onFooterTap((id) => (tapped.push(id), setTimeout(() => publishFooter([{ id: "context", text: "23%" }]), 20), true));
+	await owner();
+	assert.deepEqual(await ask({ type: "footer_tap", chip: "context" }), { ok: true, footer: [{ id: "context", segments: [{ text: "23%" }] }] });
+	assert.equal((await ask({ type: "footer_tap", chip: "git" })).error, "that chip doesn't flip");
+	assert.deepEqual(tapped, ["context"]);
+	stop();
+});
+
+test("compaction: the phone hears of it, and a reply meanwhile waits for it to end", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	m.ctx.isIdle = () => true;
+	await m.fire("session_before_compact", { reason: "threshold" });
+	const { nonce } = await ask({ type: "nonce" });
+	const text = "and then the docs";
+	assert.deepEqual(await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) }), { ok: true, delivered: "prompt" });
+	assert.equal(m.sent.length, 0, "pi refuses a prompt mid-compaction");
+	await m.fire("session_compact", { reason: "threshold" });
+	assert.deepEqual(m.sent.at(-1), { content: text, options: undefined });
+});
+
+test("bypass: the phone hears the guardian's state, and a signed /bypass flips it", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	const asked = [];
+	m.pi.events.on("approval-guardian:set-temporary-bypass", (request) => {
+		asked.push(request.active);
+		request.handled = true;
+	});
+	const say = async (text) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) });
+	};
+	assert.deepEqual(await say("/bypass on"), { ok: true, delivered: "command" });
+	assert.equal((await say("/bypass maybe")).error, "say /bypass on or /bypass off");
+	assert.deepEqual(asked, [true]);
+	assert.equal(m.sent.length, 0, "nothing went to the model");
 });
