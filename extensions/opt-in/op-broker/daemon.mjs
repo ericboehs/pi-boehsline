@@ -5,7 +5,8 @@
 // warm with `op whoami` every few minutes (whoami never prompts), until 1Password's 12-hour limit
 // or the app locks.
 //
-// Socket: <dir>/daemon.sock (dir 0700, socket 0600), one JSON line each way. It takes only:
+// Socket: <dir>/daemon.sock (dir 0700, socket 0600), one JSON line each way, one request per
+// connection. It takes only:
 //   {cmd:"status"}                         → {ok, armed: [accounts], pid}
 //   {cmd:"op", kind:"read", ref}           → op read --no-newline <ref>
 //   {cmd:"op", kind:"otp", item, vault?}   → op item get <item> [--vault V] --otp
@@ -18,26 +19,25 @@
 // Approval happens in the sessions (the card), not here: any process running as this user can
 // talk to this socket. That's the accepted risk (README).
 
-import { execFile, execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, appendFileSync, unlinkSync, existsSync, lstatSync, statSync, openSync, writeSync, closeSync, readFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { chmodSync, mkdirSync, appendFileSync, unlinkSync, existsSync, lstatSync, statSync } from "node:fs";
 import { createServer, createConnection } from "node:net";
-import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
+import { brokerDir, validRequest } from "./validate.mjs";
 
-export const brokerDir = (env = process.env) => env.PI_OP_BROKER_DIR || join(homedir(), ".local", "state", "pi-op-broker");
+export { brokerDir };
 
 const DIR = brokerDir();
 const SOCK = join(DIR, "daemon.sock");
 const LOG = join(DIR, "daemon.log");
-const LOCK = join(DIR, "daemon.lock");
 const KEEPALIVE_MS = Number(process.env.PI_OP_BROKER_KEEPALIVE_MS) || 4 * 60_000; // inside the CLI's 10-minute idle window
 const IDLE_EXIT_MS = Number(process.env.PI_OP_BROKER_IDLE_MS) || 30 * 60_000;     // unarmed and unused this long: exit
-const OP_TIMEOUT_MS = 90_000; // a Touch ID prompt waits 60 s
+export const OP_TIMEOUT_MS = 90_000; // a Touch ID prompt waits 60 s (index.ts's daemonRequest waits a little longer)
+// PI_OP_BROKER_TTL_MS (tests only; unset in production): exit this long after starting, armed or
+// not, so a test run killed before its cleanup can't leave a daemon behind for good.
+const TTL_MS = Number(process.env.PI_OP_BROKER_TTL_MS) || 0;
+const STARTED = Date.now();
 const MAX_LINE = 16 * 1024;
-const ACCOUNT = /^(?!-)[\w.@-]{1,100}$/;
-const NAME = /^(?!-)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}]{1,200}$/u; // as the shim: no leading "-", nothing invisible
-const SEG = "[^/?\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]+"; // no "?": the only query taken is ?attribute=otp
-const REF = new RegExp(`^op://${SEG}/${SEG}(/${SEG}){1,2}(\\?attribute=(otp|totp))?$`, "u");
 
 // The op binary: an override (tests), else op on PATH minus the shim's folder.
 const OP = process.env.PI_OP_BROKER_OP || "op";
@@ -58,20 +58,16 @@ const log = (msg) => {
 	} catch {}
 };
 
-// The argv for a request, or null if it isn't one we run.
+// The argv for a request, or null if it isn't one we run (validate.mjs: the session's rules too).
 export function argvFor(req) {
-	const acct = req.account === undefined ? [] : ACCOUNT.test(req.account) ? ["--account", req.account] : null;
-	if (!acct) return null;
-	const vault = req.vault === undefined ? [] : typeof req.vault === "string" && NAME.test(req.vault) ? ["--vault", req.vault] : null;
-	if (!vault) return null;
+	if (!validRequest(req)) return null;
+	const acct = req.account === undefined ? [] : ["--account", req.account];
+	const vault = req.vault === undefined ? [] : ["--vault", req.vault];
 	switch (req.kind) {
 		case "whoami": return ["whoami", ...acct];
-		case "read": return typeof req.ref === "string" && REF.test(req.ref) ? ["read", "--no-newline", req.ref, ...acct] : null;
-		case "otp": return typeof req.item === "string" && NAME.test(req.item) ? ["item", "get", req.item, ...vault, "--otp", ...acct] : null;
-		case "fields":
-			if (typeof req.item !== "string" || !NAME.test(req.item)) return null;
-			if (!Array.isArray(req.fields) || req.fields.length < 1 || req.fields.length > 10 || !req.fields.every((f) => typeof f === "string" && NAME.test(f) && !f.includes(","))) return null;
-			return ["item", "get", req.item, ...vault, "--fields", req.fields.join(","), "--reveal", ...acct];
+		case "read": return ["read", "--no-newline", req.ref, ...acct];
+		case "otp": return ["item", "get", req.item, ...vault, "--otp", ...acct];
+		case "fields": return ["item", "get", req.item, ...vault, "--fields", req.fields.join(","), "--reveal", ...acct];
 		default: return null;
 	}
 }
@@ -107,7 +103,31 @@ async function handle(req) {
 	return { ok: true, value: req.kind === "read" ? r.out : r.out.replace(/\n$/, "") };
 }
 
+// Our folder deleted, or our socket gone or replaced (another daemon bound a new one): nobody can
+// reach this daemon any more, so it exits instead of holding an authorization for no one.
+function orphaned() {
+	if (sockIno === undefined) return false; // not listening yet
+	try {
+		if (!statSync(DIR).isDirectory()) return true;
+		return statSync(SOCK).ino !== sockIno;
+	} catch {
+		return true;
+	}
+}
+
+// Every tick: should this daemon go?
+function tick() {
+	if (orphaned()) {
+		log("socket or folder gone: exiting");
+		return shutdown(), true;
+	}
+	if (TTL_MS && Date.now() - STARTED > TTL_MS) return shutdown(), true;
+	if (armed.size === 0 && Date.now() - lastUse > IDLE_EXIT_MS) return shutdown(), true;
+	return false;
+}
+
 async function keepAlive() {
+	if (tick()) return;
 	for (const key of [...armed]) {
 		const r = await run(["whoami", ...(key ? ["--account", key] : [])]);
 		if (!r.ok) {
@@ -115,50 +135,19 @@ async function keepAlive() {
 			log(`disarmed ${key || "(default)"}: ${r.error}`);
 		}
 	}
-	if (armed.size === 0 && Date.now() - lastUse > IDLE_EXIT_MS) shutdown();
+	tick();
 }
 
 let server;
 let sockIno; // the socket this daemon bound: shutdown removes only that one
-let haveLock = false;
 function shutdown() {
+	// No server.close(): Node unlinks the socket's path on close, which may be another daemon's by
+	// now. Exiting closes it; the path is removed only if it's still the one this daemon bound.
 	try {
-		server?.close();
 		if (sockIno !== undefined && existsSync(SOCK) && statSync(SOCK).ino === sockIno) unlinkSync(SOCK);
-		if (haveLock && readFileSync(LOCK, "utf8").trim() === String(process.pid)) unlinkSync(LOCK);
 	} catch {}
 	log("stopped");
 	process.exit(0);
-}
-
-function isDaemon(pid) {
-	try {
-		process.kill(pid, 0);
-		return execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 }).includes("daemon.mjs");
-	} catch {
-		return false;
-	}
-}
-
-// One daemon at a time: a lock file holding its pid. A dead holder's lock is taken over.
-function lock() {
-	for (let attempt = 0; attempt < 2; attempt++) {
-		try {
-			const fd = openSync(LOCK, "wx", 0o600);
-			writeSync(fd, String(process.pid));
-			closeSync(fd);
-			return true;
-		} catch (e) {
-			if (e.code !== "EEXIST") return false;
-			const pid = Number(readFileSync(LOCK, "utf8").trim());
-			if (pid > 0 && isDaemon(pid)) return false; // the daemon is running
-			// A dead holder, or a reused pid that isn't a daemon: take it over.
-			try {
-				unlinkSync(LOCK);
-			} catch {}
-		}
-	}
-	return false;
 }
 
 // Another daemon already answering means this one isn't needed.
@@ -170,49 +159,71 @@ function alive() {
 	});
 }
 
-async function main() {
-	mkdirSync(DIR, { recursive: true, mode: 0o700 });
-	chmodSync(DIR, 0o700);
-	if (!lock()) process.exit(0);
-	haveLock = true;
-	if (existsSync(SOCK)) {
-		if (await alive()) {
-			try {
-				unlinkSync(LOCK); // ours, just taken: the answering daemon's pid isn't ours to record
-			} catch {}
-			process.exit(0);
-		}
-		if (lstatSync(SOCK).isSocket()) unlinkSync(SOCK);
-	}
-	server = createServer((conn) => {
-		let buf = "";
-		conn.setEncoding("utf8");
-		conn.on("data", async (d) => {
-			buf += d;
-			if (buf.length > MAX_LINE) return conn.destroy();
-			const nl = buf.indexOf("\n");
-			if (nl < 0) return;
-			let req;
-			try {
-				req = JSON.parse(buf.slice(0, nl));
-			} catch {}
-			buf = "";
-			const reply = await handle(req).catch((e) => ({ ok: false, error: String(e?.message ?? e) }));
-			conn.end(`${JSON.stringify(reply)}\n`);
-		});
-		conn.on("error", () => {});
+// One request per connection, one reply: anything after the first line is ignored.
+function serve(conn) {
+	let buf = "";
+	let done = false;
+	conn.setEncoding("utf8");
+	conn.on("data", async (d) => {
+		if (done) return;
+		buf += d;
+		if (buf.length > MAX_LINE) return conn.destroy();
+		const nl = buf.indexOf("\n");
+		if (nl < 0) return;
+		done = true;
+		let req;
+		try {
+			req = JSON.parse(buf.slice(0, nl));
+		} catch {}
+		buf = "";
+		const reply = await handle(req).catch((e) => ({ ok: false, error: String(e?.message ?? e) }));
+		conn.end(`${JSON.stringify(reply)}\n`);
 	});
-	server.on("error", (e) => {
-		log(`can't listen: ${e.message}`);
-		shutdown();
+	conn.on("error", () => {});
+}
+
+// One daemon at a time: whoever binds daemon.sock. A path in use is a live daemon (this one isn't
+// needed), a stale socket left by a dead one (taken over, once), or something else (left alone).
+function listen(retry) {
+	server = createServer(serve);
+	server.once("error", async (e) => {
+		if (e.code !== "EADDRINUSE") {
+			log(`can't listen: ${e.message}`);
+			return process.exit(1);
+		}
+		if (await alive()) return process.exit(0);
+		let stale = false;
+		try {
+			stale = lstatSync(SOCK).isSocket();
+		} catch (err) {
+			stale = err?.code === "ENOENT"; // gone meanwhile: just try again
+		}
+		if (retry && stale) {
+			try {
+				unlinkSync(SOCK);
+			} catch {}
+			return listen(false);
+		}
+		log(`can't listen: ${SOCK} is in use and isn't a daemon answering${stale ? "" : " (not a socket: left alone)"}`);
+		process.exit(1);
 	});
 	server.listen(SOCK, () => {
 		chmodSync(SOCK, 0o600); // the folder is 0700 already
 		sockIno = statSync(SOCK).ino;
+		server.on("error", (e) => {
+			log(`server error: ${e.message}`);
+			shutdown();
+		});
 		log(`started pid ${process.pid}`);
 	});
+}
+
+async function main() {
+	mkdirSync(DIR, { recursive: true, mode: 0o700 });
+	chmodSync(DIR, 0o700);
+	listen(true);
 	setInterval(keepAlive, KEEPALIVE_MS).unref?.();
-	setInterval(() => armed.size === 0 && Date.now() - lastUse > IDLE_EXIT_MS && shutdown(), 60_000);
+	setInterval(tick, Math.min(60_000, KEEPALIVE_MS, TTL_MS || Infinity));
 	for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, shutdown);
 }
 

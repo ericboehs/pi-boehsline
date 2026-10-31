@@ -38,21 +38,32 @@ bash tool: op read "op://Personal/GitHub/token"
             ├─ live grant for (item) → daemon read
             └─ card: "GitHub · token, for `gh auth login --with-token`" Once · 1 h · 8 h · Deny
                  → grant (in the extension's memory) → daemon read → value to that shim only
-op daemon (~/.local/state/pi-op/daemon.sock, 0600; started on demand, exits when idle and unarmed)
+op daemon (~/.local/state/pi-op-broker/daemon.sock, 0600; started on demand, exits when idle and unarmed)
   └─ its own pty (PTY: own session, controlling terminal) → `op read`, `op whoami` every ~5 min
 ```
 
 - **Grants live in the extension,** per session. The daemon only holds the authorization and runs
   allowed commands for local clients.
+- **One daemon, no lock file:** the daemon is whoever binds `daemon.sock`. On `EADDRINUSE` a
+  starter exits 0 if a daemon answers there, takes the path over (once) if it's a stale socket,
+  and otherwise leaves the path alone, logs why and exits. On exit a daemon removes the socket only
+  if it's still the one it bound (same inode). One request per connection; later lines are ignored.
+- **One set of rules** (`validate.mjs`) for item, vault, field, account and `op://` names, used by
+  the shim, the session's socket (a same-user process can write to it directly) and the daemon.
+  The card's `parseRef` uses the same segment pattern.
 - **What the daemon runs:** `op read <ref>` (a strict `op://` pattern), `op item get <item>
   [--vault V] --fields <f> --reveal`, `whoami`, and `arm` (pops the one Touch ID). Nothing else,
   no shell. Values go back over the socket only, never to a file or log.
+- **Sessions kept apart:** grants, open cards and queued reads belong to the session they arrived
+  in. After `/new`, `/resume` or `/fork` they're refused, never carded in the next session.
 - **Daemon status:** armed until (time), not armed, or locked. The footer can show a small key
   chip while armed.
 - **The shim** (stdlib Node or a tiny script, fast start) blocks for the card up to 5 minutes,
   then exits 1 with "not approved". `op signin [--account x]` answers ok when armed.
 - **The card** says what's asked in plain words, plus the parent command line (truncated) the
-  read is for. Esc means Deny. With Botsun, the phone gets the same card through botsun-owner.
+  read is for. Esc means Deny. With Botsun, the phone gets the same card through
+  botsun-owner, offered as a sensitive prompt: answered on the phone screen (device-signed) or the
+  keyboard, never by a voice confirm.
 
 ## Steps
 

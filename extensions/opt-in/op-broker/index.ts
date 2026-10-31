@@ -14,24 +14,29 @@
 import { spawn } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { homedir, platform } from "node:os";
+import { platform } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { optIn } from "../../../lib/opt-in.ts";
 import { offerPrompt } from "../../../lib/remote-prompts.ts";
 import { Broker, CHOICES, type Decision, type OpRequest, type Reply } from "./broker.ts";
+import { brokerDir, validRequest } from "./validate.mjs";
+
+export { brokerDir };
 
 // The real path: the shim compares PATH entries by real path, so a symlinked install can't loop.
 const HERE = realpathSync(dirname(fileURLToPath(import.meta.url)));
 const CARD_MS = 5 * 60_000; // an unanswered card is a deny
 const MAX_LINE = 16 * 1024;
 const KINDS = new Set(["read", "otp", "fields", "whoami"]);
-
-export const brokerDir = (env = process.env) => env.PI_OP_BROKER_DIR || join(homedir(), ".local", "state", "pi-op-broker");
+// The daemon gives op OP_TIMEOUT_MS (90 s, daemon.mjs) before killing it; waiting 10 s more lets
+// its own "op failed" reply arrive rather than a vaguer "didn't answer". Keep the two in step.
+export const OP_TIMEOUT_MS = 90_000;
+export const DAEMON_REPLY_MS = OP_TIMEOUT_MS + 10_000;
 
 /** One request to the daemon's socket, one reply; null if nothing is listening. */
-export function daemonRequest(sock: string, request: object, timeoutMs = 100_000): Promise<Reply & Record<string, unknown> | null> {
+export function daemonRequest(sock: string, request: object, timeoutMs = DAEMON_REPLY_MS): Promise<Reply & Record<string, unknown> | null> {
 	return new Promise((resolve) => {
 		const conn = createConnection(sock);
 		let buf = "";
@@ -76,26 +81,42 @@ function startDaemon(dir: string): void {
 	child.unref();
 }
 
-async function ensureDaemon(dir: string): Promise<boolean> {
+/** The daemon's status, starting it first if nothing answers; null if it won't start. */
+async function ensureDaemon(dir: string): Promise<(Reply & Record<string, unknown>) | null> {
 	const sock = join(dir, "daemon.sock");
-	if (await daemonRequest(sock, { cmd: "status" }, 3000)) return true;
+	const status = await daemonRequest(sock, { cmd: "status" }, 3000);
+	if (status) return status;
 	startDaemon(dir);
 	for (let i = 0; i < 50; i++) {
 		await new Promise((r) => setTimeout(r, 100));
-		if (await daemonRequest(sock, { cmd: "status" }, 3000)) return true;
+		const started = await daemonRequest(sock, { cmd: "status" }, 3000);
+		if (started) return started;
 	}
-	return false;
+	return null;
 }
 
-/** A request from the shim, checked field by field; null if it isn't one. */
+/**
+ * A request from the shim, checked by the shim's and daemon's own rules (validate.mjs); null if it
+ * isn't one. Any process running as this user can reach the session's socket, not only the shim,
+ * so nothing reaches a card (newlines, bidi, a leading "-") that the shim wouldn't have sent.
+ */
 export function cleanRequest(msg: unknown): OpRequest | null {
 	if (!msg || typeof msg !== "object") return null;
 	const m = msg as Record<string, unknown>;
 	if (m.v !== 1 || typeof m.kind !== "string" || !KINDS.has(m.kind)) return null;
-	const str = (k: string) => (typeof m[k] === "string" ? (m[k] as string) : undefined);
 	const req: OpRequest = { kind: m.kind as OpRequest["kind"] };
-	for (const k of ["ref", "item", "vault", "account", "command"] as const) if (str(k) !== undefined) req[k] = str(k);
-	if (Array.isArray(m.fields) && m.fields.every((f) => typeof f === "string")) req.fields = m.fields as string[];
+	for (const k of ["ref", "item", "vault", "account"] as const) {
+		const v = m[k];
+		if (v === undefined) continue;
+		if (typeof v !== "string") return null;
+		req[k] = v;
+	}
+	if (m.fields !== undefined) {
+		if (!Array.isArray(m.fields)) return null;
+		req.fields = m.fields as string[];
+	}
+	if (!validRequest(req)) return null;
+	if (typeof m.command === "string") req.command = m.command.slice(0, 2000); // the card flattens and trims it (broker.ts)
 	return req;
 }
 
@@ -106,6 +127,9 @@ export default optIn("op-broker", "1Password reads for agents: an approval card 
 	let server: Server | undefined;
 	let sockPath: string | undefined;
 	const openCards = new Set<AbortController>(); // closed with the session
+	// This session: a connection belongs to the session it arrived in, and once that session ends
+	// (/new, /resume, /fork) its requests are refused, never carded in the next one.
+	let session = { closed: true };
 
 	// The card is also offered as a remote prompt, so botsun-owner can put it on the phone, where
 	// the answer is signed by the device and checked again here. Whichever answers first wins and
@@ -117,7 +141,8 @@ export default optIn("op-broker", "1Password reads for agents: an approval card 
 		const ctl = new AbortController();
 		openCards.add(ctl);
 		const timer = setTimeout(() => ctl.abort(), CARD_MS);
-		const remote = offerPrompt([{ question: title, options: labels.map((label) => ({ label })) }]);
+		// Sensitive: it guards a secret, so a device-signed tap or the keyboard answers it, never voice.
+		const remote = offerPrompt([{ question: title, options: labels.map((label) => ({ label })) }], { sensitive: true });
 		const closed = new Promise<undefined>((r) => ctl.signal.addEventListener("abort", () => r(undefined), { once: true }));
 		try {
 			return await Promise.race([
@@ -137,26 +162,32 @@ export default optIn("op-broker", "1Password reads for agents: an approval card 
 	};
 
 	const daemon = async (req: OpRequest): Promise<Reply> => {
-		if (!(await ensureDaemon(dir))) return { ok: false, error: `op-broker: couldn't start its daemon (see ${join(dir, "daemon.log")})` };
-		if (req.kind !== "whoami") {
-			const status = await daemonRequest(daemonSock, { cmd: "status" }, 3000);
-			const armed = Array.isArray(status?.armed) && (status.armed as string[]).includes(req.account ?? "");
-			if (!armed) ctxRef?.ui.notify("1Password: approve Touch ID on the Mac to unlock op-broker (once, for up to 12 hours)", "info");
-		}
+		// One status round trip: it finds (or starts) the daemon and says whether this read will
+		// need the Touch ID, so the notice shows only then.
+		const status = await ensureDaemon(dir);
+		if (!status) return { ok: false, error: `op-broker: couldn't start its daemon (see ${join(dir, "daemon.log")})` };
+		const armed = Array.isArray(status.armed) && (status.armed as string[]).includes(req.account ?? "");
+		if (req.kind !== "whoami" && !armed) ctxRef?.ui.notify("1Password: approve Touch ID on the Mac to unlock op-broker (once, for up to 12 hours)", "info");
 		const { command: _command, ...rest } = req;
 		return (await daemonRequest(daemonSock, { cmd: "op", ...rest })) ?? { ok: false, error: "op-broker: the daemon went away" };
 	};
 
 	const broker = new Broker({ ask, daemon });
 
+	// One request per connection, in the session it connected in; anything after the first line is ignored.
 	function serve(conn: Socket) {
+		const mine = session;
 		let buf = "";
+		let done = false;
 		conn.setEncoding("utf8");
 		conn.on("data", async (d: string) => {
+			if (done) return;
 			buf += d;
 			if (buf.length > MAX_LINE) return conn.destroy();
 			const nl = buf.indexOf("\n");
 			if (nl < 0) return;
+			done = true;
+			if (mine.closed) return void conn.end(`${JSON.stringify({ ok: false, error: "op-broker: that session ended" })}\n`);
 			let msg: unknown;
 			try {
 				msg = JSON.parse(buf.slice(0, nl));
@@ -188,6 +219,7 @@ export default optIn("op-broker", "1Password reads for agents: an approval card 
 	}
 
 	function close() {
+		session.closed = true;
 		broker.revoke(); // grants belong to this session: not to the next one after /new, /resume or /fork
 		for (const ctl of openCards) ctl.abort(); // and its open cards close, on the phone too
 		server?.close();
@@ -204,6 +236,7 @@ export default optIn("op-broker", "1Password reads for agents: an approval card 
 	pi.on("session_start", (_event, ctx) => {
 		if (!ctx.hasUI || ctx.mode !== "tui") return;
 		ctxRef = ctx;
+		if (session.closed) session = { closed: false };
 		if (!server) listen();
 	});
 

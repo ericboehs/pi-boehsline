@@ -8,6 +8,8 @@
  * left one.
  */
 
+import { REF_PARTS } from "./validate.mjs";
+
 export type Kind = "read" | "otp" | "fields" | "whoami";
 export interface OpRequest {
 	kind: Kind;
@@ -37,8 +39,9 @@ const MAX_COMMAND = 200;
 
 /** op://Vault/Item[/section]/field → its parts, or null. */
 export function parseRef(ref: string): { vault: string; item: string; field: string } | null {
-	// The one query op-broker takes is ?attribute=otp|totp; anything else isn't parsed (the card shows the raw ref).
-	const m = /^op:\/\/([^/?]+)\/([^/?]+)\/(?:([^/?]+)\/)?([^/?]+)(\?attribute=(?:otp|totp))?$/.exec(ref);
+	// The shim's and daemon's REF, its parts captured (validate.mjs). The one query op-broker takes
+	// is ?attribute=otp|totp; anything else isn't parsed (the card shows the raw ref).
+	const m = REF_PARTS.exec(ref);
 	if (!m) return null;
 	const [, vault = "", item = "", section, field = "", query] = m;
 	return { vault, item, field: query ? "one-time code" : section ? `${section} › ${field}` : field };
@@ -99,10 +102,13 @@ export class Broker {
 		const key = grantKey(req);
 		if (!key) return { ok: false, error: "op-broker: not a read it takes" };
 		if (this.live(key)) return this.deps.daemon(req);
-		// One card at a time; a grant the card before left may cover this read.
+		// One card at a time; a grant the card before left may cover this read. The generation is
+		// the one this read arrived in: a revoke (the session ended) while it waited refuses it, so
+		// its card never shows in the next session.
+		const gen = this.generation;
 		const turn = this.queue.then(async () => {
+			if (gen !== this.generation) return false;
 			if (this.live(key)) return true;
-			const gen = this.generation;
 			const decision = await this.deps.ask(cardTitle(req), req).catch(() => undefined);
 			if (!decision || decision === "deny" || gen !== this.generation) return false;
 			if (GRANT_MS[decision]) this.grants.set(key, this.now() + GRANT_MS[decision]);

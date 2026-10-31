@@ -16,13 +16,8 @@ import { realpathSync } from "node:fs";
 import { createConnection } from "node:net";
 import { delimiter, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-
-// Item, vault and field names: no control, format (zero-width, bidi) or line-separator characters,
-// so the card shows what's read; and no leading "-", so nothing reads as a flag.
-const NAME = /^(?!-)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}]{1,200}$/u;
-const ACCOUNT = /^(?!-)[\w.@-]{1,100}$/;
-const SEG = "[^/?\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]+"; // no "?": the only query taken is ?attribute=otp
-const REF = new RegExp(`^op://${SEG}/${SEG}(/${SEG}){1,2}(\\?attribute=(otp|totp))?$`, "u");
+// Item, vault, field, account and ref rules: the same ones the session and daemon check.
+import { ACCOUNT, NAME, REF } from "./validate.mjs";
 
 // Split "--flag=value" and pull --account out (it may come anywhere). null for any form we don't take.
 export function parse(argv) {
@@ -115,13 +110,20 @@ function realOp(argv) {
 
 const WAIT_MS = 15 * 60_000; // cards queue one at a time (5 minutes each) plus a Touch ID; the bash tool's own timeout usually ends it first
 
-function ask(sock, request) {
+// One reply, settled once: whichever of reply, error, hang-up or timeout comes first; the timer is
+// cleared with it. null means nothing is listening.
+export function ask(sock, request, waitMs = WAIT_MS) {
 	return new Promise((resolve) => {
 		const conn = createConnection(sock);
-		setTimeout(() => {
+		let settled = false;
+		const done = (v) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
 			conn.destroy();
-			resolve({ ok: false, error: "op-broker: no answer in time" });
-		}, WAIT_MS).unref();
+			resolve(v);
+		};
+		const timer = setTimeout(() => done({ ok: false, error: "op-broker: no answer in time" }), waitMs);
 		let buf = "";
 		conn.setEncoding("utf8");
 		conn.on("connect", () => conn.write(`${JSON.stringify({ v: 1, ...request })}\n`));
@@ -129,15 +131,16 @@ function ask(sock, request) {
 			buf += d;
 			const nl = buf.indexOf("\n");
 			if (nl < 0) return;
-			conn.destroy();
+			let reply;
 			try {
-				resolve(JSON.parse(buf.slice(0, nl)));
+				reply = JSON.parse(buf.slice(0, nl));
 			} catch {
-				resolve({ ok: false, error: "op-broker: a bad reply" });
+				reply = { ok: false, error: "op-broker: a bad reply" };
 			}
+			done(reply);
 		});
-		conn.on("error", () => resolve(null));
-		conn.on("close", () => resolve({ ok: false, error: "op-broker: the session went away" }));
+		conn.on("error", () => done(null));
+		conn.on("close", () => done({ ok: false, error: "op-broker: the session went away" }));
 	});
 }
 
@@ -153,6 +156,10 @@ async function main() {
 	if (reply === null) return realOp(argv); // no extension listening (the session reloaded without it)
 	if (!reply.ok) {
 		process.stderr.write(`[ERROR] ${reply.error ?? "op-broker: not approved"}\n`);
+		return process.exit(1);
+	}
+	if (typeof reply.value !== "string") {
+		process.stderr.write("[ERROR] op-broker: a reply with no value\n");
 		return process.exit(1);
 	}
 	process.stdout.write(req.kind === "read" && !req.newline ? reply.value : `${reply.value}\n`);
