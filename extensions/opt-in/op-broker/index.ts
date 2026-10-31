@@ -1,0 +1,216 @@
+/**
+ * op-broker: agents read 1Password through an approval card in the session, and every session
+ * shares one 1Password CLI authorization (one Touch ID per 12 hours, not one per command).
+ *
+ * - The `op` shim (this folder) goes first on PATH for everything pi runs, so the bash tool's
+ *   `op read …`, `op item get … --otp` and `op item get … --fields … --reveal` come here over
+ *   this session's socket ($PI_OP_BROKER_SOCK). Every other op command is the real op.
+ * - This session shows the card (Allow once / 1 hour / 8 hours / Deny) and keeps the grants.
+ * - The daemon (daemon.mjs, one per user, inside a pseudo-terminal of its own) runs the read.
+ *
+ * Interactive TUI sessions only: a card needs someone at the keyboard.
+ */
+
+import { spawn } from "node:child_process";
+import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
+import { createConnection, createServer, type Server, type Socket } from "node:net";
+import { homedir, platform } from "node:os";
+import { delimiter, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { optIn } from "../../../lib/opt-in.ts";
+import { Broker, CHOICES, type Decision, type OpRequest, type Reply } from "./broker.ts";
+
+// The real path: the shim compares PATH entries by real path, so a symlinked install can't loop.
+const HERE = realpathSync(dirname(fileURLToPath(import.meta.url)));
+const CARD_MS = 5 * 60_000; // an unanswered card is a deny
+const MAX_LINE = 16 * 1024;
+const KINDS = new Set(["read", "otp", "fields", "whoami"]);
+
+export const brokerDir = (env = process.env) => env.PI_OP_BROKER_DIR || join(homedir(), ".local", "state", "pi-op-broker");
+
+/** One request to the daemon's socket, one reply; null if nothing is listening. */
+export function daemonRequest(sock: string, request: object, timeoutMs = 100_000): Promise<Reply & Record<string, unknown> | null> {
+	return new Promise((resolve) => {
+		const conn = createConnection(sock);
+		let buf = "";
+		let settled = false;
+		const done = (v: (Reply & Record<string, unknown>) | null) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			conn.destroy();
+			resolve(v);
+		};
+		const timer = setTimeout(() => done({ ok: false, error: "op-broker: the daemon didn't answer" }), timeoutMs);
+		conn.setEncoding("utf8");
+		conn.on("connect", () => conn.write(`${JSON.stringify(request)}\n`));
+		conn.on("data", (d: string) => {
+			buf += d;
+			const nl = buf.indexOf("\n");
+			if (nl < 0) return;
+			try {
+				done(JSON.parse(buf.slice(0, nl)));
+			} catch {
+				done({ ok: false, error: "op-broker: a bad reply from the daemon" });
+			}
+		});
+		conn.on("error", () => done(null));
+		conn.on("close", () => done({ ok: false, error: "op-broker: the daemon hung up" }));
+	});
+}
+
+/** Start the daemon inside a pseudo-terminal of its own, so one Touch ID covers every op it runs. */
+function startDaemon(dir: string): void {
+	const env: NodeJS.ProcessEnv = { ...process.env, PI_OP_BROKER_DIR: dir, PI_OP_BROKER_SHIM_DIR: HERE };
+	delete env.PI_OP_BROKER_SOCK;
+	env.PATH = (env.PATH ?? "").split(delimiter).filter((p) => p && p !== HERE).join(delimiter);
+	const daemon = join(HERE, "daemon.mjs");
+	if (platform() !== "darwin") env.SHELL = "/bin/sh"; // util-linux script runs -c through $SHELL
+	const args = platform() === "darwin"
+		? ["-q", "/dev/null", process.execPath, daemon]
+		: ["-q", "-c", `'${process.execPath.replace(/'/g, "'\\''")}' '${daemon.replace(/'/g, "'\\''")}'`, "/dev/null"];
+	const child = spawn(env.PI_OP_BROKER_SCRIPT || "script", args, { detached: true, stdio: "ignore", env });
+	child.on("error", () => {});
+	child.unref();
+}
+
+async function ensureDaemon(dir: string): Promise<boolean> {
+	const sock = join(dir, "daemon.sock");
+	if (await daemonRequest(sock, { cmd: "status" }, 3000)) return true;
+	startDaemon(dir);
+	for (let i = 0; i < 50; i++) {
+		await new Promise((r) => setTimeout(r, 100));
+		if (await daemonRequest(sock, { cmd: "status" }, 3000)) return true;
+	}
+	return false;
+}
+
+/** A request from the shim, checked field by field; null if it isn't one. */
+export function cleanRequest(msg: unknown): OpRequest | null {
+	if (!msg || typeof msg !== "object") return null;
+	const m = msg as Record<string, unknown>;
+	if (m.v !== 1 || typeof m.kind !== "string" || !KINDS.has(m.kind)) return null;
+	const str = (k: string) => (typeof m[k] === "string" ? (m[k] as string) : undefined);
+	const req: OpRequest = { kind: m.kind as OpRequest["kind"] };
+	for (const k of ["ref", "item", "vault", "account", "command"] as const) if (str(k) !== undefined) req[k] = str(k);
+	if (Array.isArray(m.fields) && m.fields.every((f) => typeof f === "string")) req.fields = m.fields as string[];
+	return req;
+}
+
+export default optIn("op-broker", "1Password reads for agents: an approval card per item, one shared Touch ID", (pi: ExtensionAPI) => {
+	const dir = brokerDir();
+	const daemonSock = join(dir, "daemon.sock");
+	let ctxRef: ExtensionContext | undefined;
+	let server: Server | undefined;
+	let sockPath: string | undefined;
+
+	const ask = async (title: string): Promise<Decision | undefined> => {
+		const ctx = ctxRef;
+		if (!ctx?.hasUI) return undefined;
+		const ctl = new AbortController();
+		const timer = setTimeout(() => ctl.abort(), CARD_MS);
+		try {
+			const pick = await ctx.ui.select(title, CHOICES.map(([label]) => label), { signal: ctl.signal });
+			return CHOICES.find(([label]) => label === pick)?.[1];
+		} finally {
+			clearTimeout(timer);
+		}
+	};
+
+	const daemon = async (req: OpRequest): Promise<Reply> => {
+		if (!(await ensureDaemon(dir))) return { ok: false, error: `op-broker: couldn't start its daemon (see ${join(dir, "daemon.log")})` };
+		if (req.kind !== "whoami") {
+			const status = await daemonRequest(daemonSock, { cmd: "status" }, 3000);
+			const armed = Array.isArray(status?.armed) && (status.armed as string[]).includes(req.account ?? "");
+			if (!armed) ctxRef?.ui.notify("1Password: approve Touch ID on the Mac to unlock op-broker (once, for up to 12 hours)", "info");
+		}
+		const { command: _command, ...rest } = req;
+		return (await daemonRequest(daemonSock, { cmd: "op", ...rest })) ?? { ok: false, error: "op-broker: the daemon went away" };
+	};
+
+	const broker = new Broker({ ask, daemon });
+
+	function serve(conn: Socket) {
+		let buf = "";
+		conn.setEncoding("utf8");
+		conn.on("data", async (d: string) => {
+			buf += d;
+			if (buf.length > MAX_LINE) return conn.destroy();
+			const nl = buf.indexOf("\n");
+			if (nl < 0) return;
+			let msg: unknown;
+			try {
+				msg = JSON.parse(buf.slice(0, nl));
+			} catch {}
+			buf = "";
+			const req = cleanRequest(msg);
+			const reply = req ? await broker.handle(req).catch((e) => ({ ok: false, error: String(e?.message ?? e) })) : { ok: false, error: "op-broker: a bad request" };
+			if (!conn.destroyed) conn.end(`${JSON.stringify(reply)}\n`);
+		});
+		conn.on("error", () => {});
+	}
+
+	function listen() {
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		chmodSync(dir, 0o700);
+		sockPath = join(dir, `s-${process.pid}.sock`);
+		if (existsSync(sockPath) && lstatSync(sockPath).isSocket()) unlinkSync(sockPath);
+		server = createServer(serve);
+		server.listen(sockPath, () => {
+			if (sockPath) chmodSync(sockPath, 0o600); // the folder is 0700 already
+		});
+		server.on("error", (e) => ctxRef?.ui.notify(`op-broker: ${e.message}`, "error"));
+		// Everything pi runs from here on finds the shim first and this session's socket.
+		const path = (process.env.PATH ?? "").split(delimiter).filter((p) => p && p !== HERE);
+		process.env.PATH = [HERE, ...path].join(delimiter);
+		process.env.PI_OP_BROKER_SOCK = sockPath;
+		process.env.PI_OP_BROKER_NODE = process.execPath;
+		delete process.env.PI_OP_BROKER_PASSTHRU; // a pi started under the real op (op run -- pi) starts fresh
+	}
+
+	function close() {
+		broker.revoke(); // grants belong to this session: not to the next one after /new, /resume or /fork
+		server?.close();
+		server = undefined;
+		if (sockPath && existsSync(sockPath)) {
+			try {
+				unlinkSync(sockPath);
+			} catch {}
+		}
+		process.env.PATH = (process.env.PATH ?? "").split(delimiter).filter((p) => p && p !== HERE).join(delimiter);
+		delete process.env.PI_OP_BROKER_SOCK;
+	}
+
+	pi.on("session_start", (_event, ctx) => {
+		if (!ctx.hasUI || ctx.mode !== "tui") return;
+		ctxRef = ctx;
+		if (!server) listen();
+	});
+
+	pi.on("session_shutdown", () => {
+		close();
+		ctxRef = undefined;
+	});
+
+	pi.registerCommand("op-broker", {
+		description: "1Password broker: status, revoke (this session's grants), stop (the daemon)",
+		handler: async (args, ctx) => {
+			const sub = args.trim();
+			if (sub === "revoke") {
+				ctx.ui.notify(`op-broker: revoked ${broker.revoke()} grant(s) in this session`, "info");
+			} else if (sub === "stop") {
+				const r = await daemonRequest(daemonSock, { cmd: "stop" }, 3000);
+				ctx.ui.notify(r ? "op-broker: daemon stopped (1Password access dropped)" : "op-broker: no daemon running", "info");
+			} else {
+				const status = await daemonRequest(daemonSock, { cmd: "status" }, 3000);
+				const armed = Array.isArray(status?.armed) ? (status.armed as string[]) : [];
+				const lines = [
+					status ? `daemon: running, ${armed.length ? `unlocked for ${armed.map((a) => a || "default account").join(", ")}` : "not unlocked yet"}` : "daemon: not running",
+					...broker.list().map(([k, ms]) => `grant: ${(JSON.parse(k) as Array<string | null>).filter(Boolean).join(" / ")} · ${Math.ceil(ms / 60_000)} min left`),
+				];
+				ctx.ui.notify(lines.join("\n"), "info");
+			}
+		},
+	});
+});

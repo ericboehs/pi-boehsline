@@ -55,6 +55,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [image-prune](extensions/opt-in/image-prune/README.md) | Shrinks big tool result images on arrival, and swaps old images for a note with their path past a size threshold | `/image-prune` |
 | [watch](extensions/opt-in/watch/README.md) | Slack, bot feed and notification watcher with digests and drafts | `/watch`, `watch_items` tool |
 | [meeting](extensions/opt-in/meeting/README.md) | Live meeting copilot: rolling notes, name and action alerts, slide summaries, and chat answers, from the transcript | `/meeting` |
+| [op-broker](extensions/opt-in/op-broker/README.md) | 1Password for agents: an approval card per item, one shared Touch ID for every session | `/op-broker` |
 | [omlx](extensions/opt-in/omlx/README.md) | Adds models loaded in a local oMLX server to `/model` |  |
 | [scheduler-tool](packages/scheduler/README.md#letting-the-agent-set-timers-schedule-tool) | Lets the agent set and manage `/once` and `/loop` timers | `schedule` tool (deferred) |
 | [sc](extensions/opt-in/sc/README.md) | Attach the newest screenshot from iCloud Downloads | `/sc` |

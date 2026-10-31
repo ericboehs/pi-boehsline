@@ -1,0 +1,3 @@
+#!/bin/sh
+# op-broker's op shim: see shim.mjs. The node pi runs under, else the first on PATH.
+exec "${PI_OP_BROKER_NODE:-node}" "$(dirname "$0")/shim.mjs" "$@"
