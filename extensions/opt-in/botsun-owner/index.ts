@@ -92,8 +92,10 @@ interface Conn {
 	commands?: () => PhoneCommand[];
 	/** Delivers released call words: queued after the turn, steered in, or stopping the run first. */
 	deliver?: (text: string, mode: "queue" | "steer" | "stop") => string;
+	/** Stops the running turn as Esc does: "stopped", or "idle" when nothing is running. */
+	stop?: () => string;
 	/** A call's verified words, held until the voice helper releases them (session-voice plan). */
-	held?: Map<string, { text: string; at: number }>;
+	held?: Map<string, { text: string; at: number; proposal?: string }>;
 }
 
 const store = globalThis as unknown as { [STORE]?: Conn };
@@ -211,14 +213,16 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 			try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 		})();
 		return { nonce: newNonce(c), session_id: c.sessionId,
-			features: ["say", "images", "files", "say_audio", "hold", "stream", "ask", ...(hasStash ? ["stash"] : [])] };
+			features: ["say", "images", "files", "say_audio", "hold", "stop", "confirm", "stream", "ask", ...(hasStash ? ["stash"] : [])] };
 	}
 	if (r.type === "say_audio") return sayAudio(c, r);
 	if (r.type === "release") return releaseHeld(c, r);
 	if (r.type === "drop") return dropHeld(c, r);
 	if (r.type === "call_end") return dropHeld(c, {});
+	if (r.type === "confirm") return confirmHeld(c, r);
 	if (r.type === "answer") return answerAsk(c, r);
 	if (r.type === "stash") return stashRequest(c, r);
+	if (r.type === "stop") return stopRequest(c, r);
 	// Display only (a chip's mode, as a click on the footer flips it): not signed, nothing acts.
 	if (r.type === "footer_tap") return footerTap(String(r.chip ?? ""));
 	if (r.type !== "say") return { error: "unknown request" };
@@ -280,6 +284,9 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 function sayAudio(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
 	const { text, nonce, signature, wav_sha256: wav } = r;
 	const deviceId = typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
+	// A reply to a proposal on the call (an `ask` answer read back to him): its hash is signed too.
+	const proposal = typeof r.proposal_sha256 === "string" && /^[0-9a-f]{64}$/.test(r.proposal_sha256) ? r.proposal_sha256 : undefined;
+	if (r.proposal_sha256 !== undefined && !proposal) return { error: "bad request" };
 	if (typeof text !== "string" || !text.trim() || text.length > TEXT_MAX) return { error: "nothing was said" };
 	if (typeof nonce !== "string" || typeof signature !== "string" || typeof wav !== "string" || !/^[0-9a-f]{64}$/.test(wav) ||
 		!/^\d{1,12}$/.test(deviceId)) return { error: "bad request" };
@@ -295,7 +302,8 @@ function sayAudio(c: Conn, r: Record<string, unknown>): Record<string, unknown> 
 	let ok = false;
 	try {
 		const pub = createPublicKey({ key: Buffer.concat([P256_SPKI, key]), format: "der", type: "spki" });
-		const msg = Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, "say_audio", wav].join("\n"), "utf8");
+		const msg = Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, "say_audio", wav,
+			...(proposal ? [proposal] : [])].join("\n"), "utf8");
 		ok = verifySignature("sha256", msg, { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"));
 	} catch {}
 	if (!ok) return { error: "signature does not verify" };
@@ -305,7 +313,7 @@ function sayAudio(c: Conn, r: Record<string, unknown>): Record<string, unknown> 
 		pruneHeld(c);
 		if (held.size >= HELD_MAX) return { error: "too many words are waiting; release or drop some" };
 		const id = randomBytes(6).toString("hex");
-		held.set(id, { text, at: Date.now() });
+		held.set(id, { text, at: Date.now(), ...(proposal ? { proposal } : {}) });
 		writeHeld(c);
 		debug(`owner say_audio held (${text.length} chars)`);
 		return { ok: true, held: id };
@@ -331,6 +339,58 @@ export function saysStop(text: string): boolean {
 	if (/^(?:(?:ok|okay|hey|wait|no|please|hold on|actually|pi)\s+)*(?:stop|cancel|abort|halt)\b/.test(t)) return true;
 	// "make it stop", "tell it to stop": only that short, so "make it stop retrying the spec" isn't one.
 	return words.length <= 4 && /^(?:please\s+)?(?:make it|tell it to)\s+(?:stop|cancel|abort|halt)\b/.test(t);
+}
+
+/**
+ * His reply to a proposal says no ("no", "wait", "not that", "cancel"): the session refuses the
+ * confirm whatever the voice helper made of it. Leans to no ("no problem" is refused too).
+ */
+export function saysNo(text: string): boolean {
+	const t = text.toLowerCase().replace(/[’']/g, "'");
+	return /\b(no|nope|nah|uh-uh|don't|dont|do not|not|cancel|wait|stop|hold on|never ?mind|wrong|scratch|actually|instead)\b/.test(t);
+}
+
+/**
+ * His reply to a read-back says yes in so many words ("yeah", "sure, send it", "go ahead") and
+ * is short: a question back, "hmm" or "read it again" carries the card's hash too, and must not
+ * count whatever the voice helper made of it.
+ */
+export function saysYes(text: string): boolean {
+	const t = text.toLowerCase().replace(/[’']/g, "'").replace(/[^a-z' -]+/g, " ").trim();
+	if (!t || t.split(/\s+/).length > 12 || saysNo(t) || /\?/.test(text)) return false;
+	return /\b(yes|yeah|yep|yup|ya|sure|ok|okay|correct|right|confirm|confirmed|affirmative|absolutely|definitely|perfect|fine|sounds good|go ahead|go for it|do it|do that|send|send it|send that|that's it|that one|uh huh|uh-huh|mm-hmm|mhm|please do|you got it|ship it)\b/.test(t);
+}
+
+/**
+ * The voice helper says his held reply means yes to the proposal it read back: answer the open
+ * `ask` with it. The session checks on its own that his signed words carry this exact answer's
+ * hash (canonicalAnswer) and don't say no; the helper can't write the yes, only point at it.
+ */
+function confirmHeld(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const { id, ask_id: askId, answers } = r;
+	if (typeof id !== "string" || typeof askId !== "string" || !Array.isArray(answers)) return { error: "bad request" };
+	pruneHeld(c);
+	const h = c.held?.get(id);
+	if (!h) return { error: `not waiting: ${id}` };
+	if (!h.proposal) return { error: "his words weren't a reply to a proposal" };
+	let digest: string;
+	try {
+		digest = sha256hex(Buffer.from(canonicalAnswer(askId, answers as never), "utf8"));
+	} catch {
+		return { error: "bad request" };
+	}
+	// Whatever happens next, these words are spent: a failed confirm never leaves them to retry.
+	c.held?.delete(id);
+	writeHeld(c);
+	if (digest !== h.proposal) return { error: "his yes was for a different answer" };
+	if (saysNo(h.text)) return { error: "his words say no" };
+	if (!saysYes(h.text)) return { error: "his words don't say yes" };
+	const prompt = openPrompts().find((p) => p.id === askId);
+	if (!prompt) return { error: "that question was already answered" };
+	const error = prompt.answer(answers as never);
+	if (error) return { error };
+	debug("owner confirm answered an ask");
+	return { ok: true };
 }
 
 function pruneHeld(c: Conn): void {
@@ -450,6 +510,35 @@ function stashRequest(c: Conn, r: Record<string, unknown>): Record<string, unkno
 	const entry = takeStash(c.sessionId, id);
 	if (!entry) return { error: "that stash is gone" };
 	return op === "take" ? { ok: true, text: entry.text } : { ok: true };
+}
+
+/**
+ * The phone's Stop button: ends the running turn as Esc does. Signed with the decision key over
+ * "stop" (this session's nonce makes each one single-use).
+ */
+function stopRequest(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const { nonce, signature } = r;
+	const deviceId = typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
+	if (typeof nonce !== "string" || typeof signature !== "string" || !/^\d{1,12}$/.test(deviceId)) return { error: "bad request" };
+	if (!c.sessionId) return { error: "this session has no id yet" };
+	if (!takeNonce(c, nonce)) return { error: "nonce is expired or used" };
+	let key: Buffer | null;
+	try {
+		key = deviceKey(deviceId);
+	} catch (e) {
+		return { error: (e as Error).message.startsWith("owner-keys") ? (e as Error).message : "no device keys" };
+	}
+	if (!key) return { error: "unknown device" };
+	let ok = false;
+	try {
+		const msg = Buffer.from(["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, "stop",
+			sha256hex(Buffer.from("stop", "utf8"))].join("\n"), "utf8");
+		const pub = createPublicKey({ key: Buffer.concat([P256_SPKI, key]), format: "der", type: "spki" });
+		ok = verifySignature("sha256", msg, { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"));
+	} catch {}
+	if (!ok) return { error: "signature does not verify" };
+	if (!c.stop) return { error: "this session can't stop from the phone yet; run /reload" };
+	return { ok: true, stopped: c.stop() === "stopped" };
 }
 
 function listenOwner(c: Conn): void {
@@ -871,6 +960,12 @@ function main(pi: ExtensionAPI): void {
 			ctx.abort();
 			return "stopped";
 		};
+		// The phone's Stop: Esc. A compaction counts as running (Esc stops that too).
+		const stop = (): string => {
+			if (ctx.isIdle() && !compacting) return "idle";
+			ctx.abort();
+			return "stopped";
+		};
 		const command = (text: string, busy: boolean) =>
 			compacting && /^\//.test(text.trim()) && !/^\/(model|thinking|name|bypass)\b/.test(text.trim()) ? "wait for the compaction to finish" : runCommand(pi, ctx, text, busy);
 		const commands = () => phoneCommands(pi);
@@ -885,6 +980,7 @@ function main(pi: ExtensionAPI): void {
 			conn.sessionName = sessionName;
 			conn.inject = inject;
 			conn.deliver = deliver;
+			conn.stop = stop;
 			conn.command = command;
 			conn.commands = commands;
 			conn.models = models;
@@ -916,7 +1012,7 @@ function main(pi: ExtensionAPI): void {
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
 			busy: false, prompt: null, promptDepth: 0, sessionName, ...info,
-			nonces: new Map(), inject, deliver, command, commands, models, context, model: modelOf(ctx),
+			nonces: new Map(), inject, deliver, stop, command, commands, models, context, model: modelOf(ctx),
 		};
 		store[STORE] = conn;
 		connect(conn);

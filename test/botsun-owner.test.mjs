@@ -733,11 +733,14 @@ async function heldCall() {
 	m.ctx.isIdle = () => idle;
 	m.ctx.abort = () => aborts++;
 	const wav = createHash("sha256").update("RIFF…audio").digest("hex");
-	const hold = async (text) => {
+	// proposal: the hash of the answer read back to him, signed with his reply; signedFor: what the
+	// phone actually signed (a forged request claims one hash, signed another).
+	const hold = async (text, proposal, signedFor = proposal) => {
 		const { nonce } = await ask({ type: "nonce" });
-		const signature = cryptoSign("sha256", Buffer.from(["botsun-decide-v1", "7", nonce, "session", "sid-a", "say_audio", wav].join("\n")),
-			{ key: call.privateKey, dsaEncoding: "der" }).toString("base64");
-		return ask({ type: "say_audio", text, nonce, device_id: 7, wav_sha256: wav, signature, hold: true });
+		const lines = ["botsun-decide-v1", "7", nonce, "session", "sid-a", "say_audio", wav, ...(signedFor ? [signedFor] : [])];
+		const signature = cryptoSign("sha256", Buffer.from(lines.join("\n")), { key: call.privateKey, dsaEncoding: "der" }).toString("base64");
+		return ask({ type: "say_audio", text, nonce, device_id: 7, wav_sha256: wav, signature, hold: true,
+			...(proposal ? { proposal_sha256: proposal } : {}) });
 	};
 	return { m, hold, busy: (b) => (idle = !b), aborts: () => aborts };
 }
@@ -776,6 +779,73 @@ test("interrupt stops the run only when Eric's own words say stop", async () => 
 	await m.fire("agent_settled");
 	assert.equal(m.sent.length, before + 1, "sent once the aborted run settled");
 	assert.deepEqual(m.sent.at(-1), { content: "stop, that's the wrong branch", options: undefined });
+});
+
+test("the phone's Stop ends the running turn as Esc does, signed", async () => {
+	const decide = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: { 7: decide.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	const m = await owner();
+	let idle = false;
+	let aborts = 0;
+	m.ctx.isIdle = () => idle;
+	m.ctx.abort = () => aborts++;
+	const stop = async (key = decide) => {
+		const { nonce, features } = await ask({ type: "nonce" });
+		assert.ok(features.includes("stop"));
+		const digest = createHash("sha256").update("stop", "utf8").digest("hex");
+		const msg = ["botsun-decide-v1", "7", nonce, "session", "sid-a", "stop", digest].join("\n");
+		const signature = cryptoSign("sha256", Buffer.from(msg), { key: key.privateKey, dsaEncoding: "der" }).toString("base64");
+		return ask({ type: "stop", nonce, device_id: 7, signature });
+	};
+	assert.deepEqual(await stop(), { ok: true, stopped: true });
+	assert.equal(aborts, 1);
+	assert.equal((await stop(phoneKey())).error, "signature does not verify");
+	assert.equal(aborts, 1, "only Eric's phone");
+	idle = true;
+	assert.deepEqual(await stop(), { ok: true, stopped: false }, "nothing running");
+	assert.equal(aborts, 1);
+	assert.equal(m.sent.length, 0);
+});
+
+test("a yes on the call answers the ask only with the read-back answer's hash, and never a no", async () => {
+	const { offerPrompt, canonicalAnswer } = await import("../lib/remote-prompts.ts");
+	const { m, hold } = await heldCall();
+	assert.ok((await ask({ type: "nonce" })).features.includes("confirm"));
+	const offered = offerPrompt([{ question: "Pizza?", options: [{ label: "Pepperoni" }, { label: "Mushrooms" }] }]);
+	const mushrooms = [{ picks: [1] }];
+	const sha = createHash("sha256").update(canonicalAnswer(offered.id, mushrooms)).digest("hex");
+	const other = createHash("sha256").update(canonicalAnswer(offered.id, [{ picks: [0] }])).digest("hex");
+	const confirm = (id, answers = mushrooms) => ask({ type: "confirm", id, ask_id: offered.id, answers });
+
+	const plain = await hold("yeah send it");
+	assert.equal((await confirm(plain.held)).error, "his words weren't a reply to a proposal");
+	assert.equal((await hold("yes", sha, other)).error, "signature does not verify", "the hash is in the signature");
+	const no = await hold("no, the other one", sha);
+	assert.equal((await confirm(no.held)).error, "his words say no");
+	assert.equal((await confirm(no.held)).error, `not waiting: ${no.held}`, "a failed confirm spends them");
+	const hmm = await hold("hmm which one is safer", sha);
+	assert.equal((await confirm(hmm.held)).error, "his words don't say yes", "a misled helper can't confirm on any words");
+	const wrong = await hold("yes", sha);
+	assert.equal((await confirm(wrong.held, [{ picks: [0] }])).error, "his yes was for a different answer");
+	const yes = await hold("yeah that's fine, send it over", sha);
+	assert.deepEqual(await confirm(yes.held), { ok: true });
+	assert.deepEqual(await offered.answered, mushrooms);
+	assert.equal((await confirm(yes.held)).error, `not waiting: ${yes.held}`, "used once");
+	assert.equal(m.sent.length, 0, "an answer, not words for the model");
+	offered.dispose();
+});
+
+test("saysNo leans to no, and saysYes takes a short yes in so many words", async () => {
+	const { saysNo, saysYes } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	for (const t of ["no", "No, the other one", "nope", "wait", "don't", "dont", "not that", "I'm not sure", "cancel it", "hold on", "never mind",
+		"no problem", "actually the first one", "scratch that", "yes, no wait"]) assert.equal(saysNo(t), true, t);
+	for (const t of ["yes", "yeah that's fine, send it over", "sure", "go ahead", "I know, send it", "do it"]) assert.equal(saysNo(t), false, t);
+	for (const t of ["yes", "Yeah.", "yeah that's fine, send it over", "sure, send it", "go ahead", "ok do it", "that's it", "sounds good", "uh huh", "mm-hmm", "please do", "send", "yes sir", "ship it"]) {
+		assert.equal(saysYes(t), true, t);
+	}
+	for (const t of ["hmm", "which one is safer?", "read the question again", "say yes to send it?", "yes, no wait", "I'm not sure",
+		"tell it to also run the linter on the whole repo before pushing anything at all please"]) assert.equal(saysYes(t), false, t);
 });
 
 test("saysStop: stop words, not their negations or lookalikes", async () => {

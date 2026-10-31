@@ -35,9 +35,11 @@ Each session also listens on its own socket, `~/.local/state/botsun/owner/<pid>.
 | request | does |
 |---|---|
 | `say` | Eric's words as if typed (steering a running turn), with photos; files are saved to `~/.local/state/botsun/inbox/<pid>/` and named in the message |
-| `say_audio` | a call into the session: the transcribed words, signed over the audio with the call key. With `hold: true` they're verified and held (`{ok, held: id}`) instead of put in |
+| `say_audio` | a call into the session: the transcribed words, signed over the audio with the call key. With `hold: true` they're verified and held (`{ok, held: id}`) instead of put in; with `proposal_sha256` the hash of an answer read back to him is signed with them |
 | `release` | `{ids, mode}` from the voice helper: held words go in as `queue` (a follow-up after the turn), `steer`, or `interrupt` (steer; abort the run first only when the released words themselves say stop, then send them once pi settles). It adds no words, so it isn't signed |
+| `confirm` | `{id, ask_id, answers}` from the voice helper: his held reply means yes to the answer read back on the call. Answers the open `ask` only when that utterance was signed with this answer's hash (`say_audio` with `proposal_sha256`, an extra line of the signed message) and its words don't say no (`saysNo`) |
 | `drop` / `call_end` | forget the held words named, or all of them |
+| `stop` | the phone's Stop button: ends the running turn (or a compaction) as Esc does; signed over `stop` with the decision key; `{ok, stopped}` |
 | `answer` | answers the open `ask` question; the tool takes it as if picked at the keyboard and closes its dialog |
 | `stash` | the message stash (with the stash extension): `push` a draft, `take` one back to the phone, `drop` one; signed over `push\n<sha256(text)>`, `take\n<id>` or `drop\n<id>` |
 | `footer_tap` | flips a display chip (`dir`, `context`, `cost`, `usage`, `rate`, `timers`) as a click on the footer does, and answers with the new row; display only, so not signed |
