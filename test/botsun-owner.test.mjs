@@ -902,7 +902,7 @@ test("drop forgets the ids given; call_end forgets them all", async () => {
 	assert.equal(m.sent.length, 0);
 });
 
-test("a sensitive prompt is flagged to Botsun and refuses a spoken yes, not a signed tap", async () => {
+test("a sensitive prompt is flagged to Botsun and refuses a spoken yes and a v1 tap, not a v2-signed tap", async () => {
 	const { offerPrompt, canonicalAnswer } = await import("../lib/remote-prompts.ts");
 	const decide = phoneKey();
 	const call = phoneKey();
@@ -937,7 +937,15 @@ test("a sensitive prompt is flagged to Botsun and refuses a spoken yes, not a si
 	({ nonce } = await ask({ type: "nonce" }));
 	const msg = ["botsun-decide-v1", "7", nonce, "session", "sid-a", "answer", sha].join("\n");
 	const signature = cryptoSign("sha256", Buffer.from(msg), { key: decide.privateKey, dsaEncoding: "der" }).toString("base64");
-	assert.deepEqual(await ask({ type: "answer", ask_id: offered.id, answers: allow, nonce, device_id: 7, signature }), { ok: true });
+	assert.match((await ask({ type: "answer", ask_id: offered.id, answers: allow, nonce, device_id: 7, signature })).error ?? "",
+		/^this one needs a v2-signed answer/, "a v1 tap doesn't bind the card's text, even before the ratchet");
+	assert.equal((await ask({ type: "stop", nonce, device_id: 7, signature })).error, "nonce is expired or used", "the refusal spent the nonce");
+	({ nonce } = await ask({ type: "nonce" }));
+	const { canonicalAnswerV2 } = await import("../lib/remote-prompts.ts");
+	const payload = canonicalAnswerV2(offered.id, [{ question: "Allow the read?", options: [{ label: "Allow" }, { label: "Deny" }] }], allow);
+	const v2msg = ["botsun-sign-v2", "7", nonce, "answer", "sid-a", "answer", createHash("sha256").update(payload).digest("hex")].join("\n");
+	const v2sig = cryptoSign("sha256", Buffer.from(v2msg), { key: decide.privateKey, dsaEncoding: "der" }).toString("base64");
+	assert.deepEqual(await ask({ type: "answer", ask_id: offered.id, answers: allow, nonce, device_id: 7, sig_v: 2, signature: v2sig }), { ok: true });
 	assert.deepEqual(await offered.answered, allow);
 	assert.equal(m.sent.length, 0);
 	offered.dispose();
@@ -1004,7 +1012,10 @@ test("v2: the nonce reply advertises sign_v2 and ask_v2; say, stash and stop ver
 
 	let { nonce } = await ask({ type: "nonce" });
 	const text = "ship it";
-	let res = await ask({ type: "say", text, nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "say", text) });
+	let res = await ask({ type: "say", text: "v1", nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", "v1") });
+	assert.equal(res.ok, true, "v1 verifies before the device has signed v2");
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "say", text, nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "say", text) });
 	assert.equal(res.error, "signature does not verify", "v2 say signs botsun-propose-text-v1\\n<text>, not the bare text");
 	({ nonce } = await ask({ type: "nonce" }));
 	res = await ask({ type: "say", text, nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "say", `botsun-propose-text-v1\n${text}`) });
@@ -1024,7 +1035,7 @@ test("v2: the nonce reply advertises sign_v2 and ask_v2; say, stash and stop ver
 	assert.equal((await ask({ type: "say", text, nonce, device_id: 7, sig_v: 2, signature: other })).error, "signature does not verify", "scoped to this session");
 	({ nonce } = await ask({ type: "nonce" }));
 	res = await ask({ type: "say", text: "v1", nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", "v1") });
-	assert.equal(res.ok, true, "v1 still verifies");
+	assert.match(res.error ?? "", /^this phone signs v2/, "v1 is refused once the device signed v2");
 
 	({ nonce } = await ask({ type: "nonce" }));
 	assert.deepEqual(await ask({ type: "stop", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "stop", "stop") }), { ok: true, stopped: true });
@@ -1124,7 +1135,7 @@ test("device keys are pinned on first use; a changed key is refused until a keyb
 	assert.equal(pins().devices["7"].sha256, keyFingerprint(first.raw), "pinned");
 	assert.equal(statSync(join(pinDir, "pins.json")).mode & 0o777, 0o600);
 	assert.equal(statSync(pinDir).mode & 0o777, 0o700);
-	assert.equal((await say(first, "two", 1)).ok, true, "same key passes (v1 too)");
+	assert.equal((await say(first, "two")).ok, true, "same key passes");
 
 	writeKeys({ 7: second.raw.toString("base64") }); // Botsun (or whatever wrote the file) swapped the key
 	assert.equal((await say(second, "three")).error, "this device's key changed: confirm at the keyboard");
@@ -1171,12 +1182,9 @@ test("pins: the call key is pinned apart; a loose pin file or no keyboard refuse
 
 	const swapped = phoneKey();
 	writeFileSync(keysFile, JSON.stringify({ devices: { 7: swapped.raw.toString("base64") }, call_devices: { 7: call.raw.toString("base64") } }));
-	({ nonce } = await ask({ type: "nonce" }));
-	assert.equal((await ask({ type: "say", text: "x", nonce, device_id: 7, signature: signed(swapped, 7, nonce, "sid-a", "x") })).error,
-		"this device's key changed: confirm at the keyboard");
+	assert.equal((await sayAs(swapped, 7, "x")).error, "this device's key changed: confirm at the keyboard");
 	chmodSync(join(pinDir, "pins.json"), 0o644);
-	({ nonce } = await ask({ type: "nonce" }));
-	assert.match((await ask({ type: "say", text: "x", nonce, device_id: 7, signature: signed(swapped, 7, nonce, "sid-a", "x") })).error, /^device pins file must be/);
+	assert.match((await sayAs(swapped, 7, "x")).error, /^device pins file must be/);
 	assert.equal(m.sent.length, 2, "the two first-use requests only");
 });
 
@@ -1452,4 +1460,79 @@ test("v2 answer refused before the signature check still spends the nonce", asyn
 	({ nonce } = await ask({ type: "nonce" }));
 	assert.deepEqual(await ask({ type: "answer", ask_id: offered.id, answers, nonce, device_id: 7, sig_v: 2, signature: signedAnswer(nonce) }), { ok: true });
 	offered.dispose();
+});
+
+// ---- The v2 ratchet (pins.json sign_versions) -------------------------------
+
+test("ratchet: after a device's first v2, its v1 (either key) is refused; an un-ratcheted device's v1 still works", async () => {
+	const { readFileSync } = await import("node:fs");
+	const { keyFingerprint, pin } = await import("../extensions/opt-in/botsun-owner/pins.ts");
+	const a = phoneKey();
+	const b = phoneKey();
+	const call = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: { 7: a.raw.toString("base64"), 8: b.raw.toString("base64") }, call_devices: { 7: call.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	pin("decide", "7", keyFingerprint(a.raw));
+	pin("decide", "8", keyFingerprint(b.raw));
+	pin("call", "7", keyFingerprint(call.raw));
+	const m = await owner();
+	const v1 = async (key, deviceId, text) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "say", text, nonce, device_id: deviceId, signature: signed(key, deviceId, nonce, "sid-a", text) });
+	};
+	const pins = () => JSON.parse(readFileSync(join(pinDir, "pins.json"), "utf8"));
+	assert.equal((await v1(a, 7, "v1 before")).ok, true);
+	assert.equal(pins().sign_versions?.["7"], undefined, "v1 doesn't ratchet");
+	assert.equal((await sayAs(a, 7, "v2")).ok, true);
+	assert.equal(pins().sign_versions["7"].sign_version, 2, "recorded next to the pin");
+	assert.equal((await v1(a, 7, "downgrade")).error, "this phone signs v2: v1 is refused (update Botsun and the app)");
+	assert.equal((await v1(b, 8, "other device")).ok, true, "device 8 never signed v2");
+	const wav = sha("RIFF…audio");
+	const { nonce } = await ask({ type: "nonce" });
+	const spoken = ["botsun-decide-v1", "7", nonce, "session", "sid-a", "say_audio", wav].join("\n");
+	const sig = cryptoSign("sha256", Buffer.from(spoken), { key: call.privateKey, dsaEncoding: "der" }).toString("base64");
+	assert.match((await ask({ type: "say_audio", text: "hi", nonce, device_id: 7, wav_sha256: wav, signature: sig })).error, /^this phone signs v2/,
+		"the call key shares the device's ratchet");
+	assert.deepEqual(m.sent.map((s) => s.content), ["v1 before", "v2", "other device"]);
+});
+
+test("ratchet: survives a reload (it's in the file), and pin() rewrites keep it; a malformed entry refuses", async () => {
+	const { readFileSync } = await import("node:fs");
+	const { pin, signVersionOf } = await import("../extensions/opt-in/botsun-owner/pins.ts");
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	await owner();
+	assert.equal((await sayAs(key, 7, "v2")).ok, true);
+	await cleanups.pop()(); // quit this session
+	pin("decide", "9", "c".repeat(64)); // another write of the file
+	assert.equal(signVersionOf("7"), 2);
+	await owner(); // a fresh instance (reload/restart) reads it back
+	const { nonce } = await ask({ type: "nonce" });
+	assert.match((await ask({ type: "say", text: "x", nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", "x") })).error, /^this phone signs v2/);
+	const file = join(pinDir, "pins.json");
+	const raw = JSON.parse(readFileSync(file, "utf8"));
+	writeFileSync(file, JSON.stringify({ ...raw, sign_versions: { 7: { sign_version: 1 } } }));
+	assert.equal((await sayAs(key, 7, "x")).error, "device pins file is malformed", "not a quiet un-ratchet");
+});
+
+test("ratchet: pin() and ratchet() from two processes at once keep both pins and ratchets", async () => {
+	const { spawn } = await import("node:child_process");
+	const { readFileSync } = await import("node:fs");
+	const pinsTs = new URL("../extensions/opt-in/botsun-owner/pins.ts", import.meta.url).href;
+	const start = Date.now() + 300;
+	const run = (body) => new Promise((resolve, reject) => {
+		const code = `import { pin, ratchet } from ${JSON.stringify(pinsTs)};
+			while (Date.now() < ${start});
+			for (let i = 0; i < 40; i++) ${body};`;
+		const p = spawn(process.execPath, ["--input-type=module", "-e", code], { env: { ...process.env, BOTSUN_OWNER_PIN_DIR: pinDir }, stdio: ["ignore", "ignore", "pipe"] });
+		let err = "";
+		p.stderr.on("data", (d) => { err += d; });
+		p.on("error", reject);
+		p.on("exit", (c) => (c === 0 ? resolve() : reject(new Error(`exit ${c}: ${err}`))));
+	});
+	await Promise.all([run(`pin("decide", "p" + i, "a".repeat(64))`), run(`ratchet("r" + i)`)]);
+	const file = JSON.parse(readFileSync(join(pinDir, "pins.json"), "utf8"));
+	assert.equal(Object.keys(file.devices).length, 40, "every pin");
+	assert.equal(Object.keys(file.sign_versions).length, 40, "every ratchet");
+	assert.equal(existsSync(join(pinDir, "pins.lock")), false);
 });

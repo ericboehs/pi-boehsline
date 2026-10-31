@@ -26,7 +26,9 @@ export interface RemotePrompt {
 	questions: RemoteQuestion[];
 	/**
 	 * Guards a secret (op-broker's 1Password approval): only a device-signed screen tap or the
-	 * keyboard may answer it, never a spoken yes on a call.
+	 * keyboard may answer it, never a spoken yes on a call. botsun-owner takes only a v2-signed
+	 * answer for it (canonicalAnswerV2 binds the card's text; v1 doesn't), even from a device
+	 * that hasn't ratcheted to v2.
 	 */
 	sensitive: boolean;
 	/** Delivers an answer; returns an error, or null once taken. */

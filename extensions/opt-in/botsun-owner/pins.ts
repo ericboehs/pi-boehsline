@@ -12,6 +12,12 @@
  * 0700 dir of Eric's, written atomically (temp file + rename) under an O_EXCL lock file so two
  * pi processes don't lose each other's pins. Decision and call keys are pinned apart.
  *
+ * Signing ratchet: the same file records, per device id, that the device has signed v2
+ * ("botsun-sign-v2"): the first v2 request that verifies (and passes the pin) records
+ * sign_version 2 under sign_versions, shared by the device's decision and call keys. From then on
+ * a v1 request from that device is refused, so a compromised Botsun can't downgrade it to v1
+ * (whose ask answers don't cover the question text). Deleting pins.json resets pins and ratchets.
+ *
  * What this can't do: anything running as Eric's user can rewrite pins.json (or this file).
  */
 import {
@@ -40,11 +46,18 @@ export const keyFingerprint = (raw: Buffer): string => createHash("sha256").upda
 export const shortFingerprint = (fp: string): string => fp.slice(0, 16).match(/.{4}/g)!.join(" ");
 
 interface PinEntry { sha256: string; at: string }
-interface PinFile { version: 1; devices: Record<string, PinEntry>; call_devices: Record<string, PinEntry> }
+interface RatchetEntry { sign_version: 2; at: string }
+interface PinFile {
+	version: 1;
+	devices: Record<string, PinEntry>;
+	call_devices: Record<string, PinEntry>;
+	/** device id → the signing version it has moved to (only 2 so far): v1 from it is refused. */
+	sign_versions: Record<string, RatchetEntry>;
+}
 
 const section = (kind: KeyKind): "devices" | "call_devices" => (kind === "call" ? "call_devices" : "devices");
 const otherSection = (kind: KeyKind): "devices" | "call_devices" => (kind === "call" ? "devices" : "call_devices");
-const empty = (): PinFile => ({ version: 1, devices: {}, call_devices: {} });
+const empty = (): PinFile => ({ version: 1, devices: {}, call_devices: {}, sign_versions: {} });
 const myUid = (): number | null => (typeof process.getuid === "function" ? process.getuid() : null);
 
 /**
@@ -85,6 +98,18 @@ function pick(o: unknown): Record<string, PinEntry> {
 	return out;
 }
 
+/** The ratchet section: every entry must be {sign_version: 2}, or the whole file is refused. */
+function pickRatchets(o: unknown): Record<string, RatchetEntry> {
+	const out: Record<string, RatchetEntry> = {};
+	if (o === undefined) return out;
+	if (!o || typeof o !== "object" || Array.isArray(o)) throw malformed();
+	for (const [id, e] of Object.entries(o as Record<string, unknown>)) {
+		if (!e || typeof e !== "object" || (e as RatchetEntry).sign_version !== 2) throw malformed();
+		out[id] = { sign_version: 2, at: String((e as RatchetEntry).at ?? "") };
+	}
+	return out;
+}
+
 /** The pin file, or an empty one when there is none. Throws on a file others could have written, or a malformed one. */
 export function readPins(): PinFile {
 	if (!checkDir(false)) return empty();
@@ -116,7 +141,7 @@ export function readPins(): PinFile {
 	}
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw malformed();
 	const r = raw as Record<string, unknown>;
-	return { version: 1, devices: pick(r.devices), call_devices: pick(r.call_devices) };
+	return { version: 1, devices: pick(r.devices), call_devices: pick(r.call_devices), sign_versions: pickRatchets(r.sign_versions) };
 }
 
 function writePins(file: PinFile): void {
@@ -266,4 +291,24 @@ export function checkPin(kind: KeyKind, deviceId: string, raw: Buffer): PinCheck
 			? readError(e)
 			: { ok: false, error: "couldn't record the device's key pin" };
 	}
+}
+
+/** The signing version a device has ratcheted to (2), or 1 when none. Throws on an unreadable pin file. */
+export function signVersionOf(deviceId: string): 1 | 2 {
+	const file = readPins();
+	return Object.hasOwn(file.sign_versions, deviceId) ? 2 : 1;
+}
+
+/**
+ * Records that a device signs v2 (re-read under the lock; written only when it isn't recorded
+ * yet). Throws when the file can't be read or written.
+ */
+export function ratchet(deviceId: string): void {
+	if (signVersionOf(deviceId) === 2) return;
+	withLock(() => {
+		const file = readPins();
+		if (Object.hasOwn(file.sign_versions, deviceId)) return;
+		file.sign_versions[deviceId] = { sign_version: 2, at: new Date().toISOString() };
+		writePins(file);
+	});
 }

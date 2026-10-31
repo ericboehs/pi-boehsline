@@ -12,7 +12,9 @@
 // Signing v1 ("botsun-decide-v1") and v2 ("botsun-sign-v2", sig_v: 2;
 // lib/signing-v2.ts) are both taken, and each device's key is pinned on first
 // use (pins.ts): a changed key, or a new device once one is pinned, needs a
-// yes at the keyboard.
+// yes at the keyboard. A device's first verified v2 request ratchets it: v1
+// from it is refused after that (recorded in pins.json too). A sensitive
+// prompt takes only a v2 answer.
 //
 // Best effort throughout: a missing socket or a refused connection is normal
 // (Botsun not running), so it retries quietly with backoff and never logs
@@ -28,7 +30,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { optIn } from "../../../lib/opt-in.ts";
 import { canonicalAnswer, canonicalAnswerV2, invalidAnswer, onPromptsChange, openPrompts, type RemotePrompt } from "../../../lib/remote-prompts.ts";
 import { messageV2, validScope } from "../../../lib/signing-v2.ts";
-import { checkPin, pin, shortFingerprint, type KeyKind } from "./pins.ts";
+import { checkPin, pin, ratchet, shortFingerprint, signVersionOf, type KeyKind } from "./pins.ts";
 import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
 
@@ -286,11 +288,34 @@ function verifyDevice(c: Conn, r: Record<string, unknown>, spec: SignSpec, keyKi
 		verified = verifySignature("sha256", Buffer.from(text, "utf8"), { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"));
 	} catch {}
 	if (!verified) return "signature does not verify";
+	if (v === 1) {
+		// The ratchet (pins.ts): a device that has signed v2 isn't taken at v1 again (a downgrade).
+		try {
+			if (signVersionOf(deviceId) === 2) return V1_REFUSED;
+		} catch (e) {
+			return (e as Error).message.startsWith("device pins") ? (e as Error).message : "couldn't read the device pins";
+		}
+	}
 	const pinCheck = checkPin(keyKind, deviceId, key);
-	if (pinCheck.ok) return null;
-	if (pinCheck.ask) askPin(c, keyKind, deviceId, pinCheck.ask);
-	return pinCheck.error;
+	if (!pinCheck.ok) {
+		if (pinCheck.ask) askPin(c, keyKind, deviceId, pinCheck.ask);
+		return pinCheck.error;
+	}
+	if (v === 2) {
+		try {
+			ratchet(deviceId);
+		} catch (e) {
+			const msg = (e as Error).message;
+			return msg.startsWith("device pins file") || msg.startsWith("device pins dir") ? msg : "couldn't record the device's signing version";
+		}
+	}
+	return null;
 }
+
+/** A v1 request from a device that has signed v2 (the ratchet). */
+export const V1_REFUSED = "this phone signs v2: v1 is refused (update Botsun and the app)";
+/** A v1 answer to a sensitive prompt: v1 doesn't bind the card's text. */
+export const SENSITIVE_V1_REFUSED = "this one needs a v2-signed answer (update Botsun and the app), or answer it at the keyboard";
 
 /** After a no at the keyboard, that device's key kind is refused without asking for this long. */
 export const PIN_COOLDOWN_MS = 10 * 60_000;
@@ -607,12 +632,15 @@ function answerAsk(c: Conn, r: Record<string, unknown>): Record<string, unknown>
 	if (typeof id !== "string" || !Array.isArray(answers)) return { error: "bad request" };
 	// v2 signs the questions as asked, so the prompt is looked up before the digest is built.
 	const prompt = openPrompts().find((p) => p.id === id);
+	// Refused before verifyDevice: spend the nonce anyway (one try per nonce, as there).
+	const spend = (error: string) => {
+		if (typeof r.nonce === "string") takeNonce(c, r.nonce);
+		return { error };
+	};
+	// A secret's approval (op-broker) binds its card text only in v2: a v1 answer is refused,
+	// ratchet or not.
+	if (prompt?.sensitive && sigVersion(r) !== 2) return spend(SENSITIVE_V1_REFUSED);
 	if (sigVersion(r) === 2) {
-		// Refused before verifyDevice: spend the nonce anyway (one try per nonce, as there).
-		const spend = (error: string) => {
-			if (typeof r.nonce === "string") takeNonce(c, r.nonce);
-			return { error };
-		};
 		if (!prompt) return spend("that question was already answered");
 		const bad = invalidAnswer(prompt.questions, answers);
 		if (bad) return spend(bad);

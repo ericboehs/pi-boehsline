@@ -47,6 +47,12 @@ Each session also listens on its own socket, `~/.local/state/botsun/owner/<pid>.
 
 A `confirm` of an `ask` answer checks the proposal hash the way his words were signed: a v2-signed `say_audio` carries `sha256(canonicalAnswerV2(…))`, a v1 one `sha256(canonicalAnswer(…))`. A reworded message's proposal is `sha256("botsun-propose-text-v1\n<text>")` either way.
 
+**The v2 ratchet:** v1 answers don't cover the question text, so a compromised Botsun could otherwise ask the phone for v1 signatures to swap a question under them. So the first v2 request from a device id that verifies (and passes its pin, below) records `sign_version: 2` for that device in `pins.json` (`sign_versions`, next to the pins, under the same lock and the same strict parse; the device's decision and call keys share it). From then on a v1 request from that device is refused: "this phone signs v2: v1 is refused (update Botsun and the app)". Other devices that have never signed v2 keep working at v1. A re-pinned key (a keyboard yes) keeps its device's ratchet.
+
+**Sensitive prompts** (`offerPrompt(…, {sensitive: true})`, op-broker's 1Password card) take only a v2-signed `answer`, ratchet or not, since v1 doesn't bind the card's text; a v1 one is refused (its nonce spent) and the keyboard still works.
+
+**Resetting:** there's no command for it. Deleting `pins.json` (or the pin dir) resets every pin and every ratchet at once, which re-opens the blind first pairing below; do it only when a phone really has to go back to v1 and you're watching who pairs next.
+
 **Device key pinning** (trust on first use): Botsun writes `owner-keys.json`, so this session keeps its own record of which key each paired device signs with, in `~/.local/state/pi-botsun-owner/pins.json` (`$BOTSUN_OWNER_PIN_DIR`). The first request a device's key verifies pins `sha256(public key)` for that device id (decision and call keys pinned apart). It pins silently in two cases only:
 
 - **The first pairing:** nothing is pinned at all, of either kind (a fresh install, or the move to pinning). That key is trusted blindly, whatever `owner-keys.json` says: whoever controls Botsun at that moment gets pinned. Deleting `pins.json` or the pin dir (or removing a malformed pin file to get unstuck) opens that blind first pairing again.
@@ -73,7 +79,7 @@ What pinning can and can't do: it protects against a Botsun whose logic is compr
 | `confirm` | `{id, ask_id, answers}` from the voice helper: his held reply means yes to the answer read back on the call. Answers the open `ask` only when that utterance was signed with this answer's hash (`say_audio` with `proposal_sha256`, an extra line of the signed message) and its words don't say no (`saysNo`). Never a `sensitive` prompt: "answer this one on the phone screen or the keyboard" |
 | `drop` / `call_end` | forget the held words named, or all of them |
 | `stop` | the phone's Stop button: ends the running turn (or a compaction) as Esc does; signed over `stop` with the decision key; `{ok, stopped}` |
-| `answer` | answers the open `ask` question; the tool takes it as if picked at the keyboard and closes its dialog |
+| `answer` | answers the open `ask` question; the tool takes it as if picked at the keyboard and closes its dialog (a `sensitive` one: v2-signed only) |
 | `stash` | the message stash (with the stash extension): `push` a draft, `take` one back to the phone, `drop` one; signed over `push\n<sha256(text)>`, `take\n<id>` or `drop\n<id>` |
 | `footer_tap` | flips a display chip (`dir`, `context`, `cost`, `usage`, `rate`, `timers`) as a click on the footer does, and answers with the new row; display only, so not signed |
 
