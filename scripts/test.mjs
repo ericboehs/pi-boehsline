@@ -13,6 +13,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createWriteStream, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { loadavg } from "node:os";
 import { join } from "node:path";
+import { testEnv } from "./test-env.mjs";
 
 // Globs, not shell-expanded paths: node --test expands them itself (>= 21).
 const SUITE = [
@@ -28,6 +29,7 @@ const SUITE = [
   "packages/agent-link/test/send-close.mjs",
 ];
 const KEEP = 50;
+
 
 const args = process.argv.slice(2);
 const dir = process.env.TEST_RUNS_DIR || "/tmp/test-runs";
@@ -53,8 +55,11 @@ log.write(
   ].join("\n"),
 );
 
+// Without pi's PI_* variables, and with a canvas root and port of the run's own.
+const { env, madeRoot } = await testEnv(process.env);
 const child = spawn(process.execPath, ["--test", ...(args.length ? args : SUITE)], {
   stdio: ["inherit", "pipe", "pipe"],
+  env,
 });
 child.stdout.on("data", (chunk) => {
   process.stdout.write(chunk);
@@ -71,6 +76,7 @@ child.on("close", (code, signal) => {
     // Oldest first by name (the stamp sorts); keep the newest KEEP.
     const logs = readdirSync(dir).filter((name) => name.endsWith(".log")).sort();
     for (const name of logs.slice(0, Math.max(0, logs.length - KEEP))) rmSync(join(dir, name), { force: true });
+    if (madeRoot) rmSync(madeRoot, { recursive: true, force: true });
     process.stderr.write(`\ntest log (${status}): ${logPath}\n`);
     process.exit(code ?? 1);
   });

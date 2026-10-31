@@ -20,6 +20,11 @@ import { allowedHost, byteRange, clipTarget, latestClient, listSessions, parseFi
 
 const msg = (role, content, extra = {}) => ({ type: "message", message: { role, content, ...extra } });
 
+// Run from inside pi (a subagent, a bash tool call), these switch the canvas
+// off for this process, and the extension tests below would see nothing.
+delete process.env.PI_SUBAGENT_CHILD;
+delete process.env.PI_CANVAS;
+
 test("section ids are lowercase slugs", () => {
   assert.equal(isSectionId("hook-points"), true);
   assert.equal(isSectionId("a"), true);
@@ -871,6 +876,11 @@ function post(port, path, body, headers) {
   });
 }
 
+/** The test daemon's key (from the .daemon.json it writes in its temp root once listening) as a Bearer header. */
+function bearer(root) {
+  return { authorization: `Bearer ${JSON.parse(readFileSync(join(root, ".daemon.json"), "utf8")).token}` };
+}
+
 test("clipTarget clips the real file for a copy, a named copy for a diff, else the session file", () => {
   const { root, mk } = tempRoot();
   try {
@@ -1207,44 +1217,45 @@ test("daemon serves pages, state and sections, and refuses bad hosts and paths",
       up = await get(port, "/health").catch(() => undefined);
     }
     assert.equal(JSON.parse(up.body).version, "t1");
+    const auth = bearer(root);
     assert.equal((await get(port, "/health", "evil.example")).status, 421);
     const page = await get(port, "/s/s1");
     assert.equal(page.status, 200);
     assert.match(page.headers["content-security-policy"], /frame-ancestors 'none'/);
-    const state = JSON.parse((await get(port, "/api/s/s1")).body);
+    const state = JSON.parse((await get(port, "/api/s/s1", undefined, auth)).body);
     assert.equal(state.meta.name, "test");
     assert.equal(state.sections[0].id, "a");
-    const sec = await get(port, "/s/s1/f/a.html");
+    const sec = await get(port, "/s/s1/f/a.html", undefined, auth);
     assert.match(sec.body, /^<!doctype html>\n<style id="canvas-kit">[\s\S]*--c1:[\s\S]*<\/style>\n<script>[\s\S]*canvasFrame[\s\S]*<\/script>\n<p>hi<\/p>$/, "html sections get the kit and frame script");
     assert.match(sec.headers["content-security-policy"], /connect-src 'none'/);
     // Opaque origin however the section is opened (a frame, or an escaped popup).
     assert.match(sec.headers["content-security-policy"], /; sandbox allow-scripts [^;]*$/);
     assert.doesNotMatch(sec.headers["content-security-policy"], /allow-same-origin/);
-    const plan = await get(port, "/s/s1/f/p.html");
+    const plan = await get(port, "/s/s1/f/p.html", undefined, auth);
     assert.match(plan.body, /^<!doctype html><script>[\s\S]*canvasPlanStore[\s\S]*<\/script>\n<p>plan<\/p>$/, "html-plan gets the store script");
     assert.match(plan.headers["content-security-policy"], /; sandbox allow-scripts /);
     assert.doesNotMatch(plan.headers["content-security-policy"], /allow-same-origin/);
-    const chart = await get(port, "/s/s1/f/c.chart");
+    const chart = await get(port, "/s/s1/f/c.chart", undefined, auth);
     assert.equal(chart.headers["content-type"], "application/json; charset=utf-8");
     assert.equal(JSON.parse(chart.body).type, "bar");
-    assert.equal((await get(port, "/s/s1/f/t.term")).headers["content-type"], "application/json; charset=utf-8");
-    for (const f of ["j.jsonv", "s.steps", "b.kanban", "l.timeline"]) assert.equal((await get(port, `/s/s1/f/${f}`)).status, 200, f);
-    assert.equal(JSON.parse((await get(port, "/s/s1/f/k.compare")).body).after, "k-after.png");
-    const png = await get(port, "/s/s1/f/k-before.png");
+    assert.equal((await get(port, "/s/s1/f/t.term", undefined, auth)).headers["content-type"], "application/json; charset=utf-8");
+    for (const f of ["j.jsonv", "s.steps", "b.kanban", "l.timeline"]) assert.equal((await get(port, `/s/s1/f/${f}`, undefined, auth)).status, 200, f);
+    assert.equal(JSON.parse((await get(port, "/s/s1/f/k.compare", undefined, auth)).body).after, "k-after.png");
+    const png = await get(port, "/s/s1/f/k-before.png", undefined, auth);
     assert.equal(png.headers["content-type"], "image/png", "compare images are served");
     assert.doesNotMatch(png.headers["content-security-policy"], /sandbox/, "images can't script, so no sandbox");
-    for (const f of ["x.code", "x.tree", "x.options"]) assert.equal((await get(port, `/s/s1/f/${f}`)).headers["content-type"], "application/json; charset=utf-8", f);
-    const vid = await get(port, "/s/s1/f/v.mp4");
+    for (const f of ["x.code", "x.tree", "x.options"]) assert.equal((await get(port, `/s/s1/f/${f}`, undefined, auth)).headers["content-type"], "application/json; charset=utf-8", f);
+    const vid = await get(port, "/s/s1/f/v.mp4", undefined, auth);
     assert.equal(vid.headers["content-type"], "video/mp4");
     assert.equal(vid.headers["accept-ranges"], "bytes");
     assert.equal(vid.body, "0123456789");
-    const part = await get(port, "/s/s1/f/v.mp4", undefined, { range: "bytes=2-5" });
+    const part = await get(port, "/s/s1/f/v.mp4", undefined, { ...auth, range: "bytes=2-5" });
     assert.equal(part.status, 206);
     assert.equal(part.headers["content-range"], "bytes 2-5/10");
     assert.equal(part.body, "2345");
-    assert.equal((await get(port, "/s/s1/f/v.mp4", undefined, { range: "bytes=-3" })).body, "789", "a suffix range");
-    assert.equal((await get(port, "/s/s1/f/v.mp4", undefined, { range: "bytes=20-" })).status, 416);
-    const pdf = await get(port, "/s/s1/f/d.pdf");
+    assert.equal((await get(port, "/s/s1/f/v.mp4", undefined, { ...auth, range: "bytes=-3" })).body, "789", "a suffix range");
+    assert.equal((await get(port, "/s/s1/f/v.mp4", undefined, { ...auth, range: "bytes=20-" })).status, 416);
+    const pdf = await get(port, "/s/s1/f/d.pdf", undefined, auth);
     assert.equal(pdf.headers["content-type"], "application/pdf");
     assert.match(pdf.headers["content-security-policy"], /connect-src 'none'/, "a pdf gets the section CSP");
     for (const a of ["page.mjs", "render.mjs", "theme.mjs", "nav.mjs", "theme-boot.js"]) assert.equal((await get(port, `/assets/${a}`)).headers["content-type"], "text/javascript; charset=utf-8", a);
@@ -1257,27 +1268,27 @@ test("daemon serves pages, state and sections, and refuses bad hosts and paths",
     assert.ok(Object.keys(JSON.parse((await get(port, "/assets/themes.json")).body).themes).length >= 20, "Omarchy themes are served");
     assert.match(page.body, /<script src="\/assets\/theme-boot\.js"><\/script>[\s\S]*page\.mjs/, "the theme boot script runs before the page module");
     assert.match(sec.body, /canvasTheme/, "html frames listen for the theme");
-    assert.equal((await get(port, "/s/s1/f/meta.json")).status, 404);
-    const patch = await get(port, "/s/s1/f/diff-0123abcd.patch");
+    assert.equal((await get(port, "/s/s1/f/meta.json", undefined, auth)).status, 404);
+    const patch = await get(port, "/s/s1/f/diff-0123abcd.patch", undefined, auth);
     assert.equal(patch.headers["content-type"], "text/plain; charset=utf-8");
-    assert.equal((await get(port, "/s/s1/f/base-0123abcd")).status, 404, "diff bases are never served");
-    const copy = await get(port, "/s/s1/f/cur-0123abcd.txt");
+    assert.equal((await get(port, "/s/s1/f/base-0123abcd", undefined, auth)).status, 404, "diff bases are never served");
+    const copy = await get(port, "/s/s1/f/cur-0123abcd.txt", undefined, auth);
     assert.equal(copy.status, 200);
     assert.match(copy.headers["content-type"], /^text\/plain/, "file copies never render as html");
-    assert.equal((await get(port, "/s/s1/f/..%2Fs1%2Fmeta.json")).status, 404);
-    assert.equal((await get(port, "/s/..%2F..%2Fetc/f/a.html")).status, 404);
+    assert.equal((await get(port, "/s/s1/f/..%2Fs1%2Fmeta.json", undefined, auth)).status, 404);
+    assert.equal((await get(port, "/s/..%2F..%2Fetc/f/a.html", undefined, auth)).status, 404);
     // Clip: only from the page itself, only for the session's files. (No
     // request here gets through to clippy, so the clipboard stays untouched.)
-    assert.equal((await post(port, "/s/s1/clip", { file: "a.html" }, {})).status, 403, "needs the page's header");
-    assert.equal((await post(port, "/s/s1/clip", { file: "a.html" }, { "x-canvas-clip": "1", origin: "https://evil.example" })).status, 403, "foreign origin");
-    assert.equal((await post(port, "/s/s1/clip", { file: "a.html" }, { "x-canvas-clip": "1", origin: "null" })).status, 403, "an opaque-origin html frame");
-    assert.equal((await post(port, "/s/s1/clip", { file: "base-0123abcd" }, { "x-canvas-clip": "1" })).status, 404, "bases are never clipped");
-    assert.equal((await post(port, "/s/s1/clip", { file: "../s1/meta.json" }, { "x-canvas-clip": "1" })).status, 404);
-    assert.equal((await post(port, "/s/s1/f/a.html", {}, { "x-canvas-clip": "1" })).status, 405, "everything else stays read-only");
-    const list = JSON.parse((await get(port, "/api/sessions")).body);
+    assert.equal((await post(port, "/s/s1/clip", { file: "a.html" }, { ...auth })).status, 403, "needs the page's header");
+    assert.equal((await post(port, "/s/s1/clip", { file: "a.html" }, { ...auth, "x-canvas-clip": "1", origin: "https://evil.example" })).status, 403, "foreign origin");
+    assert.equal((await post(port, "/s/s1/clip", { file: "a.html" }, { ...auth, "x-canvas-clip": "1", origin: "null" })).status, 403, "an opaque-origin html frame");
+    assert.equal((await post(port, "/s/s1/clip", { file: "base-0123abcd" }, { ...auth, "x-canvas-clip": "1" })).status, 404, "bases are never clipped");
+    assert.equal((await post(port, "/s/s1/clip", { file: "../s1/meta.json" }, { ...auth, "x-canvas-clip": "1" })).status, 404);
+    assert.equal((await post(port, "/s/s1/f/a.html", {}, { ...auth, "x-canvas-clip": "1" })).status, 405, "everything else stays read-only");
+    const list = JSON.parse((await get(port, "/api/sessions", undefined, auth)).body);
     assert.equal(list[0].id, "s1");
-    assert.deepEqual(JSON.parse((await get(port, "/api/system-theme")).body), { theme: null }, "no Omarchy here");
-    assert.deepEqual(JSON.parse((await get(port, "/api/peers")).body), { peers: [{ name: "reviewer", status: "tool:bash" }] }, "live agents only, name and status only");
+    assert.deepEqual(JSON.parse((await get(port, "/api/system-theme", undefined, auth)).body), { theme: null }, "no Omarchy here");
+    assert.deepEqual(JSON.parse((await get(port, "/api/peers", undefined, auth)).body), { peers: [{ name: "reviewer", status: "tool:bash" }] }, "live agents only, name and status only");
   } finally {
     child.kill();
     rmSync(root, { recursive: true, force: true });
@@ -1323,9 +1334,10 @@ test("daemon /follow tells pages which session tmux moved to; /focus and /follow
   let stream;
   try {
     for (let i = 0; i < 50 && !(await get(port, "/health").catch(() => undefined)); i++) await new Promise((r) => setTimeout(r, 100));
+    const auth = bearer(root);
     let events = "";
     await new Promise((resolve) => {
-      stream = request({ host: "127.0.0.1", port, path: "/api/events", headers: { host: `127.0.0.1:${port}` } }, (res) => {
+      stream = request({ host: "127.0.0.1", port, path: "/api/events", headers: { host: `127.0.0.1:${port}`, ...auth } }, (res) => {
         res.on("data", (d) => {
           events += d;
           if (events.includes("event: hello")) resolve();
@@ -1333,17 +1345,17 @@ test("daemon /follow tells pages which session tmux moved to; /focus and /follow
       });
       stream.end();
     });
-    assert.equal((await post(port, "/follow", { pane: "%5" }, {})).status, 403, "needs the header");
-    assert.equal((await post(port, "/follow", { pane: "%5" }, { "x-canvas": "1", origin: "https://evil.example" })).status, 403, "foreign origin");
-    assert.equal((await post(port, "/s/s1/focus", {}, {})).status, 403, "needs the header");
-    assert.equal((await post(port, "/s/s2/focus", {}, { "x-canvas": "1" })).status, 404, "not in tmux: nothing to run");
-    assert.equal((await post(port, "/s/s2/send", { text: "hi" }, {})).status, 403, "send needs the header");
-    assert.equal((await post(port, "/s/s2/send", { text: "hi" }, { "x-canvas": "1", origin: "https://evil.example" })).status, 403, "and this page's origin");
-    assert.equal((await post(port, "/s/s2/send", { text: "hi" }, { "x-canvas": "1", origin: `http://127.0.0.1:${port}` })).status, 200);
+    assert.equal((await post(port, "/follow", { pane: "%5" }, { ...auth })).status, 403, "needs the header");
+    assert.equal((await post(port, "/follow", { pane: "%5" }, { ...auth, "x-canvas": "1", origin: "https://evil.example" })).status, 403, "foreign origin");
+    assert.equal((await post(port, "/s/s1/focus", {}, { ...auth })).status, 403, "needs the header");
+    assert.equal((await post(port, "/s/s2/focus", {}, { ...auth, "x-canvas": "1" })).status, 404, "not in tmux: nothing to run");
+    assert.equal((await post(port, "/s/s2/send", { text: "hi" }, { ...auth })).status, 403, "send needs the header");
+    assert.equal((await post(port, "/s/s2/send", { text: "hi" }, { ...auth, "x-canvas": "1", origin: "https://evil.example" })).status, 403, "and this page's origin");
+    assert.equal((await post(port, "/s/s2/send", { text: "hi" }, { ...auth, "x-canvas": "1", origin: `http://127.0.0.1:${port}` })).status, 200);
     assert.equal(readdirSync(join(root, "s2", "inbox")).length, 1);
-    assert.equal((await post(port, "/s/s2/send", { text: "" }, { "x-canvas": "1" })).status, 400);
-    assert.equal((await post(port, "/follow", { pane: "%9" }, { "x-canvas": "1" })).status, 200, "a non-pi pane is ignored");
-    assert.equal((await post(port, "/follow", { pane: "%5", socket: "/sock" }, { "x-canvas": "1" })).status, 200);
+    assert.equal((await post(port, "/s/s2/send", { text: "" }, { ...auth, "x-canvas": "1" })).status, 400);
+    assert.equal((await post(port, "/follow", { pane: "%9" }, { ...auth, "x-canvas": "1" })).status, 200, "a non-pi pane is ignored");
+    assert.equal((await post(port, "/follow", { pane: "%5", socket: "/sock" }, { ...auth, "x-canvas": "1" })).status, 200);
     for (let i = 0; i < 20 && !events.includes("event: follow"); i++) await new Promise((r) => setTimeout(r, 50));
     assert.match(events, /event: follow\ndata: \{"id":"s1"\}/);
     assert.equal(events.match(/event: follow/g).length, 1, "only the pi pane");
@@ -1378,11 +1390,12 @@ test("daemon follows the Omarchy theme: serves it, and tells pages when it switc
       await new Promise((r) => setTimeout(r, 100));
       if (await get(port, "/health").catch(() => undefined)) break;
     }
-    const first = JSON.parse((await get(port, "/api/system-theme")).body).theme;
+    const auth = bearer(root);
+    const first = JSON.parse((await get(port, "/api/system-theme", undefined, auth)).body).theme;
     assert.equal(first.name, "tokyo-night");
     assert.equal(first.colors.background, "#1a1b26");
     const got = new Promise((resolve, reject) => {
-      stream = request({ host: "127.0.0.1", port, path: "/api/events", headers: { host: `127.0.0.1:${port}` } }, (res) => {
+      stream = request({ host: "127.0.0.1", port, path: "/api/events", headers: { host: `127.0.0.1:${port}`, ...auth } }, (res) => {
         let buf = "";
         res.on("data", (d) => {
           buf += d;
@@ -1397,7 +1410,7 @@ test("daemon follows the Omarchy theme: serves it, and tells pages when it switc
     await new Promise((r) => setTimeout(r, 300));
     put("flexoki-light", "#fffcf0", "#100f0f");
     assert.deepEqual(await got, { name: "flexoki-light" });
-    assert.equal(JSON.parse((await get(port, "/api/system-theme")).body).theme.colors.background, "#fffcf0");
+    assert.equal(JSON.parse((await get(port, "/api/system-theme", undefined, auth)).body).theme.colors.background, "#fffcf0");
   } finally {
     stream?.destroy();
     child.kill();

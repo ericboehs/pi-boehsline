@@ -7,7 +7,7 @@ import { asQuote, boardMarks, cardKey, cardPrompt, dismissPipe, optionsText, own
 // The renderers themselves live in render.mjs (with render.css): the page passes
 // what only it has (its copy buttons, highlight.js loading, the kanban modal,
 // owner links, remembered folds, talk-back) through each one's opts.
-import { clock, counts, dayLabel, diffBlock, diffFileList, h, inline, langFor, noteParas, parsePatch, renderChart, renderCode, renderJson, renderKanban, renderMermaid, renderOptions, renderStats, renderSteps, renderTable, renderTerminal, renderTimeline, renderTracker, renderTree, svg, tilde, tip, toneVar } from "/assets/render.mjs";
+import { clock, counts, dayLabel, diffBlock, diffFileList, h, highlightInto, HL_CLEAN, inline, langFor, noteParas, parsePatch, renderChart, renderCode, renderJson, renderKanban, renderMarkdown as renderMd, renderMermaid, renderOptions, renderStats, renderSteps, renderTable, renderTerminal, renderTimeline, renderTracker, renderTree, svg, tilde, tip, toneVar } from "/assets/render.mjs";
 
 const CSS = `
 :root { color-scheme: light dark; --bg:#f7f5f0; --card:#fff; --ink:#1c1b19; --dim:#8a8578; --line:#e6e1d6; --soft:#f0ece3; --accent:#b4541f; --ok:#1f7a52; --warn:#a86a00; --bad:#c0392b; --code:#f3f0e8; --tint:#fbf3ec; --hl-kw:#285880; --hl-str:#42632a; --hl-num:#805424; --hl-com:#5b6a7f; --hl-title:#68448b; --c1:#3b7dd8; --c2:#e0703a; --c3:#2f9e72; --c4:#c4475b; --c5:#8a63c9; --c6:#b8901c; --c7:#2e9bb0; --c8:#8c8577; }
@@ -334,8 +334,9 @@ dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: h
 .fileview .src { flex: 1; min-width: 0; overflow-x: auto; padding: 8px 14px; tab-size: 4; }
 .fileview .src code { font: inherit; background: none; padding: 0; }
 .mbody > .md.doc { padding: 18px 26px 26px; max-width: 920px; font-size: 14.5px; line-height: 1.6; }
-.md li:has(> input[type="checkbox"]) { list-style: none; margin-left: -1.3em; }
-.md li > input[type="checkbox"] { margin: 0 0.45em 0 0; vertical-align: -1px; }
+.md li:has(> .task-box) { list-style: none; margin-left: -1.3em; }
+.md li > .task-box { margin: 0 0.35em 0 0; color: var(--dim); }
+.md li > .task-box.done { color: var(--ok); }
 .toc a { display: flex; gap: 10px; align-items: baseline; padding: 4px 12px; color: var(--ink); text-decoration: none; font-size: 13px; }
 .toc a:hover { background: color-mix(in srgb, var(--soft) 45%, transparent); }
 .toc a .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -764,26 +765,6 @@ function loadHighlight() {
   return hljsReady;
 }
 
-/** What a highlighter's output may keep: <span class> and nothing else. */
-const HL_CLEAN = { ALLOWED_TAGS: ["span"], ALLOWED_ATTR: ["class"], ALLOW_DATA_ATTR: false, ALLOW_ARIA_ATTR: false };
-const PLAIN = new Set(["text", "txt", "plain", "plaintext", "output", "console", "log"]);
-
-/**
- * Colour a code element in place. Only a named language (no guessing), only
- * blocks up to 16 KB, and the result is cut down to <span class> before use.
- */
-async function highlightInto(code, lang) {
-  const name = String(lang || "").trim().split(/\s/, 1)[0].toLowerCase();
-  const text = code.textContent;
-  if (!name || PLAIN.has(name) || text.length > 16000 || !/^[a-z0-9_+#.-]{1,40}$/.test(name)) return;
-  const hl = await loadHighlight();
-  if (!hl?.getLanguage(name) || !window.DOMPurify) return;
-  try {
-    const html = hl.highlight(text, { language: name, ignoreIllegals: true }).value;
-    if (code.textContent === text) code.innerHTML = window.DOMPurify.sanitize(html, HL_CLEAN);
-  } catch {}
-}
-
 function loadMermaid() {
   mermaidReady ??= new Promise((resolve, reject) => {
     const s = document.createElement("script");
@@ -801,32 +782,52 @@ function loadMermaid() {
 /** mermaid, drawn by render.mjs with this page's lazy loader (and its theme config). */
 const drawMermaid = (el, source) => renderMermaid(el, source, { loadMermaid });
 
+// The page's own files (/s/<id>/f/<name>) as well as data: images; PAGE_CSP keeps anything else out anyway.
+const PAGE_IMG = /^(data:|\/(?![/\\]))/i;
+
+// A 401 from the daemon: this browser has no key (a daemon from before keys,
+// cleared cookies). /canvas in pi reopens the page with one, and re-keys a tab
+// whose title says it is locked (AppleScript can read a title without JavaScript).
+const LOCKED_TITLE = "Canvas (locked)";
+function showLocked() {
+  if (document.title === LOCKED_TITLE) return;
+  document.title = LOCKED_TITLE;
+  $app.replaceChildren(h("section", { class: "card" }, h("div", { class: "bd empty" }, "This canvas needs its key. Run /canvas in pi to reopen it (or /canvas url for a link to open in any browser).")));
+}
+
+/** A data route's JSON; a 401 locks the page and throws. */
+async function apiJson(url) {
+  const r = await fetch(url);
+  if (r.status === 401) {
+    showLocked();
+    throw new Error("locked");
+  }
+  return r.json();
+}
+
+/**
+ * Markdown through render.mjs's renderMarkdown (its one sanitize policy,
+ * MD_CLEAN), with this page's look: .codeblock fences, highlight.js loaded on
+ * first use, mermaid drawn, then relative times, path wrapping and quote copies.
+ */
 function renderMarkdown(text) {
-  const el = h("div", { class: "md" });
-  if (!window.marked || !window.DOMPurify) {
-    el.append(h("pre", {}, text));
-    return el;
-  }
-  el.innerHTML = window.DOMPurify.sanitize(window.marked.parse(text, { gfm: true }));
+  const el = renderMd(text, {
+    imgSrc: PAGE_IMG,
+    mermaid: drawMermaid,
+    // A named language only, no guessing: highlight.js loads on the first one.
+    highlight: (code, lang) => lang && loadHighlight().then((hl) => hl && highlightInto(code, lang, hl)),
+    wrapCode: (pre, code, lang) => {
+      const wrap = h("div", { class: "codeblock" });
+      pre.replaceWith(wrap);
+      wrap.append(lang ? h("span", { class: "lang" }, lang) : "", pre, copyButton(() => code.textContent.replace(/\n$/, ""), "Copy", null, { plain: "code" }));
+    },
+  });
+  if (!window.marked || !window.DOMPurify) return el;
   relTimes(el);
-  for (const a of el.querySelectorAll("a[href]")) a.target = "_blank";
-  for (const code of el.querySelectorAll("pre > code.language-mermaid")) {
-    const box = h("div");
-    code.parentElement.replaceWith(box);
-    drawMermaid(box, code.textContent);
-  }
   // Paths in table cells may wrap at their slashes, not mid-name.
   for (const code of el.querySelectorAll("td code")) {
     const parts = code.textContent.split(/(?<=\/)/);
     if (parts.length > 1) code.replaceChildren(...parts.flatMap((p, i) => (i ? [document.createElement("wbr"), p] : [p])));
-  }
-  for (const pre of el.querySelectorAll("pre")) {
-    const code = pre.querySelector("code") || pre;
-    const lang = [...code.classList].find((c) => c.startsWith("language-"))?.slice(9);
-    const wrap = h("div", { class: "codeblock" });
-    pre.replaceWith(wrap);
-    wrap.append(lang ? h("span", { class: "lang" }, lang) : "", pre, copyButton(() => code.textContent.replace(/\n$/, ""), "Copy", null, { plain: "code" }));
-    if (lang) highlightInto(code, lang);
   }
   // Top-level quotes (drafts, mostly) copy their markdown without the > markers; ⌥-click keeps them.
   const quotes = [...el.querySelectorAll("blockquote")].filter((b) => !b.parentElement.closest("blockquote"));
@@ -3422,7 +3423,7 @@ async function sessionView(id) {
   async function refresh() {
     let state;
     try {
-      state = await (await fetch(`/api/s/${encodeURIComponent(id)}`)).json();
+      state = await apiJson(`/api/s/${encodeURIComponent(id)}`);
     } catch {
       return;
     }
@@ -4511,7 +4512,7 @@ async function indexView() {
   async function refresh() {
     let sessions;
     try {
-      sessions = await (await fetch("/api/sessions")).json();
+      sessions = await apiJson("/api/sessions");
       sessionsCache = sessions;
     } catch {
       return;

@@ -11,11 +11,17 @@
 //
 // Loopback only. Requests must arrive on 127.0.0.1 with a loopback Host header,
 // which stops DNS rebinding: a web page cannot read the canvas through a
-// hostname that resolves to 127.0.0.1. Other local processes stay trusted.
+// hostname that resolves to 127.0.0.1.
+//
+// And a key: <root>/.daemon.json (mode 600, root 700) holds a 32-byte token.
+// Session data (/api/*, /s/<id>/f/*, slides) and every POST need it, as the
+// cookie a /?k=<token> link sets, or as Authorization: Bearer <token> for local
+// tools. The page shells and /assets/ hold no data and stay open. pi's /canvas
+// opens the keyed link; see "Access" in the README.
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { execFile } from "node:child_process";
-import { copyFileSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, watch, writeFileSync, renameSync } from "node:fs";
+import { chmodSync, copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, watch, writeFileSync, renameSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
@@ -413,6 +419,76 @@ function loopback(addr) {
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 }
 
+// ── the key ──────────────────────────────────────────────────────────────────
+
+const TOKEN_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * The daemon's key: the one in <root>/.daemon.json when there is one (so a
+ * restart or upgrade keeps open tabs' cookies working), else 32 fresh bytes.
+ * Only a file that could have stayed secret is trusted: a regular file (not a
+ * symlink), ours, and unreadable by group and others. Anything else may have
+ * leaked or been planted, so the daemon mints a new key.
+ */
+export function loadToken(root) {
+  const path = join(root, ".daemon.json");
+  try {
+    const st = lstatSync(path);
+    const uid = typeof process.getuid === "function" ? process.getuid() : st.uid;
+    if (!st.isFile() || st.uid !== uid || (st.mode & 0o077) !== 0) return randomBytes(32).toString("hex");
+  } catch {
+    return randomBytes(32).toString("hex");
+  }
+  const t = readJson(path, null)?.token;
+  return typeof t === "string" && TOKEN_RE.test(t) ? t : randomBytes(32).toString("hex");
+}
+
+/** <root>/.daemon.json, mode 600: pid (what pi may SIGTERM), port, version and the key. */
+export function writeDaemonFile(root, info) {
+  const path = join(root, ".daemon.json");
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(info), { mode: 0o600 });
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, path);
+}
+
+/** The cookie's name: per port, so a second daemon on another port can't overwrite this one's. */
+export const cookieName = (port = PORT) => `canvas_k_${port}`;
+
+function sameToken(given, token) {
+  if (typeof given !== "string" || typeof token !== "string") return false;
+  // Byte lengths, not string lengths: a non-ASCII key of the right length
+  // would make timingSafeEqual throw (a 500) instead of failing.
+  const a = Buffer.from(given);
+  const b = Buffer.from(token);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/** The key a request carries: Authorization: Bearer <token>, or the page's cookie. */
+export function requestToken(headers, port = PORT) {
+  const auth = /^Bearer\s+(\S+)$/i.exec(String(headers.authorization || ""));
+  if (auth) return auth[1];
+  const want = cookieName(port);
+  for (const part of String(headers.cookie || "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0 && part.slice(0, i).trim() === want) return part.slice(i + 1).trim();
+  }
+  return "";
+}
+
+export const authorized = (headers, token, port = PORT) => sameToken(requestToken(headers, port), token);
+
+let TOKEN = "";
+
+/** A path's parts, percent-decoded; null when one doesn't decode (a bare %, a broken UTF-8 sequence). */
+export function decodeParts(pathname) {
+  try {
+    return pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  } catch {
+    return null;
+  }
+}
+
 // Files the page loads from /assets/, read fresh on each request so edits
 // show on reload without restarting the daemon.
 const JS = "text/javascript; charset=utf-8";
@@ -620,36 +696,24 @@ function runClippy(path, i = 0) {
   );
 }
 
-function clip(req, res, id) {
-  // Only this page may ask: a cross-site form or fetch can't send this header
-  // without a preflight the daemon never answers, and its Origin won't match.
-  if (!fromPage(req, "x-canvas-clip")) return send(res, 403, "forbidden");
-  let body = "";
-  req.on("data", (c) => {
-    body += c;
-    if (body.length > 1024) req.destroy();
-  });
-  req.on("end", () => {
-    let name = "";
-    try {
-      name = JSON.parse(body).file;
-    } catch {}
-    const target = clipTarget(ROOT, id, name);
-    if (!target) return send(res, 404, "not found");
-    let path = target.path;
-    if (target.copy) {
-      // A fresh folder each time: the clipboard keeps pointing at the last one.
-      const dir = join(tmpdir(), "pi-canvas-clip", String(Date.now()));
-      rmSync(dirname(dir), { recursive: true, force: true });
-      mkdirSync(dir, { recursive: true });
-      path = join(dir, target.copy[1]);
-      copyFileSync(target.copy[0], path);
-    }
-    runClippy(path).then(
-      () => json(res, { ok: true, name: basename(path) }),
-      (e) => send(res, e.status || 500, e.message),
-    );
-  });
+async function clip(req, res, id) {
+  const body = await readBody(req);
+  if (!body) return;
+  const target = clipTarget(ROOT, id, typeof body.file === "string" ? body.file : "");
+  if (!target) return send(res, 404, "not found");
+  let path = target.path;
+  if (target.copy) {
+    // A fresh folder each time: the clipboard keeps pointing at the last one.
+    const dir = join(tmpdir(), "pi-canvas-clip", String(Date.now()));
+    rmSync(dirname(dir), { recursive: true, force: true });
+    mkdirSync(dir, { recursive: true });
+    path = join(dir, target.copy[1]);
+    copyFileSync(target.copy[0], path);
+  }
+  return runClippy(path).then(
+    () => json(res, { ok: true, name: basename(path) }),
+    (e) => send(res, e.status || 500, e.message),
+  );
 }
 
 /**
@@ -662,28 +726,40 @@ function fromPage(req, header) {
   return req.headers[header] === "1" && (!origin || origin === `http://${req.headers.host}`);
 }
 
-/** A small JSON body, or {} (anything over `max` bytes drops the connection). */
-function readBody(req, max = 1024) {
+/**
+ * A small JSON body, or {} when it isn't JSON. Anything over `max` bytes drops
+ * the connection and resolves null, on "close" ("end" never comes after a
+ * destroy), so the caller stops there instead of waiting forever.
+ */
+export function readBody(req, max = 1024) {
   return new Promise((ok) => {
     let body = "";
+    let over = false;
     req.on("data", (c) => {
+      if (over) return;
       body += c;
-      if (body.length > max) req.destroy();
+      if (body.length > max) {
+        over = true;
+        req.destroy();
+      }
     });
     req.on("end", () => {
+      if (over) return ok(null);
       try {
         ok(JSON.parse(body) || {});
       } catch {
         ok({});
       }
     });
+    req.on("close", () => ok(over ? null : {}));
   });
 }
 
 /** POST /s/<id>/send { text, mode } from the page: queue a message for that session's pi (see queueMessage). */
 async function sendToPi(req, res, id) {
-  if (!fromPage(req, "x-canvas")) return send(res, 403, "forbidden");
-  const r = queueMessage(ROOT, id, await readBody(req, 96 * 1024));
+  const body = await readBody(req, 96 * 1024);
+  if (!body) return;
+  const r = queueMessage(ROOT, id, body);
   if (r.error) return send(res, r.status, r.error);
   json(res, { id: r.id });
 }
@@ -731,9 +807,10 @@ let lastFollow = { id: "", at: 0 };
 
 /** POST /follow { pane, socket? } from the tmux hook: follow-mode pages go to that pane's session. */
 async function follow(req, res) {
-  if (!fromPage(req, "x-canvas")) return send(res, 403, "forbidden");
   if (!TMUX_ON) return send(res, 404, "tmux follow is off (PI_CANVAS_TMUX=0)");
-  const { pane, socket } = await readBody(req);
+  const body = await readBody(req);
+  if (!body) return;
+  const { pane, socket } = body;
   const id = sessionForPane(ROOT, String(pane || ""), typeof socket === "string" && socket.startsWith("/") ? socket : undefined);
   if (id && (id !== lastFollow.id || Date.now() - lastFollow.at > 500)) broadcast("follow", { id });
   if (id) lastFollow = { id, at: Date.now() };
@@ -742,34 +819,90 @@ async function follow(req, res) {
 
 /** POST /s/<id>/focus from a follow-mode page: move tmux to that session's pane. */
 async function focus(req, res, id) {
-  if (!fromPage(req, "x-canvas")) return send(res, 403, "forbidden");
   if (!TMUX_ON) return send(res, 404, "tmux follow is off (PI_CANVAS_TMUX=0)");
-  await readBody(req);
+  if (!(await readBody(req))) return;
   const meta = readJson(join(ROOT, id, "meta.json"), null);
   const t = tmuxOf(meta);
   if (!t || meta.ended || !pidAlive(meta.pid)) return send(res, 404, "not a live session in tmux");
   // Tell the hook's echo of this move apart from a move you made in tmux.
   lastFollow = { id, at: Date.now() };
-  focusPane(t).then(
+  return focusPane(t).then(
     (r) => json(res, r),
     (e) => send(res, 502, e.message),
   );
 }
 
+// ── routes ───────────────────────────────────────────────────────────────────────
+
+/**
+ * The POSTs, the only routes that make the daemon do anything. Each needs the
+ * key (the page's cookie, or Bearer for the tmux hook) and its header from
+ * fromPage. Keys: "follow" for /follow, "s/<name>" for /s/<id>/<name>.
+ */
+const POST_ROUTES = new Map();
+function postRoute(name, fn, header = "x-canvas") {
+  POST_ROUTES.set(name, { fn, header });
+}
+postRoute("follow", follow);
+postRoute("s/focus", focus);
+postRoute("s/send", sendToPi);
+// Only this page may ask: a cross-site form or fetch can't send this header
+// without a preflight the daemon never answers, and its Origin won't match.
+postRoute("s/clip", clip, "x-canvas-clip");
+
+function post(req, res, route) {
+  const sess = route.length === 3 && route[0] === "s" && SESSION_ID.test(route[1]);
+  const r = route.length === 1 ? POST_ROUTES.get(route[0]) : sess ? POST_ROUTES.get(`s/${route[2]}`) : undefined;
+  if (!r) return send(res, 405, "read only");
+  if (!authorized(req.headers, TOKEN)) return send(res, 401, "no key: run /canvas in pi to reopen the page");
+  if (!fromPage(req, r.header)) return send(res, 403, "forbidden");
+  return r.fn(req, res, sess ? route[1] : undefined);
+}
+
+/**
+ * The request handler, never allowed to take the daemon down: a throw, or a
+ * rejection from an async route, is a 500 (or a dropped connection once the
+ * headers are out) and a line in .daemon.log.
+ */
+export function safeHandler(fn) {
+  const fail = (res, e) => {
+    console.error(`${new Date().toISOString()} canvas daemon: request failed: ${e?.stack || e}`);
+    if (res.headersSent) return res.destroy();
+    try {
+      send(res, 500, "internal error");
+    } catch {}
+  };
+  return (req, res) => {
+    try {
+      const p = fn(req, res);
+      if (p && typeof p.then === "function") p.then(undefined, (e) => fail(res, e));
+    } catch (e) {
+      fail(res, e);
+    }
+  };
+}
+
 function handler(req, res) {
   if (!loopback(req.socket.remoteAddress)) return send(res, 403, "forbidden");
   if (!allowedHost(req.headers.host)) return send(res, 421, "misdirected");
-  const route = new URL(req.url || "/", `http://127.0.0.1:${PORT}`).pathname.split("/").filter(Boolean);
-  if (req.method === "POST" && route.length === 3 && route[0] === "s" && route[2] === "clip" && SESSION_ID.test(route[1])) return clip(req, res, route[1]);
-  if (req.method === "POST" && route.length === 1 && route[0] === "follow") return follow(req, res);
-  if (req.method === "POST" && route.length === 3 && route[0] === "s" && route[2] === "focus" && SESSION_ID.test(route[1])) return focus(req, res, route[1]);
-  if (req.method === "POST" && route.length === 3 && route[0] === "s" && route[2] === "send" && SESSION_ID.test(route[1])) return sendToPi(req, res, route[1]);
+  const url = new URL(req.url || "/", `http://127.0.0.1:${PORT}`);
+  if (req.method === "POST") return post(req, res, url.pathname.split("/").filter(Boolean));
   if (req.method !== "GET" && req.method !== "HEAD") return send(res, 405, "read only");
 
-  const url = new URL(req.url || "/", `http://127.0.0.1:${PORT}`);
-  const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
+  const parts = decodeParts(url.pathname);
+  if (!parts) return send(res, 400, "bad path");
 
   if (url.pathname === "/health") return json(res, { ok: true, version: VERSION, pid: process.pid, root: ROOT });
+  // A keyed link (what pi's /canvas opens): set the cookie, then go to the same
+  // URL without the key, so it stays out of history and copied links.
+  if (url.searchParams.has("k")) {
+    if (!sameToken(url.searchParams.get("k"), TOKEN)) return send(res, 403, "wrong key: run /canvas in pi to reopen the page");
+    url.searchParams.delete("k");
+    // One leading slash only: "/.//evil.com" normalises to "//evil.com",
+    // which a browser reads as another host.
+    const location = "/" + url.pathname.replace(/^[\/\\]+/, "") + url.search;
+    return send(res, 303, "", { Location: location, "Set-Cookie": `${cookieName()}=${TOKEN}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000` });
+  }
   if (url.pathname === "/" || (parts[0] === "s" && parts.length === 2 && SESSION_ID.test(parts[1]))) {
     return send(res, 200, SHELL, { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": PAGE_CSP });
   }
@@ -790,6 +923,9 @@ function handler(req, res) {
   }
   if (url.pathname === "/meeting") return send(res, 200, MEETING_SHELL, { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": PAGE_CSP });
   if (url.pathname === "/meetings") return send(res, 200, MEETINGS_SHELL, { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": PAGE_CSP });
+  // Open so far: /health and the page shells and their scripts, none of which
+  // hold data. Everything below is data: sessions, replies, section files, meetings.
+  if (!authorized(req.headers, TOKEN)) return send(res, 401, "no key: run /canvas in pi to reopen the page");
   // id: the meeting wanted (empty: the live one); cur: the id the page's cursor (since) belongs to.
   if (url.pathname === "/api/meeting") {
     const id = url.searchParams.get("id") || "";
@@ -1067,7 +1203,13 @@ function pollMeeting() {
 }
 
 export function start() {
-  mkdirSync(ROOT, { recursive: true });
+  // Nothing the daemon writes (the key file, clip copies, the vendor cache) is for anyone else.
+  process.umask(0o077);
+  mkdirSync(ROOT, { recursive: true, mode: 0o700 });
+  chmodSync(ROOT, 0o700);
+  TOKEN = loadToken(ROOT);
+  // Last resort: a bug in a timer or watcher callback logs instead of taking every tab down.
+  process.on("uncaughtException", (e) => console.error(`${new Date().toISOString()} canvas daemon: uncaught: ${e?.stack || e}`));
   prune(ROOT);
   setInterval(() => prune(ROOT), 6 * 3_600_000).unref();
   // Liveness is a pid check, so a pi that dies without session_shutdown only
@@ -1076,7 +1218,7 @@ export function start() {
   watch(ROOT, { recursive: true }, (_event, file) => onChange(file ? String(file) : ""));
   watchSystemTheme();
   pollMeeting();
-  const server = createServer(handler);
+  const server = createServer(safeHandler(handler));
   server.on("error", (e) => {
     // Another daemon won the race for the port: that one serves, this one goes.
     // Say so: if another program holds the port, this line in .daemon.log is
@@ -1085,11 +1227,13 @@ export function start() {
       console.error(`${new Date().toISOString()} canvas daemon: port ${PORT} is in use (another canvas daemon, or another program); exiting`);
       process.exit(0);
     }
-    throw e;
+    // Not listening is fatal: say why and go, rather than idle without a server.
+    console.error(`${new Date().toISOString()} canvas daemon: ${e.message}; exiting`);
+    process.exit(1);
   });
   // Written once listening, so a daemon that lost the race leaves no pid behind.
   server.on("listening", () => {
-    writeFileSync(join(ROOT, ".daemon.json"), JSON.stringify({ pid: process.pid, port: PORT, version: VERSION, started: new Date().toISOString() }));
+    writeDaemonFile(ROOT, { pid: process.pid, port: PORT, version: VERSION, started: new Date().toISOString(), token: TOKEN });
   });
   server.listen(PORT, "127.0.0.1");
   return server;

@@ -18,8 +18,10 @@
 // its own allow-lists on every call, and the sanitised markdown is parsed into
 // an inert <template> and filtered there before any of it is appended.
 //
-// The canvas page still has its own renderMarkdown (page.mjs: a .codeblock DOM,
-// no image filter) so its look is unchanged; bubbles use this one.
+// The canvas page and bubbles share renderMarkdown and its one sanitize policy
+// (MD_CLEAN). The page passes its look in through opts (wrapCode: its
+// .codeblock DOM; highlight: its lazily loaded highlight.js; mermaid; imgSrc:
+// its own files as well as data: images).
 //
 // The DOM a host page styles (bubble.css):
 //   .md                 markdown root
@@ -52,7 +54,7 @@ export const h = (tag, attrs = {}, ...kids) => {
 // chat WebView) instead of the clipboard.
 
 /** What a highlighter's output may keep: <span class> and nothing else. */
-const HL_CLEAN = { ALLOWED_TAGS: ["span"], ALLOWED_ATTR: ["class"], ALLOW_DATA_ATTR: false, ALLOW_ARIA_ATTR: false };
+export const HL_CLEAN = { ALLOWED_TAGS: ["span"], ALLOWED_ATTR: ["class"], ALLOW_DATA_ATTR: false, ALLOW_ARIA_ATTR: false };
 const PLAIN = new Set(["text", "txt", "plain", "plaintext", "output", "console", "log"]);
 
 /** A fence's language, if it is one: lowercase, short, and not a plain-text alias. */
@@ -63,12 +65,12 @@ function langName(lang) {
 
 /**
  * Colour a fence in place. Only a named language (no guessing), only blocks up
- * to 16 KB, and the result is cut down to <span class> before use.
+ * to 16 KB, and the result is cut down to <span class> before use. `hljs`: a
+ * host that loads highlight.js lazily passes it once loaded.
  */
-function highlightInto(code, lang) {
+export function highlightInto(code, lang, hljs = window.hljs) {
   const name = langName(lang);
   const text = code.textContent;
-  const hljs = window.hljs;
   // A huge fence would block a bubble's main thread; leave the big ones plain.
   if (!name || text.length > 16000 || !window.DOMPurify || !hljs?.getLanguage?.(name)) return;
   try {
@@ -106,6 +108,11 @@ const MD_CLEAN = {
 };
 const DATA_IMG = /^data:/i;
 
+// GFM task items: marked writes a disabled checkbox, which MD_CLEAN's no-<input>
+// rule would drop with its meaning. A span with a box character keeps it, inert.
+const TASK_BOX = /<input (checked="" )?disabled="" type="checkbox"\s*\/?>/g;
+const taskBoxes = (html) => html.replace(TASK_BOX, (_m, on) => `<span class="task-box${on ? " done" : ""}">${on ? "\u2611" : "\u2610"}</span>`);
+
 /**
  * Put text on the clipboard: opts.onCopy first (the host app's own pasteboard),
  * else the async Clipboard API. Throws when neither works, so the button can
@@ -141,6 +148,12 @@ function copyButton(getText, opts) {
  * Markdown as a detached div.md. GFM (tables, strikethrough, autolinks) comes
  * from marked; DOMPurify decides what survives, so a bot's HTML can't script
  * the host page.
+ *
+ * opts (all optional): onCopy (see copyButton); imgSrc, a RegExp an <img src>
+ * must match (default data: only); mermaid(box, source), drawing ```mermaid
+ * fences into an empty div instead of showing their source; highlight(code,
+ * lang), instead of highlightInto/highlightGuess; wrapCode(pre, code, lang),
+ * putting each fence in the host's own wrapper instead of .code-wrap.
  */
 export function renderMarkdown(text, opts = {}) {
   const el = h("div", { class: "md" });
@@ -153,23 +166,36 @@ export function renderMarkdown(text, opts = {}) {
   // live document owns would already start an <img> fetch). What survives is
   // appended to the detached div this returns.
   const tpl = document.createElement("template");
-  tpl.innerHTML = window.DOMPurify.sanitize(window.marked.parse(text, { gfm: true }), MD_CLEAN);
+  tpl.innerHTML = window.DOMPurify.sanitize(taskBoxes(window.marked.parse(text, { gfm: true })), MD_CLEAN);
   for (const bad of tpl.content.querySelectorAll("picture, source, video, audio, track")) bad.remove();
   // Dropping the attribute is what stops the fetch; the element (and its text)
   // stays, so <td background> keeps its cell.
   for (const el of tpl.content.querySelectorAll("[srcset], [background], [poster]")) for (const attr of ["srcset", "background", "poster"]) el.removeAttribute(attr);
-  for (const img of tpl.content.querySelectorAll("img")) if (!DATA_IMG.test(img.getAttribute("src") || "")) img.remove();
+  const imgOk = opts.imgSrc instanceof RegExp ? opts.imgSrc : DATA_IMG;
+  for (const img of tpl.content.querySelectorAll("img")) if (!imgOk.test(img.getAttribute("src") || "")) img.remove();
   el.append(tpl.content);
   // A bubble is its own page: links leave for the real browser.
   for (const a of el.querySelectorAll("a[href]")) {
     a.target = "_blank";
     a.rel = "noopener noreferrer";
   }
+  if (typeof opts.mermaid === "function") {
+    for (const code of el.querySelectorAll("pre > code.language-mermaid")) {
+      const box = h("div");
+      code.parentElement.replaceWith(box);
+      opts.mermaid(box, code.textContent);
+    }
+  }
   for (const pre of el.querySelectorAll("pre")) {
     const code = pre.querySelector("code") || pre;
     const lang = [...code.classList].find((c) => c.startsWith("language-"))?.slice(9);
-    if (lang) highlightInto(code, lang);
+    if (typeof opts.highlight === "function") opts.highlight(code, lang);
+    else if (lang) highlightInto(code, lang);
     else highlightGuess(code);
+    if (typeof opts.wrapCode === "function") {
+      opts.wrapCode(pre, code, lang);
+      continue;
+    }
     // The empty span keeps the bar's layout when the fence has no language.
     const head = h("div", { class: "code-head" }, lang ? h("span", { class: "lang" }, lang) : h("span"), copyButton(() => code.textContent.replace(/\n$/, ""), opts));
     const wrap = h("div", { class: "code-wrap" });

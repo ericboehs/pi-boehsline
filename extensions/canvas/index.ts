@@ -25,7 +25,7 @@
 
 import { spawn, spawnSync, execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, copyFileSync, existsSync, fstatSync, type FSWatcher, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, fstatSync, type FSWatcher, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,6 +47,44 @@ const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]);
 
 export const canvasRoot = () => resolve(process.env.PI_CANVAS_ROOT || join(homedir(), ".pi", "canvas"));
 export const pageUrl = (sessionId: string) => `http://127.0.0.1:${PORT}/s/${encodeURIComponent(sessionId)}`;
+
+/** The daemon's key from <root>/.daemon.json, or "" before a daemon with one has started. */
+export function daemonToken(root = canvasRoot()): string {
+  try {
+    const t = JSON.parse(readFileSync(join(root, ".daemon.json"), "utf8"))?.token;
+    return typeof t === "string" && /^[0-9a-f]{64}$/.test(t) ? t : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * A page URL carrying the key: the daemon sets its cookie from ?k= and
+ * redirects to the plain URL. Only for opening a browser; never handed to the
+ * model or written anywhere.
+ */
+export function keyedUrl(url: string, token = daemonToken()): string {
+  return token ? `${url}${url.includes("?") ? "&" : "?"}k=${token}` : url;
+}
+
+/**
+ * The daemon's environment: what it reads (PI_CANVAS_*, the meeting and usage
+ * paths) plus PATH, HOME and TMPDIR, not all of pi's (API keys and the like).
+ */
+const DAEMON_ENV = new Set(["PATH", "HOME", "TMPDIR", "PI_CODING_AGENT_DIR", "PI_MEETING_NOTES_FILE", "PI_MEETING_NOTES_DIR", "MEETING_CAPTURE_STATE_DIR", "MEETING_CAPTURE_DATA_DIR", "XDG_DATA_HOME"]);
+export function daemonEnv(env: NodeJS.ProcessEnv, root: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) if (v !== undefined && (DAEMON_ENV.has(k) || k.startsWith("PI_CANVAS_"))) out[k] = v;
+  out.PI_CANVAS_ROOT = root;
+  return out;
+}
+
+/** The canvas root, made private (700) whether it is new or not. */
+export function makeRoot(root = canvasRoot()): string {
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  chmodSync(root, 0o700);
+  return root;
+}
 
 /**
  * The tmux pane pi runs in and its server's socket, for follow mode (the
@@ -1051,20 +1089,23 @@ async function startDaemon(): Promise<boolean> {
   const version = daemonVersion();
   const h = await health();
   if (h?.version === version) return true;
-  if (h?.pid) {
+  const root = canvasRoot();
+  // Stop only the daemon this root recorded, and only when it is what answers
+  // the port: never a pid /health alone names (another root's daemon, or not one at all).
+  const rec = readJson<{ pid?: number; port?: number }>(join(root, ".daemon.json"), {});
+  if (h?.pid && Number.isInteger(rec.pid) && rec.pid === h.pid && (rec.port ?? PORT) === PORT) {
     try {
-      process.kill(h.pid, "SIGTERM");
+      process.kill(rec.pid, "SIGTERM");
     } catch {}
     for (let i = 0; i < 20 && (await health()); i++) await sleep(100);
   }
-  const root = canvasRoot();
-  mkdirSync(root, { recursive: true });
+  makeRoot(root);
   const log = openSync(join(root, ".daemon.log"), "a");
   const node = basename(process.execPath).startsWith("node") ? process.execPath : "node";
   const child = spawn(node, [DAEMON, "--port", String(PORT), "--root", root, "--version", version], {
     detached: true,
     stdio: ["ignore", log, log],
-    env: { ...process.env, PI_CANVAS_ROOT: root },
+    env: daemonEnv(process.env, root),
   });
   // A spawn failure (no node on PATH) arrives as an "error" event, which throws
   // when nothing listens. The health loop below then reports false.
@@ -1079,14 +1120,21 @@ async function startDaemon(): Promise<boolean> {
 
 // ── safari ───────────────────────────────────────────────────────────────────
 
+// argv: the page URL (a tab already on it is focused), the keyed URL a new tab
+// opens (and a locked tab is sent to), then the window bounds. A tab is
+// locked when the page got a 401 (no key, e.g. a daemon from before keys) and
+// titled itself "Canvas (locked)": reading a tab's name needs no JavaScript
+// permission.
 const OPEN_SCRIPT = `
 on run argv
   set u to item 1 of argv
+  set ku to item 2 of argv
   tell application "Safari"
     repeat with w in windows
       repeat with t in tabs of w
         try
           if (URL of t as text) starts with u then
+            if (name of t as text) starts with "Canvas (locked)" then set URL of t to ku
             set current tab of w to t
             set index of w to 1
             activate
@@ -1095,9 +1143,9 @@ on run argv
         end try
       end repeat
     end repeat
-    make new document with properties {URL:u}
-    if (count of argv) is 5 then
-      set bounds of front window to {(item 2 of argv) as integer, (item 3 of argv) as integer, (item 4 of argv) as integer, (item 5 of argv) as integer}
+    make new document with properties {URL:ku}
+    if (count of argv) is 6 then
+      set bounds of front window to {(item 3 of argv) as integer, (item 4 of argv) as integer, (item 5 of argv) as integer, (item 6 of argv) as integer}
     end if
     activate
     return "opened"
@@ -1110,9 +1158,26 @@ function run(cmd: string, args: string[], timeout = 5000): Promise<string> {
   });
 }
 
-async function openInSafari(url: string): Promise<string> {
-  const bounds = leftHalfBounds(await run("wrangle", ["displays"]));
-  const out = await run("osascript", ["-e", OPEN_SCRIPT, url, ...(bounds ? bounds.map(String) : [])]);
+/**
+ * Where Eric's Canvas web app (a Safari "Add to Dock" app, with its own cookie
+ * jar) may live, first found wins. PI_CANVAS_APP overrides the list (one path,
+ * or several joined with ":"); set but empty turns the web app off.
+ */
+export function canvasAppCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
+  if (env.PI_CANVAS_APP !== undefined) return env.PI_CANVAS_APP.split(":").filter(Boolean);
+  return [join(homedir(), "Applications", "Canvas.app"), "/Applications/Canvas.app"];
+}
+
+export async function openInSafari(url: string, opts: { apps?: string[]; run?: typeof run } = {}): Promise<string> {
+  const exec = opts.run ?? run;
+  const app = (opts.apps ?? canvasAppCandidates()).find((path) => existsSync(path));
+  if (app) {
+    // The web app keeps its own cookies, so it gets the keyed URL too.
+    await exec("open", ["-a", app, keyedUrl(url)]);
+    return "opened in Canvas.app";
+  }
+  const bounds = leftHalfBounds(await exec("wrangle", ["displays"]));
+  const out = await exec("osascript", ["-e", OPEN_SCRIPT, url, keyedUrl(url), ...(bounds ? bounds.map(String) : [])]);
   return out.trim() || "failed";
 }
 
@@ -1764,7 +1829,7 @@ export default function canvas(pi: ExtensionAPI) {
   function ensureDir(ctx: ExtensionContext): string {
     const d = dir();
     const fresh = !existsSync(join(d, "activity.json"));
-    mkdirSync(d, { recursive: true });
+    mkdirSync(d, { recursive: true, mode: 0o700 });
     if (fresh) writeActivity(true);
     if (fresh) writeTurn();
     const metaPath = join(d, "meta.json");
@@ -1932,7 +1997,7 @@ export default function canvas(pi: ExtensionAPI) {
     if (body === watchLast) return;
     watchLast = body;
     try {
-      mkdirSync(canvasRoot(), { recursive: true });
+      makeRoot();
       const tmp = `${watchFile()}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify({ pid: process.pid, at: new Date().toISOString(), ...snap }), { mode: 0o600 });
       renameSync(tmp, watchFile());
@@ -2381,7 +2446,8 @@ export default function canvas(pi: ExtensionAPI) {
       }
       const url = pageUrl(sessionId);
       if (arg === "url") {
-        ctx.ui.notify(url, "info");
+        // With the key, so it opens in any browser; the daemon trades it for a cookie.
+        ctx.ui.notify(keyedUrl(url), "info");
         return;
       }
       if (arg === "status") {
@@ -2410,7 +2476,7 @@ export default function canvas(pi: ExtensionAPI) {
         return;
       }
       const how = await openInSafari(url);
-      ctx.ui.notify(how === "failed" ? `canvas: could not drive Safari; open ${url}` : `canvas: ${how} ${url}`, how === "failed" ? "warning" : "info");
+      ctx.ui.notify(how === "failed" ? `canvas: could not drive Safari; open ${keyedUrl(url)}` : `canvas: ${how} ${url}`, how === "failed" ? "warning" : "info");
     },
   });
 

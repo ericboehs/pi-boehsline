@@ -330,6 +330,51 @@ test("renderMarkdown's config survives a host that never calls DOMPurify.setConf
   assert.ok(render.renderMarkdown("# md").querySelector("[style]"), "a global config would win over MD_CLEAN");
 });
 
+test("renderMarkdown keeps GFM task items as inert boxes, though MD_CLEAN drops <input>", () => {
+  // marked's own checkbox markup, as marked 18 writes it.
+  stubHost({ html: '<ul><li><input checked="" disabled="" type="checkbox"> done</li><li><input disabled="" type="checkbox"> todo</li></ul><input name="q">' });
+  const el = render.renderMarkdown("- [x] done\n- [ ] todo");
+  assert.equal(el.querySelector("input"), null, "no form control survives");
+  const boxes = [...el.querySelectorAll("li > span.task-box")];
+  assert.deepEqual(boxes.map((b) => [b.className, b.textContent]), [["task-box done", "\u2611"], ["task-box", "\u2610"]]);
+});
+
+test("renderMarkdown takes the canvas page's look through opts: mermaid, highlight, wrapCode, imgSrc", () => {
+  stubHost({ html: '<pre><code class="language-mermaid">graph TD;A--&gt;B</code></pre><pre><code class="language-js">a()\n</code></pre><img src="/s/x/f/shot.png"><img src="https://t.test/p.gif"><img src="//t.test/p.gif">' });
+  const drawn = [];
+  const lit = [];
+  const wrapped = [];
+  const el = render.renderMarkdown("x", {
+    imgSrc: /^(data:|\/(?![/\\]))/i,
+    mermaid: (box, src) => drawn.push([box.tagName, src]),
+    highlight: (code, lang) => lit.push(lang),
+    wrapCode: (pre, code, lang) => {
+      const w = document.createElement("div");
+      w.className = "codeblock";
+      pre.replaceWith(w);
+      w.append(pre);
+      wrapped.push(lang);
+    },
+  });
+  assert.deepEqual(drawn, [["DIV", "graph TD;A-->B"]], "a mermaid fence is handed over, not shown as code");
+  assert.deepEqual(lit, ["js"], "the host's highlighter, mermaid's fence gone by then");
+  assert.deepEqual(wrapped, ["js"]);
+  assert.equal(el.querySelectorAll(".codeblock > pre").length, 1, "the host's wrapper");
+  assert.equal(el.querySelector(".code-wrap"), null, "instead of .code-wrap");
+  assert.deepEqual([...el.querySelectorAll("img")].map((i) => i.getAttribute("src")), ["/s/x/f/shot.png"], "same-origin paths only");
+  stubHost({ html: '<img src="/s/x/f/shot.png">' });
+  assert.equal(render.renderMarkdown("x").querySelector("img"), null, "without imgSrc: data: only, as before");
+});
+
+test("highlightInto takes a lazily loaded highlight.js", () => {
+  stubHost({ html: "" });
+  const code = document.createElement("code");
+  code.textContent = "a()";
+  render.highlightInto(code, "js", { getLanguage: (l) => l === "js", highlight: (t) => ({ value: `<span class="hljs-title">${t}</span><b>x</b>` }) });
+  assert.equal(code.innerHTML, '<span class="hljs-title">a()</span>x', "cut down to <span class> by HL_CLEAN");
+  assert.deepEqual(render.HL_CLEAN.ALLOWED_TAGS, ["span"]);
+});
+
 test("a chart redraws on width changes only, one frame later", () => {
   const observers = [];
   const ro = globalThis.ResizeObserver;
