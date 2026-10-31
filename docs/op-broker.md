@@ -45,12 +45,16 @@ op daemon (~/.local/state/pi-op-broker/daemon.sock, 0600; started on demand, exi
 - **Grants live in the extension,** per session. The daemon only holds the authorization and runs
   allowed commands for local clients.
 - **One daemon, no lock file:** the daemon is whoever binds `daemon.sock`. On `EADDRINUSE` a
-  starter exits 0 if a daemon answers there, takes the path over (once) if it's a stale socket,
-  and otherwise leaves the path alone, logs why and exits. On exit a daemon removes the socket only
-  if it's still the one it bound (same inode). One request per connection; later lines are ignored.
+  starter exits 0 if a daemon answers there, takes the path over (once) if it's a stale socket
+  (removed only if a second look still finds nobody answering and it's still the same file, by
+  device and inode, so two starters can't remove each other's fresh socket), and otherwise leaves
+  the path alone, logs why and exits. On exit, or when its socket is replaced, a daemon removes the
+  socket only if it's still the one it bound (same device, inode and birth time: inodes are reused). One request per connection; later lines are ignored.
 - **One set of rules** (`validate.mjs`) for item, vault, field, account and `op://` names, used by
   the shim, the session's socket (a same-user process can write to it directly) and the daemon.
-  The card's `parseRef` uses the same segment pattern.
+  The card's `parseRef` uses the same segment pattern. Names can't hold invisible, surrogate,
+  private-use or unassigned characters, runs of whitespace, or the card's own separators (`·`, `›`).
+  An `OP_ACCOUNT` the rules refuse sends the command to the real op, never to the default account.
 - **What the daemon runs:** `op read <ref>` (a strict `op://` pattern), `op item get <item>
   [--vault V] --fields <f> --reveal`, `whoami`, and `arm` (pops the one Touch ID). Nothing else,
   no shell. Values go back over the socket only, never to a file or log.
@@ -60,8 +64,9 @@ op daemon (~/.local/state/pi-op-broker/daemon.sock, 0600; started on demand, exi
   chip while armed.
 - **The shim** (stdlib Node or a tiny script, fast start) blocks for the card up to 5 minutes,
   then exits 1 with "not approved". `op signin [--account x]` answers ok when armed.
-- **The card** says what's asked in plain words, plus the parent command line (truncated) the
-  read is for. Esc means Deny. With Botsun, the phone gets the same card through
+- **The card** says what's asked in plain words, plus the parent command line (truncated; likely inline
+  secrets such as `TOKEN=…`, `--password=…` or `Authorization: Bearer …` masked as `•••`) the read
+  is for. Esc means Deny. With Botsun, the phone gets the same card through
   botsun-owner, offered as a sensitive prompt: answered on the phone screen (device-signed) or the
   keyboard, never by a voice confirm.
 

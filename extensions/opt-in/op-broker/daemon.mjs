@@ -20,7 +20,7 @@
 // talk to this socket. That's the accepted risk (README).
 
 import { execFile } from "node:child_process";
-import { chmodSync, mkdirSync, appendFileSync, unlinkSync, existsSync, lstatSync, statSync } from "node:fs";
+import { chmodSync, mkdirSync, appendFileSync, unlinkSync, lstatSync, statSync } from "node:fs";
 import { createServer, createConnection } from "node:net";
 import { delimiter, join } from "node:path";
 import { brokerDir, validRequest } from "./validate.mjs";
@@ -103,13 +103,19 @@ async function handle(req) {
 	return { ok: true, value: req.kind === "read" ? r.out : r.out.replace(/\n$/, "") };
 }
 
+// Which file a path is: device, inode and birth time (ctime where the filesystem has none). An
+// inode alone can be reused once its file is gone (ext4 does it at once), so a newer socket at the
+// path could look like ours.
+export const fileId = (st) => ({ dev: st.dev, ino: st.ino, born: st.birthtimeMs || st.ctimeMs });
+export const sameFile = (st, id) => !!id && st.dev === id.dev && st.ino === id.ino && (st.birthtimeMs || st.ctimeMs) === id.born;
+
 // Our folder deleted, or our socket gone or replaced (another daemon bound a new one): nobody can
 // reach this daemon any more, so it exits instead of holding an authorization for no one.
 function orphaned() {
-	if (sockIno === undefined) return false; // not listening yet
+	if (sockId === undefined) return false; // not listening yet
 	try {
 		if (!statSync(DIR).isDirectory()) return true;
-		return statSync(SOCK).ino !== sockIno;
+		return !sameFile(lstatSync(SOCK), sockId);
 	} catch {
 		return true;
 	}
@@ -139,21 +145,21 @@ async function keepAlive() {
 }
 
 let server;
-let sockIno; // the socket this daemon bound: shutdown removes only that one
+let sockId; // the socket this daemon bound (fileId): shutdown removes only that one
 function shutdown() {
 	// No server.close(): Node unlinks the socket's path on close, which may be another daemon's by
 	// now. Exiting closes it; the path is removed only if it's still the one this daemon bound.
 	try {
-		if (sockIno !== undefined && existsSync(SOCK) && statSync(SOCK).ino === sockIno) unlinkSync(SOCK);
+		if (sameFile(lstatSync(SOCK), sockId)) unlinkSync(SOCK);
 	} catch {}
 	log("stopped");
 	process.exit(0);
 }
 
 // Another daemon already answering means this one isn't needed.
-function alive() {
+function alive(sock = SOCK) {
 	return new Promise((resolve) => {
-		const c = createConnection(SOCK);
+		const c = createConnection(sock);
 		c.on("connect", () => { c.destroy(); resolve(true); });
 		c.on("error", () => resolve(false));
 	});
@@ -182,6 +188,30 @@ function serve(conn) {
 	conn.on("error", () => {});
 }
 
+// A path in use with nobody answering: remove it only if it's a socket, still nobody answers on a
+// second look (a slow daemon, or another starter that just bound it), and it's still the same file
+// first judged stale (another starter may have removed it and bound its own meanwhile).
+// "alive" | "removed" | "replaced" | "gone" | "not-socket" | "error".
+export async function clearStale(sock, isAlive) {
+	if (await isAlive()) return "alive";
+	let first;
+	try {
+		first = lstatSync(sock);
+	} catch (e) {
+		return e?.code === "ENOENT" ? "gone" : "error";
+	}
+	if (!first.isSocket()) return "not-socket";
+	if (await isAlive()) return "alive";
+	try {
+		const now = lstatSync(sock);
+		if (now.dev !== first.dev || now.ino !== first.ino) return "replaced";
+		unlinkSync(sock);
+		return "removed";
+	} catch (e) {
+		return e?.code === "ENOENT" ? "gone" : "error";
+	}
+}
+
 // One daemon at a time: whoever binds daemon.sock. A path in use is a live daemon (this one isn't
 // needed), a stale socket left by a dead one (taken over, once), or something else (left alone).
 function listen(retry) {
@@ -191,25 +221,15 @@ function listen(retry) {
 			log(`can't listen: ${e.message}`);
 			return process.exit(1);
 		}
-		if (await alive()) return process.exit(0);
-		let stale = false;
-		try {
-			stale = lstatSync(SOCK).isSocket();
-		} catch (err) {
-			stale = err?.code === "ENOENT"; // gone meanwhile: just try again
-		}
-		if (retry && stale) {
-			try {
-				unlinkSync(SOCK);
-			} catch {}
-			return listen(false);
-		}
-		log(`can't listen: ${SOCK} is in use and isn't a daemon answering${stale ? "" : " (not a socket: left alone)"}`);
+		const r = await clearStale(SOCK, () => alive());
+		if (r === "alive") return process.exit(0);
+		if (retry && (r === "removed" || r === "gone" || r === "replaced")) return listen(false);
+		log(`can't listen: ${SOCK} is in use and isn't a daemon answering${r === "not-socket" ? " (not a socket: left alone)" : ""}`);
 		process.exit(1);
 	});
 	server.listen(SOCK, () => {
 		chmodSync(SOCK, 0o600); // the folder is 0700 already
-		sockIno = statSync(SOCK).ino;
+		sockId = fileId(lstatSync(SOCK));
 		server.on("error", (e) => {
 			log(`server error: ${e.message}`);
 			shutdown();

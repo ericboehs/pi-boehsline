@@ -18,14 +18,15 @@ process.env.BOEHSLINE_CONFIG = join(root, "boehsline.json");
 process.env.BOEHSLINE_ENABLE = "op-broker";
 // Every daemon these tests start (directly or through the extension) exits within 30 s even if
 // this run is killed before its cleanup: the fake op's whoami always succeeds, so they'd stay armed.
+const savedTtl = process.env.PI_OP_BROKER_TTL_MS; // put back by the last test
 process.env.PI_OP_BROKER_TTL_MS = "30000";
 after(() => rmSync(root, { recursive: true, force: true }));
 
 const EXT = join(import.meta.dirname, "..", "extensions", "opt-in", "op-broker");
 const { parse } = await import(join(EXT, "shim.mjs"));
-const { Broker, cardTitle, grantKey, parseRef } = await import(join(EXT, "broker.ts"));
-const { REF } = await import(join(EXT, "validate.mjs"));
-const { argvFor } = await import(join(EXT, "daemon.mjs"));
+const { Broker, cardTitle, grantKey, maskSecrets, parseRef } = await import(join(EXT, "broker.ts"));
+const { NAME, REF } = await import(join(EXT, "validate.mjs"));
+const { argvFor, clearStale, fileId, sameFile } = await import(join(EXT, "daemon.mjs"));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(check, ms = 5000) {
@@ -233,6 +234,124 @@ test("the daemon runs only what it allows", () => {
 	]) assert.equal(argvFor(bad), null, JSON.stringify(bad));
 });
 
+test("an OP_ACCOUNT the shim can't pass on sends the read to the real op, never to the default account", () => {
+	const restoreEnv = snapshotEnv();
+	try {
+		process.env.OP_ACCOUNT = "work";
+		assert.deepEqual(parse(["item", "get", "Rubygems", "--otp"]), { account: "work", kind: "otp", item: "Rubygems" });
+		process.env.OP_ACCOUNT = "bad account";
+		assert.equal(parse(["item", "get", "Rubygems", "--otp"]), null);
+		assert.equal(parse(["read", "op://P/I/f"]), null);
+		assert.deepEqual(parse(["read", "op://P/I/f", "--account", "my"]), { account: "my", kind: "read", ref: "op://P/I/f", newline: true }, "--account wins");
+		process.env.OP_ACCOUNT = "";
+		assert.deepEqual(parse(["read", "op://P/I/f"]), { kind: "read", ref: "op://P/I/f", newline: true }, "empty is unset");
+	} finally {
+		restoreEnv();
+	}
+});
+
+test("names: legit ones pass; surrogates, private use, unassigned, whitespace runs and the card's separators don't", () => {
+	for (const ok of ["GitHub", "My Item", "AWS (prod)", "api.example.com", "foo-bar_baz", "Café 日本 Ümläut", "🔑 GitHub", "👍🏽", "x ", "a b c"])
+		assert.ok(NAME.test(ok), JSON.stringify(ok));
+	for (const bad of ["\ud800x", "x\udc00", "\ue000", "\u{f0000}", "\u0378", "\u{10fffe}", "a  b", "a \u00a0b", "a\u3000\u3000b", "GitHub · token", "AWS › key", "·", "›"])
+		assert.equal(NAME.test(bad), false, JSON.stringify(bad));
+	// The same in a ref, as the shim, the session and the card's parseRef see it.
+	for (const ref of ["op://P/Git·Hub/f", "op://P/I/a›b", "op://P/a  b/f", "op://P/\ue000/f", "op://P/I/\ud800"]) {
+		assert.equal(REF.test(ref), false, ref);
+		assert.equal(parseRef(ref), null, ref);
+		assert.equal(argvFor({ kind: "read", ref }), null, ref);
+	}
+	assert.ok(REF.test("op://Personal/🔑 My Item (x)/sec/field"));
+	assert.equal(parse(["item", "get", "Git·Hub", "--otp"]), null);
+	assert.equal(argvFor({ kind: "otp", item: "a  b" }), null);
+});
+
+test("the card masks likely secrets in the command line it shows (and sends to the phone)", () => {
+	const cases = [
+		["GITHUB_TOKEN=ghp_abc123 gh auth status", "GITHUB_TOKEN=••• gh auth status"],
+		["curl -H 'Authorization: Bearer eyJhbGc.x.y' https://x", "curl -H 'Authorization: •••' https://x"], // gitleaks:allow (a fake token: the card must mask it)
+		['curl -H "authorization:Basic dXNlcjpw" x', 'curl -H "authorization:•••" x'],
+		["curl --oauth2-bearer tok -H 'X: Bearer abc.def'", "curl --oauth2-bearer ••• -H 'X: Bearer •••'"],
+		["mysql --password=hunter2 -u root", "mysql --password=••• -u root"],
+		["API_KEY='a b c' ./run", "API_KEY=••• ./run"],
+		['echo {"client_secret": "s3", "id": 1}', 'echo {"client_secret": •••, "id": 1}'],
+		["PGPASSWORD=x&&psql; aws --pwd: y", "PGPASSWORD=•••&&psql; aws --pwd: •••"],
+		["bash -c gh auth login --with-token", "bash -c gh auth login --with-token"], // nothing inline
+		["op read op://P/GitHub/token", "op read op://P/GitHub/token"],
+	];
+	for (const [cmd, want] of cases) assert.equal(maskSecrets(cmd), want, cmd);
+	const title = cardTitle({ kind: "read", ref: "op://P/GitHub/token", command: "env\nSECRET_KEY=abc DB_PASS=ok curl -H 'Authorization: Bearer zzz'" });
+	assert.equal(title, "🔑 1Password: GitHub · token (P)\nfor: env SECRET_KEY=••• DB_PASS=ok curl -H 'Authorization: •••'");
+	assert.doesNotMatch(title, /abc|zzz/);
+});
+
+// A socket file with nobody behind it: a process that bound it, killed outright.
+async function staleSocket(path) {
+	const child = spawn(process.execPath, ["-e", `require("net").createServer().listen(${JSON.stringify(path)})`], { stdio: "ignore" });
+	after(() => child.kill("SIGKILL"));
+	await until(() => existsSync(path));
+	child.kill("SIGKILL");
+	await exited(child);
+	assert.ok(lstatSync(path).isSocket());
+}
+
+test("a stale socket is removed only if nobody answers on a second look and it's still the same file", async () => {
+	const dir = mkdtempSync(join(root, "stale-"));
+	const sock = join(dir, "daemon.sock");
+	const never = async () => false;
+
+	await staleSocket(sock);
+	assert.equal(await clearStale(sock, never), "removed");
+	assert.equal(existsSync(sock), false);
+
+	// A daemon that answers only on the second look (slow, or another starter just bound it): kept.
+	await staleSocket(sock);
+	const ino = lstatSync(sock).ino;
+	let looks = 0;
+	assert.equal(await clearStale(sock, async () => ++looks > 1), "alive");
+	assert.equal(looks, 2);
+	assert.equal(lstatSync(sock).ino, ino, "left in place");
+
+	// Between the two looks another starter removed it and bound its own (still a false "not alive"):
+	// the new one isn't the file judged stale, so it stays.
+	looks = 0;
+	let other;
+	const replace = async () => {
+		if (++looks === 2) {
+			rmSync(sock);
+			other = createServer(() => {});
+			after(() => other.close()); // closed even if an assertion below fails
+			await new Promise((r) => other.listen(sock, r));
+		}
+		return false;
+	};
+	assert.equal(await clearStale(sock, replace), "replaced");
+	assert.ok(lstatSync(sock).isSocket(), "the other starter's socket is still there");
+	await new Promise((r) => other.close(r));
+
+	writeFileSync(sock, "x");
+	assert.equal(await clearStale(sock, never), "not-socket");
+	assert.equal(readFileSync(sock, "utf8"), "x");
+	rmSync(sock);
+	assert.equal(await clearStale(sock, never), "gone");
+});
+
+test("a daemon knows its socket by device, inode and birth time, not the inode alone (inodes are reused)", () => {
+	const f = join(root, "id-file");
+	writeFileSync(f, "");
+	const st = lstatSync(f);
+	const id = fileId(st);
+	const born = st.birthtimeMs || st.ctimeMs;
+	assert.deepEqual(id, { dev: st.dev, ino: st.ino, born });
+	assert.equal(sameFile(st, id), true);
+	assert.equal(sameFile(lstatSync(f), id), true, "stable across stats");
+	const like = (o) => ({ ...st, birthtimeMs: st.birthtimeMs, ctimeMs: st.ctimeMs, dev: st.dev, ino: st.ino, ...o });
+	assert.equal(sameFile(like({ ino: st.ino + 1 }), id), false, "another inode");
+	assert.equal(sameFile(like({ dev: st.dev + 1 }), id), false, "same inode, another device");
+	assert.equal(sameFile(like({ birthtimeMs: born + 1, ctimeMs: born + 1 }), id), false, "same inode reused: a newer file");
+	assert.equal(sameFile(st, undefined), false, "not listening yet: never ours");
+});
+
 const exited = (child) => new Promise((r) => (child.exitCode !== null || child.signalCode !== null ? r(child.exitCode) : child.on("exit", (code) => r(code))));
 async function within(promise, ms, what) {
 	let timer;
@@ -263,7 +382,7 @@ test("one daemon: whoever binds the socket; a stale socket is taken over, anythi
 	const pid = (await daemonRequest(sock, { cmd: "status" })).pid;
 	const ino = statSync(sock).ino;
 	const second = startDaemon(dir, fakeOp(fake));
-	assert.equal(await exited(second), 0, "a second daemon defers to a live one");
+	assert.equal(await within(exited(second), 3000, "a second daemon"), 0, "a second daemon defers to a live one");
 	assert.equal(statSync(sock).ino, ino, "and leaves its socket alone");
 	assert.equal((await daemonRequest(sock, { cmd: "status" })).pid, pid, "the first still answers on its socket");
 	assert.equal(existsSync(join(dir, "daemon.lock")), false, "no lock file");
@@ -461,6 +580,11 @@ test("the shim: approved reads print the value, refusals fail, unknown forms and
 	assert.equal((await runShim(["read", "op://P/GitHub/token"], { ...env, PI_OP_BROKER_SOCK: join(root, "gone.sock") })).stdout,
 		"real op: read op://P/GitHub/token\n", "no session listening: the real op, same arguments");
 	assert.deepEqual(calls(fake), ["read op://P/GitHub/token", "vault list", "read op://P/GitHub/token"], "approved reads never ran the real op here");
+	const asks = got.length;
+	assert.equal((await runShim(["item", "get", "Rubygems", "--otp"], { ...env, OP_ACCOUNT: "bad account" })).stdout, "123456\n",
+		"an OP_ACCOUNT op-broker can't pass on: the real op, not a read from the default account");
+	assert.equal(calls(fake).at(-1), "item get Rubygems --otp", "the real op ran it, as typed");
+	assert.equal(got.length, asks, "and the session was never asked");
 });
 
 test("the extension: a card in the session, then the daemon's value through the shim", async (t) => {
@@ -646,4 +770,7 @@ test("the extension tests leave no session socket and process.env as it was", ()
 	assert.equal(process.env.PI_OP_BROKER_SOCK, undefined);
 	assert.equal(process.env.PI_OP_BROKER_DIR, undefined);
 	assert.equal(process.env.BOEHSLINE_ENABLE, "op-broker");
+	assert.equal(process.env.PI_OP_BROKER_TTL_MS, "30000", "the file's own TTL survived every snapshot restore");
+	if (savedTtl === undefined) delete process.env.PI_OP_BROKER_TTL_MS;
+	else process.env.PI_OP_BROKER_TTL_MS = savedTtl;
 });

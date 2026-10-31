@@ -73,8 +73,24 @@ export function cardTitle(req: OpRequest): string {
 }
 
 function oneLine(s: string): string {
-	const flat = s.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").replace(/\s+/g, " ").trim();
+	const flat = maskSecrets(s.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").replace(/\s+/g, " ").trim());
 	return flat.length > MAX_COMMAND ? `${flat.slice(0, MAX_COMMAND - 1)}…` : flat;
+}
+
+// A value: quoted, or a run up to whitespace, a quote or a shell separator.
+const VALUE = `(?:"[^"]*"?|'[^']*'?|[^\\s"'&;|]+)`;
+// A secret-looking name (GITHUB_TOKEN=, --api-key, password:, "token": …) and its value; an
+// Authorization header's scheme goes with its value.
+const NAMED = new RegExp(`((?:token|key|secret|passw(?:or)?d|pwd|auth)[\\w-]*["']?\\s*[=:]\\s*)(?:(?:Bearer|Basic|Token)\\s+)?${VALUE}`, "gi");
+const BEARER = new RegExp(`\\b(Bearer|Basic)\\s+${VALUE}`, "gi");
+
+/**
+ * The command line with likely inline secrets masked (•••): the card's title goes to the phone
+ * and to a push notification, and a command line can carry a token (TOKEN=… cmd, curl -H
+ * "Authorization: Bearer …", --password=…). Best effort: the names op-broker can guess.
+ */
+export function maskSecrets(s: string): string {
+	return s.replace(NAMED, "$1•••").replace(BEARER, "$1 •••");
 }
 
 export interface BrokerDeps {

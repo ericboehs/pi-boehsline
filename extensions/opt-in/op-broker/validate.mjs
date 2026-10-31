@@ -7,15 +7,20 @@ import { join } from "node:path";
 
 export const brokerDir = (env = process.env) => env.PI_OP_BROKER_DIR || join(homedir(), ".local", "state", "pi-op-broker");
 
-// Item, vault and field names: no control, format (zero-width, bidi) or line-separator characters,
-// so the card shows what's read; and no leading "-", so nothing reads as a flag.
-export const NAME = /^(?!-)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}]{1,200}$/u;
+// Item, vault and field names, so the card shows exactly what's read: no control, format
+// (zero-width, bidi), line-separator, surrogate, private-use or unassigned characters; no runs of
+// whitespace (two names that look alike); none of the card's own separators (broker.ts's
+// cardTitle: "·" between item and field, "›" between section and field); and no leading "-", so
+// nothing reads as a flag.
+const BAD = "\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\\p{Cs}\\p{Co}\\p{Cn}·›";
+const NO_RUNS = "(?![^]*\\s\\s)";
+export const NAME = new RegExp(`^${NO_RUNS}(?!-)[^${BAD}]{1,200}$`, "u");
 export const ACCOUNT = /^(?!-)[\w.@-]{1,100}$/;
-// One op:// path segment: the same invisibles refused, and no "?" (the only query taken is ?attribute=otp).
-export const SEG = "[^/?\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]+";
-export const REF = new RegExp(`^op://${SEG}/${SEG}(/${SEG}){1,2}(\\?attribute=(otp|totp))?$`, "u");
+// One op:// path segment: the same characters refused, and no "?" (the only query taken is ?attribute=otp).
+export const SEG = `[^/?${BAD}]+`;
+export const REF = new RegExp(`^${NO_RUNS}op://${SEG}/${SEG}(/${SEG}){1,2}(\\?attribute=(otp|totp))?$`, "u");
 // The same shape with its parts captured (broker.ts's parseRef): vault, item, section?, field, query?.
-export const REF_PARTS = new RegExp(`^op://(${SEG})/(${SEG})/(?:(${SEG})/)?(${SEG})(\\?attribute=(?:otp|totp))?$`, "u");
+export const REF_PARTS = new RegExp(`^${NO_RUNS}op://(${SEG})/(${SEG})/(?:(${SEG})/)?(${SEG})(\\?attribute=(?:otp|totp))?$`, "u");
 
 const str = (v) => typeof v === "string";
 

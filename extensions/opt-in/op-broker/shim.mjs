@@ -34,7 +34,12 @@ export function parse(argv) {
 			account = value;
 		} else args.push(value === undefined ? a : `${a}=${value}`);
 	}
-	account ??= process.env.OP_ACCOUNT && ACCOUNT.test(process.env.OP_ACCOUNT) ? process.env.OP_ACCOUNT : undefined;
+	// OP_ACCOUNT names the account when --account doesn't. One we can't pass on as it is: the real
+	// op, never a read from the default account instead.
+	if (account === undefined && process.env.OP_ACCOUNT) {
+		if (!ACCOUNT.test(process.env.OP_ACCOUNT)) return null;
+		account = process.env.OP_ACCOUNT;
+	}
 	const base = account ? { account } : {};
 	const [cmd, ...rest] = args;
 	if (cmd === "signin" && rest.length === 0) return { ...base, kind: "signin" };
