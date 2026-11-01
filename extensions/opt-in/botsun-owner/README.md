@@ -44,6 +44,7 @@ Each session also listens on its own socket, `~/.local/state/botsun/owner/<pid>.
 | `answer` | `answer` | `answer` | `canonicalAnswerV2`: `botsun-answer-v2`, the ask id, then per question `q<i> <sha(question)> <0\|1 multi>`, its options `o<i>.<j> <sha(label)> <sha(description)>`, and `a<i> <picks> <sha(text)>`, built from the open prompt's own questions (looked up before the digest), so a yes can't carry over to a reworded question or option |
 | `stash` | `session` | `stash` | `push\n<sha256(text)>`, `take\n<id>` or `drop\n<id>` |
 | `stop` | `session` | `stop` | `stop` |
+| `close` (v2 only) | `session` | `close` | `close` |
 
 A `confirm` of an `ask` answer checks the proposal hash the way his words were signed: a v2-signed `say_audio` carries `sha256(canonicalAnswerV2(…))`, a v1 one `sha256(canonicalAnswer(…))`. A reworded message's proposal is `sha256("botsun-propose-text-v1\n<text>")` either way.
 
@@ -81,6 +82,7 @@ What pinning can and can't do: it protects against a Botsun whose logic is compr
 | `confirm` | `{id, ask_id, answers}` from the voice helper: his held reply means yes to the answer read back on the call. Answers the open `ask` only when that utterance was signed with this answer's hash (`say_audio` with `proposal_sha256`, an extra line of the signed message) and its words don't say no (`saysNo`). Never a `sensitive` prompt: "answer this one on the phone screen or the keyboard" |
 | `drop` / `call_end` | forget the held words named, or all of them |
 | `stop` | the phone's Stop button: ends the running turn (or a compaction) as Esc does; signed over `stop` with the decision key; `{ok, stopped}` |
+| `close` | the phone's Close: aborts a running turn if any, replies `{ok}` at once, then shuts pi down gracefully (`ctx.shutdown()`) so the process exits; signed like `stop`, over `close`, but v2 only (a v1 signature is refused, ratchet or not); advertised as `close` in the nonce reply's `features` |
 | `answer` | answers the open `ask` question; the tool takes it as if picked at the keyboard and closes its dialog (a `sensitive` one: v2-signed only) |
 | `stash` | the message stash (with the stash extension): `push` a draft, `take` one back to the phone, `drop` one; signed over `push\n<sha256(text)>`, `take\n<id>` or `drop\n<id>` |
 | `footer_tap` | flips a display chip (`dir`, `context`, `cost`, `usage`, `rate`, `timers`) as a click on the footer does, and answers with the new row; display only, so not signed |

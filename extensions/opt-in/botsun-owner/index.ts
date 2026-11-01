@@ -102,6 +102,8 @@ interface Conn {
 	deliver?: (text: string, mode: "queue" | "steer" | "stop") => string;
 	/** Stops the running turn as Esc does: "stopped", or "idle" when nothing is running. */
 	stop?: () => string;
+	/** The phone's Close: aborts a running turn ("stopped" / "idle"); the shutdown it returns runs once the reply is sent. */
+	close?: () => { stopped: boolean; shutdown: () => void };
 	/** A call's verified words, held until the voice helper releases them (session-voice plan). */
 	held?: Map<string, { text: string; at: number; proposal?: string; sigV?: 1 | 2; deviceId?: string }>;
 	/** The keyboard's yes/no (ctx.ui.confirm), for pinning a device whose key changed or that's new. */
@@ -313,6 +315,8 @@ function verifyDevice(c: Conn, r: Record<string, unknown>, spec: SignSpec, keyKi
 
 /** A v1 request from a device that has signed v2 (the ratchet). */
 export const V1_REFUSED = "this phone signs v2: v1 is refused (update Botsun and the app)";
+/** A v1-signed close: close takes v2 only. */
+export const CLOSE_V1_REFUSED = "close needs a v2 signature: v1 is refused (update Botsun and the app)";
 /** A v1 answer to a sensitive prompt: v1 doesn't bind the card's text. */
 export const SENSITIVE_V1_REFUSED = "this one needs a v2-signed answer (update Botsun and the app), or answer it at the keyboard";
 
@@ -387,7 +391,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 			try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 		})();
 		return { nonce: newNonce(c), session_id: c.sessionId,
-			features: ["say", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "ask_v2",
+			features: ["say", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "ask_v2", "close",
 				...(hasStash ? ["stash"] : [])] };
 	}
 	if (r.type === "say_audio") return sayAudio(c, r);
@@ -398,6 +402,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (r.type === "answer") return answerAsk(c, r);
 	if (r.type === "stash") return stashRequest(c, r);
 	if (r.type === "stop") return stopRequest(c, r);
+	if (r.type === "close") return closeRequest(c, r);
 	// Display only (a chip's mode, as a click on the footer flips it): not signed, nothing acts.
 	if (r.type === "footer_tap") return footerTap(String(r.chip ?? ""));
 	if (r.type !== "say") return { error: "unknown request" };
@@ -700,6 +705,25 @@ function stopRequest(c: Conn, r: Record<string, unknown>): Record<string, unknow
 	return { ok: true, stopped: c.stop() === "stopped" };
 }
 
+/** Runs once the reply carrying it has been written to the owner socket (a symbol, so never sent). */
+export const AFTER_REPLY = Symbol("afterReply");
+
+/**
+ * The phone's Close: aborts a running turn, replies at once, then shuts pi down gracefully
+ * (ctx.shutdown) so the process exits. Signed exactly like stop, over "close" (single-use nonce).
+ */
+function closeRequest(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const denied = verifyDevice(c, r, { decision: "close", digest: () => sha256hex(Buffer.from("close", "utf8")),
+		v2: { kind: "session", decision: "close", payload: () => "close" } });
+	if (denied) return { error: denied };
+	// v2 only (scoped to this session), ratchet or not: even a v1 signature that verifies is
+	// refused (checked after verifyDevice, so its nonce is spent and its errors stay alike).
+	if (sigVersion(r) !== 2) return { error: CLOSE_V1_REFUSED };
+	if (!c.close) return { error: "this session can't close from the phone yet; run /reload" };
+	const { shutdown } = c.close();
+	return { ok: true, [AFTER_REPLY]: shutdown };
+}
+
 function listenOwner(c: Conn): void {
 	if (c.server || c.closed) return;
 	const path = ownerSock();
@@ -733,7 +757,18 @@ function listenOwner(c: Conn): void {
 			}
 			Promise.resolve(reply)
 				.catch(() => ({ error: "bad request" }))
-				.then((r) => sock.end(`${JSON.stringify(r)}\n`));
+				.then((r) => {
+					const after = (r as Record<symbol, unknown>)[AFTER_REPLY];
+					if (typeof after !== "function") { sock.end(`${JSON.stringify(r)}\n`); return; }
+					let ran = false;
+					const once = () => {
+						if (ran) return;
+						ran = true;
+						try { (after as () => void)(); } catch (e) { debug(`after reply: ${(e as Error).message}`); }
+					};
+					sock.once("close", once); // even if the phone hung up before the reply went out
+					sock.end(`${JSON.stringify(r)}\n`, once);
+				});
 		});
 		sock.on("error", () => {});
 	});
@@ -1128,6 +1163,8 @@ function main(pi: ExtensionAPI): void {
 			ctx.abort();
 			return "stopped";
 		};
+		// The phone's Close: stop what's running, then (after the reply) a graceful exit.
+		const close = () => ({ stopped: stop() === "stopped", shutdown: () => ctx.shutdown() });
 		const command = (text: string, busy: boolean) =>
 			compacting && /^\//.test(text.trim()) && !/^\/(model|thinking|name|bypass)\b/.test(text.trim()) ? "wait for the compaction to finish" : runCommand(pi, ctx, text, busy);
 		const commands = () => phoneCommands(pi);
@@ -1145,6 +1182,7 @@ function main(pi: ExtensionAPI): void {
 			conn.inject = inject;
 			conn.deliver = deliver;
 			conn.stop = stop;
+			conn.close = close;
 			conn.command = command;
 			conn.commands = commands;
 			conn.models = models;
@@ -1177,7 +1215,7 @@ function main(pi: ExtensionAPI): void {
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
 			busy: false, prompt: null, promptDepth: 0, sessionName, ...info,
-			nonces: new Map(), inject, deliver, stop, command, commands, models, context, confirm, model: modelOf(ctx),
+			nonces: new Map(), inject, deliver, stop, close, command, commands, models, context, confirm, model: modelOf(ctx),
 		};
 		store[STORE] = conn;
 		connect(conn);

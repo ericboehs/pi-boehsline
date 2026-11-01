@@ -813,6 +813,43 @@ test("the phone's Stop ends the running turn as Esc does, signed", async () => {
 	assert.equal(m.sent.length, 0);
 });
 
+test("close: Eric's phone aborts a running turn, gets {ok} at once, then pi shuts down", async () => {
+	const decide = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: { 7: decide.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	const m = await owner();
+	let idle = false;
+	const log = [];
+	m.ctx.isIdle = () => idle;
+	m.ctx.abort = () => log.push("abort");
+	m.ctx.shutdown = () => log.push("shutdown");
+	const close = async (key = decide) => {
+		const { nonce, features } = await ask({ type: "nonce" });
+		assert.ok(features.includes("close"));
+		return ask({ type: "close", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "close", "close") });
+	};
+	assert.equal((await close(phoneKey())).error, "signature does not verify");
+	// v1 (a signature that verifies, from a device that hasn't ratcheted): refused, nonce spent.
+	const { nonce: n1 } = await ask({ type: "nonce" });
+	const digest = createHash("sha256").update("close", "utf8").digest("hex");
+	const msg = ["botsun-decide-v1", "7", n1, "session", "sid-a", "close", digest].join("\n");
+	const v1 = { type: "close", nonce: n1, device_id: 7, signature: cryptoSign("sha256", Buffer.from(msg), { key: decide.privateKey, dsaEncoding: "der" }).toString("base64") };
+	assert.match((await ask(v1)).error ?? "", /^close needs a v2 signature/);
+	assert.equal((await ask({ ...v1, sig_v: 1 })).error, "nonce is expired or used", "spent");
+	assert.equal((await ask({ type: "close" })).error, "bad request", "unsigned");
+	assert.deepEqual(log, [], "only Eric's phone, signed");
+	const reply = close();
+	assert.deepEqual(await reply, { ok: true });
+	await until(() => log.includes("shutdown"));
+	assert.deepEqual(log, ["abort", "shutdown"], "aborted first, shut down after the reply");
+	idle = true;
+	log.length = 0;
+	assert.deepEqual(await close(), { ok: true });
+	await until(() => log.includes("shutdown"));
+	assert.deepEqual(log, ["shutdown"], "nothing running: no abort");
+	assert.equal(m.sent.length, 0);
+});
+
 test("a yes on the call answers the ask only with the read-back answer's hash, and never a no", async () => {
 	const { offerPrompt, canonicalAnswer } = await import("../lib/remote-prompts.ts");
 	const { m, hold } = await heldCall();
@@ -966,6 +1003,7 @@ test("every signed request type refuses alike: bad request, used nonce, unknown 
 		answer: { type: "answer", ask_id: "nope", answers: [] },
 		stash: { type: "stash", op: "drop", id: "x1" },
 		stop: { type: "stop" },
+		close: { type: "close" },
 	};
 	for (const [name, body] of Object.entries(bodies)) {
 		assert.equal((await ask({ ...body, nonce: "n", device_id: "x", signature: "s" })).error, "bad request", name);
@@ -1039,6 +1077,19 @@ test("v2: the nonce reply advertises sign_v2 and ask_v2; say, stash and stop ver
 
 	({ nonce } = await ask({ type: "nonce" }));
 	assert.deepEqual(await ask({ type: "stop", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "stop", "stop") }), { ok: true, stopped: true });
+	({ nonce } = await ask({ type: "nonce" }));
+	assert.equal((await ask({ type: "close", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "stop", "stop") })).error,
+		"signature does not verify", "a stop signature isn't a close");
+	({ nonce } = await ask({ type: "nonce" }));
+	assert.equal((await ask({ type: "close", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "close", "close", { scope: "sid-b" }) })).error,
+		"signature does not verify", "close is scoped to this session");
+	({ nonce } = await ask({ type: "nonce" }));
+	let shutdowns = 0;
+	m.ctx.shutdown = () => shutdowns++;
+	const closeSig = signV2(key, nonce, "session", "close", "close");
+	assert.deepEqual(await ask({ type: "close", nonce, device_id: 7, sig_v: 2, signature: closeSig }), { ok: true });
+	assert.equal((await ask({ type: "close", nonce, device_id: 7, sig_v: 2, signature: closeSig })).error, "nonce is expired or used", "no replay");
+	await until(() => shutdowns === 1);
 	({ nonce } = await ask({ type: "nonce" }));
 	const push = `push\n${sha("draft")}`;
 	res = await ask({ type: "stash", op: "push", text: "draft", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "stash", push) });
