@@ -22,10 +22,11 @@
 // so nothing here keeps pi alive.
 
 import { createHash, createPublicKey, randomBytes, verify as verifySignature } from "node:crypto";
-import { appendFileSync, chmodSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { accessSync, appendFileSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
-import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, delimiter, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { optIn } from "../../../lib/opt-in.ts";
 import { canonicalAnswer, canonicalAnswerV2, invalidAnswer, onPromptsChange, openPrompts, type RemotePrompt } from "../../../lib/remote-prompts.ts";
@@ -48,12 +49,21 @@ const HANDOFF_MS = 10_000;
 const STORE = Symbol.for("botsun-owner.v1");
 const NONCE_TTL_MS = 120_000;
 const NONCES_MAX = 16;
-const REQUEST_MAX = 24 * 1024 * 1024; // a reply with up to IMAGES_MAX photos, base64
+// A reply with up to ATTACH_MAX files of FILE_B64_MAX each (as Botsun's MAX_SESSION_SAY_BODY), plus slack.
+const REQUEST_MAX = 60 * 1024 * 1024;
 const IMAGES_MAX = 4;
 const IMAGE_B64_MAX = 5 * 1024 * 1024;
-const FILE_B64_MAX = 14 * 1024 * 1024; // ~10 MB a file
+const FILE_B64_MAX = Math.ceil((25 * 1024 * 1024) / 3) * 4; // 25 MB a file, base64'd
+// All of a message's photos and files: 40 MB (Botsun's MAX_SESSION_SAY_BODY holds that, base64'd).
+const ATTACH_B64_TOTAL_MAX = Math.ceil((40 * 1024 * 1024) / 3) * 4;
 const ATTACH_MAX = 4;
 export const inboxDir = (): string => process.env.BOTSUN_OWNER_INBOX || join(homedir(), ".local", "state", "botsun", "inbox");
+/** Video frames shown to the agent: at most this many per video and per message (on top of the photos). */
+const FRAMES_PER_VIDEO = 8;
+const FRAMES_MAX = 16;
+/** All of a message's ffprobe/ffmpeg runs together. */
+const FRAMES_TIMEOUT_MS = 20_000;
+const VIDEO_NAME = /\.(mp4|mov|m4v)$/i;
 const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/heic", "image/webp", "image/gif"]);
 const TEXT_MAX = 20_000;
 /** Streaming text to Botsun: at most this often, and at most this much (the end is kept). */
@@ -106,6 +116,8 @@ interface Conn {
 	close?: () => { stopped: boolean; shutdown: () => void };
 	/** A call's verified words, held until the voice helper releases them (session-voice plan). */
 	held?: Map<string, { text: string; at: number; proposal?: string; sigV?: 1 | 2; deviceId?: string }>;
+	/** A reply whose video frames are still being extracted: later replies wait for it, to keep their order. */
+	framing?: Promise<void>;
 	/** The keyboard's yes/no (ctx.ui.confirm), for pinning a device whose key changed or that's new. */
 	confirm?: (title: string, message: string) => Promise<boolean>;
 	/** Pin confirms open now (kind:device; at most one), so retries and minted keys don't stack dialogs. */
@@ -171,26 +183,136 @@ function filesOf(raw: unknown): File[] | string {
 	for (const f of raw) {
 		if (!f || typeof f.name !== "string" || typeof f.data !== "string") return "bad file";
 		if (!f.name.trim() || f.name.length > 200 || /[\/\0]/.test(f.name) || f.name.startsWith(".")) return "bad file name";
-		if (f.data.length > FILE_B64_MAX || !/^[A-Za-z0-9+/]*={0,2}$/.test(f.data)) return "a file is too big (10 MB) or not base64";
+		if (f.data.length > FILE_B64_MAX || !/^[A-Za-z0-9+/]*={0,2}$/.test(f.data)) return "a file is too big (25 MB) or not base64";
 	}
 	return raw as File[];
 }
 
+interface Saved { path: string; note: string; video: boolean }
+
 /** Saves attached files where the agent can read them: inbox/<pid>/<time>-<name>, 0600. */
-function saveFiles(files: File[]): string[] {
+function saveFiles(files: File[]): Saved[] {
 	if (!files.length) return [];
 	const dir = join(inboxDir(), String(process.pid));
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	chmodSync(dir, 0o700);
 	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 	return files.map((f, i) => {
-		const path = join(dir, `${stamp}-${i}-${f.name}`);
+		// A random tag too: two replies in one millisecond with the same name mustn't collide (wx refuses).
+		const path = join(dir, `${stamp}-${i}-${randomBytes(3).toString("hex")}-${f.name}`);
 		const data = Buffer.from(f.data, "base64");
 		writeFileSync(path, data, { mode: 0o600, flag: "wx" });
 		const kb = data.length < 1024 ? `${data.length} B` : data.length < 1048576 ? `${Math.round(data.length / 1024)} KB` : `${(data.length / 1048576).toFixed(1)} MB`;
-		return `📎 Attached: ${path} (${kb})`;
+		// A video by name and by its first box (MP4 / QuickTime "ftyp"), so a renamed file isn't fed to ffmpeg.
+		const video = VIDEO_NAME.test(f.name) && data.length >= 12 && data.subarray(4, 8).toString("latin1") === "ftyp";
+		return { path, note: `📎 Attached: ${path} (${kb})`, video };
 	});
 }
+
+/** Runs a program (argv, never a shell) with a timeout; resolves its stdout. SIGKILL at the
+ * timeout (ffmpeg can sit on SIGTERM inside a decoder), and the promise settles by then plus a
+ * grace even if the child never reports its exit: the reply queue waits on it. */
+type VideoRunner = (cmd: string, args: string[], timeoutMs: number) => Promise<string>;
+const runFile: VideoRunner = (cmd, args, timeoutMs) => new Promise((resolve, reject) => {
+	const ms = Math.max(1, timeoutMs);
+	const child = execFile(cmd, args, { timeout: ms, killSignal: "SIGKILL", maxBuffer: 64 * 1024, windowsHide: true, encoding: "utf8" },
+		(err, stdout) => { clearTimeout(guard); err ? reject(err) : resolve(stdout); });
+	const guard = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} reject(new Error("timed out")); }, ms + 1000);
+	guard.unref?.();
+});
+
+/** ffmpeg / ffprobe on PATH, else in BOTSUN_OWNER_FFMPEG_DIRS (default Homebrew's); null when missing. */
+function findTool(name: string): string | null {
+	const extra = process.env.BOTSUN_OWNER_FFMPEG_DIRS ?? "/opt/homebrew/bin:/usr/local/bin";
+	for (const dir of [...(process.env.PATH ?? "").split(delimiter), ...extra.split(delimiter)]) {
+		if (!dir || !dir.startsWith("/")) continue;
+		const path = join(dir, name);
+		try {
+			accessSync(path, fsConstants.X_OK);
+			if (lstatSync(path).isDirectory()) continue;
+			return path;
+		} catch {}
+	}
+	return null;
+}
+
+/** 42.4 → "0:42", 3725 → "1:02:05". */
+export function clock(seconds: number): string {
+	const s = Math.max(0, Math.floor(seconds));
+	const mm = String(Math.floor((s % 3600) / 60));
+	const ss = String(s % 60).padStart(2, "0");
+	return s >= 3600 ? `${Math.floor(s / 3600)}:${mm.padStart(2, "0")}:${ss}` : `${mm}:${ss}`;
+}
+
+/** n evenly spaced times in [0, duration): 0, d/n, 2d/n, … (one at 0 for a clip under a second). */
+export function frameTimes(duration: number, n: number): number[] {
+	if (!(duration > 0) || n < 1) return [0];
+	const count = duration < 1 ? 1 : n;
+	return Array.from({ length: count }, (_, i) => Math.round((duration * i / count) * 100) / 100);
+}
+
+const isJpeg = (b: Buffer) => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+
+/**
+ * A saved video's frames for the agent: ffprobe for the duration, then one ffmpeg per frame into
+ * a fresh 0700 temp dir (frames 0600, read back as JPEG, the dir removed). Note: the 🎞️ line, or
+ * why there are none (appended to the 📎 line by the caller).
+ */
+async function videoFrames(path: string, max: number, deadline: number, run: VideoRunner):
+	Promise<{ images: UserContent[]; note: string } | { why: string }> {
+	const ffmpeg = findTool("ffmpeg");
+	const ffprobe = findTool("ffprobe");
+	if (!ffmpeg || !ffprobe) return { why: "ffmpeg unavailable" };
+	const left = () => deadline - Date.now();
+	let dir: string | undefined;
+	try {
+		if (left() <= 0) return { why: "ffmpeg timed out" };
+		const out = await run(ffprobe, ["-v", "error", "-protocol_whitelist", "file", "-f", "mov", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path], left());
+		const duration = Number.parseFloat(out.trim());
+		if (!Number.isFinite(duration) || duration < 0) return { why: "ffmpeg failed" };
+		dir = mkdtempSync(join(tmpdir(), "botsun-frames-"));
+		chmodSync(dir, 0o700);
+		const images: UserContent[] = [];
+		const at: number[] = [];
+		for (const [i, t] of frameTimes(duration, max).entries()) {
+			if (left() <= 0) break;
+			const jpg = join(dir, `frame-${i}.jpg`);
+			try {
+				await run(ffmpeg, ["-nostdin", "-v", "error", "-protocol_whitelist", "file", "-f", "mov", "-ss", String(t), "-i", path, "-frames:v", "1", "-vf", "scale=768:-2", "-q:v", "4", "-y", jpg], left());
+				chmodSync(jpg, 0o600);
+				const data = readFileSync(jpg);
+				if (!isJpeg(data) || data.length * 4 / 3 > IMAGE_B64_MAX) continue;
+				images.push({ type: "image", data: data.toString("base64"), mimeType: "image/jpeg" });
+				at.push(t);
+			} catch {}
+		}
+		if (!images.length) return { why: left() <= 0 ? "ffmpeg timed out" : "ffmpeg failed" };
+		const noun = images.length === 1 ? "frame" : "frames";
+		return { images, note: `🎞️ Video ${path} (${clock(duration)}): ${images.length} ${noun} at ${at.map(clock).join(", ")}` };
+	} catch {
+		return { why: left() <= 0 ? "ffmpeg timed out" : "ffmpeg failed" };
+	} finally {
+		if (dir) rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+/** Every saved file's note, each video's with its frames (or why none); frames after the photos. */
+async function withFrames(saved: Saved[], run: VideoRunner): Promise<{ notes: string[]; frames: UserContent[] }> {
+	const videos = saved.filter((s) => s.video).length;
+	const per = videos ? Math.max(1, Math.min(FRAMES_PER_VIDEO, Math.floor(FRAMES_MAX / videos))) : 0;
+	const deadline = Date.now() + FRAMES_TIMEOUT_MS;
+	const notes: string[] = [];
+	const frames: UserContent[] = [];
+	for (const s of saved) {
+		if (!s.video) { notes.push(s.note); continue; }
+		const got = await videoFrames(s.path, per, deadline, run);
+		if ("why" in got) { notes.push(`${s.note} (no frames: ${got.why})`); continue; }
+		notes.push(s.note, got.note);
+		frames.push(...got.images);
+	}
+	return { notes, frames };
+}
+
 
 function imagesOf(raw: unknown): Image[] | string {
 	if (raw === undefined || raw === null) return [];
@@ -407,6 +529,9 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	const files = filesOf(r.files);
 	if (typeof files === "string") return { error: files };
 	if (images.length + files.length > ATTACH_MAX) return { error: `at most ${ATTACH_MAX} attachments` };
+	if ([...images, ...files].reduce((n, a) => n + a.data.length, 0) > ATTACH_B64_TOTAL_MAX) {
+		return { error: "attachments are over 40 MB together" };
+	}
 	if (typeof text !== "string" || text.length > TEXT_MAX || (!text.trim() && !images.length && !files.length)) {
 		return { error: "text must be 1 to 20000 characters (or attach something)" };
 	}
@@ -414,12 +539,18 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	const denied = verifyDevice(c, r, { decision: say.decision, digest: () => say.digest,
 		v2: { kind: "session", decision: say.decision, payload: () => say.payload } });
 	if (denied) return { error: denied };
-	let notes: string[];
+	let saved: Saved[];
 	try {
-		notes = saveFiles(files);
+		saved = saveFiles(files);
 	} catch (e) {
 		return { error: `couldn't save the file: ${(e as NodeJS.ErrnoException).code ?? "error"}` };
 	}
+	const compose = (notes: string[], frames: UserContent[]): string | UserContent[] => {
+		const said = [text, ...notes].filter((t) => t.trim()).join("\n\n");
+		const pics: UserContent[] = [...images.map((i) => ({ type: "image" as const, data: i.data, mimeType: i.mime_type })), ...frames];
+		return pics.length ? [...(said.trim() ? [{ type: "text" as const, text: said }] : []), ...pics] : said;
+	};
+	const notes = saved.map((s) => s.note);
 	if (!images.length && !notes.length && c.command) {
 		const outcome = c.command(text, c.busy);
 		if (typeof outcome === "string") return { error: outcome };
@@ -428,13 +559,22 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 			return { ok: true, delivered: "command" };
 		}
 	}
-	const said = [text, ...notes].filter((t) => t.trim()).join("\n\n");
-	const content: string | UserContent[] = images.length
-		? [...(said.trim() ? [{ type: "text" as const, text: said }] : []), ...images.map((i) => ({ type: "image" as const, data: i.data, mimeType: i.mime_type }))]
-		: said;
-	c.inject(content, c.busy);
+	const delivered = c.busy ? "steer" : "prompt";
+	if (saved.some((s) => s.video) || c.framing) {
+		// Frames take ffmpeg a few seconds: reply now (the socket and Botsun don't wait), deliver when
+		// they're ready, and queue later replies behind it so they keep their order.
+		const job: Promise<void> = (c.framing ?? Promise.resolve())
+			.then(() => withFrames(saved, runFile))
+			.then(({ notes, frames }) => c.inject(compose(notes, frames), c.busy))
+			.catch((e) => debug(`owner say with a video: ${(e as Error).message}`))
+			.finally(() => { if (c.framing === job) c.framing = undefined; });
+		c.framing = job;
+		debug(`owner say accepted (${text.length} chars, ${images.length} photos, ${files.length} files, frames pending)`);
+		return { ok: true, delivered };
+	}
+	c.inject(compose(notes, []), c.busy);
 	debug(`owner say accepted (${text.length} chars, ${images.length} photos, ${files.length} files)`); // never the text
-	return { ok: true, delivered: c.busy ? "steer" : "prompt" };
+	return { ok: true, delivered };
 }
 
 /**

@@ -92,6 +92,8 @@ What pinning can and can't do: it protects against a Botsun whose logic is compr
 
 **During a compaction** pi refuses a prompt, so words from the phone are held and sent once it ends (or fails); slash commands that would start a turn answer "wait for the compaction to finish".
 
+**Videos:** an attached file named `.mp4` / `.mov` / `.m4v` whose bytes start with an MP4 / QuickTime `ftyp` box gets up to 8 evenly spaced frames shown to the agent as images (after any photos; at most 16 frames a message, so 4 videos get 4 each). Done after the signature is verified and the file saved, from the saved copy: `ffprobe` for the duration, then one `ffmpeg -ss <t> -i <file> -frames:v 1 -vf scale=768:-2 -q:v 4` per frame into a fresh 0700 temp dir (frames 0600, removed once read), via `execFile` with argv (no shell), 20 s for all of a message's runs. `ffmpeg` / `ffprobe` are looked up on `PATH`, then in `BOTSUN_OWNER_FFMPEG_DIRS` (default `/opt/homebrew/bin:/usr/local/bin`). The message gets the `📎 Attached` line and `🎞️ Video <path> (0:42): 8 frames at 0:00, 0:05, …`; without ffmpeg, the `📎` line ends `(no frames: ffmpeg unavailable)` (`ffmpeg failed` / `ffmpeg timed out` when it ran but gave none). The reply goes back at once and the message goes in when the frames are ready; replies sent meanwhile queue behind it, in order. A file may be up to 25 MB, and a message's photos and files up to 40 MB together; a request line may be up to 60 MB (40 MB base64'd, plus the text).
+
 ## Notes
 
 **Name:** the agent-link name (`~/.claude/sessions/<pid>.json`), else the pi session name, else the folder name. Re-read on every line, so a rename shows up on the next event.

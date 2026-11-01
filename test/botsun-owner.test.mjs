@@ -468,7 +468,88 @@ test("attached files are saved for the agent, named in the message, and bound by
 	({ nonce } = await ask({ type: "nonce" }));
 	res = await ask({ type: "say", text: "x", files: [{ name: "../up.txt", data: "" }], nonce, device_id: 7, signature: "AA==" });
 	assert.equal(res.error, "bad file name");
+	// 25 MB a file; 40 MB a message, together (both checked before the signature).
+	const b64 = (mb) => "A".repeat(Math.ceil((mb * 1024 * 1024) / 3) * 4);
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "say", text: "x", files: [{ name: "big.mp4", data: b64(25.01) }], nonce, device_id: 7, signature: "AA==" });
+	assert.equal(res.error, "a file is too big (25 MB) or not base64");
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "say", text: "x", files: [{ name: "a.mp4", data: b64(24) }, { name: "b.mp4", data: b64(16.01) }], nonce, device_id: 7, signature: "AA==" });
+	assert.equal(res.error, "attachments are over 40 MB together");
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "say", text: "x", files: [{ name: "a.mp4", data: b64(24) }, { name: "b.mp4", data: b64(15.9) }], nonce, device_id: 7, signature: "AA==" });
+	assert.equal(res.error, "signature does not verify", "40 MB together is taken (then checked)");
 	assert.equal(m.sent.length, 1);
+});
+
+test("a video's frames go to the agent as images, with a note of when; none without ffmpeg", async () => {
+	const { readdirSync: ls, statSync } = await import("node:fs");
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const hex = (b) => createHash("sha256").update(b).digest("hex");
+	const sign = (nonce, text, files) => {
+		const digest = hex([hex(Buffer.from(text, "utf8")), ...files.map((f) => `file ${hex(Buffer.from(f.name, "utf8"))} ${hex(Buffer.from(f.data, "base64"))}`)].join("\n"));
+		const msg = ["botsun-decide-v1", "7", nonce, "session", "sid-a", "say_attach", digest].join("\n");
+		return cryptoSign("sha256", Buffer.from(msg), { key: key.privateKey, dsaEncoding: "der" }).toString("base64");
+	};
+	// Fake ffprobe / ffmpeg on PATH (never the real ones): a 42.5 s clip; each frame a tiny "JPEG"
+	// with its -ss in it; argv logged one per line, to show there's no shell in between.
+	const bin = join(home, "fakebin");
+	const log = join(home, "ffmpeg.log");
+	mkdirSync(bin, { recursive: true });
+	writeFileSync(join(bin, "ffprobe"), "#!/bin/sh\necho 42.5\n", { mode: 0o755 });
+	writeFileSync(join(bin, "ffmpeg"), `#!/bin/sh\nfor a; do printf '%s\\n' "$a" >> '${log}'; out=$a; done\nsleep 0.05\nprintf '\\377\\330\\377frame %s' "$9" > "$out"\n`, { mode: 0o755 });
+	const path0 = process.env.PATH;
+	const dirs0 = process.env.BOTSUN_OWNER_FFMPEG_DIRS;
+	cleanups.push(() => { process.env.PATH = path0; if (dirs0 === undefined) delete process.env.BOTSUN_OWNER_FFMPEG_DIRS; else process.env.BOTSUN_OWNER_FFMPEG_DIRS = dirs0; });
+	process.env.PATH = bin;
+	process.env.BOTSUN_OWNER_FFMPEG_DIRS = "";
+	const m = await owner();
+	const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from("ftypmp42"), Buffer.alloc(32)]);
+	const video = { name: "IMG_1234.mp4", data: mp4.toString("base64") };
+
+	let { nonce } = await ask({ type: "nonce" });
+	let res = await ask({ type: "say", text: "watch", files: [video], nonce, device_id: 7, signature: sign(nonce, "watch", [video]) });
+	assert.deepEqual(res, { ok: true, delivered: "prompt" });
+	await until(() => m.sent.length === 1, 10_000); // 8 fake ffmpeg runs a video, maybe two
+	const [first, ...frames] = m.sent[0].content;
+	assert.equal(frames.length, 8);
+	assert.ok(frames.every((f) => f.type === "image" && f.mimeType === "image/jpeg"));
+	assert.equal(Buffer.from(frames[1].data, "base64").subarray(3).toString(), "frame 5.31");
+	const saved = first.text.match(/📎 Attached: (\S+) \(44 B\)/)[1];
+	assert.ok(first.text.startsWith("watch\n\n📎 Attached: "));
+	assert.ok(first.text.includes(`🎞️ Video ${saved} (0:42): 8 frames at 0:00, 0:05, 0:10, 0:15, 0:21, 0:26, 0:31, 0:37`));
+	const argv = (await import("node:fs")).readFileSync(log, "utf8").split("\n");
+	assert.deepEqual(argv.slice(0, 16), ["-nostdin", "-v", "error", "-protocol_whitelist", "file", "-f", "mov", "-ss", "0", "-i", saved, "-frames:v", "1", "-vf", "scale=768:-2", "-q:v"]);
+	assert.equal(ls(tmpdir()).filter((d) => d.startsWith("botsun-frames-")).length, 0, "the frames' temp dir is removed");
+	assert.equal(statSync(saved).mode & 0o777, 0o600);
+
+	// A .mp4 that isn't one (no ftyp box) isn't handed to ffmpeg; it's just a file.
+	const fake = { name: "x.mp4", data: Buffer.from("#!/bin/sh\nrm -rf /\n").toString("base64") };
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "say", text: "", files: [fake], nonce, device_id: 7, signature: sign(nonce, "", [fake]) });
+	assert.equal(res.ok, true);
+	assert.match(m.sent[1].content, /^📎 Attached: \S+-x\.mp4 \(19 B\)$/);
+
+	// No ffmpeg: the file note says so, and no frames.
+	process.env.PATH = join(home, "nothing-here");
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "say", text: "", files: [video], nonce, device_id: 7, signature: sign(nonce, "", [video]) });
+	assert.equal(res.ok, true);
+	await until(() => m.sent.length === 3, 10_000); // 8 fake ffmpeg runs a video, maybe two
+	assert.match(m.sent[2].content, /^📎 Attached: \S+-IMG_1234\.mp4 \(44 B\) \(no frames: ffmpeg unavailable\)$/);
+
+	// Replies sent while frames are pending wait behind them, in order.
+	process.env.PATH = bin;
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "say", text: "v", files: [video], nonce, device_id: 7, signature: sign(nonce, "v", [video]) });
+	assert.equal(res.ok, true, "the same file again, at once: its own name (no collision)");
+	({ nonce } = await ask({ type: "nonce" }));
+	await ask({ type: "say", text: "after", nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", "after") });
+	await until(() => m.sent.length === 5, 10_000);
+	assert.ok(Array.isArray(m.sent[3].content));
+	assert.equal(m.sent[4].content, "after");
 });
 
 test("the model and thinking level go in hello and follow /model", async () => {
