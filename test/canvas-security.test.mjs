@@ -1,6 +1,7 @@
 /**
- * The canvas daemon's guards: bad paths can't crash it (N4), data routes and
- * POSTs need its key (N5), and its files, folders and environment stay
+ * The canvas daemon's guards: bad paths can't crash it (N4), no key but
+ * loopback, the Host check, no CORS and the page's header and Origin on
+ * POSTs (N5), and its files, folders and environment stay
  * private (N6). Every daemon here runs on a spare port with a temp root;
  * nothing touches ~/.pi/canvas or port 8790.
  */
@@ -8,7 +9,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, request } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -87,8 +88,6 @@ async function startDaemon(root, version = "sec") {
   return { port, child, stop };
 }
 
-const tokenOf = (root) => JSON.parse(readFileSync(join(root, ".daemon.json"), "utf8")).token;
-
 function tempRoot() {
   const root = mkdtempSync(join(tmpdir(), "canvas-sec-"));
   mkdirSync(join(root, "s1"));
@@ -105,10 +104,9 @@ test("N4: a path that doesn't decode is a 400, and the daemon stays up", async (
   const root = tempRoot();
   const d = await startDaemon(root);
   try {
-    const auth = { authorization: `Bearer ${tokenOf(root)}` };
     assert.equal((await get(d.port, "/%E0")).status, 400, "a broken UTF-8 sequence (an <img src> on any web page could send it)");
-    assert.equal((await get(d.port, "/s/%zz/f/a.md", auth)).status, 400, "a bare %");
-    assert.equal((await get(d.port, "/api/s/%E0%A4", auth)).status, 400);
+    assert.equal((await get(d.port, "/s/%zz/f/a.md")).status, 400, "a bare %");
+    assert.equal((await get(d.port, "/api/s/%E0%A4")).status, 400);
     const h = await get(d.port, "/health");
     assert.equal(h.status, 200, "still serving");
     assert.equal(d.child.exitCode, null, "still running");
@@ -162,54 +160,69 @@ test("N4: safeHandler turns a throw or a rejection into a 500, never a crash", a
 
 // ── N5 ──────────────────────────────────────────────────────────────────────
 
-test("N5: data routes and POSTs need the key; the page shells and assets don't", async () => {
+test("N5: no key: every route answers without one, and POSTs still need the page's header and Origin", async () => {
   const root = tempRoot();
   const d = await startDaemon(root);
   try {
-    const token = tokenOf(root);
-    assert.match(token, /^[0-9a-f]{64}$/, "32 random bytes");
-    for (const path of ["/api/sessions", "/api/s/s1", "/api/s/s1/info", "/s/s1/f/a.md", "/api/events", "/api/meeting", "/api/meetings", "/api/peers", "/meeting/aaaaaaaaaaaa/slide/1.jpg"]) {
+    const info = JSON.parse(readFileSync(join(root, ".daemon.json"), "utf8"));
+    assert.deepEqual(Object.keys(info).sort(), ["pid", "port", "started", "version"], ".daemon.json holds no token");
+    for (const path of ["/", "/s/s1", "/meeting", "/meetings", "/assets/page.mjs", "/health", "/api/sessions", "/api/s/s1", "/api/s/s1/info", "/s/s1/f/a.md", "/api/meetings", "/api/peers"]) {
       const r = await get(d.port, path);
-      assert.equal(r.status, 401, `${path} without the key`);
-      assert.doesNotMatch(r.body, /private|secret session/);
+      assert.equal(r.status, 200, `${path} needs no key`);
+      assert.equal(r.headers["set-cookie"], undefined, `${path} sets no cookie`);
     }
-    assert.equal((await get(d.port, "/api/sessions", { authorization: `Bearer ${"0".repeat(64)}` })).status, 401, "a wrong key");
-    assert.equal((await get(d.port, "/api/sessions", { cookie: `canvas_k_${d.port}=${"0".repeat(64)}` })).status, 401, "a wrong cookie");
-    assert.equal((await get(d.port, "/api/sessions", { cookie: `canvas_k_1=${token}` })).status, 401, "another port's cookie");
-    for (const path of ["/", "/s/s1", "/meeting", "/meetings", "/assets/page.mjs", "/assets/render.mjs", "/health"]) assert.equal((await get(d.port, path)).status, 200, `${path} holds no data`);
-    assert.doesNotMatch((await get(d.port, "/health")).body, new RegExp(token), "/health never shows the key");
+    assert.equal(JSON.parse((await get(d.port, "/api/sessions")).body)[0].name, "secret session");
+    assert.equal((await get(d.port, "/s/s1/f/a.md")).body, "# private");
 
-    // POSTs: no key is a 401 even with the page's header; the key alone isn't enough either.
-    assert.equal((await post(d.port, "/s/s1/send", { text: "hi" }, { "x-canvas": "1" })).status, 401);
-    assert.equal((await post(d.port, "/follow", { pane: "%1" }, { "x-canvas": "1" })).status, 401);
-    assert.equal((await post(d.port, "/s/s1/focus", {}, { "x-canvas": "1" })).status, 401);
-    assert.equal((await post(d.port, "/s/s1/clip", { file: "a.md" }, { "x-canvas-clip": "1" })).status, 401);
-    assert.equal((await post(d.port, "/s/s1/send", { text: "hi" }, { authorization: `Bearer ${token}` })).status, 403, "still needs the header");
-    assert.equal((await post(d.port, "/s/s1/send", { text: "hi" }, { cookie: `canvas_k_${d.port}=${token}`, "x-canvas": "1", origin: "https://evil.example" })).status, 403, "and a matching Origin");
-    assert.equal((await post(d.port, "/s/s1/send", { text: "hi" }, { authorization: `Bearer ${token}`, "x-canvas": "1" })).status, 200, "a local tool with the key");
-    assert.equal((await post(d.port, "/s/s1/nope", {}, { authorization: `Bearer ${token}`, "x-canvas": "1" })).status, 405);
-
-    // The keyed link: sets the cookie, then the same URL without the key.
-    assert.equal((await get(d.port, "/s/s1?k=nope")).status, 403, "a wrong key in the link");
-    const r = await get(d.port, `/s/s1?x=1&k=${token}`);
-    assert.equal(r.status, 303);
-    assert.equal(r.headers.location, "/s/s1?x=1", "the key leaves the URL");
-    const cookie = r.headers["set-cookie"][0];
-    assert.match(cookie, new RegExp(`^canvas_k_${d.port}=${token}; `));
-    for (const flag of ["HttpOnly", "SameSite=Strict", "Path=/"]) assert.ok(cookie.split("; ").includes(flag), flag);
-    const jar = { cookie: cookie.split(";")[0] };
-    const list = await get(d.port, "/api/sessions", jar);
-    assert.equal(list.status, 200, "the cookie opens the data routes");
-    assert.equal(JSON.parse(list.body)[0].name, "secret session");
-    assert.equal((await get(d.port, "/s/s1/f/a.md", jar)).body, "# private");
-    assert.equal((await get(d.port, "/api/s/s1", jar)).status, 200);
+    // POSTs: the page's header and, when sent, the daemon's own Origin.
+    assert.equal((await post(d.port, "/s/s1/send", { text: "hi" }, { "x-canvas": "1" })).status, 200, "a local tool with the header (curl sends no Origin)");
+    assert.equal((await post(d.port, "/s/s1/send", { text: "hi" }, { "x-canvas": "1", origin: `http://127.0.0.1:${d.port}` })).status, 200, "the page itself");
+    for (const [path, body, header] of [["/s/s1/send", { text: "hi" }, "x-canvas"], ["/follow", { pane: "%1" }, "x-canvas"], ["/s/s1/focus", {}, "x-canvas"], ["/s/s1/clip", { file: "a.md" }, "x-canvas-clip"]]) {
+      assert.equal((await post(d.port, path, body)).status, 403, `${path}: no header`);
+      assert.equal((await post(d.port, path, body, { [header]: "0" })).status, 403, `${path}: the header must be 1`);
+      assert.equal((await post(d.port, path, body, { [header]: "1", origin: "https://evil.example" })).status, 403, `${path}: a cross-origin POST`);
+      assert.equal((await post(d.port, path, body, { [header]: "1", origin: `http://localhost:${d.port}` })).status, 403, `${path}: an Origin other than the Host`);
+      assert.equal((await post(d.port, path, body, { [header]: "1", authorization: "Bearer anything", cookie: `canvas_k_${d.port}=x`, origin: "https://evil.example" })).status, 403, `${path}: an old key or cookie changes nothing`);
+    }
+    assert.equal((await post(d.port, "/s/s1/clip", { file: "a.md" }, { "x-canvas": "1" })).status, 403, "/clip needs its own header");
+    assert.equal((await post(d.port, "/s/s1/nope", {}, { "x-canvas": "1" })).status, 405);
   } finally {
     await d.stop();
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test("N5: the key lives in <root>/.daemon.json (600, root 700) and survives a restart", async () => {
+test("N5: what still guards it: loopback Host (421), no CORS headers, frame-ancestors 'none' on the page", async () => {
+  const root = tempRoot();
+  const d = await startDaemon(root);
+  try {
+    for (const host of ["evil.example", `evil.example:${d.port}`, `192.168.1.5:${d.port}`, `127.0.0.1:${d.port + 1}`, `localhost.evil.example:${d.port}`]) {
+      const r = await get(d.port, "/api/sessions", { host });
+      assert.equal(r.status, 421, `Host ${host}`);
+      assert.doesNotMatch(r.body, /secret session/);
+    }
+    assert.equal((await get(d.port, "/api/sessions", { host: `localhost:${d.port}` })).status, 200, "localhost is fine");
+    assert.equal((await post(d.port, "/s/s1/send", { text: "hi" }, { host: `evil.example:${d.port}`, "x-canvas": "1", origin: `http://evil.example:${d.port}` })).status, 421, "a rebinding POST, header, Origin and all");
+    for (const path of ["/", "/s/s1", "/api/sessions", "/api/s/s1", "/api/s/s1/info", "/s/s1/f/a.md", "/api/meetings", "/health"]) {
+      const r = await get(d.port, path, { origin: "https://evil.example" });
+      assert.deepEqual(Object.keys(r.headers).filter((k) => k.startsWith("access-control-")), [], `${path}: no Access-Control-* headers`);
+    }
+    for (const path of ["/", "/s/s1", "/meeting", "/meetings"]) assert.match((await get(d.port, path)).headers["content-security-policy"], /frame-ancestors 'none'/, `${path} can't be framed`);
+    // A preflight is never answered with CORS either.
+    const pre = await new Promise((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port: d.port, path: "/s/s1/send", method: "OPTIONS", headers: { host: `127.0.0.1:${d.port}`, origin: "https://evil.example", "access-control-request-method": "POST", "access-control-request-headers": "x-canvas" } }, (res) => (res.resume(), res.on("end", () => resolve(res))));
+      req.on("error", reject);
+      req.end();
+    });
+    assert.notEqual(pre.statusCode, 200);
+    assert.deepEqual(Object.keys(pre.headers).filter((k) => k.startsWith("access-control-")), []);
+  } finally {
+    await d.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("N5: .daemon.json (600, root 700) holds pid, port and version, rewritten on a restart", async () => {
   const root = tempRoot();
   chmodSync(root, 0o755);
   let d = await startDaemon(root, "v1");
@@ -219,11 +232,13 @@ test("N5: the key lives in <root>/.daemon.json (600, root 700) and survives a re
     assert.equal(statSync(root).mode & 0o777, 0o700, "an existing root is made private");
     const first = JSON.parse(readFileSync(file, "utf8"));
     assert.equal(first.pid, d.child.pid);
+    assert.equal(first.port, d.port);
     await d.stop();
     d = await startDaemon(root, "v2");
     const second = JSON.parse(readFileSync(file, "utf8"));
     assert.equal(second.version, "v2");
-    assert.equal(second.token, first.token, "an upgraded daemon keeps the key, so open tabs keep working");
+    assert.equal(second.pid, d.child.pid);
+    assert.equal("token" in second, false);
     assert.equal(statSync(file).mode & 0o777, 0o600);
   } finally {
     await d.stop();
@@ -231,33 +246,45 @@ test("N5: the key lives in <root>/.daemon.json (600, root 700) and survives a re
   }
 });
 
-test("N5: requestToken reads Bearer or the port's cookie; keyedUrl adds ?k=", () => {
-  assert.equal(daemon.requestToken({ authorization: "Bearer abc" }, 1), "abc");
-  assert.equal(daemon.requestToken({ cookie: "x=1; canvas_k_1=def; y=2" }, 1), "def");
-  assert.equal(daemon.requestToken({ cookie: "canvas_k_2=def" }, 1), "");
-  assert.equal(daemon.authorized({ authorization: "Bearer abc" }, "abd", 1), false);
-  assert.equal(daemon.authorized({}, "abc", 1), false);
-  const root = mkdtempSync(join(tmpdir(), "canvas-sec-"));
-  try {
-    assert.equal(canvas.daemonToken(root), "", "no daemon yet");
-    assert.equal(canvas.keyedUrl("http://127.0.0.1:1/s/x", ""), "http://127.0.0.1:1/s/x", "no key: the plain URL");
-    writeFileSync(join(root, ".daemon.json"), JSON.stringify({ pid: 1, token: "a".repeat(64) }));
-    assert.equal(canvas.daemonToken(root), "a".repeat(64));
-    assert.equal(canvas.keyedUrl("http://127.0.0.1:1/s/x", canvas.daemonToken(root)), `http://127.0.0.1:1/s/x?k=${"a".repeat(64)}`);
-    assert.equal(canvas.keyedUrl("http://127.0.0.1:1/?a=1", "b".repeat(64)), `http://127.0.0.1:1/?a=1&k=${"b".repeat(64)}`);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("N5: the page shows a lock (and a title /canvas can see) on a 401", () => {
+test("N5: no key code is left: /canvas opens and prints the plain URL, the page has no locked state", () => {
   const page = readFileSync(join(ROOT_DIR, "extensions/canvas/page.mjs"), "utf8");
   const index = readFileSync(join(ROOT_DIR, "extensions/canvas/index.ts"), "utf8");
-  assert.match(page, /const LOCKED_TITLE = "Canvas \(locked\)"/);
+  const src = readFileSync(DAEMON, "utf8");
+  for (const name of ["loadToken", "requestToken", "authorized", "cookieName"]) assert.equal(name in daemon, false, `daemon.mjs exports no ${name}`);
+  for (const name of ["daemonToken", "keyedUrl"]) assert.equal(name in canvas, false, `index.ts exports no ${name}`);
+  assert.doesNotMatch(src, /Set-Cookie|timingSafeEqual|randomBytes/);
+  for (const f of ["page.mjs", "meeting-page.mjs", "meetings-page.mjs"]) assert.doesNotMatch(readFileSync(join(ROOT_DIR, "extensions/canvas", f), "utf8"), /Canvas \(locked\)|status === 401/, f);
+  assert.doesNotMatch(index, /Canvas \(locked\)|keyedUrl/);
+  assert.match(page, /if \(!r\.ok\) throw new Error/, "apiJson still fails on a real error");
   assert.match(page, /state = await apiJson\(`\/api\/s\//, "the session page's state goes through apiJson");
   assert.match(page, /sessions = await apiJson\("\/api\/sessions"\)/, "and the index's");
-  assert.match(index, /starts with "Canvas \(locked\)" then set URL of t to ku/, "/canvas re-keys a locked tab");
-  assert.match(index, /OPEN_SCRIPT, url, keyedUrl\(url\)/, "and opens new tabs with the key");
+  assert.match(index, /OPEN_SCRIPT, url, \.\.\./, "Safari gets the plain URL");
+  assert.match(index, /if \(arg === "url"\) \{\n\s*ctx\.ui\.notify\(url, "info"\);/, "/canvas url prints it");
+});
+
+test("N5: a legacy ?k= link just drops the key: any value, no cookie, never off-site", async () => {
+  const root = tempRoot();
+  const d = await startDaemon(root);
+  try {
+    for (const k of ["nope", "0".repeat(64), "%C3%A9".repeat(64), ""]) {
+      const r = await get(d.port, `/s/s1?x=1&k=${k}`);
+      assert.equal(r.status, 303, `k=${k}`);
+      assert.equal(r.headers.location, "/s/s1?x=1", "the key leaves the URL");
+      assert.equal(r.headers["set-cookie"], undefined, "and sets nothing");
+    }
+    assert.equal((await get(d.port, "/?k=abc")).headers.location, "/");
+    assert.equal((await get(d.port, "/.//evil.com?k=abc")).headers.location, "/evil.com");
+    for (const path of ["/.//evil.com", "//evil.com", "/./\\evil.com", "/.///evil.com/x"]) {
+      const r = await get(d.port, `${path}?a=1&k=abc`);
+      if (r.status !== 303) continue; // a path the daemon refuses outright is fine too
+      assert.match(r.headers.location, /^\/(?![\/\\])/, `${path} -> ${r.headers.location}: one leading slash`);
+      assert.ok(r.headers.location.endsWith("?a=1"));
+    }
+    assert.equal((await get(d.port, "/health")).status, 200, "still up");
+  } finally {
+    await d.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ── N6 ──────────────────────────────────────────────────────────────────────
@@ -281,10 +308,9 @@ test("N6: an oversized POST (clip included) drops the connection, and the daemon
   const root = tempRoot();
   const d = await startDaemon(root);
   try {
-    const auth = { authorization: `Bearer ${tokenOf(root)}` };
     const big = JSON.stringify({ file: "a.md", pad: "x".repeat(4096) });
     for (const [path, header] of [["/s/s1/clip", "x-canvas-clip"], ["/follow", "x-canvas"]]) {
-      const r = await post(d.port, path, big, { ...auth, [header]: "1" }).catch((e) => e);
+      const r = await post(d.port, path, big, { [header]: "1" }).catch((e) => e);
       assert.ok(r instanceof Error || r.status !== 200, `${path}: no answer for an oversized body`);
     }
     assert.equal((await get(d.port, "/health")).status, 200);
@@ -490,66 +516,6 @@ test("N6: testEnv never yields the live canvas root or port 8790", async () => {
   }
 });
 
-test("N5: loadToken reuses .daemon.json's key only from a private regular file of ours", () => {
-  const root = mkdtempSync(join(tmpdir(), "canvas-sec-"));
-  try {
-    const file = join(root, ".daemon.json");
-    const key = "c".repeat(64);
-    assert.match(daemon.loadToken(root), /^[0-9a-f]{64}$/, "no file: a fresh key");
-    writeFileSync(file, JSON.stringify({ token: key }), { mode: 0o600 });
-    chmodSync(file, 0o600);
-    assert.equal(daemon.loadToken(root), key, "600, ours: reused");
-    chmodSync(file, 0o640);
-    const fresh = daemon.loadToken(root);
-    assert.notEqual(fresh, key, "group-readable: a new key");
-    assert.match(fresh, /^[0-9a-f]{64}$/);
-    chmodSync(file, 0o604);
-    assert.notEqual(daemon.loadToken(root), key, "world-readable: a new key");
-    // A symlink to a private file is still not trusted.
-    const real = join(root, "elsewhere.json");
-    writeFileSync(real, JSON.stringify({ token: key }), { mode: 0o600 });
-    rmSync(file);
-    symlinkSync(real, file);
-    assert.notEqual(daemon.loadToken(root), key, "a symlink: a new key");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("N5: a non-ASCII key of the right length is a 401/403, never a 500", async () => {
-  assert.equal(daemon.authorized({ authorization: `Bearer ${"\u00e9".repeat(64)}` }, "0".repeat(64), 1), false, "no throw");
-  assert.equal(daemon.authorized({ cookie: `canvas_k_1=${"\u00e9".repeat(64)}` }, "0".repeat(64), 1), false);
-  const root = tempRoot();
-  const d = await startDaemon(root);
-  try {
-    assert.equal((await get(d.port, "/api/sessions", { authorization: `Bearer ${"\u00e9".repeat(64)}` })).status, 401);
-    assert.equal((await get(d.port, "/api/sessions", { cookie: `canvas_k_${d.port}=${"\u00e9".repeat(64)}` })).status, 401);
-    assert.equal((await get(d.port, `/s/s1?k=${"%C3%A9".repeat(64)}`)).status, 403);
-    assert.equal((await get(d.port, "/health")).status, 200, "still up");
-  } finally {
-    await d.stop();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("N5: a keyed link can't redirect off-site", async () => {
-  const root = tempRoot();
-  const d = await startDaemon(root);
-  try {
-    const token = tokenOf(root);
-    assert.equal((await get(d.port, `/.//evil.com?k=${token}`)).headers.location, "/evil.com");
-    for (const path of ["/.//evil.com", "//evil.com", "/./\\evil.com", "/.///evil.com/x"]) {
-      const r = await get(d.port, `${path}?a=1&k=${token}`);
-      if (r.status !== 303) continue; // a path the daemon refuses outright is fine too
-      assert.match(r.headers.location, /^\/(?![\/\\])/, `${path} -> ${r.headers.location}: one leading slash`);
-      assert.ok(r.headers.location.endsWith("?a=1"));
-    }
-  } finally {
-    await d.stop();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test("/canvas opens Canvas.app when there is one, else drives Safari", async () => {
   const dir = mkdtempSync(join(tmpdir(), "canvas-sec-"));
   try {
@@ -562,10 +528,11 @@ test("/canvas opens Canvas.app when there is one, else drives Safari", async () 
     let calls = [];
     const fake = async (cmd, args) => (calls.push([cmd, ...args]), cmd === "osascript" ? "opened\n" : "");
     assert.equal(await canvas.openInSafari(url, { apps: [join(dir, "Missing.app"), app], run: fake }), "opened in Canvas.app");
-    assert.deepEqual(calls, [["open", "-a", app, canvas.keyedUrl(url)]], "open -a with the keyed URL, no AppleScript");
+    assert.deepEqual(calls, [["open", "-a", app, url]], "open -a with the plain URL, no AppleScript");
     calls = [];
     assert.equal(await canvas.openInSafari(url, { apps: [join(dir, "Missing.app")], run: fake }), "opened");
     assert.deepEqual(calls.map((c) => c[0]), ["wrangle", "osascript"], "no app: the Safari path");
+    assert.equal(calls[1][3], url, "osascript gets the plain URL");
     assert.equal(await canvas.openInSafari(url, { apps: [], run: async () => "" }), "failed");
   } finally {
     rmSync(dir, { recursive: true, force: true });

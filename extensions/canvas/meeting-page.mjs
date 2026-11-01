@@ -745,7 +745,6 @@ async function pull() {
   inflight = true;
   try {
     const r = await fetch(`/api/meeting?since=${entries.length}&id=${encodeURIComponent(wanted)}&cur=${encodeURIComponent(id)}`, { cache: "no-store" });
-    if (r.status === 401) document.title = "Canvas (locked)"; // no key: /canvas in pi reopens with one
     if (r.ok) apply(await r.json());
   } catch {}
   inflight = false;

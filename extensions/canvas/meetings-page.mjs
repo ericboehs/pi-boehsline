@@ -250,7 +250,6 @@ async function load(append = false) {
     const start = append ? meetings.length : 0;
     do {
       const r = await fetch(`/api/meetings?offset=${start + got.length}&limit=${Math.min(100, want - got.length)}`, { cache: "no-store" });
-      if (r.status === 401) document.title = "Canvas (locked)"; // no key: /canvas in pi reopens with one
       if (!r.ok || my !== seq) return;
       d = await r.json();
       got.push(...d.meetings);

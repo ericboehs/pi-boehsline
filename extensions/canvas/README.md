@@ -514,16 +514,11 @@ the review prompt — so a renderer never reaches for a page global.
   - A follow-mode page posts `/s/<id>/focus`. The daemon then runs `tmux
     switch-client`, `select-window` and `select-pane`, and does nothing if
     that pane is already current.
-  - Both POSTs need an `X-Canvas: 1` header and a matching Origin, like
-    `/clip`, and the daemon's key (see **Access** below). The hook has to
-    send it as `Authorization: Bearer <token>`, read from
-    `~/.pi/canvas/.daemon.json`. Without it every hook POST is a 401 and
-    follow mode silently stops; the copy of `canvas-follow.sh` in your
-    dotfiles must send it:
+  - Both POSTs need an `X-Canvas: 1` header and a matching Origin (curl
+    sends none), like `/clip` (see **Access** below). The hook's POST:
 
     ```sh
-    key=$(sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p' "${PI_CANVAS_ROOT:-$HOME/.pi/canvas}/.daemon.json" 2>/dev/null)
-    curl -s -m 1 -o /dev/null -X POST -H 'X-Canvas: 1' -H "Authorization: Bearer $key" ...
+    curl -s -m 1 -o /dev/null -X POST -H 'X-Canvas: 1' ...
     ```
   - The mode is saved in `sessionStorage`, so each tab chooses for itself.
     `PI_CANVAS_TMUX=0` turns it off everywhere: the daemon refuses both
@@ -583,9 +578,8 @@ the review prompt — so a renderer never reaches for a page global.
 - **Opening it.** Safari never opens by itself. `/canvas` opens this session's
   page on display 1, left half, or focuses the tab if it is already open.
   If a Safari web app named **Canvas.app** exists (`~/Applications/Canvas.app`,
-  then `/Applications/Canvas.app`), `/canvas` opens the keyed URL there with
-  `open -a` instead: a web app keeps its own cookie jar, so it needs the key
-  too, and re-running `/canvas` re-keys it after a 401. `PI_CANVAS_APP` sets
+  then `/Applications/Canvas.app`), `/canvas` opens the page there with
+  `open -a` instead. `PI_CANVAS_APP` sets
   the app path(s) to try (`:`-separated); set but empty skips the web app.
   `/canvas url` prints the address, `/canvas status` forces a status run, and
   `/canvas off` / `on` pauses status runs for this process.
@@ -605,10 +599,10 @@ commit here.
 
 Loopback only. The daemon answers only 127.0.0.1 with a loopback `Host`
 header, which stops DNS rebinding. It serves reads plus a few writes, each
-needing the key (below) and the page's own header and origin: Clippy's `POST /s/<id>/clip`,
+needing the page's own header and origin: Clippy's `POST /s/<id>/clip`,
 which only copies that session's files, tmux follow's `/follow` and
 `/focus`, and talk-back's `/s/<id>/send`, which only queues a message for a
-running session. Anything that holds the key can type into your
+running session. Anything local that can reach the port can type into your
 pi, so the same trust as the terminal applies. `html` and `html-plan` sections
 run in an opaque-origin frame (no `allow-same-origin`): they can't touch the
 page or call the daemon. Anything served that can run script (html, svg, xml)
@@ -619,25 +613,30 @@ the daemon adds to `html` reports its height and stands in an in-memory
 keeps per section, so a plan's answers survive a reload. The page can hold
 anything the session saw; it is not a redaction layer.
 
-**Access.** Session data needs the daemon's key, so other local users and
-any process or web page without it can't read your sessions or type into
-pi. The key is 32 random bytes in `~/.pi/canvas/.daemon.json` (mode 600;
-the folder and every session folder are 700, and the daemon runs with umask
-077). It survives daemon restarts and upgrades, but only while that file is
-a regular file you own with no group or other access; otherwise the daemon
-mints a new key (and open tabs re-key via `/canvas`). `/canvas` opens the page as
-`/s/<id>?k=<key>`; the daemon trades that for a cookie
-(`canvas_k_<port>`, HttpOnly, SameSite=Strict, a year) and redirects to the
-plain URL, so the key stays out of history and copied links. Every `/api/*`,
-`/s/<id>/f/*`, slide and POST route then needs that cookie, or
-`Authorization: Bearer <key>` from a local tool. `/health`, the page shells
-(`/`, `/s/<id>`, `/meeting`, `/meetings`) and `/assets/` hold no data and stay
-open. A browser without the cookie (a fresh profile, cleared cookies, or a tab
-from before keys existed) gets 401s; the page then says so and titles itself
-**Canvas (locked)**. To get back in: run `/canvas` (it re-keys a locked tab it
-finds, or opens a new keyed one), or `/canvas url` for a keyed link to paste
-into any browser. The canvas tool's replies to the model carry only the plain
-URL. The daemon also gets a minimal environment (PATH, HOME, TMPDIR,
+**Access.** There is no key: the canvas trusts whatever can reach
+127.0.0.1 on this Mac. What protects it:
+
+- The socket listens on 127.0.0.1 only, so other machines can't connect.
+- The `Host` header must be `127.0.0.1:<port>` or `localhost:<port>` (else
+  421), so a web page can't reach it through a hostname that resolves to
+  127.0.0.1 (DNS rebinding).
+- No route sends CORS headers, so a web page on another origin can't read
+  any answer, and the page shells carry `frame-ancestors 'none'` (section
+  files only `'self'`), so another site can't frame them.
+- Every POST needs the page's own header (`X-Canvas: 1`, or
+  `X-Canvas-Clip: 1` for `/clip`) and, when the request has an Origin, the
+  daemon's own. A cross-site form or fetch can't add the header without a
+  preflight the daemon never answers.
+
+What that leaves open: any local account, and any local process or
+sandboxed app that can open 127.0.0.1, can read every session (`/api/*`,
+section files) and post to `/s/<id>/send` to type into pi. That is the same
+trust as anyone logged into this Mac. `~/.pi/canvas` and every session
+folder are 700 and the daemon runs with umask 077, so the files themselves
+stay yours. `/canvas` opens, and `/canvas url` prints, the plain
+`/s/<id>` URL. A link from when the canvas had a key (`?k=...`) just
+redirects to the same URL without it. `.daemon.json` holds the daemon's
+pid, port and version. The daemon also gets a minimal environment (PATH, HOME, TMPDIR,
 `PI_CANVAS_*` and the meeting and usage paths it reads), not pi's, and pi only
 ever SIGTERMs the daemon pid its root's `.daemon.json` recorded.
 

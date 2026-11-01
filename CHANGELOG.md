@@ -31,6 +31,8 @@
 
 ### Changed
 
+- canvas: the daemon no longer has a key. No route needs a cookie or `Authorization: Bearer`, `.daemon.json` holds only pid, port and version, `/canvas` and `/canvas url` use the plain URL, and the page has no "Canvas (locked)" state. An old `?k=` link redirects to the same URL without it. What stays: loopback only, the `Host` allowlist (DNS rebinding), no CORS headers, `frame-ancestors 'none'`, and the page's header and Origin on every POST. Anything local that can reach 127.0.0.1 can read sessions and type into pi; see "Access" in the canvas README. The tmux follow hook no longer needs to send a key.
+
 - auto-bundle is now an opt-in extension (`/boehsline enable auto-bundle`), split out of the footer because it depends on a personal `~/bin/pi-bundle`. Behaviour when enabled is unchanged; it listens for the footer's version checks, which the footer now announces on `pi.events` as `boehsline:pi-version`, so it adds no `mise which pi` spawns. Without it enabled nothing re-runs pi-bundle.
 - footer: drop the redundant `updateTimerStarted` flag; the update poll checks its own timer (pi rebinds extensions on every session switch).
 - footer: OpenCode Go's provider chip reads `oc` (was `ocg`).

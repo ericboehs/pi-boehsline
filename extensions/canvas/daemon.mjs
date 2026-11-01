@@ -13,15 +13,13 @@
 // which stops DNS rebinding: a web page cannot read the canvas through a
 // hostname that resolves to 127.0.0.1.
 //
-// And a key: <root>/.daemon.json (mode 600, root 700) holds a 32-byte token.
-// Session data (/api/*, /s/<id>/f/*, slides) and every POST need it, as the
-// cookie a /?k=<token> link sets, or as Authorization: Bearer <token> for local
-// tools. The page shells and /assets/ hold no data and stay open. pi's /canvas
-// opens the keyed link; see "Access" in the README.
+// No key: anything that can reach 127.0.0.1 can read sessions, the same trust
+// as anyone logged into this machine. No CORS headers anywhere, and every POST
+// needs the page's own header and Origin (fromPage). See "Access" in the README.
 
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmodSync, copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, watch, writeFileSync, renameSync } from "node:fs";
+import { chmodSync, copyFileSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, watch, writeFileSync, renameSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
@@ -419,31 +417,9 @@ function loopback(addr) {
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 }
 
-// ── the key ──────────────────────────────────────────────────────────────────
+// ── .daemon.json ─────────────────────────────────────────────────────────────
 
-const TOKEN_RE = /^[0-9a-f]{64}$/;
-
-/**
- * The daemon's key: the one in <root>/.daemon.json when there is one (so a
- * restart or upgrade keeps open tabs' cookies working), else 32 fresh bytes.
- * Only a file that could have stayed secret is trusted: a regular file (not a
- * symlink), ours, and unreadable by group and others. Anything else may have
- * leaked or been planted, so the daemon mints a new key.
- */
-export function loadToken(root) {
-  const path = join(root, ".daemon.json");
-  try {
-    const st = lstatSync(path);
-    const uid = typeof process.getuid === "function" ? process.getuid() : st.uid;
-    if (!st.isFile() || st.uid !== uid || (st.mode & 0o077) !== 0) return randomBytes(32).toString("hex");
-  } catch {
-    return randomBytes(32).toString("hex");
-  }
-  const t = readJson(path, null)?.token;
-  return typeof t === "string" && TOKEN_RE.test(t) ? t : randomBytes(32).toString("hex");
-}
-
-/** <root>/.daemon.json, mode 600: pid (what pi may SIGTERM), port, version and the key. */
+/** <root>/.daemon.json, mode 600: pid (what pi may SIGTERM), port and version. */
 export function writeDaemonFile(root, info) {
   const path = join(root, ".daemon.json");
   const tmp = `${path}.${process.pid}.tmp`;
@@ -451,34 +427,6 @@ export function writeDaemonFile(root, info) {
   chmodSync(tmp, 0o600);
   renameSync(tmp, path);
 }
-
-/** The cookie's name: per port, so a second daemon on another port can't overwrite this one's. */
-export const cookieName = (port = PORT) => `canvas_k_${port}`;
-
-function sameToken(given, token) {
-  if (typeof given !== "string" || typeof token !== "string") return false;
-  // Byte lengths, not string lengths: a non-ASCII key of the right length
-  // would make timingSafeEqual throw (a 500) instead of failing.
-  const a = Buffer.from(given);
-  const b = Buffer.from(token);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
-/** The key a request carries: Authorization: Bearer <token>, or the page's cookie. */
-export function requestToken(headers, port = PORT) {
-  const auth = /^Bearer\s+(\S+)$/i.exec(String(headers.authorization || ""));
-  if (auth) return auth[1];
-  const want = cookieName(port);
-  for (const part of String(headers.cookie || "").split(";")) {
-    const i = part.indexOf("=");
-    if (i > 0 && part.slice(0, i).trim() === want) return part.slice(i + 1).trim();
-  }
-  return "";
-}
-
-export const authorized = (headers, token, port = PORT) => sameToken(requestToken(headers, port), token);
-
-let TOKEN = "";
 
 /** A path's parts, percent-decoded; null when one doesn't decode (a bare %, a broken UTF-8 sequence). */
 export function decodeParts(pathname) {
@@ -835,9 +783,8 @@ async function focus(req, res, id) {
 // ── routes ───────────────────────────────────────────────────────────────────────
 
 /**
- * The POSTs, the only routes that make the daemon do anything. Each needs the
- * key (the page's cookie, or Bearer for the tmux hook) and its header from
- * fromPage. Keys: "follow" for /follow, "s/<name>" for /s/<id>/<name>.
+ * The POSTs, the only routes that make the daemon do anything. Each needs
+ * its header from fromPage (and a matching Origin when one is sent). Keys: "follow" for /follow, "s/<name>" for /s/<id>/<name>.
  */
 const POST_ROUTES = new Map();
 function postRoute(name, fn, header = "x-canvas") {
@@ -854,7 +801,6 @@ function post(req, res, route) {
   const sess = route.length === 3 && route[0] === "s" && SESSION_ID.test(route[1]);
   const r = route.length === 1 ? POST_ROUTES.get(route[0]) : sess ? POST_ROUTES.get(`s/${route[2]}`) : undefined;
   if (!r) return send(res, 405, "read only");
-  if (!authorized(req.headers, TOKEN)) return send(res, 401, "no key: run /canvas in pi to reopen the page");
   if (!fromPage(req, r.header)) return send(res, 403, "forbidden");
   return r.fn(req, res, sess ? route[1] : undefined);
 }
@@ -893,15 +839,14 @@ function handler(req, res) {
   if (!parts) return send(res, 400, "bad path");
 
   if (url.pathname === "/health") return json(res, { ok: true, version: VERSION, pid: process.pid, root: ROOT });
-  // A keyed link (what pi's /canvas opens): set the cookie, then go to the same
-  // URL without the key, so it stays out of history and copied links.
+  // A link from when the canvas had a key (an old bookmark or tab): the value
+  // means nothing now, so just go to the same URL without it.
   if (url.searchParams.has("k")) {
-    if (!sameToken(url.searchParams.get("k"), TOKEN)) return send(res, 403, "wrong key: run /canvas in pi to reopen the page");
     url.searchParams.delete("k");
     // One leading slash only: "/.//evil.com" normalises to "//evil.com",
     // which a browser reads as another host.
     const location = "/" + url.pathname.replace(/^[\/\\]+/, "") + url.search;
-    return send(res, 303, "", { Location: location, "Set-Cookie": `${cookieName()}=${TOKEN}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000` });
+    return send(res, 303, "", { Location: location });
   }
   if (url.pathname === "/" || (parts[0] === "s" && parts.length === 2 && SESSION_ID.test(parts[1]))) {
     return send(res, 200, SHELL, { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": PAGE_CSP });
@@ -923,9 +868,7 @@ function handler(req, res) {
   }
   if (url.pathname === "/meeting") return send(res, 200, MEETING_SHELL, { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": PAGE_CSP });
   if (url.pathname === "/meetings") return send(res, 200, MEETINGS_SHELL, { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": PAGE_CSP });
-  // Open so far: /health and the page shells and their scripts, none of which
-  // hold data. Everything below is data: sessions, replies, section files, meetings.
-  if (!authorized(req.headers, TOKEN)) return send(res, 401, "no key: run /canvas in pi to reopen the page");
+  // Everything below is data: sessions, replies, section files, meetings.
   // id: the meeting wanted (empty: the live one); cur: the id the page's cursor (since) belongs to.
   if (url.pathname === "/api/meeting") {
     const id = url.searchParams.get("id") || "";
@@ -1203,11 +1146,10 @@ function pollMeeting() {
 }
 
 export function start() {
-  // Nothing the daemon writes (the key file, clip copies, the vendor cache) is for anyone else.
+  // Nothing the daemon writes (.daemon.json, clip copies, the vendor cache) is for anyone else.
   process.umask(0o077);
   mkdirSync(ROOT, { recursive: true, mode: 0o700 });
   chmodSync(ROOT, 0o700);
-  TOKEN = loadToken(ROOT);
   // Last resort: a bug in a timer or watcher callback logs instead of taking every tab down.
   process.on("uncaughtException", (e) => console.error(`${new Date().toISOString()} canvas daemon: uncaught: ${e?.stack || e}`));
   prune(ROOT);
@@ -1233,7 +1175,7 @@ export function start() {
   });
   // Written once listening, so a daemon that lost the race leaves no pid behind.
   server.on("listening", () => {
-    writeDaemonFile(ROOT, { pid: process.pid, port: PORT, version: VERSION, started: new Date().toISOString(), token: TOKEN });
+    writeDaemonFile(ROOT, { pid: process.pid, port: PORT, version: VERSION, started: new Date().toISOString() });
   });
   server.listen(PORT, "127.0.0.1");
   return server;

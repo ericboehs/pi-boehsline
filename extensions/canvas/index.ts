@@ -52,25 +52,6 @@ const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"]);
 export const canvasRoot = () => resolve(process.env.PI_CANVAS_ROOT || join(homedir(), ".pi", "canvas"));
 export const pageUrl = (sessionId: string) => `http://127.0.0.1:${PORT}/s/${encodeURIComponent(sessionId)}`;
 
-/** The daemon's key from <root>/.daemon.json, or "" before a daemon with one has started. */
-export function daemonToken(root = canvasRoot()): string {
-  try {
-    const t = JSON.parse(readFileSync(join(root, ".daemon.json"), "utf8"))?.token;
-    return typeof t === "string" && /^[0-9a-f]{64}$/.test(t) ? t : "";
-  } catch {
-    return "";
-  }
-}
-
-/**
- * A page URL carrying the key: the daemon sets its cookie from ?k= and
- * redirects to the plain URL. Only for opening a browser; never handed to the
- * model or written anywhere.
- */
-export function keyedUrl(url: string, token = daemonToken()): string {
-  return token ? `${url}${url.includes("?") ? "&" : "?"}k=${token}` : url;
-}
-
 /**
  * The daemon's environment: what it reads (PI_CANVAS_*, the meeting and usage
  * paths) plus PATH, HOME and TMPDIR, not all of pi's (API keys and the like).
@@ -1223,21 +1204,16 @@ async function startDaemon(): Promise<boolean> {
 
 // ── safari ───────────────────────────────────────────────────────────────────
 
-// argv: the page URL (a tab already on it is focused), the keyed URL a new tab
-// opens (and a locked tab is sent to), then the window bounds. A tab is
-// locked when the page got a 401 (no key, e.g. a daemon from before keys) and
-// titled itself "Canvas (locked)": reading a tab's name needs no JavaScript
-// permission.
+// argv: the page URL (a tab already on it is focused, else a new tab opens
+// it), then the window bounds.
 const OPEN_SCRIPT = `
 on run argv
   set u to item 1 of argv
-  set ku to item 2 of argv
   tell application "Safari"
     repeat with w in windows
       repeat with t in tabs of w
         try
           if (URL of t as text) starts with u then
-            if (name of t as text) starts with "Canvas (locked)" then set URL of t to ku
             set current tab of w to t
             set index of w to 1
             activate
@@ -1246,9 +1222,9 @@ on run argv
         end try
       end repeat
     end repeat
-    make new document with properties {URL:ku}
-    if (count of argv) is 6 then
-      set bounds of front window to {(item 3 of argv) as integer, (item 4 of argv) as integer, (item 5 of argv) as integer, (item 6 of argv) as integer}
+    make new document with properties {URL:u}
+    if (count of argv) is 5 then
+      set bounds of front window to {(item 2 of argv) as integer, (item 3 of argv) as integer, (item 4 of argv) as integer, (item 5 of argv) as integer}
     end if
     activate
     return "opened"
@@ -1262,8 +1238,7 @@ function run(cmd: string, args: string[], timeout = 5000): Promise<string> {
 }
 
 /**
- * Where Eric's Canvas web app (a Safari "Add to Dock" app, with its own cookie
- * jar) may live, first found wins. PI_CANVAS_APP overrides the list (one path,
+ * Where Eric's Canvas web app (a Safari "Add to Dock" app) may live, first found wins. PI_CANVAS_APP overrides the list (one path,
  * or several joined with ":"); set but empty turns the web app off.
  */
 export function canvasAppCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
@@ -1275,12 +1250,11 @@ export async function openInSafari(url: string, opts: { apps?: string[]; run?: t
   const exec = opts.run ?? run;
   const app = (opts.apps ?? canvasAppCandidates()).find((path) => existsSync(path));
   if (app) {
-    // The web app keeps its own cookies, so it gets the keyed URL too.
-    await exec("open", ["-a", app, keyedUrl(url)]);
+    await exec("open", ["-a", app, url]);
     return "opened in Canvas.app";
   }
   const bounds = leftHalfBounds(await exec("wrangle", ["displays"]));
-  const out = await exec("osascript", ["-e", OPEN_SCRIPT, url, keyedUrl(url), ...(bounds ? bounds.map(String) : [])]);
+  const out = await exec("osascript", ["-e", OPEN_SCRIPT, url, ...(bounds ? bounds.map(String) : [])]);
   return out.trim() || "failed";
 }
 
@@ -2597,8 +2571,7 @@ export default function canvas(pi: ExtensionAPI) {
       }
       const url = pageUrl(sessionId);
       if (arg === "url") {
-        // With the key, so it opens in any browser; the daemon trades it for a cookie.
-        ctx.ui.notify(keyedUrl(url), "info");
+        ctx.ui.notify(url, "info");
         return;
       }
       if (arg === "status") {
@@ -2627,7 +2600,7 @@ export default function canvas(pi: ExtensionAPI) {
         return;
       }
       const how = await openInSafari(url);
-      ctx.ui.notify(how === "failed" ? `canvas: could not drive Safari; open ${keyedUrl(url)}` : `canvas: ${how} ${url}`, how === "failed" ? "warning" : "info");
+      ctx.ui.notify(how === "failed" ? `canvas: could not drive Safari; open ${url}` : `canvas: ${how} ${url}`, how === "failed" ? "warning" : "info");
     },
   });
 

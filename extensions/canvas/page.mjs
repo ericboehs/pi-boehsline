@@ -761,23 +761,10 @@ const drawMermaid = (el, source) => renderMermaid(el, source, { loadMermaid });
 // The page's own files (/s/<id>/f/<name>) as well as data: images; PAGE_CSP keeps anything else out anyway.
 const PAGE_IMG = /^(data:|\/(?![/\\]))/i;
 
-// A 401 from the daemon: this browser has no key (a daemon from before keys,
-// cleared cookies). /canvas in pi reopens the page with one, and re-keys a tab
-// whose title says it is locked (AppleScript can read a title without JavaScript).
-const LOCKED_TITLE = "Canvas (locked)";
-function showLocked() {
-  if (document.title === LOCKED_TITLE) return;
-  document.title = LOCKED_TITLE;
-  $app.replaceChildren(h("section", { class: "card" }, h("div", { class: "bd empty" }, "This canvas needs its key. Run /canvas in pi to reopen it (or /canvas url for a link to open in any browser).")));
-}
-
-/** A data route's JSON; a 401 locks the page and throws. */
+/** A data route's JSON; any other answer (a daemon error, a gone session) throws. */
 async function apiJson(url) {
   const r = await fetch(apiUrl(url));
-  if (r.status === 401) {
-    showLocked();
-    throw new Error("locked");
-  }
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
   return r.json();
 }
 
