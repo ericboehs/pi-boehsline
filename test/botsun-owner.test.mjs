@@ -437,6 +437,52 @@ test("a call's utterance is checked against the phone's call key and its audio h
 	assert.equal(m.sent.length, 1);
 });
 
+test("a locked phone's text reply: call key, v2, decision say_call, text only; keys and decisions never cross", async () => {
+	const decide = phoneKey();
+	const call = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: { 7: decide.raw.toString("base64") }, call_devices: { 7: call.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	const m = await owner();
+	const payload = (text) => `botsun-propose-text-v1\n${text}`;
+	const callSay = async (text, { key = call, decision = "say_call", extra = {} } = {}) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "say", key: "call", text, nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", decision, payload(text)), ...extra });
+	};
+	assert.ok((await ask({ type: "nonce" })).features.includes("say_call"));
+	assert.deepEqual(await callSay("ship it"), { ok: true, delivered: "prompt" });
+	assert.equal(m.sent.at(-1).content, "ship it");
+	assert.equal((await callSay("hi", { key: decide })).error, "signature does not verify", "the main key isn't the call key");
+	assert.equal((await callSay("hi", { decision: "say" })).error, "signature does not verify", "a say signature isn't a say_call one");
+	const jpeg = Buffer.from("\xff\xd8jpeg").toString("base64");
+	assert.equal((await callSay("look", { extra: { images: [{ data: jpeg, mime_type: "image/jpeg" }] } })).error, "a call-key reply is text only");
+	assert.equal((await callSay("look", { extra: { files: [{ name: "a.txt", data: jpeg }] } })).error, "a call-key reply is text only");
+	assert.equal((await callSay("hi", { extra: { sig_v: 1 } })).error, "a call-key reply must be signed v2");
+	assert.equal((await callSay("hi", { extra: { key: "main" } })).error, "bad request");
+	assert.match((await callSay("  ")).error, /^text must be/);
+	// Words only: no command, skill, template or bash prefix from a locked phone.
+	for (const cmd of ["/bypass on", "  /model x", "\n/skill:review", "!ls", " !!rm -rf x", "\uFEFF/bypass on", "\u200B/model x"]) {
+		assert.equal((await callSay(cmd)).error, "a locked-phone reply can't run commands", JSON.stringify(cmd));
+	}
+	assert.deepEqual(await callSay("use /tmp, not !important"), { ok: true, delivered: "prompt" }, "a slash or bang later on is just text");
+	// The other way round: a say_call signature by the call key, sent as a main-key say.
+	let { nonce } = await ask({ type: "nonce" });
+	let res = await ask({ type: "say", text: "hi", nonce, device_id: 7, sig_v: 2, signature: signV2(call, nonce, "session", "say_call", payload("hi")) });
+	assert.equal(res.error, "signature does not verify");
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "say", text: "hi", nonce, device_id: 7, sig_v: 2, signature: signV2(call, nonce, "session", "say", payload("hi")) });
+	assert.equal(res.error, "signature does not verify", "the call key never signs a main-key say");
+	// A say_call signature is no good for any other request.
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ type: "stop", key: "call", nonce, device_id: 7, sig_v: 2, signature: signV2(call, nonce, "session", "say_call", payload("stop")) });
+	assert.ok(res.error);
+	// Spent nonces stay spent.
+	({ nonce } = await ask({ type: "nonce" }));
+	const signature = signV2(call, nonce, "session", "say_call", payload("once"));
+	assert.equal((await ask({ type: "say", key: "call", text: "once", nonce, device_id: 7, sig_v: 2, signature })).ok, true);
+	assert.equal((await ask({ type: "say", key: "call", text: "once", nonce, device_id: 7, sig_v: 2, signature })).error, "nonce is expired or used");
+	assert.deepEqual(m.sent.map((s) => s.content), ["ship it", "use /tmp, not !important", "once"]);
+});
+
 test("attached files are saved for the agent, named in the message, and bound by the signature", async () => {
 	const { readFileSync, statSync } = await import("node:fs");
 	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");

@@ -42,6 +42,7 @@ Each session also listens on its own socket, `~/.local/state/botsun/owner/<pid>.
 | `say`, text only | `session` | `say` | `botsun-propose-text-v1\n<text>` |
 | `say` with photos / files | `session` | `say_images` / `say_attach` | the lines v1 hashes: `sha256(text)`, then one per photo / file |
 | `say_audio` (call key) | `session` | `say_audio` | `<wav sha256>` and, with a proposal, `\n<proposal sha256>` |
+| `say` with `key: "call"` (call key, v2 only, text only) | `session` | `say_call` | `botsun-propose-text-v1\n<text>` |
 | `answer` | `answer` | `answer` | `canonicalAnswerV2`: `botsun-answer-v2`, the ask id, then per question `q<i> <sha(question)> <0\|1 multi>`, its options `o<i>.<j> <sha(label)> <sha(description)>`, and `a<i> <picks> <sha(text)>`, built from the open prompt's own questions (looked up before the digest), so a yes can't carry over to a reworded question or option |
 | `stash` | `session` | `stash` | `push\n<sha256(text)>`, `take\n<id>` or `drop\n<id>` |
 | `stop` | `session` | `stop` | `stop` |
@@ -77,7 +78,7 @@ What pinning can and can't do: it protects against a Botsun whose logic is compr
 
 | request | does |
 |---|---|
-| `say` | Eric's words as if typed (steering a running turn), with photos; files are saved to `~/.local/state/botsun/inbox/<pid>/` and named in the message |
+| `say` | Eric's words as if typed (steering a running turn), with photos; files are saved to `~/.local/state/botsun/inbox/<pid>/` and named in the message. With `key: "call"` (feature `say_call`): text only, signed v2 with the phone's call key (decision `say_call`), so the Watch can reply while the iPhone is locked; photos, files, v1, and text starting with `/` (a command, skill or template, e.g. `/bypass on`) or `!` are refused, and it never runs a command |
 | `say_audio` | a call into the session: the transcribed words, signed over the audio with the call key. With `hold: true` they're verified and held (`{ok, held: id}`) instead of put in; with `proposal_sha256` the hash of an answer read back to him is signed with them |
 | `release` | `{ids, mode}` from the voice helper: held words go in as `queue` (a follow-up after the turn), `steer`, or `interrupt` (steer; abort the run first only when the released words themselves say stop, then send them once pi settles). It adds no words, so it isn't signed |
 | `confirm` | `{id, ask_id, answers}` from the voice helper: his held reply means yes to the answer read back on the call. Answers the open `ask` only when that utterance was signed with this answer's hash (`say_audio` with `proposal_sha256`, an extra line of the signed message) and its words don't say no (`saysNo`). Never a `sensitive` prompt: "answer this one on the phone screen or the keyboard" |

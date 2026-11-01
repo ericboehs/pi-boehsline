@@ -523,6 +523,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	// Display only (a chip's mode, as a click on the footer flips it): not signed, nothing acts.
 	if (r.type === "footer_tap") return footerTap(String(r.chip ?? ""));
 	if (r.type !== "say") return { error: "unknown request" };
+	if (r.key !== undefined) return sayCall(c, r);
 	const { text } = r;
 	const images = imagesOf(r.images);
 	if (typeof images === "string") return { error: images };
@@ -539,6 +540,34 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	const denied = verifyDevice(c, r, { decision: say.decision, digest: () => say.digest,
 		v2: { kind: "session", decision: say.decision, payload: () => say.payload } });
 	if (denied) return { error: denied };
+	return deliverSay(c, text, images, files);
+}
+
+/**
+ * A text reply signed with the phone's call key (key: "call"), so the Watch can answer while the
+ * phone is locked. Text only, v2 only, its own decision "say_call" over the same payload as a
+ * text say: a main-key "say" signature never verifies here, nor this one as a "say".
+ */
+function sayCall(c: Conn, r: Record<string, unknown>): Record<string, unknown> | Promise<Record<string, unknown>> {
+	if (r.key !== "call") return { error: "bad request" };
+	if (r.images !== undefined || r.files !== undefined || r.attachments !== undefined) return { error: "a call-key reply is text only" };
+	if (sigVersion(r) !== 2) return { error: "a call-key reply must be signed v2" };
+	const { text } = r;
+	if (typeof text !== "string" || !text.trim() || text.length > TEXT_MAX) return { error: "text must be 1 to 20000 characters" };
+	// Words only from a locked phone: no slash command (/bypass on, /model, a skill or a template)
+	// and nothing in the shape of pi's ! bash prefix. Botsun refuses these too.
+	if (LOCKED_COMMAND.test(text)) return { error: "a locked-phone reply can't run commands" };
+	const payload = () => `botsun-propose-text-v1\n${text}`;
+	const denied = verifyDevice(c, r, { decision: "say_call", digest: () => sha256hex(payload()),
+		v2: { kind: "session", decision: "say_call", payload } }, "call");
+	if (denied) return { error: denied };
+	return deliverSay(c, text, [], [], { noCommands: true });
+}
+
+/** What a locked-phone reply may not start with: "/" (commands, skills, templates) or "!" (bash). */
+export const LOCKED_COMMAND = /^[\s\p{Cf}]*[\/!]/u; // spaces and invisible format chars, then / or ! (as Botsun checks)
+
+function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts: { noCommands?: boolean } = {}): Record<string, unknown> | Promise<Record<string, unknown>> {
 	let saved: Saved[];
 	try {
 		saved = saveFiles(files);
@@ -551,7 +580,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 		return pics.length ? [...(said.trim() ? [{ type: "text" as const, text: said }] : []), ...pics] : said;
 	};
 	const notes = saved.map((s) => s.note);
-	if (!images.length && !notes.length && c.command) {
+	if (!opts.noCommands && !images.length && !notes.length && c.command) {
 		const outcome = c.command(text, c.busy);
 		if (typeof outcome === "string") return { error: outcome };
 		if (outcome === null) {
@@ -1015,7 +1044,7 @@ function featureList(c: Conn): string[] {
 	const hasStash = (() => {
 		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 	})();
-	return ["say", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "ask_v2", "close",
+	return ["say", "say_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "ask_v2", "close",
 		...(hasStash ? ["stash"] : [])];
 }
 
