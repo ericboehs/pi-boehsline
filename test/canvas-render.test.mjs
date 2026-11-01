@@ -66,6 +66,7 @@ test("render.mjs exports the shared renderers, with no DOM at import time", () =
     "pipelineRunning",
     "stageStatus",
     "renderJobs",
+    "keepOpen",
     "jobState",
     "jobTime",
     "jobDot",
@@ -1003,6 +1004,26 @@ test("renderJobs draws running, done and failed jobs with no page callbacks, spe
 
 // A running row ticks its elapsed time while attached and stops for good once removed: a bubble
 // re-rendered often must not leave intervals behind. A hidden list skips its update.
+test("keepOpen: a job's log folded open stays open when the card redraws with a new tail", () => {
+  const root = document.createElement("div");
+  const spec = (tail) => ({ jobs: [{ ...JOBS_SPEC.jobs[0], tail }, JOBS_SPEC.jobs[1]] });
+  root.append(render.renderJobs(spec("one\n")));
+  const tails = () => [...root.querySelectorAll("details.job-tail")];
+  tails()[0].open = true;
+  render.keepOpen(root, () => root.replaceChildren(render.renderJobs(spec("one\ntwo\n"))));
+  assert.equal(tails()[0].open, true, "the open log is open again");
+  assert.equal(tails()[1].open, false, "a closed one stays closed");
+  assert.equal(text(tails()[0].querySelector("pre.job-m-log")), "one\ntwo\n", "with the new tail");
+  // Closed by the reader: the next redraw leaves it closed.
+  tails()[0].open = false;
+  render.keepOpen(root, () => root.replaceChildren(render.renderJobs(spec("three\n"))));
+  assert.equal(tails()[0].open, false);
+  // Keys are per job: a log open for one job never opens another's.
+  tails()[1].open = true;
+  render.keepOpen(root, () => root.replaceChildren(render.renderJobs({ jobs: [JOBS_SPEC.jobs[2], JOBS_SPEC.jobs[1]] })));
+  assert.deepEqual(tails().map((d) => d.open), [false, true]);
+});
+
 test("renderJobs' ticker runs while attached, skips while hidden, and stops once removed", (t) => {
   t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.parse("2026-10-31T12:00:00Z") });
   const spec = { jobs: [{ ...JOBS_SPEC.jobs[0], started: "2026-10-31T11:59:00Z", ended: null }] };

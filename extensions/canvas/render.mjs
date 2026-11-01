@@ -1154,6 +1154,28 @@ export const jobDot = (j) => h("span", { class: `pulse ${{ live: "working", ok: 
 export const jobLog = (j) =>
   j.hidden ? h("p", { class: "job-m-none" }, "Output not shown: the command may print secrets.") : j.tail ? h("pre", { class: "job-m-log" }, j.tail) : h("p", { class: "job-m-none" }, j.ended ? "No output." : "No output yet.");
 
+/**
+ * Redraw root with swap() and keep what the reader opened: a <details data-key> that was open is
+ * open again after the redraw (a job's log folded open stays open as its tail updates), and its
+ * log keeps its scroll, or stays at the bottom if it was there.
+ */
+export function keepOpen(root, swap) {
+  const was = new Map();
+  for (const d of root.querySelectorAll("details[data-key][open]")) {
+    const pre = d.querySelector("pre");
+    was.set(d.dataset.key, pre ? { top: pre.scrollTop, end: pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 2 } : null);
+  }
+  swap();
+  if (!was.size) return;
+  for (const d of root.querySelectorAll("details[data-key]")) {
+    if (!was.has(d.dataset.key)) continue;
+    d.open = true;
+    const pre = d.querySelector("pre");
+    const at = was.get(d.dataset.key);
+    if (pre && at) pre.scrollTop = at.end ? pre.scrollHeight : at.top;
+  }
+}
+
 /** Keep every [data-since] under root ticking while it is attached; stops once it is gone. */
 function tickSince(root) {
   if (!root.querySelector("[data-since]")) return;
@@ -1178,7 +1200,7 @@ export function renderJobs(spec, opts = {}) {
     { class: "jobs" },
     jobs.map((j, i) => {
       const parts = [jobDot(j), h("b", {}, j.name), jobTime(j), h("code", { class: "job-cmd" }, j.command)];
-      if (!open) return h("div", { class: `job ${jobState(j)}`, "data-job": j.id }, ...parts, h("details", { class: "job-tail" }, h("summary", {}, "Log"), jobLog(j)));
+      if (!open) return h("div", { class: `job ${jobState(j)}`, "data-job": j.id }, ...parts, h("details", { class: "job-tail", "data-key": `job:${j.id}` }, h("summary", {}, "Log"), jobLog(j)));
       const row = h("div", { class: `job ${jobState(j)}`, "data-job": j.id, tabindex: "0", role: "button", title: "Open the log" }, ...parts);
       row.addEventListener("click", () => open(i, jobs));
       row.addEventListener("keydown", (e) => {
