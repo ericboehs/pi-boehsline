@@ -170,7 +170,7 @@ test("session change keeps the connection and sends a session line", async () =>
 	});
 	await b.fire("session_start", { reason: "new" });
 	await until(() => srv.lines.length >= 2);
-	assert.deepEqual(srv.types(), ["hello", "session", "context", "stash"]);
+	assert.deepEqual(srv.types(), ["hello", "session", "features", "context", "stash"]);
 	assert.equal(srv.lines[1].session_file, "/tmp/sessions/b.jsonl");
 	assert.equal(srv.lines[1].session_id, "sid-b");
 	assert.equal(srv.lines[1].cwd, "/tmp/work/proj");
@@ -593,6 +593,23 @@ test("hello lists the commands the phone can run; a reload sends the list again"
 	await until(() => srv.types().includes("commands"));
 	await until(() => srv.types().includes("context") && srv.types().includes("stash"));
 	assert.deepEqual(srv.lines.find((l) => l.type === "commands").commands.map((c) => c.name).slice(4), ["deploy"]);
+});
+
+test("hello carries the nonce reply's features (no nonce minted); a reload sends them again", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	m.pi.getCommands = () => [];
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello") && existsSync(join(ownerDir, `${process.pid}.sock`)));
+	const hello = srv.lines.find((l) => l.type === "hello");
+	assert.ok(hello.features.includes("close"));
+	assert.ok(!hello.features.includes("stash"));
+	assert.deepEqual(hello.features, (await ask({ type: "nonce" })).features, "the same list the nonce reply advertises");
+	m.pi.getCommands = () => [{ name: "stash", source: "extension" }];
+	await m.fire("session_start", { reason: "reload" });
+	await until(() => srv.types().includes("features"));
+	assert.ok(srv.lines.find((l) => l.type === "features").features.includes("stash"));
 });
 
 test("hello carries the model id and the models the phone's picker offers", async () => {

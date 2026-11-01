@@ -387,12 +387,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (r.type === "nonce") {
 		if (!c.sessionId) return { error: "this session has no id yet" };
 		// What this version takes, so Botsun can say "reload it" instead of a failed signature.
-		const hasStash = (() => {
-			try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
-		})();
-		return { nonce: newNonce(c), session_id: c.sessionId,
-			features: ["say", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "ask_v2", "close",
-				...(hasStash ? ["stash"] : [])] };
+		return { nonce: newNonce(c), session_id: c.sessionId, features: featureList(c) };
 	}
 	if (r.type === "say_audio") return sayAudio(c, r);
 	if (r.type === "release") return releaseHeld(c, r);
@@ -874,8 +869,19 @@ let bypassed = false;
 const GUARDIAN_BYPASS_STATE_EVENT = "approval-guardian:temporary-bypass-state";
 const GUARDIAN_BYPASS_CONTROL_EVENT = "approval-guardian:set-temporary-bypass";
 
+// What this version takes: the nonce reply's list, also in hello (and after a reload) so the
+// phone's Sessions list knows which sessions can close without asking each one for a nonce.
+function featureList(c: Conn): string[] {
+	const hasStash = (() => {
+		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
+	})();
+	return ["say", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "ask_v2", "close",
+		...(hasStash ? ["stash"] : [])];
+}
+
 function sendHello(c: Conn): void {
 	write(c, "hello", {
+		features: featureList(c),
 		cwd: c.cwd,
 		session_file: c.sessionFile,
 		session_id: c.sessionId,
@@ -1203,6 +1209,7 @@ function main(pi: ExtensionAPI): void {
 			if (changed) write(conn, "session", { session_file: conn.sessionFile, session_id: conn.sessionId, cwd: conn.cwd });
 			// A reload may have added or dropped commands: the phone's "/" list follows.
 			try { write(conn, "commands", { commands: commands() }); } catch {}
+			try { write(conn, "features", { features: featureList(conn) }); } catch {}
 			try { write(conn, "models", { models: models() }); } catch {}
 			// And what the phone shows from hello: context use and the stash, fresh, not after the next run.
 			write(conn, "context", { context: (() => { try { return context(); } catch { return null; } })() });

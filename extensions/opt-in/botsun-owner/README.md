@@ -12,13 +12,14 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 
 | type | when | extra fields |
 |---|---|---|
-| `hello` | on every (re)connect | `cwd`, `session_file`, `session_id`, `busy`, `prompt`, `model`, `ask`, `commands`, `models`, `stash`, `footer`, `context`, `compacting`, `bypass` |
+| `hello` | on every (re)connect | `cwd`, `session_file`, `session_id`, `busy`, `prompt`, `model`, `ask`, `commands`, `models`, `stash`, `footer`, `context`, `compacting`, `bypass`, `features` (the nonce reply's list) |
 | `busy` / `idle` | a run starts / pi has settled | |
 | `prompt` / `prompt_end` | a dialog (`ask`, select, confirm, input, editor, custom) opens / closes | `kind`, `title` (≤ 500 chars) |
 | `stream` / `stream_end` | the reply as it's written / done | `text` |
 | `model` | `/model`, Ctrl+P, a thinking-level change | `model` (`{name, provider, id, thinking}`) |
 | `ask` / `ask_end` | the `ask` tool has a question open / it's answered | `ask` (`{id, questions, sensitive?}`; `sensitive: true` marks a secret's approval, e.g. op-broker's, which only a signed `answer` can take) |
 | `commands` / `models` | after `/reload` (also in `hello`) | the phone's `/` list; the models its picker offers |
+| `features` | after `/reload` (also in `hello`) | `features`: what this version takes, as in the nonce reply |
 | `stash` | the message stash changed (Ctrl+S, `/stash`, the phone; also in `hello`) | `stash` (`[{id, text, ts}]`, oldest first) |
 | `context` | after each run, after a compaction, after `/reload` | `context` (`{tokens, window, percent}`) |
 | `footer` | the footer's chips changed (at most once a second) | `footer` (`[{id, segments: [{text, fg?, dim?}]}]`, from `lib/footer-snapshot.ts`) |
