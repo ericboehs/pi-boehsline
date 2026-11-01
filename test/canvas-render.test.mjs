@@ -72,6 +72,8 @@ test("render.mjs exports the shared renderers, with no DOM at import time", () =
     "jobDot",
     "jobLog",
     "elapsedText",
+    "countdownText",
+    "schedRow",
     "fullDate",
     "renderDiff",
     "renderMermaid",
@@ -1061,6 +1063,81 @@ test("renderJobs hands a row's click or Enter to the page's onOpen", (t) => {
   rows[2].dispatchEvent(new window.Event("click"));
   rows[1].dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter" }));
   assert.deepEqual(seen, [[2, 4], [1, 4]]);
+});
+
+// ── scheduled tasks (the Scheduled group under the jobs) ──
+
+const SCHED_NOW = Date.parse("2026-10-31T12:00:00Z");
+const at = (s) => new Date(SCHED_NOW + s * 1000).toISOString();
+// The shape index.ts's jobsSpec() writes in `scheduled`. A prompt never arrives, only a short name.
+const SCHED = [
+  { id: "s1", name: "<img src=x onerror=alert(1)>check CI", kind: "interval", every: "every 5m", next: at(252), last: null, status: "armed", source: "session" },
+  { id: "d1", name: "nightly grades", kind: "daily", every: "daily 15:30", next: at(7500), last: at(-90), status: "ok", source: "durable" },
+  { id: "d2", name: "deploy check", kind: "cron", every: "cron 30 15 * * 1-5", next: at(-5), last: at(-3600), status: "running", source: "durable" },
+  { id: "d3", name: "report", kind: "interval", every: "every 1h", next: at(100_000), last: at(-30), status: "error", source: "durable" },
+  { id: "a1", name: "remind me", kind: "once", every: "once", next: null, last: null, status: "paused", source: "agent" },
+];
+
+test("countdownText: m:ss, h:mm:ss, days, and now", () => {
+  assert.equal(render.countdownText(252_000), "4:12");
+  assert.equal(render.countdownText(251_001), "4:12", "rounded up, so it never reads 0:00 early");
+  assert.equal(render.countdownText(3_723_000), "1:02:03");
+  assert.equal(render.countdownText(2 * 86_400_000 + 3 * 3_600_000), "2d 3h");
+  assert.equal(render.countdownText(0), "now");
+  assert.equal(render.countdownText(-5000), "now");
+});
+
+test("renderJobs draws a Scheduled group alone: dots by status, schedule, countdown, last run, text only", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "Date"], now: SCHED_NOW });
+  const el = render.renderJobs({ jobs: [], scheduled: SCHED });
+  assert.equal(el.className, "jobs", "the card, not the empty note");
+  assert.equal(text(el.querySelector(".sched-hd")), "Scheduled");
+  const rows = [...el.querySelectorAll(".job.sched")];
+  assert.deepEqual(rows.map((r) => r.dataset.sched), ["s1", "d1", "d2", "d3", "a1"]);
+  assert.deepEqual(rows.map((r) => r.className), ["job sched armed", "job sched ok", "job sched running", "job sched error", "job sched paused"]);
+  assert.deepEqual(rows.map((r) => r.querySelector(".pulse").className), ["pulse armed", "pulse ok", "pulse working", "pulse error", "pulse idle"]);
+  assert.deepEqual(rows.map((r) => text(r.querySelector(".job-el"))), ["next in 4:12", "next in 2:05:00", "running", "next in 1d 3h", "paused"]);
+  assert.deepEqual(rows.map((r) => text(r.querySelector(".sched-every"))), ["every 5m", "daily 15:30", "cron 30 15 * * 1-5", "every 1h", "once"]);
+  assert.equal(rows[0].querySelector(".sched-last"), null, "never run: no last");
+  assert.equal(text(rows[1].querySelector(".sched-last")), "last 1m30s ago · ✓");
+  assert.equal(rows[1].querySelector(".sched-last").className, "sched-last ok");
+  assert.equal(text(rows[3].querySelector(".sched-last")), "last 30s ago · ✗ error");
+  assert.equal(text(rows[1].querySelector(".sched-src")), "durable");
+  assert.equal(text(rows[4].querySelector(".sched-src")), "agent");
+  assert.equal(rows[0].querySelector(".sched-src"), null, "a user's session timer needs no tag");
+  // DOM-safe, and nothing beyond the name: no markup made from spec strings.
+  assert.equal(el.querySelector("img, script"), null);
+  assert.equal(text(rows[0].querySelector("b")), "<img src=x onerror=alert(1)>check CI");
+  // Countdown ticks client-side while attached; due turns into "due now"; last run ages.
+  document.body.append(el);
+  t.mock.timers.tick(12_000);
+  assert.equal(text(rows[0].querySelector(".job-el")), "next in 4:00");
+  assert.equal(text(rows[1].querySelector(".sched-last")), "last 1m42s ago · ✓");
+  t.mock.timers.tick(240_000);
+  assert.equal(text(rows[0].querySelector(".job-el")), "due now");
+  el.remove();
+  t.mock.timers.tick(1000);
+});
+
+test("renderJobs puts the Scheduled group under the jobs; onOpen still indexes only jobs", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "Date"], now: SCHED_NOW });
+  for (const opts of [{}, { onOpen: () => {} }]) {
+    const el = render.renderJobs({ ...JOBS_SPEC, scheduled: SCHED.slice(0, 2) }, opts);
+    const kids = [...el.children].map((c) => (c.classList.contains("sched-hd") ? "hd" : c.dataset.sched ? `s:${c.dataset.sched}` : `j:${c.dataset.job}`));
+    assert.deepEqual(kids, ["j:b1", "j:b2", "j:b3", "j:b4", "hd", "s:s1", "s:d1"]);
+    assert.equal(el.querySelector(".job.sched[role], .job.sched[tabindex], .job.sched details"), null, "scheduled rows are plain rows");
+  }
+  const seen = [];
+  const el = render.renderJobs({ ...JOBS_SPEC, scheduled: SCHED }, { onOpen: (i, jobs) => seen.push([i, jobs.length]) });
+  el.querySelector(".job[role=button]:nth-child(2)").dispatchEvent(new window.Event("click"));
+  el.querySelector(".job.sched").dispatchEvent(new window.Event("click"));
+  assert.deepEqual(seen, [[1, 4]]);
+  assert.equal(render.renderJobs({ jobs: [], scheduled: [] }).className, "k-muted jobs-none");
+});
+
+test("render.css styles the Scheduled group like the jobs rows", () => {
+  const css = readFileSync(new URL("../extensions/canvas/render.css", import.meta.url), "utf8");
+  for (const rule of [".sched-hd", ".sched-meta", ".job .pulse.armed", ".sched-last.ok", ".sched-last.bad"]) assert.ok(css.includes(`\n${rule} {`), `render.css styles ${rule}`);
 });
 
 test("the page draws jobs with render.mjs's renderer, styled by render.css", () => {

@@ -32,6 +32,10 @@ import { fileURLToPath } from "node:url";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+// pi-scheduler (packages/scheduler, developed here): read-only use of its
+// registry path, validator and schedule wording for the Scheduled group.
+import { describeSchedule, taskLabel, TASK_LABEL_MAX } from "../../packages/scheduler/extensions/lib/schedule-core.ts";
+import { isDurableTask, registryPath } from "../../packages/scheduler/extensions/lib/task-registry.ts";
 
 export const PORT = Number(process.env.PI_CANVAS_PORT || 8790);
 export const STATUS_MODEL = process.env.PI_CANVAS_MODEL || "github-copilot/claude-haiku-5.5";
@@ -711,8 +715,106 @@ export function logTail(text: string, n = 20): string {
   return lines.slice(-n).join("\n");
 }
 
-/** The Background jobs card: running jobs first (oldest first), then finished ones (newest first). */
-export function jobsSpec(jobs: BgJob[], read: (path: string) => string | null, lines = 200) {
+/**
+ * A scheduled task as the Background jobs card shows it: what, when, and how
+ * the last run went. Never its prompt (only a short label), deliver command,
+ * cwd, model, env, runner pid/host, or run output.
+ */
+export type ScheduledView = {
+  id: string;
+  name: string;
+  kind: "once" | "interval" | "daily" | "cron";
+  every: string;
+  next: string | null;
+  last: string | null;
+  status: "armed" | "paused" | "running" | "ok" | "error" | "timeout" | "skipped";
+  source: "session" | "agent" | "durable";
+};
+export const MAX_SCHEDULED = 20;
+const SCHED_KINDS = new Set(["once", "interval", "daily", "cron"]);
+const SCHED_STATUSES = new Set(["armed", "paused", "running", "ok", "error", "timeout", "skipped"]);
+const isoOrNull = (v: unknown) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? new Date(v).toISOString() : null);
+const msIso = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? new Date(v).toISOString() : null);
+
+/** session-scheduler's `scheduler:tasks` views, re-checked field by field (only the contract's fields pass). */
+export function sessionViews(list: unknown): ScheduledView[] {
+  if (!Array.isArray(list)) return [];
+  const out: ScheduledView[] = [];
+  for (const t of list as Record<string, unknown>[]) {
+    if (!t || typeof t !== "object" || typeof t.id !== "string" || !SCHED_KINDS.has(t.kind as string)) continue;
+    const name = typeof t.name === "string" ? taskLabel(t.name, "") : "";
+    out.push({
+      id: t.id.slice(0, 32),
+      name,
+      kind: t.kind as ScheduledView["kind"],
+      every: typeof t.every === "string" ? t.every.slice(0, 60) : String(t.kind),
+      next: isoOrNull(t.next),
+      last: isoOrNull(t.last),
+      status: t.status === "paused" ? "paused" : "armed",
+      source: t.source === "agent" ? "agent" : "session",
+    });
+  }
+  return out;
+}
+
+const realOr = (p: string) => {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+};
+
+/** Durable /schedule tasks whose cwd is this session's (realpath compare), as views. */
+export function durableViews(tasks: unknown, cwd: string): ScheduledView[] {
+  if (!Array.isArray(tasks)) return [];
+  const here = realOr(cwd);
+  const out: ScheduledView[] = [];
+  for (const t of tasks) {
+    if (!isDurableTask(t) || typeof t.cwd !== "string" || !t.cwd || realOr(t.cwd) !== here) continue;
+    const status: ScheduledView["status"] = t.runningSince !== undefined ? "running" : t.paused ? "paused" : t.lastStatus && SCHED_STATUSES.has(t.lastStatus) ? t.lastStatus : "armed";
+    // One task with an odd field (a non-string name, a time out of range) is skipped, not the list.
+    try {
+      out.push({
+        id: t.id,
+        name: taskLabel(typeof t.name === "string" ? t.name : undefined, t.prompt, TASK_LABEL_MAX),
+        kind: t.kind,
+        every: describeSchedule(t).slice(0, 60),
+        next: t.paused ? null : msIso(t.nextRunAt),
+        last: msIso(t.lastRunAt),
+        status,
+        source: "durable",
+      });
+    } catch {
+      continue;
+    }
+  }
+  return out;
+}
+
+/** Durable views for cwd straight from the registry file; [] when it is missing or unreadable. Read-only, no lock. */
+export function readDurableViews(cwd: string, path = registryPath()): ScheduledView[] {
+  try {
+    return durableViews((JSON.parse(readFileSync(path, "utf8")) as { tasks?: unknown } | null)?.tasks, cwd);
+  } catch {
+    return [];
+  }
+}
+
+/** Soonest next first, then any with no next time, paused last; at most MAX_SCHEDULED. */
+export function scheduledSpec(views: ScheduledView[]): ScheduledView[] {
+  const key = (v: ScheduledView) => (v.status === "paused" ? Infinity : v.next ? Date.parse(v.next) : Number.MAX_VALUE);
+  return [...views].sort((a, b) => key(a) - key(b) || a.name.localeCompare(b.name)).slice(0, MAX_SCHEDULED);
+}
+
+/** The Background jobs card body, or null when it has neither a job nor a scheduled task (the card goes). */
+export function jobsCard(jobs: BgJob[], scheduled: ScheduledView[], read: (path: string) => string | null): string | null {
+  if (!jobs.length && !scheduled.length) return null;
+  return JSON.stringify(jobsSpec(jobs, read, 200, scheduled), null, 2);
+}
+
+/** The Background jobs card: running jobs first (oldest first), then finished ones (newest first); then scheduled tasks. */
+export function jobsSpec(jobs: BgJob[], read: (path: string) => string | null, lines = 200, scheduled: ScheduledView[] = []) {
   const iso = (ms?: number) => (typeof ms === "number" ? new Date(ms).toISOString() : null);
   const live = (j: BgJob) => j.endedAt == null;
   const order = [...jobs].sort((a, b) => (live(a) !== live(b) ? (live(a) ? -1 : 1) : live(a) ? a.startedAt - b.startedAt : (b.endedAt ?? 0) - (a.endedAt ?? 0)));
@@ -734,6 +836,7 @@ export function jobsSpec(jobs: BgJob[], read: (path: string) => string | null, l
         hidden,
       };
     }),
+    scheduled: scheduledSpec(scheduled),
   };
 }
 
@@ -1945,8 +2048,9 @@ export default function canvas(pi: ExtensionAPI) {
     for (const j of bgJobs) if (j.endedAt != null && j.endedAt < stale) bgShown.delete(j.id);
     syncJobsTimer();
     const shown = bgJobs.filter((j) => bgShown.has(j.id));
-    if (shown.length) return void putMarkdown(ensureDir(ctx), { id: "auto-jobs", title: "Background jobs", body: JSON.stringify(jobsSpec(shown, readLogTail), null, 2), by: "auto", kind: "jobs" });
-    // None left: drop the card (and never create a page just to say so).
+    const body = jobsCard(shown, [...schedSession, ...schedDurable], readLogTail);
+    if (body) return void putMarkdown(ensureDir(ctx), { id: "auto-jobs", title: "Background jobs", body, by: "auto", kind: "jobs" });
+    // No jobs and no timers left: drop the card (and never create a page just to say so).
     const listPath = join(dir(), "sections.json");
     const list = existsSync(listPath) ? readJson<Section[]>(listPath, []) : [];
     const old = list.find((s) => s.id === "auto-jobs");
@@ -1974,6 +2078,49 @@ export default function canvas(pi: ExtensionAPI) {
     void serial(writeJobs).catch(() => {});
   }
   pi.events?.on?.("bg:jobs", onJobs);
+
+  /**
+   * Scheduled: session timers from session-scheduler's `scheduler:tasks`
+   * events (kept even before session_start, which may run in either order),
+   * and durable /schedule tasks for this cwd, read-only from the registry and
+   * re-checked by mtime every 30 s while the session lives.
+   */
+  const SCHED_EVERY_MS = 30_000;
+  let schedSession: ScheduledView[] = [];
+  let schedDurable: ScheduledView[] = [];
+  let schedTimer: ReturnType<typeof setInterval> | undefined;
+  let durableKey = "";
+  function onSchedTasks(list: unknown) {
+    schedSession = sessionViews(list);
+    if (!autoOn || !bgCtx?.hasUI) return;
+    void serial(writeJobs).catch(() => {});
+  }
+  /** Re-read the registry only when it changed (or the cwd did); true when the views changed. */
+  function checkDurable(cwd: string): boolean {
+    let key = cwd;
+    let views: ScheduledView[] = [];
+    try {
+      const path = registryPath();
+      const st = statSync(path);
+      key = `${cwd}\0${st.mtimeMs}\0${st.size}`;
+      if (key === durableKey) return false;
+      views = readDurableViews(cwd, path);
+    } catch {} // no registry: no durable tasks
+    durableKey = key;
+    const changed = JSON.stringify(views) !== JSON.stringify(schedDurable);
+    schedDurable = views;
+    return changed;
+  }
+  function watchDurable(ctx: ExtensionContext) {
+    clearInterval(schedTimer);
+    durableKey = "";
+    checkDurable(ctx.cwd);
+    schedTimer = setInterval(() => {
+      if (checkDurable(ctx.cwd)) void serial(writeJobs).catch(() => {});
+    }, SCHED_EVERY_MS);
+    schedTimer.unref?.();
+  }
+  pi.events?.on?.("scheduler:tasks", onSchedTasks);
 
   /**
    * Watching: watch.ts's snapshot, from its `watch:state` events (no import).
@@ -2300,6 +2447,8 @@ export default function canvas(pi: ExtensionAPI) {
       watchTasks(ctx);
       // Catch up with bg.ts (jobs started before a /reload); with none, a stale card goes.
       bgCtx = ctx;
+      watchDurable(ctx);
+      pi.events?.emit?.("scheduler:list", { reply: (l: unknown) => void (schedSession = sessionViews(l)) });
       let answered = false;
       pi.events?.emit?.("bg:list", { reply: (l: unknown) => ((answered = true), onJobs(l)) });
       if (!answered) onJobs([]);
@@ -2422,6 +2571,8 @@ export default function canvas(pi: ExtensionAPI) {
     dropWatch();
     clearInterval(bgTimer);
     bgTimer = undefined;
+    clearInterval(schedTimer);
+    schedTimer = undefined;
     for (const r of runs.values()) clearTimeout(r.showTimer), clearTimeout(r.writeTimer);
     runs.clear();
     inflight?.abort();

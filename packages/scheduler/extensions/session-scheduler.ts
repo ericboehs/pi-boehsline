@@ -24,6 +24,7 @@ import {
   parseOnceCommand,
   parseOnceTime,
   stripPromptDelimiter,
+  taskLabel,
 } from "./lib/schedule-core.ts";
 
 const SNAPSHOT_TYPE = "session-scheduler:snapshot";
@@ -68,6 +69,37 @@ export function timerStatusText(active: number, paused: number): string | undefi
   if (active === 0) return `${paused} paused`;
   const armed = `${active} timer${active === 1 ? "" : "s"}`;
   return paused > 0 ? `${armed} · ${paused} paused` : armed;
+}
+
+/**
+ * What other extensions see on `scheduler:tasks` (canvas's Background jobs
+ * card): a display-safe view of each timer. Never the prompt beyond its first
+ * line cut to a short label, so nothing private leaves this process.
+ */
+export interface TaskView {
+  id: string;
+  name: string;
+  kind: ScheduleKind;
+  every: string;
+  next: string | null;
+  last: string | null;
+  status: "armed" | "paused";
+  source: "session" | "agent";
+}
+
+export const TASKS_EVENT = "scheduler:tasks";
+
+export function taskViews(tasks: ScheduledTask[]): TaskView[] {
+  return tasks.map((task) => ({
+    id: task.id,
+    name: taskLabel(undefined, task.prompt),
+    kind: task.kind,
+    every: describeSchedule(task),
+    next: task.paused || !Number.isFinite(task.nextRunAt) ? null : new Date(task.nextRunAt).toISOString(),
+    last: null,
+    status: task.paused ? "paused" : "armed",
+    source: task.source === "agent" ? "agent" : "session",
+  }));
 }
 
 interface ToolParams {
@@ -273,7 +305,20 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     else process.stderr.write(`${message}\n`);
   };
 
+  // Every change passes through persist or updateStatus: tell listeners
+  // (canvas.ts) the same way bg.ts does with `bg:jobs`. Unchanged views are
+  // not re-sent.
+  let lastEmitted: string | undefined;
+  const emitTasks = () => {
+    const views = taskViews(tasks);
+    const key = JSON.stringify(views);
+    if (key === lastEmitted) return;
+    lastEmitted = key;
+    pi.events?.emit?.(TASKS_EVENT, views);
+  };
+
   const updateStatus = (ctx = activeCtx) => {
+    emitTasks();
     if (!ctx?.hasUI) return;
     const active = new Set([
       ...tasks.filter((task) => !task.paused).map((task) => task.id),
@@ -284,6 +329,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
   };
 
   const persist = () => {
+    emitTasks();
     if (!sessionId) return;
     pi.appendEntry(SNAPSHOT_TYPE, {
       version: SNAPSHOT_VERSION,
@@ -790,6 +836,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     });
   }
 
+  pi.events?.on?.("scheduler:list", (data) => (data as { reply?: (tasks: TaskView[]) => void } | undefined)?.reply?.(taskViews(tasks)));
   pi.on("session_start", (_event, ctx) => restoreRuntime(ctx));
   pi.on("session_tree", (_event, ctx) => restoreRuntime(ctx));
   pi.on("agent_settled", (_event, ctx) => {
@@ -797,11 +844,15 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     activeCtx = ctx;
     drainPending();
   });
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", (event, ctx) => {
     clearRuntime();
     if (ctx.hasUI) ctx.ui.setStatus("session-scheduler", undefined);
     activeCtx = undefined;
     sessionId = undefined;
     tasks = [];
+    lastEmitted = undefined;
+    // A /reload brings the same timers straight back: saying [] now would drop the card (and the
+    // phone's strip) for a moment, only to draw it again.
+    if (event?.reason !== "reload") emitTasks();
   });
 }

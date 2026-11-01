@@ -1119,6 +1119,13 @@ export function renderPipeline(spec) {
 //              tail,                      // the log's last lines, or null
 //              hidden }] }                // true: the command may print secrets, no tail
 // Running jobs come first (oldest first), then ended ones (newest first).
+//   scheduled: [{ id, name,                // name: a short label (≤40 chars), never the prompt
+//                 kind, every,             // once|interval|daily|cron; "every 5m", "daily 15:30", …
+//                 next, last,              // ISO strings or null
+//                 status,                  // armed|paused|running|ok|error|timeout|skipped
+//                 source }]                // session|agent|durable
+// Scheduled tasks follow the jobs in their own group (or stand alone), soonest first, with
+// "next in 4:12" counting down while the card is attached. They are not buttons either way.
 // opts.onOpen(index, jobs): the page's full-screen log; with it each row is a
 // button. Without it (a bubble: no modal, no daemon routes) each row shows its
 // log tail inline in a <details>. Running times tick while the card is attached.
@@ -1176,9 +1183,62 @@ export function keepOpen(root, swap) {
   }
 }
 
-/** Keep every [data-since] under root ticking while it is attached; stops once it is gone. */
+/** "4:12", "1:02:03", "2d 3h": how long until a scheduled run; "now" once it is due. */
+export function countdownText(ms) {
+  const s = Math.ceil(ms / 1000);
+  if (s <= 0) return "now";
+  const d = Math.floor(s / 86400);
+  if (d > 0) return `${d}d ${Math.floor((s % 86400) / 3600)}h`;
+  const hh = Math.floor(s / 3600);
+  const mm = Math.floor((s % 3600) / 60);
+  const ss = String(s % 60).padStart(2, "0");
+  return hh > 0 ? `${hh}:${String(mm).padStart(2, "0")}:${ss}` : `${mm}:${ss}`;
+}
+const untilText = (iso) => {
+  const c = countdownText(Date.parse(iso) - Date.now());
+  return c === "now" ? "due now" : `next in ${c}`;
+};
+const agoText = (iso) => `${elapsedText(Date.now() - Date.parse(iso))} ago`;
+const updateTimes = (root) => {
+  for (const t of root.querySelectorAll("[data-since]")) t.textContent = elapsedText(Date.now() - Date.parse(t.dataset.since));
+  for (const t of root.querySelectorAll("[data-until]")) t.textContent = untilText(t.dataset.until);
+  for (const t of root.querySelectorAll("[data-ago]")) t.textContent = agoText(t.dataset.ago);
+};
+
+const SCHED_DOT = { armed: "armed", paused: "idle", running: "working", ok: "ok", error: "error", timeout: "error", skipped: "idle" };
+const SCHED_LAST = { ok: "✓", error: "✗ error", timeout: "✗ timeout", skipped: "skipped" };
+const validIso = (v) => typeof v === "string" && !Number.isNaN(Date.parse(v));
+/** One scheduled task: dot, name, when it runs next (counting down), then its schedule and last run. */
+export function schedRow(t) {
+  const status = SCHED_DOT[t.status] ? t.status : "armed";
+  const when =
+    status === "paused"
+      ? h("span", { class: "job-el" }, "paused")
+      : status === "running"
+        ? h("span", { class: "job-el ok" }, "running")
+        : validIso(t.next)
+          ? h("span", { class: "job-el", "data-until": t.next, title: `Next ${fullDate(t.next)}` }, untilText(t.next))
+          : h("span", { class: "job-el" }, "no next run");
+  const meta = [h("span", { class: "sched-every" }, String(t.every || t.kind || ""))];
+  if (validIso(t.last)) {
+    const mark = SCHED_LAST[t.status];
+    meta.push(h("span", { class: `sched-last${t.status === "ok" ? " ok" : t.status === "error" || t.status === "timeout" ? " bad" : ""}`, title: `Last run ${fullDate(t.last)}` }, "last ", h("span", { "data-ago": t.last }, agoText(t.last)), mark ? ` · ${mark}` : ""));
+  }
+  if (t.source === "durable") meta.push(h("span", { class: "sched-src", title: "A /schedule task: runs without an open session" }, "durable"));
+  else if (t.source === "agent") meta.push(h("span", { class: "sched-src", title: "Set by the agent with the schedule tool" }, "agent"));
+  return h(
+    "div",
+    { class: `job sched ${status}`, "data-sched": String(t.id || "") },
+    h("span", { class: `pulse ${SCHED_DOT[status]}` }),
+    h("b", {}, String(t.name || t.id || "")),
+    when,
+    h("div", { class: "sched-meta" }, ...meta),
+  );
+}
+
+/** Keep every [data-since] / [data-until] / [data-ago] under root ticking while it is attached; stops once it is gone. */
 function tickSince(root) {
-  if (!root.querySelector("[data-since]")) return;
+  if (!root.querySelector("[data-since], [data-until], [data-ago]")) return;
   let was = false;
   let idle = 0;
   const iv = setInterval(() => {
@@ -1186,14 +1246,15 @@ function tickSince(root) {
       was = true;
       idle = 0;
       if (root.checkVisibility?.() === false) return; // a display:none bubble: nothing to show
-      for (const t of root.querySelectorAll("[data-since]")) t.textContent = elapsedText(Date.now() - Date.parse(t.dataset.since));
+      updateTimes(root);
     } else if (was || ++idle > 10) clearInterval(iv);
   }, 1000);
 }
 
 export function renderJobs(spec, opts = {}) {
   const jobs = spec.jobs || [];
-  if (!jobs.length) return h("p", { class: "k-muted jobs-none" }, "No background jobs.");
+  const scheduled = Array.isArray(spec.scheduled) ? spec.scheduled : [];
+  if (!jobs.length && !scheduled.length) return h("p", { class: "k-muted jobs-none" }, "No background jobs.");
   const open = typeof opts.onOpen === "function" ? opts.onOpen : null;
   const list = h(
     "div",
@@ -1212,6 +1273,7 @@ export function renderJobs(spec, opts = {}) {
       return row;
     }),
   );
+  if (scheduled.length) list.append(h("div", { class: "sched-hd" }, "Scheduled"), ...scheduled.map(schedRow));
   tickSince(list);
   return list;
 }

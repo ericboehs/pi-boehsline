@@ -15,7 +15,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import canvasExtension, { ActivityTracker, daemonVersion, STATUS_PROMPT, checkChart, compareOptions, normalizeSpec, parseDelimited, diffSkipReason, fileId, filesMarkdown, syncCopies, gitDiff, isSensitivePath, jobsSpec, logTail, looksLikeDiff, makePatch, findingLine, findingTexts, isSectionId, newFindings, parseExtras, shotsMarkdown, agentTraffic, agentsMarkdown, bashExit, runSpec, streamable, tailLines, readPeers, resolvePeerName, tallyFiles, lastReply, sessionInfo, uniichatInfo, lastTurn, mergeOps, normalizeCode, normalizeOptions, normalizeTracker, normalizeTree, parseLineRange, nextSteps, claimInbox, ackInbox, withoutNextSteps, leftHalfBounds, openTodos, parseStatus, tmuxMeta, todoBoard, turnDigest, upsertSection, worthStatus } from "../extensions/canvas/index.ts";
+import canvasExtension, { ActivityTracker, daemonVersion, STATUS_PROMPT, checkChart, compareOptions, normalizeSpec, parseDelimited, diffSkipReason, fileId, filesMarkdown, syncCopies, gitDiff, isSensitivePath, jobsSpec, jobsCard, durableViews, readDurableViews, scheduledSpec, sessionViews, MAX_SCHEDULED, logTail, looksLikeDiff, makePatch, findingLine, findingTexts, isSectionId, newFindings, parseExtras, shotsMarkdown, agentTraffic, agentsMarkdown, bashExit, runSpec, streamable, tailLines, readPeers, resolvePeerName, tallyFiles, lastReply, sessionInfo, uniichatInfo, lastTurn, mergeOps, normalizeCode, normalizeOptions, normalizeTracker, normalizeTree, parseLineRange, nextSteps, claimInbox, ackInbox, withoutNextSteps, leftHalfBounds, openTodos, parseStatus, tmuxMeta, todoBoard, turnDigest, upsertSection, worthStatus } from "../extensions/canvas/index.ts";
 import { allowedHost, byteRange, clipTarget, latestClient, listSessions, parseFindings, prune, queueMessage, readAcks, readReply, readWatch, replyPreview, sessionForPane, sessionState, tmuxOf, withKit, PLAN_JS, SANDBOXED_SECTION_CSP, scriptableType, parseGitStatus, usageRows, gitInfo, sessionInfoOf } from "../extensions/canvas/daemon.mjs";
 
 const msg = (role, content, extra = {}) => ({ type: "message", message: { role, content, ...extra } });
@@ -1141,6 +1141,82 @@ test("Background jobs: log tails and the card spec", () => {
   assert.deepEqual([d2.tail, d2.hidden, d2.stopped, d2.exit], [null, true, true, 1], "a secret-printing command never shows its log");
   assert.deepEqual([d1.exit, d1.ended, d1.log], [0, "1970-01-01T00:00:05.000Z", "/t/b.log"]);
   assert.equal(jobsSpec([{ id: "x", name: "x", command: "x", logPath: "/gone.log", startedAt: 0 }], read).jobs[0].tail, null, "an unreadable log");
+});
+
+test("Scheduled: session views keep only the contract's fields", () => {
+  const views = sessionViews([
+    { id: "s1", name: "x".repeat(80), kind: "interval", every: "every 5m", next: "2026-10-31T12:04:12.000Z", last: null, status: "armed", source: "session", prompt: "SECRET full prompt", cwd: "/x", model: "m" },
+    { id: "a1", name: "remind me", kind: "once", every: "once", next: null, last: null, status: "paused", source: "agent" },
+    { id: "bad", kind: "weekly" },
+    null,
+  ]);
+  assert.deepEqual(views.map((v) => Object.keys(v).sort()), [0, 1].map(() => ["every", "id", "kind", "last", "name", "next", "source", "status"]));
+  assert.equal(views[0].name.length, 40);
+  assert.ok(views[0].name.endsWith("…"));
+  assert.equal(JSON.stringify(views).includes("SECRET"), false);
+  assert.deepEqual([views[1].status, views[1].source, views[1].next], ["paused", "agent", null]);
+  assert.deepEqual(sessionViews("nope"), []);
+});
+
+test("Scheduled: durable tasks come from a temp store, filtered to this cwd by realpath, with no private fields", () => {
+  const root = mkdtempSync(join(tmpdir(), "canvas-sched-"));
+  const store = join(root, "scheduler");
+  const was = process.env.PI_SCHEDULER_DIR;
+  process.env.PI_SCHEDULER_DIR = store;
+  try {
+    const here = join(root, "proj");
+    const other = join(root, "other");
+    mkdirSync(here);
+    mkdirSync(other);
+    symlinkSync(here, join(root, "link"));
+    mkdirSync(store);
+    const base = { createdAt: 1, nextRunAt: Date.parse("2026-10-31T15:30:00Z"), deliver: "mail me", model: "x/y", runnerHost: "h" };
+    const tasks = [
+      { ...base, id: "d1", name: "grades", kind: "daily", dailyAt: "15:30", prompt: "SECRET one", cwd: here, lastRunAt: Date.parse("2026-10-30T15:30:00Z"), lastStatus: "ok" },
+      { ...base, id: "d2", kind: "cron", cronExpr: "30 15 * * 1-5", prompt: "  first line of the prompt that goes on and on past forty\nSECRET second line", cwd: join(root, "link"), runningSince: 5, runnerPid: 42 },
+      { ...base, id: "d3", kind: "interval", intervalMs: 300_000, prompt: "nightly check\nSECRET three", cwd: here, paused: true, lastStatus: "error" },
+      { ...base, id: "d4", kind: "interval", intervalMs: 300_000, prompt: "SECRET elsewhere", cwd: other },
+      { ...base, id: "d5", kind: "once", prompt: "SECRET no cwd" },
+      { id: "junk", kind: "interval", prompt: "SECRET malformed", cwd: here },
+    ];
+    writeFileSync(join(store, "tasks.json"), JSON.stringify({ version: 1, tasks }));
+    const views = readDurableViews(here);
+    assert.deepEqual(views.map((v) => v.id), ["d1", "d2", "d3"], "this cwd only (a symlinked cwd counts), valid tasks only");
+    assert.equal(JSON.stringify(views).match(/SECRET|mail me|x\/y|"h"|42|proj/g), null, "no prompt beyond the label, deliver, model, runner or cwd");
+    const [d1, d2, d3] = views;
+    assert.deepEqual(d1, { id: "d1", name: "grades", kind: "daily", every: "daily 15:30", next: "2026-10-31T15:30:00.000Z", last: "2026-10-30T15:30:00.000Z", status: "ok", source: "durable" });
+    assert.equal(d2.name, "first line of the prompt that goes on a…");
+    assert.equal(d2.name.length, 40);
+    assert.deepEqual([d2.every, d2.status, d2.last], ["cron 30 15 * * 1-5", "running", null]);
+    assert.deepEqual([d3.name, d3.status, d3.next, d3.every], ["nightly check", "paused", null, "every 5m"]);
+    assert.deepEqual(readDurableViews(other).map((v) => v.id), ["d4"]);
+    assert.deepEqual(readDurableViews(here, join(root, "missing.json")), [], "no store: none");
+    writeFileSync(join(store, "tasks.json"), "{nope");
+    assert.deepEqual(readDurableViews(here), [], "unreadable: none, no throw");
+    assert.deepEqual(durableViews(tasks, other).map((v) => v.id), ["d4"]);
+    // One odd task (a non-string name, a last run out of Date's range) is skipped, not the list.
+    const odd = [{ ...base, id: "o1", kind: "once", prompt: "odd name", cwd: here, name: 5 }, { ...base, id: "o2", kind: "once", prompt: "far", cwd: here, lastRunAt: 1e20 }, tasks[0]];
+    assert.deepEqual(durableViews(odd, here).map((v) => [v.id, v.name]), [["o1", "odd name"], ["d1", "grades"]]);
+  } finally {
+    if (was === undefined) delete process.env.PI_SCHEDULER_DIR;
+    else process.env.PI_SCHEDULER_DIR = was;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Scheduled: soonest first, paused last, at most 20; the jobs card keeps timers alone and goes when both are empty", () => {
+  const v = (id, next, status = "armed") => ({ id, name: id, kind: "interval", every: "every 5m", next, last: null, status, source: "session" });
+  const order = scheduledSpec([v("p", null, "paused"), v("late", "2026-10-31T13:00:00Z"), v("none", null), v("soon", "2026-10-31T12:01:00Z")]);
+  assert.deepEqual(order.map((x) => x.id), ["soon", "late", "none", "p"]);
+  assert.equal(scheduledSpec(Array.from({ length: 30 }, (_, i) => v(`t${i}`, new Date(Date.UTC(2026, 9, 31, 12, i)).toISOString()))).length, MAX_SCHEDULED);
+  const read = () => null;
+  const job = { id: "j", name: "vite", command: "vite", logPath: "/t/a.log", startedAt: 0 };
+  assert.equal(jobsCard([], [], read), null, "both empty: the card goes");
+  const timersOnly = JSON.parse(jobsCard([], [v("soon", "2026-10-31T12:01:00Z")], read));
+  assert.deepEqual([timersOnly.jobs, timersOnly.scheduled.map((x) => x.id)], [[], ["soon"]], "timers but no jobs: the card stays");
+  const both = JSON.parse(jobsCard([job], [v("p", null, "paused"), v("soon", "2026-10-31T12:01:00Z")], read));
+  assert.deepEqual([both.jobs.map((j) => j.id), both.scheduled.map((x) => x.id)], [["j"], ["soon", "p"]]);
+  assert.deepEqual(JSON.parse(jobsCard([job], [], read)).scheduled, [], "jobs only: an empty group");
 });
 
 test("Running: tail, exit code, secret commands and the spec", () => {

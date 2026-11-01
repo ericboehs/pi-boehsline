@@ -387,3 +387,14 @@ ol.tline { list-style: none; margin: 0; padding: 0; }
 .job-m-log { margin: 0; overflow: auto; padding: 12px 16px; background: var(--soft); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }
 .job-m-none { margin: 0; padding: 18px 16px; color: var(--dim); font-size: 13px; }
 .jobs-none { color: var(--dim); }
+/* scheduled tasks (renderJobs' Scheduled group): the same rows as the jobs, with the schedule and last run underneath. */
+.sched-hd { padding: 8px 6px 2px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--dim); }
+.job + .sched-hd { border-top: 1px solid var(--line); margin-top: 2px; }
+.job .pulse.armed { background: transparent; border: 1.5px solid var(--accent); }
+.job.sched.paused > b { color: var(--dim); }
+.sched-meta { grid-column: 2 / 4; display: flex; flex-wrap: wrap; gap: 0 8px; min-width: 0; font-size: 11.5px; color: var(--dim); }
+.sched-meta > span + span::before { content: "·"; margin-right: 8px; }
+.sched-every { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.sched-last { font-variant-numeric: tabular-nums; }
+.sched-last.ok { color: var(--ok); }
+.sched-last.bad { color: var(--bad); }

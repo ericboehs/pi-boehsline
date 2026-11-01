@@ -347,6 +347,19 @@ export function formatDuration(milliseconds: number): string {
   return output.join("") || `${Math.max(0, milliseconds)}ms`;
 }
 
+/** Longest display name a task view carries (canvas, footer, anything that shows tasks to the user). */
+export const TASK_LABEL_MAX = 40;
+
+/**
+ * A short, safe label for a task: its name when it has one, else the first line
+ * of the prompt, trimmed, with an ellipsis when cut. Never the whole prompt.
+ */
+export function taskLabel(name: string | undefined, prompt: string, max = TASK_LABEL_MAX): string {
+  const source = name?.trim() || (prompt.split("\n").find((line) => line.trim()) ?? "").trim();
+  const folded = source.replace(/\s+/g, " ");
+  return folded.length > max ? `${folded.slice(0, max - 1).trimEnd()}…` : folded;
+}
+
 export function describeSchedule(schedule: Schedule): string {
   if (schedule.kind === "interval") return `every ${formatDuration(schedule.intervalMs ?? 0)}`;
   if (schedule.kind === "daily") return `daily ${schedule.dailyAt}`;

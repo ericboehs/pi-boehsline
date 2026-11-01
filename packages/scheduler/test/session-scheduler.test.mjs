@@ -62,7 +62,13 @@ async function mount({
     },
   };
 
+  const emitted = [];
+  const listeners = {};
   const pi = {
+    events: {
+      emit: (name, data) => { emitted.push({ name, data }); for (const fn of listeners[name] ?? []) fn(data); },
+      on: (name, fn) => { (listeners[name] ??= []).push(fn); },
+    },
     on: (name, handler) => { handlers[name] = handler; },
     registerCommand: (name, options) => { commands[name] = options; },
     registerTool: (tool) => { registeredTools += 1; tools.push(tool); },
@@ -84,6 +90,8 @@ async function mount({
   return {
     commands,
     ctx,
+    emitted,
+    pi,
     entries,
     handlers,
     notices,
@@ -731,4 +739,36 @@ test("the footer status is plain text: no emoji", async (t) => {
   await ui.run("loop", "5m b");
   await ui.run("loop", `pause ${latestTasks(ui)[0].id}`);
   assert.deepEqual(ui.statuses.at(-1), { key: "session-scheduler", value: "1 timer · 1 paused" });
+});
+
+test("emits scheduler:tasks with a display-safe view on start, every change and shutdown", async () => {
+  const restored = { id: "r1", kind: "interval", prompt: "restored task", createdAt: 0, nextRunAt: Date.now() + 600_000, intervalMs: 600_000 };
+  const ui = await mount({ branch: [snapshot("session-a", [restored])] });
+  const events = () => ui.emitted.filter((e) => e.name === "scheduler:tasks").map((e) => e.data);
+  assert.deepEqual(events().at(-1).map((v) => v.id), ["r1"], "session_start sends the restored timers");
+
+  const long = "check the deploy and the long tail of things that follow it\nPRIVATE second line with a token";
+  await ui.run("loop", `5m ${long}`);
+  const [, view] = events().at(-1);
+  assert.deepEqual(Object.keys(view).sort(), ["every", "id", "kind", "last", "name", "next", "source", "status"]);
+  assert.equal(view.name, "check the deploy and the long tail of t\u2026");
+  assert.equal(view.name.length, 40);
+  assert.deepEqual([view.kind, view.every, view.status, view.source, view.last], ["interval", "every 5m", "armed", "session", null]);
+  assert.ok(Date.parse(view.next) > Date.now());
+  assert.equal(JSON.stringify(events()).includes("PRIVATE"), false, "never the full prompt");
+
+  const count = events().length;
+  ui.handlers.agent_settled?.({}, ui.ctx);
+  assert.equal(events().length, count, "nothing changed: not re-sent");
+
+  await ui.run("loop", `pause ${view.id}`);
+  const paused = events().at(-1).find((v) => v.id === view.id);
+  assert.deepEqual([paused.status, paused.next], ["paused", null]);
+
+  let replied;
+  ui.pi.events.emit("scheduler:list", { reply: (list) => (replied = list) });
+  assert.deepEqual(replied.map((v) => v.id), ["r1", view.id], "answers scheduler:list");
+
+  await ui.shutdown();
+  assert.deepEqual(events().at(-1), [], "shutdown clears them");
 });
