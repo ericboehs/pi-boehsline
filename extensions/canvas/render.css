@@ -380,6 +380,8 @@ ol.tline { list-style: none; margin: 0; padding: 0; }
 .job-el.ok { color: var(--ok); }
 .job-el.bad { color: var(--bad); }
 .job-cmd { grid-column: 2 / 4; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--dim); background: none; padding: 0; }
+/* The log open: the whole command, wrapped (closed, it's one line with an ellipsis). */
+.job:has(> details.job-tail[open]) > .job-cmd { white-space: pre-wrap; overflow-wrap: anywhere; text-overflow: clip; }
 .job-tail { grid-column: 2 / 4; min-width: 0; font-size: 12px; }
 .job-tail summary { cursor: pointer; color: var(--dim); }
 .job-tail .job-m-log { max-height: 240px; margin-top: 4px; padding: 8px 10px; border-radius: 6px; }

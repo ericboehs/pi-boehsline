@@ -1153,4 +1153,6 @@ test("the page draws jobs with render.mjs's renderer, styled by render.css", () 
     assert.ok(css.includes(`\n${rule} {`), `render.css styles ${rule}`);
     assert.ok(!page.includes(`\n${rule} {`), `page.mjs leaves ${rule} to render.css`);
   }
+  // The log folded open shows the whole command, wrapped (the phone's cards have no hover title).
+  assert.match(css, /\n\.job:has\(> details\.job-tail\[open\]\) > \.job-cmd \{ white-space: pre-wrap;/);
 });
