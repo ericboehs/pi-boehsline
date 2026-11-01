@@ -578,7 +578,7 @@ test("page.mjs renders markdown through render.mjs: no sanitize policy of its ow
   const page = readFileSync(join(ROOT_DIR, "extensions/canvas/page.mjs"), "utf8");
   assert.doesNotMatch(page, /marked\.parse\(/, "page.mjs never parses markdown itself");
   assert.doesNotMatch(page, /const HL_CLEAN\b/, "nor keeps its own highlight allow-list");
-  assert.match(page, /renderMarkdown as renderMd\b[^;]*from "\/assets\/render\.mjs"/);
+  assert.match(page, /renderMarkdown as renderMd\b[^;]*from "\.\/render\.mjs"/);
   assert.match(page, /renderMd\(text, \{[\s\S]*?mermaid: drawMermaid/);
   assert.ok(!existsSync(join(ROOT_DIR, "extensions/canvas/markdown.mjs")));
 });

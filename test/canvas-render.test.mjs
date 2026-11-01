@@ -950,7 +950,7 @@ test("the page draws pipelines with render.mjs's renderer, styled by render.css"
   const read = (f) => readFileSync(new URL(`../extensions/canvas/${f}`, import.meta.url), "utf8");
   const page = read("page.mjs");
   const css = read("render.css");
-  assert.match(page, /import \{[^}]*\brenderPipeline\b[^}]*\} from "\/assets\/render\.mjs"/);
+  assert.match(page, /import \{[^}]*\brenderPipeline\b[^}]*\} from "\.\/render\.mjs"/);
   assert.match(page, /case "pipeline":\n\s*return renderPipeline\(/);
   assert.doesNotMatch(page, /function (renderPipeline|stageStatus|pipelineNow|pipelineChips)\b/, "no copy of its own");
   for (const rule of [".pipe-svg .ring", ".pipe-chip.now", ".pipe-edges path.on", ".pipe-svg .loop"]) {
@@ -962,19 +962,21 @@ test("the page draws pipelines with render.mjs's renderer, styled by render.css"
 // ── background jobs ──
 
 const ago = (s) => new Date(Date.now() - s * 1000).toISOString();
-// The shape index.ts's jobsSpec() writes.
-const JOBS_SPEC = {
+// The shape index.ts's jobsSpec() writes. A function: its times are relative to now, so a
+// test built late in a slow run doesn't see them a few seconds older.
+const jobsFixture = () => ({
   jobs: [
     { id: "b1", name: "<b>build</b>", command: "npm run <i>build</i>", log: "/tmp/b1.log", started: ago(75), ended: null, exit: null, signal: null, stopped: false, tail: "compiling <script>x</script>\n", hidden: false },
     { id: "b2", name: "tests", command: "npm test", log: "/tmp/b2.log", started: ago(130), ended: ago(5), exit: 0, signal: null, stopped: false, tail: "ok 12\n", hidden: false },
     { id: "b3", name: "deploy", command: "./deploy.sh", log: "/tmp/b3.log", started: ago(50), ended: ago(20), exit: 2, signal: null, stopped: false, tail: null, hidden: true },
     { id: "b4", name: "lint", command: "npm run lint", log: "/tmp/b4.log", started: ago(30), ended: ago(25), exit: null, signal: "SIGTERM", stopped: false, tail: null, hidden: false },
   ],
-};
+});
 
 test("renderJobs draws running, done and failed jobs with no page callbacks, spec text as text", (t) => {
   t.mock.timers.enable({ apis: ["setInterval"] }); // a row's ticker must not keep the run alive
-  const el = render.renderJobs(JOBS_SPEC);
+  const spec = jobsFixture();
+  const el = render.renderJobs(spec);
   assert.equal(el.className, "jobs");
   const rows = [...el.querySelectorAll(".job")];
   assert.deepEqual(rows.map((r) => r.className), ["job live", "job ok", "job bad", "job bad"]);
@@ -982,7 +984,7 @@ test("renderJobs draws running, done and failed jobs with no page callbacks, spe
   assert.deepEqual(rows.map((r) => r.querySelector(".pulse").className), ["pulse working", "pulse ok", "pulse error", "pulse error"]);
   // Elapsed: ticking while running, else the outcome and how long it took.
   const times = rows.map((r) => r.querySelector(".job-el"));
-  assert.equal(times[0].dataset.since, JOBS_SPEC.jobs[0].started);
+  assert.equal(times[0].dataset.since, spec.jobs[0].started);
   assert.match(text(times[0]), /^1m1[45]s$/);
   assert.equal(text(times[1]), "✓ 2m05s");
   assert.equal(text(times[2]), "✗ exit 2 · 30s");
@@ -1008,7 +1010,7 @@ test("renderJobs draws running, done and failed jobs with no page callbacks, spe
 // re-rendered often must not leave intervals behind. A hidden list skips its update.
 test("keepOpen: a job's log folded open stays open when the card redraws with a new tail", () => {
   const root = document.createElement("div");
-  const spec = (tail) => ({ jobs: [{ ...JOBS_SPEC.jobs[0], tail }, JOBS_SPEC.jobs[1]] });
+  const spec = (tail) => ({ jobs: [{ ...jobsFixture().jobs[0], tail }, jobsFixture().jobs[1]] });
   root.append(render.renderJobs(spec("one\n")));
   const tails = () => [...root.querySelectorAll("details.job-tail")];
   tails()[0].open = true;
@@ -1022,13 +1024,13 @@ test("keepOpen: a job's log folded open stays open when the card redraws with a 
   assert.equal(tails()[0].open, false);
   // Keys are per job: a log open for one job never opens another's.
   tails()[1].open = true;
-  render.keepOpen(root, () => root.replaceChildren(render.renderJobs({ jobs: [JOBS_SPEC.jobs[2], JOBS_SPEC.jobs[1]] })));
+  render.keepOpen(root, () => root.replaceChildren(render.renderJobs({ jobs: [jobsFixture().jobs[2], jobsFixture().jobs[1]] })));
   assert.deepEqual(tails().map((d) => d.open), [false, true]);
 });
 
 test("renderJobs' ticker runs while attached, skips while hidden, and stops once removed", (t) => {
   t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.parse("2026-10-31T12:00:00Z") });
-  const spec = { jobs: [{ ...JOBS_SPEC.jobs[0], started: "2026-10-31T11:59:00Z", ended: null }] };
+  const spec = { jobs: [{ ...jobsFixture().jobs[0], started: "2026-10-31T11:59:00Z", ended: null }] };
   const el = render.renderJobs(spec);
   const since = el.querySelector("[data-since]");
   assert.ok(since, "a running row has a ticking time");
@@ -1056,7 +1058,7 @@ test("renderJobs' ticker runs while attached, skips while hidden, and stops once
 test("renderJobs hands a row's click or Enter to the page's onOpen", (t) => {
   t.mock.timers.enable({ apis: ["setInterval"] });
   const seen = [];
-  const el = render.renderJobs(JOBS_SPEC, { onOpen: (i, jobs) => seen.push([i, jobs.length]) });
+  const el = render.renderJobs(jobsFixture(), { onOpen: (i, jobs) => seen.push([i, jobs.length]) });
   const rows = [...el.querySelectorAll(".job")];
   assert.ok(rows.every((r) => r.getAttribute("role") === "button" && r.tabIndex === 0));
   assert.equal(el.querySelector("details"), null, "the page shows logs in its modal");
@@ -1122,13 +1124,13 @@ test("renderJobs draws a Scheduled group alone: dots by status, schedule, countd
 test("renderJobs puts the Scheduled group under the jobs; onOpen still indexes only jobs", (t) => {
   t.mock.timers.enable({ apis: ["setInterval", "Date"], now: SCHED_NOW });
   for (const opts of [{}, { onOpen: () => {} }]) {
-    const el = render.renderJobs({ ...JOBS_SPEC, scheduled: SCHED.slice(0, 2) }, opts);
+    const el = render.renderJobs({ ...jobsFixture(), scheduled: SCHED.slice(0, 2) }, opts);
     const kids = [...el.children].map((c) => (c.classList.contains("sched-hd") ? "hd" : c.dataset.sched ? `s:${c.dataset.sched}` : `j:${c.dataset.job}`));
     assert.deepEqual(kids, ["j:b1", "j:b2", "j:b3", "j:b4", "hd", "s:s1", "s:d1"]);
     assert.equal(el.querySelector(".job.sched[role], .job.sched[tabindex], .job.sched details"), null, "scheduled rows are plain rows");
   }
   const seen = [];
-  const el = render.renderJobs({ ...JOBS_SPEC, scheduled: SCHED }, { onOpen: (i, jobs) => seen.push([i, jobs.length]) });
+  const el = render.renderJobs({ ...jobsFixture(), scheduled: SCHED }, { onOpen: (i, jobs) => seen.push([i, jobs.length]) });
   el.querySelector(".job[role=button]:nth-child(2)").dispatchEvent(new window.Event("click"));
   el.querySelector(".job.sched").dispatchEvent(new window.Event("click"));
   assert.deepEqual(seen, [[1, 4]]);
@@ -1144,7 +1146,7 @@ test("the page draws jobs with render.mjs's renderer, styled by render.css", () 
   const read = (f) => readFileSync(new URL(`../extensions/canvas/${f}`, import.meta.url), "utf8");
   const page = read("page.mjs");
   const css = read("render.css");
-  assert.match(page, /import \{[^}]*\brenderJobs\b[^}]*\} from "\/assets\/render\.mjs"/);
+  assert.match(page, /import \{[^}]*\brenderJobs\b[^}]*\} from "\.\/render\.mjs"/);
   assert.match(page, /case "jobs":\n\s*return renderJobs\(followJobs\([^\n]*\{ onOpen: jobDetail \}\);/);
   assert.doesNotMatch(page, /function (renderJobs|jobState|jobTime|elapsedText)\b|const (jobDot|jobLog|fullDate) =/, "no copy of its own");
   for (const rule of [".jobs", ".job", ".job-el", ".job-cmd", ".job .pulse.ok", ".job-m-log", ".job-m-none"]) {

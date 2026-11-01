@@ -789,3 +789,40 @@ export function infoRows(d, ago = (t) => t) {
   if (i.uniichat !== undefined) rows.push({ key: "uniichat", label: "UniiChat", value: uniichatSummary(i.uniichat), note: i.uniichat?.compactor ? `compactor ${i.uniichat.compactor}` : "" });
   return rows;
 }
+
+// ── the embedding seam ──
+// The page reads one config from <meta> tags in its shell (no inline script,
+// so the CSP holds), and every URL it fetches goes through canvasUrls. The
+// daemon's shell sets none of them: the defaults are its own routes. Another
+// host (Botsun's web view) sets them to show the page from its own data.
+
+/**
+ * The page's config. `meta(name)` is a <meta name> tag's content ("" when
+ * absent); `pathname` is location.pathname (the session id when no
+ * canvas-session tag names one).
+ */
+export function canvasConfig(meta = () => "", pathname = "") {
+  const get = (name) => String(meta(name) ?? "").trim();
+  const path = String(pathname || "").match(/^\/s\/([^/]+)\/?$/);
+  const poll = get("canvas-live").match(/^poll:(\d+)$/);
+  const assets = get("canvas-assets") || "/assets/";
+  return {
+    session: get("canvas-session") || (path ? decodeURIComponent(path[1]) : ""),
+    api: get("canvas-api").replace(/\/+$/, ""),
+    assets: assets.endsWith("/") ? assets : `${assets}/`,
+    readonly: get("canvas-readonly") === "1",
+    // 0: the server's event stream (sse). A poll never runs faster than every 250 ms.
+    poll: poll ? Math.max(250, Number(poll[1])) : 0,
+    embed: get("canvas-host") === "embed",
+  };
+}
+
+/** The URL helpers for a config: apiUrl("/api/…"), assetUrl("vendor/x.js"), bodyUrl(id, sec, bust). */
+export function canvasUrls(cfg) {
+  const enc = encodeURIComponent;
+  return {
+    apiUrl: (path) => `${cfg.api}${path}`,
+    assetUrl: (name) => `${cfg.assets}${String(name).replace(/^\/+/, "")}`,
+    bodyUrl: (id, sec, bust = true) => `${cfg.api}/s/${enc(id)}/f/${enc(sec.file)}${bust ? `?v=${enc(sec.at || "")}` : ""}`,
+  };
+}

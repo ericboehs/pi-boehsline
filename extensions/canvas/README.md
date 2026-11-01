@@ -641,6 +641,35 @@ URL. The daemon also gets a minimal environment (PATH, HOME, TMPDIR,
 `PI_CANVAS_*` and the meeting and usage paths it reads), not pi's, and pi only
 ever SIGTERMs the daemon pid its root's `.daemon.json` recorded.
 
+**Embedding the page.** Another host (Botsun's iPhone web view) can show the
+full session page read-only from its own data, with the same `page.mjs`. The
+page reads one config at startup from `<meta name>` tags in its shell (no
+inline script, so a `script-src 'self'` CSP holds); the daemon's shell sets
+none of them, and the defaults are its own routes:
+
+| Tag | Default | Meaning |
+| --- | --- | --- |
+| `canvas-session` | the `/s/<id>` path | the session to show |
+| `canvas-api` | `''` | prefix for every data route and POST |
+| `canvas-assets` | `/assets/` | base for `themes.json` and `vendor/highlight.js`, `vendor/mermaid.js` |
+| `canvas-readonly` | off | `1`: no send box, Clippy, follow tmux, review notes or theme picker, and never a POST |
+| `canvas-live` | `sse` | `poll:<ms>` (250 at least): re-read the state route on a timer instead of `EventSource` |
+| `canvas-host` | `daemon` | `embed`: no session list, waiting chips, peers, meeting card, info panel or Omarchy theme, and none of their routes |
+
+Serve `page.mjs` with `theme.mjs`, `nav.mjs` and `render.mjs` beside it (it
+imports them as `./*.mjs`), plus `theme-boot.js`, `render.css` and
+`vendor/marked.js`, `vendor/purify.js` in the shell, as the daemon's shell
+does. An embedded read-only page asks only for `GET <api>/api/s/<id>` (the
+state: `{ meta: { id, name, cwd }, live, activity, status, reply: { text, at,
+next }, acks, sections: [{ id, title, kind, file, at }], findings, turn,
+watch }`, as `sessionState` in `daemon.mjs` builds it), `GET
+<api>/s/<id>/f/<file>?v=<at>` (each section's body, raw; html sections load
+there in a sandboxed frame), and `<assets>themes.json` plus the vendor
+scripts. In read-only mode, Next steps, Picks and card prompts post `{ text }`
+to `window.webkit.messageHandlers.canvasSend` when the host provides it (the
+host signs and sends); without it they show as text or not at all. Links are
+unchanged: the host intercepts navigation.
+
 `PI_CANVAS=0` disables everything, `PI_CANVAS_STATUS=0` keeps the tool without
 status runs, `PI_CANVAS_TMUX=0` turns off tmux follow mode,
 `PI_CANVAS_THEME=system` follows Omarchy until a theme is picked, and
@@ -648,5 +677,5 @@ status runs, `PI_CANVAS_TMUX=0` turns off tmux follow mode,
 Subagent children skip the canvas.
 
 ```sh
-node --test test/canvas.test.mjs test/canvas-nav.test.mjs test/canvas-render.test.mjs test/canvas-security.test.mjs test/canvas-meeting.test.mjs
+node --test test/canvas.test.mjs test/canvas-nav.test.mjs test/canvas-render.test.mjs test/canvas-security.test.mjs test/canvas-meeting.test.mjs test/canvas-embed.test.mjs
 ```

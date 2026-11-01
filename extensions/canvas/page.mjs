@@ -2,12 +2,39 @@
 // Re-fetches state on each server-sent "changed" event and re-renders only the
 // sections whose timestamp moved, so iframes and scroll position survive.
 
-import { readPair, readPrefs, prettyName, swatch, themeMode, themeVars } from "/assets/theme.mjs";
-import { asQuote, boardMarks, cardKey, cardPrompt, dismissPipe, optionsText, ownerSession, pipeStripHidden, REVIEW_VERDICTS, reviewLabel, reviewMessage, infoRows, plainText, treeText, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, placeBefore, placeTrackers, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions } from "/assets/nav.mjs";
+import { readPair, readPrefs, prettyName, swatch, themeMode, themeVars } from "./theme.mjs";
+import { asQuote, boardMarks, cardKey, cardPrompt, dismissPipe, optionsText, ownerSession, pipeStripHidden, REVIEW_VERDICTS, reviewLabel, reviewMessage, infoRows, plainText, treeText, matchKeys, mergeOrder, moveAmong, nextSeen, orderSessions, placeBefore, placeTrackers, rankItems, splitPinned, togglePin, topQuotes, unquote, VIM_KEYS, waitingSessions, canvasConfig, canvasUrls } from "./nav.mjs";
 // The renderers themselves live in render.mjs (with render.css): the page passes
 // what only it has (its copy buttons, highlight.js loading, the kanban modal,
 // owner links, remembered folds, talk-back) through each one's opts.
-import { clock, counts, dayLabel, diffBlock, diffFileList, elapsedText, fullDate, h, highlightInto, HL_CLEAN, inline, jobDot, jobLog, jobTime, langFor, noteParas, parsePatch, pipelineChips, pipelineNow, pipelineRunning, renderChart, renderCode, renderJobs, renderJson, renderKanban, renderMarkdown as renderMd, renderMermaid, renderOptions, renderPipeline, renderStats, renderSteps, renderTable, renderTerminal, renderTimeline, renderTracker, renderTree, svg, tilde, tip, toneVar } from "/assets/render.mjs";
+import { clock, counts, dayLabel, diffBlock, diffFileList, elapsedText, fullDate, h, highlightInto, HL_CLEAN, inline, jobDot, jobLog, jobTime, langFor, noteParas, parsePatch, pipelineChips, pipelineNow, pipelineRunning, renderChart, renderCode, renderJobs, renderJson, renderKanban, renderMarkdown as renderMd, renderMermaid, renderOptions, renderPipeline, renderStats, renderSteps, renderTable, renderTerminal, renderTimeline, renderTracker, renderTree, svg, tilde, tip, toneVar } from "./render.mjs";
+
+// The embedding seam (README, "Embedding the page"): read once from the shell's
+// <meta> tags. The daemon's shell sets none, so these are its own routes.
+const CFG = canvasConfig((name) => document.querySelector(`meta[name="${name}"]`)?.content || "", location.pathname);
+
+/**
+ * canvas-live poll: one request at a time, and none while the page is hidden, so a slow state
+ * fetch never overlaps the next and an older state can't draw over a newer one.
+ */
+function pollOnce(run) {
+  let busy = false;
+  return () => {
+    if (busy || document.hidden) return;
+    busy = true;
+    Promise.resolve()
+      .then(run)
+      .catch(() => {})
+      .finally(() => (busy = false));
+  };
+}
+
+const { apiUrl, assetUrl, bodyUrl } = canvasUrls(CFG);
+/** A native host's send bridge (Botsun's WKWebView): it signs and sends what the read-only page asks for. */
+const sendBridge = () => window.webkit?.messageHandlers?.canvasSend || null;
+/** Whether Send / Pick buttons do anything: always on the daemon; read-only, only through a host bridge. */
+const canSend = () => !CFG.readonly || Boolean(sendBridge());
+const sendHook = (fn) => (canSend() ? fn : undefined);
 
 const CSS = `
 :root { color-scheme: light dark; --bg:#f7f5f0; --card:#fff; --ink:#1c1b19; --dim:#8a8578; --line:#e6e1d6; --soft:#f0ece3; --accent:#b4541f; --ok:#1f7a52; --warn:#a86a00; --bad:#c0392b; --code:#f3f0e8; --tint:#fbf3ec; --hl-kw:#285880; --hl-str:#42632a; --hl-num:#805424; --hl-com:#5b6a7f; --hl-title:#68448b; --c1:#3b7dd8; --c2:#e0703a; --c3:#2f9e72; --c4:#c4475b; --c5:#8a63c9; --c6:#b8901c; --c7:#2e9bb0; --c8:#8c8577; }
@@ -373,6 +400,8 @@ time[data-at] { font-variant-numeric: tabular-nums; }
 .card[data-kind="diff"] [data-rv], .card[data-kind="code"] [data-rv] { position: relative; cursor: pointer; }
 .card[data-kind="diff"] [data-rv]:hover::after, .card[data-kind="code"] [data-rv]:hover::after { content: "+"; position: absolute; z-index: 2; right: -9px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; border-radius: 5px; background: var(--accent); color: #fff; font: 700 13px/18px -apple-system, BlinkMacSystemFont, sans-serif; text-align: center; box-shadow: 0 1px 3px rgba(0, 0, 0, .25); opacity: 1; }
 .rv-sel > td, .cl.rv-sel { box-shadow: inset 0 0 0 999px color-mix(in srgb, var(--accent) 16%, transparent); }
+.canvas-ro .card [data-rv] { cursor: auto; }
+.canvas-ro .card [data-rv]:hover::after { content: none; }
 .rv-mark > td.ln[data-rv] { box-shadow: inset -3px 0 0 var(--accent); color: var(--accent); }
 .cl.rv-mark { box-shadow: inset 3px 0 0 var(--accent); }
 .cl.rv-mark > .ln { color: var(--accent); opacity: 1; }
@@ -566,6 +595,8 @@ const $app = document.getElementById("app");
 const style = document.createElement("style");
 style.textContent = CSS;
 document.head.append(style);
+// Read-only: no review gutter + (it opens a comment for pi).
+if (CFG.readonly) document.documentElement.classList.add("canvas-ro");
 
 function ago(t) {
   const ms = Date.now() - (typeof t === "number" ? t : Date.parse(t));
@@ -664,6 +695,7 @@ function sessionFile(href) {
  * changed file's copy that means the real file.
  */
 function clipButton(getHref, label = "Clippy", ico = null) {
+  if (CFG.readonly) return null; // the daemon's clippy: a write
   const base = ico ? "btn clip ico" : "btn clip";
   const tip = "Copy the file itself (clippy), to paste as a file";
   const face = (state) => (ico ? (state === "ok" ? icon("check") : state === "bad" ? "✗" : icon(ico)) : state === "ok" ? "Copied file" : state === "bad" ? "Failed" : label);
@@ -676,7 +708,7 @@ function clipButton(getHref, label = "Clippy", ico = null) {
     try {
       const at = sessionFile(getHref());
       if (!at) throw new Error("not a session file");
-      const r = await fetch(`/s/${encodeURIComponent(at[0])}/clip`, { method: "POST", headers: { "Content-Type": "application/json", "X-Canvas-Clip": "1" }, body: JSON.stringify({ file: at[1] }) });
+      const r = await fetch(apiUrl(`/s/${encodeURIComponent(at[0])}/clip`), { method: "POST", headers: { "Content-Type": "application/json", "X-Canvas-Clip": "1" }, body: JSON.stringify({ file: at[1] }) });
       if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
       const { name } = await r.json();
       b.replaceChildren(face("ok"));
@@ -701,7 +733,7 @@ let hljsReady;
 function loadHighlight() {
   hljsReady ??= new Promise((resolve) => {
     const s = document.createElement("script");
-    s.src = "/assets/vendor/highlight.js";
+    s.src = assetUrl("vendor/highlight.js");
     s.onload = () => resolve(window.hljs || null);
     s.onerror = () => resolve(null);
     document.head.append(s);
@@ -712,7 +744,7 @@ function loadHighlight() {
 function loadMermaid() {
   mermaidReady ??= new Promise((resolve, reject) => {
     const s = document.createElement("script");
-    s.src = "/assets/vendor/mermaid.js";
+    s.src = assetUrl("vendor/mermaid.js");
     s.onload = () => {
       window.mermaid.initialize(mermaidConfig());
       resolve(window.mermaid);
@@ -741,7 +773,7 @@ function showLocked() {
 
 /** A data route's JSON; a 401 locks the page and throws. */
 async function apiJson(url) {
-  const r = await fetch(url);
+  const r = await fetch(apiUrl(url));
   if (r.status === 401) {
     showLocked();
     throw new Error("locked");
@@ -822,7 +854,7 @@ window.addEventListener("message", (e) => {
 async function sectionBody(id, sec) {
   if (sec.kind === "watch") return renderWatch(sec.data || {});
   if (sec.kind === "meeting") return renderMeeting(sec.data || {});
-  const url = `/s/${encodeURIComponent(id)}/f/${encodeURIComponent(sec.file)}?v=${encodeURIComponent(sec.at || "")}`;
+  const url = bodyUrl(id, sec);
   switch (sec.kind) {
     case "markdown":
       return renderMarkdown(await (await fetch(url)).text());
@@ -868,13 +900,13 @@ async function sectionBody(id, sec) {
     case "timeline":
       return renderTimeline(JSON.parse(await (await fetch(url)).text()));
     case "compare":
-      return renderCompare(JSON.parse(await (await fetch(url)).text()), (f) => `/s/${encodeURIComponent(id)}/f/${encodeURIComponent(f)}?v=${encodeURIComponent(sec.at || "")}`);
+      return renderCompare(JSON.parse(await (await fetch(url)).text()), (f) => bodyUrl(id, { file: f, at: sec.at }));
     case "code":
       return renderCode(JSON.parse(await (await fetch(url)).text()), { loadHighlight });
     case "tree":
       return sectionTree(JSON.parse(await (await fetch(url)).text()), sec.id);
     case "options":
-      return renderOptions(JSON.parse(await (await fetch(url)).text()), { onSend: (prompt, e) => sendOrCopy(prompt, e) });
+      return renderOptions(JSON.parse(await (await fetch(url)).text()), { onSend: sendHook((prompt, e) => sendOrCopy(prompt, e)) });
     case "tracker":
       return renderTracker(JSON.parse(await (await fetch(url)).text()));
     case "pdf":
@@ -1104,7 +1136,7 @@ function withWatch(sections, watch) {
 }
 /** meeting-capture's live meeting as the auto-meeting widget, on every session's page (the daemon's meeting-feed.mjs). */
 function withMeeting(sections, meeting) {
-  if (!meeting || typeof meeting !== "object") return sections;
+  if (CFG.embed || !meeting || typeof meeting !== "object") return sections;
   return [...sections.filter((s) => s.id !== "auto-meeting"), { id: "auto-meeting", title: meeting.kind === "list" ? "Recent meetings" : "Meeting", kind: "meeting", by: "auto", at: meeting.at, data: meeting }];
 }
 /** A new needs-you item since the last snapshot: worth the flash the other rewrites skip. */
@@ -1122,7 +1154,7 @@ function statusCard(status, state, reply = null) {
   if (!status) {
     bd.append(h("div", { class: "empty" }, "No status yet. It appears after the next turn with tool calls."));
     if (reply) bd.append(replyPart(reply));
-    bd.append(talkBox());
+    if (!CFG.readonly) bd.append(talkBox());
     return collapsible(card, "_status");
   }
   title.append(
@@ -1135,7 +1167,7 @@ function statusCard(status, state, reply = null) {
   bd.append(h("div", { class: "goal" }, h("span", { class: "eyebrow" }, "Goal"), status.goal || "—"));
   bd.append(h("div", { class: "now" }, h("span", { class: `pulse ${state}` }), h("span", { class: "eyebrow" }, "Now"), h("span", {}, status.now || "—")));
   if (reply) bd.append(replyPart(reply));
-  bd.append(talkBox());
+  if (!CFG.readonly) bd.append(talkBox());
   const col = (kind, label, items) =>
     h(
       "div",
@@ -1171,6 +1203,8 @@ function replyPart(reply) {
         { class: "reply-next" },
         h("span", { class: "eyebrow" }, "Next steps"),
         reply.next.map((t, i) => {
+          // Read-only with no host bridge: the steps as text, nothing to press.
+          if (!canSend()) return h("div", { class: "next-btn" }, h("span", { class: "n" }, String(i + 1)), h("span", {}, inline(t, false)));
           const b = h("button", { class: "next-btn", type: "button", title: "Send this to pi (⌥-click: copy it)" }, h("span", { class: "n" }, String(i + 1)), h("span", {}, inline(t, false)));
           b.addEventListener("click", (e) => sendOrCopy(t, e));
           return b;
@@ -1260,8 +1294,21 @@ function talkSay(text, tone = "") {
 /** Queue a message for this session's pi; true once the daemon has it. `loud`: also toast how it went (sent from a button, maybe far from the box). */
 async function postToPi(text, mode = "steer", loud = false) {
   const short = shortText(text);
+  if (CFG.readonly) {
+    // Never a POST: the host's bridge sends it (signed, its own way), or nothing does.
+    const bridge = sendBridge();
+    if (!bridge) return false;
+    try {
+      bridge.postMessage({ text });
+      if (loud) toast(`Sent “${short}”`);
+      return true;
+    } catch (e) {
+      if (loud) toast(`Not sent: ${e.message}`);
+      return false;
+    }
+  }
   try {
-    const res = await fetch(`/s/${encodeURIComponent(currentSession)}/send`, { method: "POST", headers: { "x-canvas": "1", "content-type": "application/json" }, body: JSON.stringify({ text, mode }) });
+    const res = await fetch(apiUrl(`/s/${encodeURIComponent(currentSession)}/send`), { method: "POST", headers: { "x-canvas": "1", "content-type": "application/json" }, body: JSON.stringify({ text, mode }) });
     if (!res.ok) throw new Error((await res.text()) || res.statusText);
     const { id } = await res.json();
     talk.pending.set(id, { short, loud });
@@ -1296,6 +1343,8 @@ function talkUpdate(state) {
  * end. Copied instead on ⌥-click or when the session isn't running.
  */
 function sendOrCopy(text, e, onSent) {
+  if (!canSend()) return;
+  if (CFG.readonly) return void undoToast(`Sending to pi: “${shortText(text, 50)}”`, () => postToPi(text, "steer", true).then((ok) => ok && onSent?.()));
   if (!talk.live || e?.altKey) {
     copyText(text).then(
       () => toast(talk.live ? "Copied" : "Copied: the session isn't running, so paste it into pi"),
@@ -1519,6 +1568,7 @@ function reviewSync(sections) {
 let rvBarEl = null;
 let rvJump = -1;
 function reviewBar() {
+  if (CFG.readonly) return; // review notes are sent to pi: none in a read-only page
   const pend = rvPending();
   document.body.classList.toggle("rv-on", pend.length > 0);
   if (!pend.length && !rvBarEl) return;
@@ -1612,7 +1662,7 @@ function rvSend(e) {
 
 // The gutter: press on a + (and drag for a range), ⇧-click to extend the open box.
 document.addEventListener("mousedown", (e) => {
-  const cell = e.button === 0 ? e.target.closest?.(RV_CELL) : null;
+  const cell = e.button === 0 && !CFG.readonly ? e.target.closest?.(RV_CELL) : null;
   const box = cell?.closest("[data-rv-file]");
   if (!box) return;
   e.preventDefault();
@@ -1708,8 +1758,7 @@ function findingsCard(findings, showAll = false, turn = null) {
   return collapsible(card, "_findings");
 }
 
-const rawUrl = (id, sec, bust = true) =>
-  `/s/${encodeURIComponent(id)}/f/${encodeURIComponent(sec.file)}${bust ? `?v=${encodeURIComponent(sec.at || "")}` : ""}`;
+const rawUrl = (id, sec, bust = true) => bodyUrl(id, sec, bust);
 
 // Files changed and Screenshots: the newest few, the rest behind a toggle
 // that holds across updates (both lists are newest first).
@@ -1801,7 +1850,7 @@ function sectionCard(id, sec) {
     src.dataset.yank = "source"; // yc presses it, yp ⇧-presses it
     meta.append(src);
   }
-  if (sec.file && sec.kind !== "jobs" && sec.kind !== "tracker") meta.append(clipButton(() => rawUrl(id, sec, false), "Copy the file (yy)", "clip"));
+  if (sec.file && sec.kind !== "jobs" && sec.kind !== "tracker" && !CFG.readonly) meta.append(clipButton(() => rawUrl(id, sec, false), "Copy the file (yy)", "clip"));
   if (sec.file) meta.append(h("a", { class: "btn ico", href: rawUrl(id, sec, false), target: "_blank", title: "Open in a new tab", "aria-label": "Open in a new tab" }, icon("open")));
   const flush = sec.kind === "html" || sec.kind === "html-plan";
   const bd = h("div", { class: `bd${flush ? " flush" : ""}` });
@@ -1900,6 +1949,7 @@ function renderCompare(spec, src) {
 const COPY_AS = { code: (s) => s.code, tree: (s) => treeText(s), options: (s) => optionsText(s) };
 
 function sendButton(getText, label = "Send to pi", title = "Send this to pi (⌥-click: copy it)") {
+  if (!canSend()) return null;
   const b = h("button", { class: "btn", type: "button", title }, label);
   b.addEventListener("click", (e) => (e.preventDefault(), e.stopPropagation(), sendOrCopy(getText(), e)));
   return b;
@@ -1979,15 +2029,15 @@ function sectionKanban(spec, sec) {
     folds: { read: () => readStore(sessionStorage, KB_FOLD_KEY), write: (v) => writeStore(sessionStorage, KB_FOLD_KEY, v) },
     foldKey: (label) => `${currentSession}/${sec.id}/${label}`,
     ownerChip,
-    onSend: (prompt, e) => sendOrCopy(prompt, e),
+    onSend: sendHook((prompt, e) => sendOrCopy(prompt, e)),
     onCard: (k, c) => {
       const flat = (spec.columns || []).flatMap((col) => (col.cards || []).map((card) => ({ k: card, c: col })));
       cardDetail(flat, flat.findIndex((x) => x.k === k), { todo: sec.id === "auto-tasks", board: spec.title || sec.title || "Board", moves });
     },
   });
   // Owners render before the session list has loaded on a fresh page: link them once it has.
-  if (root.querySelector(".kb-owner[data-owner]") && !sessionsCache.length) {
-    fetch("/api/sessions")
+  if (root.querySelector(".kb-owner[data-owner]") && !sessionsCache.length && !CFG.embed) {
+    fetch(apiUrl("/api/sessions"))
       .then((r) => r.json())
       .then((list) => {
         if (!sessionsCache.length) sessionsCache = list;
@@ -2252,6 +2302,7 @@ async function pumpMeetTail() {
   const since = t.total;
   try {
     // ?tail=1: only {id, from, total, entries, live}, not the slide list, notes and summaries.
+    // The daemon's own route, never an embedding host's (canvas-host embed has no Meeting card).
     const r = await fetch(`/api/meeting?tail=1&since=${since}&id=${encodeURIComponent(t.id)}`, { cache: "no-store" });
     const d = await r.json();
     // A render re-seeded the tail while this was in flight: the answer is for an older cursor.
@@ -2504,7 +2555,7 @@ function showModal(items, i, render) {
 
 // ── session info: a click on the session name, or I ──
 
-const infoUrl = (id) => `/api/s/${encodeURIComponent(id)}/info`;
+const infoUrl = (id) => apiUrl(`/api/s/${encodeURIComponent(id)}/info`);
 const shortDate = (iso) => {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? "" : d.toLocaleDateString([], { month: "short", day: "numeric" });
@@ -2549,6 +2600,7 @@ function infoBody(d) {
 }
 
 function openInfo(id, name) {
+  if (CFG.embed) return; // the daemon's info route
   showModal([id], 0, () => ({
     kind: "info",
     title: name,
@@ -2562,7 +2614,7 @@ function openInfo(id, name) {
 /** While the panel is open, a change to the session redraws it in place (no Loading… flash). */
 let infoTimer;
 function infoRefresh(id) {
-  if (!dlg?.open || !dlg.classList.contains("info")) return;
+  if (CFG.embed || !dlg?.open || !dlg.classList.contains("info")) return;
   clearTimeout(infoTimer);
   infoTimer = setTimeout(() => {
     fetch(infoUrl(id), { cache: "no-store" })
@@ -2858,7 +2910,7 @@ async function sessionView(id) {
     if (!sec) return pipeSlot.replaceChildren();
     let spec;
     try {
-      spec = await (await fetch(`/s/${encodeURIComponent(id)}/f/${encodeURIComponent(sec.file)}?v=${encodeURIComponent(sec.at || "")}`)).json();
+      spec = await (await fetch(bodyUrl(id, sec))).json();
     } catch {
       return;
     }
@@ -2981,7 +3033,7 @@ async function sessionView(id) {
     infoRefresh(id);
     document.title = `${name} · canvas`;
     header.replaceChildren(
-      h("h1", {}, h("button", { class: "name-btn", type: "button", title: "Session info: model, context, usage, repo (I)", onclick: () => openInfo(id, name) }, name)),
+      h("h1", {}, CFG.embed ? name : h("button", { class: "name-btn", type: "button", title: "Session info: model, context, usage, repo (I)", onclick: () => openInfo(id, name) }, name)),
       h("span", { class: "cwd" }, tilde(state.meta.cwd)),
       stateBadge(state),
       waitbar,
@@ -2992,7 +3044,7 @@ async function sessionView(id) {
         h("button", { class: "btn", type: "button", onclick: () => setAll(false) }, "Expand all"),
         state.tmux || followOn() ? followButton() : null,
         kbdButton(),
-        h("a", { class: "back", href: "/" }, "All sessions"),
+        CFG.embed ? null : h("a", { class: "back", href: "/" }, "All sessions"),
       ),
     );
     if (state.status?.at !== lastStatusAt || state.reply?.at !== lastReplyAt || stateOf(state) !== lastState || !statusSlot.firstChild) {
@@ -3077,6 +3129,7 @@ async function sessionView(id) {
   pageHooks.info = () => openInfo(id, document.querySelector("header.top h1")?.textContent || id);
   // i: the message box, focused (the Status card opened if folded).
   pageHooks.compose = () => {
+    if (CFG.readonly) return;
     const card = statusSlot.querySelector(":scope > .card");
     if (!card || !talk.input) return;
     if (card.classList.contains("collapsed")) card.setCollapsed(false);
@@ -3104,7 +3157,12 @@ async function sessionView(id) {
   banner();
   pageHooks.refresh = refresh;
   focusTmux(id, liveTmux);
-  const es = new EventSource("/api/events");
+  if (CFG.poll) {
+    // canvas-live poll:<ms>: the state route on a timer, no event stream.
+    setInterval(pollOnce(() => refresh().then(markSeen)), CFG.poll);
+    return;
+  }
+  const es = new EventSource(apiUrl("/api/events"));
   es.addEventListener("system-theme", onSystemTheme);
   es.addEventListener("follow", onFollow);
   // The Meeting card: its transcript lines follow every meeting event (~300 ms, only what's new); the rest of the
@@ -3142,7 +3200,7 @@ let themesReady = null;
 let themePreview = null; // what the picker is hovering, until Enter or Esc
 
 function loadThemes() {
-  return (themesReady ??= fetch("/assets/themes.json")
+  return (themesReady ??= fetch(assetUrl("themes.json"))
     .then((r) => r.json())
     .then((j) => j.themes || {})
     .catch(() => ({})));
@@ -3169,7 +3227,9 @@ function themePrefs() {
 let systemReady = null;
 /** The applied Omarchy theme from the daemon, { name, colors }, or null. */
 function loadSystemTheme() {
-  return (systemReady ??= fetch("/api/system-theme")
+  // Omarchy's theme is the daemon's to read: an embedding host has none.
+  if (CFG.embed) return (systemReady ??= Promise.resolve(null));
+  return (systemReady ??= fetch(apiUrl("/api/system-theme"))
     .then((r) => r.json())
     .then((j) => j.theme || null)
     .catch(() => null));
@@ -3249,11 +3309,12 @@ function onSystemTheme() {
 const PEERS_EVERY = 4000;
 let peersBusy = false;
 async function refreshPeerDots() {
+  if (CFG.embed) return; // the daemon's peers route
   const rows = [...document.querySelectorAll("details.agent[data-agent]")];
   if (!rows.length || peersBusy || document.visibilityState !== "visible") return;
   peersBusy = true;
   try {
-    const { peers } = await (await fetch("/api/peers")).json();
+    const { peers } = await (await fetch(apiUrl("/api/peers"))).json();
     const live = new Map(peers.map((p) => [p.name, p.status]));
     for (const row of rows) {
       const status = live.get(row.dataset.agent);
@@ -3345,8 +3406,9 @@ function markSeen() {
 }
 
 async function fetchSessions() {
+  if (CFG.embed) return sessionsCache; // no session list: the host shows one session
   try {
-    sessionsCache = await (await fetch("/api/sessions")).json();
+    sessionsCache = await (await fetch(apiUrl("/api/sessions"))).json();
   } catch {
     return sessionsCache;
   }
@@ -3455,15 +3517,15 @@ function mainItems() {
       label: "Copy link to this page",
       run: () => navigator.clipboard.writeText(location.href).then(() => toast("Link copied"), () => toast("Couldn't copy the link")),
     },
-    currentSession && { label: "All sessions", sub: "the sessions index", run: (e) => go("/", e?.metaKey || e?.ctrlKey) },
-    {
+    currentSession && !CFG.embed && { label: "All sessions", sub: "the sessions index", run: (e) => go("/", e?.metaKey || e?.ctrlKey) },
+    !CFG.readonly && {
       label: "Change theme…",
       sub: themePrefs().system ? "following the system theme (Omarchy)" : `dark: ${pair.dark === "canvas" ? "Canvas" : prettyName(pair.dark)} · light: ${pair.light === "canvas" ? "Canvas" : prettyName(pair.light)}`,
       stay: true,
       run: () => setPickerMode("theme"),
     },
     { label: "Keyboard shortcuts", sub: "or press ? on the page", run: () => toggleHelp() },
-    (followOn() || sessionsCache.some((s) => s.live && s.tmux)) && {
+    followable() && (followOn() || sessionsCache.some((s) => s.live && s.tmux)) && {
       label: followOn() ? "Stop following tmux" : "Follow tmux",
       sub: "this tab: a pi pane you switch to opens here, and a session opened here switches tmux",
       run: () => setFollow(!followOn()),
@@ -3926,7 +3988,11 @@ const kbdButton = () => h("button", { class: "btn", type: "button", title: "Sess
 const FOLLOW_KEY = "canvas:follow-tmux";
 const FOLLOWED_KEY = "canvas:followed"; // the page tmux sent us to, so it doesn't send tmux back
 
+/** Following tmux writes (POST /focus) and needs the daemon's events: neither read-only nor embedded. */
+const followable = () => !CFG.readonly && !CFG.embed;
+
 function followOn() {
+  if (!followable()) return false;
   try {
     return sessionStorage.getItem(FOLLOW_KEY) === "1";
   } catch {
@@ -3947,6 +4013,7 @@ const followTitle = () =>
   followOn() ? "This tab follows tmux: switching to a pi pane opens its page, and opening a session here switches tmux. Click to stop." : "Follow tmux in this tab: switching to a pi pane opens its page, and opening a session here switches tmux";
 
 function followButton() {
+  if (!followable()) return null;
   const on = followOn();
   return h("button", { class: `btn follow${on ? " on" : ""}`, type: "button", "aria-pressed": String(on), title: followTitle(), onclick: () => setFollow(!followOn()) }, on ? "Following tmux" : "Follow tmux");
 }
@@ -3977,7 +4044,7 @@ function focusTmux(id, live) {
   } catch {}
   const nav = performance.getEntriesByType?.("navigation")?.[0]?.type;
   if (!followOn() || !live || followed === id || nav === "reload") return;
-  fetch(`/s/${encodeURIComponent(id)}/focus`, { method: "POST", headers: { "X-Canvas": "1" } })
+  fetch(apiUrl(`/s/${encodeURIComponent(id)}/focus`), { method: "POST", headers: { "X-Canvas": "1" } })
     .then(async (r) => {
       if (!r.ok) toast(`Couldn't switch tmux: ${(await r.text()).slice(0, 80)}`);
     })
@@ -4066,7 +4133,7 @@ async function indexView() {
       return;
     }
     const active = sessions.filter((s) => s.live);
-    tools.replaceChildren(viewToggle, ...(active.some((s) => s.tmux) || followOn() ? [followButton()] : []), kbdButton());
+    tools.replaceChildren(viewToggle, ...((active.some((s) => s.tmux) || followOn()) && followable() ? [followButton()] : []), kbdButton());
     const waiting = active.filter((s) => NEEDS_YOU.has(stateOf(s))).length;
     header.querySelector(".cwd").textContent = [plural(sessions.length, "session"), waiting ? `${waiting} waiting on you` : ""].filter(Boolean).join(" · ");
     if (!sessions.length) return groups.replaceChildren(h("section", { class: "card" }, h("div", { class: "bd empty" }, "No sessions yet. A session gets a page on its first status or section.")));
@@ -4088,12 +4155,14 @@ async function indexView() {
 
   await refresh();
   pageHooks.refresh = refresh;
-  const es = new EventSource("/api/events");
+  if (CFG.poll) return void setInterval(pollOnce(refresh), CFG.poll);
+  const es = new EventSource(apiUrl("/api/events"));
   es.addEventListener("system-theme", onSystemTheme);
   es.addEventListener("follow", onFollow);
   es.addEventListener("changed", refresh);
 }
 
-const m = location.pathname.match(/^\/s\/([^/]+)\/?$/);
-if (m) sessionView(decodeURIComponent(m[1]));
+// The session: canvas-session, else /s/<id>. An embedding host has no index (it is the daemon's session list).
+if (CFG.session) sessionView(CFG.session);
+else if (CFG.embed) $app.replaceChildren(h("section", { class: "card" }, h("div", { class: "bd empty" }, "No session to show.")));
 else indexView();
