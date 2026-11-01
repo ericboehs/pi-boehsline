@@ -1,7 +1,7 @@
 // Rendering shared by the canvas page (served as /assets/render.mjs, with its
 // styles in render.css) and botsun's chat bubbles (render/bubble.html): markdown,
 // tables, charts, stats, steps, timeline, JSON, code, tree, options, kanban,
-// tracker, terminal, pipeline, diff and mermaid.
+// tracker, terminal, pipeline, background jobs, diff and mermaid.
 // Plain DOM nodes with CSS-variable colours, so a host stylesheet themes them;
 // nothing here reads the page's state, storage or session globals. Where a
 // renderer needs page behaviour (clipboard buttons, highlight.js loading, the
@@ -31,7 +31,7 @@
 //   .md table           GFM/pipe tables
 //   .chart, .tbl        renderChart / renderTable (see below)
 //   .stats, .steps, .tlw, .jsonv, .code, .tree, .opts, .kanban, .tracker,
-//   .term, .pipe, .diffview, .mmd   the rest; their rules are in render.css
+//   .term, .pipe, .jobs, .diffview, .mmd   the rest; their rules are in render.css
 
 import { buildTree, cardKey, cardPrompt, codeFromText, codeLayout, inlineTokens, lineLabel, optionLetter, optionPrompt, pipeRows, trackerTone, wrapLabel } from "./nav.mjs";
 
@@ -1106,6 +1106,92 @@ export function renderPipeline(spec) {
   );
   el.flashStage = flash;
   return el;
+}
+
+// ── background jobs ────────────────────────────────────────────────────────────
+// The auto-jobs card (kind "jobs"): bg.ts's background jobs, one compact row
+// each. The spec is what index.ts's jobsSpec() writes:
+//   { jobs: [{ id, name, command,         // command: whitespace folded, ≤300 chars
+//              log,                       // the log file's path (the page copies it)
+//              started, ended,            // ISO strings; ended null while running
+//              exit, signal,              // exit code / signal name, or null
+//              stopped,                   // true when the user killed it
+//              tail,                      // the log's last lines, or null
+//              hidden }] }                // true: the command may print secrets, no tail
+// Running jobs come first (oldest first), then ended ones (newest first).
+// opts.onOpen(index, jobs): the page's full-screen log; with it each row is a
+// button. Without it (a bubble: no modal, no daemon routes) each row shows its
+// log tail inline in a <details>. Running times tick while the card is attached.
+
+/** "42s", "3m05s", "1h02m". */
+export function elapsedText(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}m${String(s % 60).padStart(2, "0")}s` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+}
+/** A local date and time, or "" for a bad date. */
+export const fullDate = (iso) => {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+};
+
+/** live | stopped | ok | bad. */
+export function jobState(j) {
+  const live = !j.ended;
+  const ok = !live && j.exit === 0 && !j.signal;
+  return live ? "live" : j.stopped ? "stopped" : ok ? "ok" : "bad";
+}
+/** Elapsed time while running (data-since: it ticks), else ✓ / ✗ with the exit and how long it took. */
+export function jobTime(j) {
+  const state = jobState(j);
+  if (state === "live") return h("span", { class: "job-el", "data-since": j.started, title: `Started ${fullDate(j.started)}` }, elapsedText(Date.now() - Date.parse(j.started)));
+  const took = elapsedText(Date.parse(j.ended) - Date.parse(j.started));
+  return h("span", { class: `job-el ${state}`, title: `Ended ${fullDate(j.ended)}` }, state === "stopped" ? `stopped · ${took}` : state === "ok" ? `✓ ${took}` : `✗ ${j.signal || `exit ${j.exit}`} · ${took}`);
+}
+export const jobDot = (j) => h("span", { class: `pulse ${{ live: "working", ok: "ok", bad: "error" }[jobState(j)] || "idle"}` });
+/** The log tail as text, or why there is none. */
+export const jobLog = (j) =>
+  j.hidden ? h("p", { class: "job-m-none" }, "Output not shown: the command may print secrets.") : j.tail ? h("pre", { class: "job-m-log" }, j.tail) : h("p", { class: "job-m-none" }, j.ended ? "No output." : "No output yet.");
+
+/** Keep every [data-since] under root ticking while it is attached; stops once it is gone. */
+function tickSince(root) {
+  if (!root.querySelector("[data-since]")) return;
+  let was = false;
+  let idle = 0;
+  const iv = setInterval(() => {
+    if (root.isConnected) {
+      was = true;
+      idle = 0;
+      if (root.checkVisibility?.() === false) return; // a display:none bubble: nothing to show
+      for (const t of root.querySelectorAll("[data-since]")) t.textContent = elapsedText(Date.now() - Date.parse(t.dataset.since));
+    } else if (was || ++idle > 10) clearInterval(iv);
+  }, 1000);
+}
+
+export function renderJobs(spec, opts = {}) {
+  const jobs = spec.jobs || [];
+  if (!jobs.length) return h("p", { class: "k-muted jobs-none" }, "No background jobs.");
+  const open = typeof opts.onOpen === "function" ? opts.onOpen : null;
+  const list = h(
+    "div",
+    { class: "jobs" },
+    jobs.map((j, i) => {
+      const parts = [jobDot(j), h("b", {}, j.name), jobTime(j), h("code", { class: "job-cmd" }, j.command)];
+      if (!open) return h("div", { class: `job ${jobState(j)}`, "data-job": j.id }, ...parts, h("details", { class: "job-tail" }, h("summary", {}, "Log"), jobLog(j)));
+      const row = h("div", { class: `job ${jobState(j)}`, "data-job": j.id, tabindex: "0", role: "button", title: "Open the log" }, ...parts);
+      row.addEventListener("click", () => open(i, jobs));
+      row.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault();
+        e.stopPropagation();
+        open(i, jobs);
+      });
+      return row;
+    }),
+  );
+  tickSince(list);
+  return list;
 }
 
 // ── terminal ───────────────────────────────────────────────────────────────────

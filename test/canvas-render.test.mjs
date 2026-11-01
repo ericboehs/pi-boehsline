@@ -65,6 +65,13 @@ test("render.mjs exports the shared renderers, with no DOM at import time", () =
     "pipelineChips",
     "pipelineRunning",
     "stageStatus",
+    "renderJobs",
+    "jobState",
+    "jobTime",
+    "jobDot",
+    "jobLog",
+    "elapsedText",
+    "fullDate",
     "renderDiff",
     "renderMermaid",
     "parsePatch",
@@ -946,5 +953,104 @@ test("the page draws pipelines with render.mjs's renderer, styled by render.css"
   for (const rule of [".pipe-svg .ring", ".pipe-chip.now", ".pipe-edges path.on", ".pipe-svg .loop"]) {
     assert.ok(css.includes(`${rule} {`), `render.css styles ${rule}`);
     assert.ok(!page.includes(`${rule} {`), `page.mjs leaves ${rule} to render.css`);
+  }
+});
+
+// ── background jobs ──
+
+const ago = (s) => new Date(Date.now() - s * 1000).toISOString();
+// The shape index.ts's jobsSpec() writes.
+const JOBS_SPEC = {
+  jobs: [
+    { id: "b1", name: "<b>build</b>", command: "npm run <i>build</i>", log: "/tmp/b1.log", started: ago(75), ended: null, exit: null, signal: null, stopped: false, tail: "compiling <script>x</script>\n", hidden: false },
+    { id: "b2", name: "tests", command: "npm test", log: "/tmp/b2.log", started: ago(130), ended: ago(5), exit: 0, signal: null, stopped: false, tail: "ok 12\n", hidden: false },
+    { id: "b3", name: "deploy", command: "./deploy.sh", log: "/tmp/b3.log", started: ago(50), ended: ago(20), exit: 2, signal: null, stopped: false, tail: null, hidden: true },
+    { id: "b4", name: "lint", command: "npm run lint", log: "/tmp/b4.log", started: ago(30), ended: ago(25), exit: null, signal: "SIGTERM", stopped: false, tail: null, hidden: false },
+  ],
+};
+
+test("renderJobs draws running, done and failed jobs with no page callbacks, spec text as text", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] }); // a row's ticker must not keep the run alive
+  const el = render.renderJobs(JOBS_SPEC);
+  assert.equal(el.className, "jobs");
+  const rows = [...el.querySelectorAll(".job")];
+  assert.deepEqual(rows.map((r) => r.className), ["job live", "job ok", "job bad", "job bad"]);
+  assert.deepEqual(rows.map((r) => r.dataset.job), ["b1", "b2", "b3", "b4"]);
+  assert.deepEqual(rows.map((r) => r.querySelector(".pulse").className), ["pulse working", "pulse ok", "pulse error", "pulse error"]);
+  // Elapsed: ticking while running, else the outcome and how long it took.
+  const times = rows.map((r) => r.querySelector(".job-el"));
+  assert.equal(times[0].dataset.since, JOBS_SPEC.jobs[0].started);
+  assert.match(text(times[0]), /^1m1[45]s$/);
+  assert.equal(text(times[1]), "✓ 2m05s");
+  assert.equal(text(times[2]), "✗ exit 2 · 30s");
+  assert.equal(text(times[3]), "✗ SIGTERM · 5s");
+  // No page: rows are not buttons, and the log tail folds open inline.
+  assert.equal(el.querySelector("[role=button], [tabindex]"), null);
+  const tails = rows.map((r) => r.querySelector("details.job-tail"));
+  assert.ok(tails.every(Boolean), "a log fold per row");
+  assert.equal(text(tails[0].querySelector("pre.job-m-log")), "compiling <script>x</script>\n");
+  assert.equal(text(tails[1].querySelector("pre.job-m-log")), "ok 12\n");
+  assert.equal(text(tails[2].querySelector(".job-m-none")), "Output not shown: the command may print secrets.");
+  assert.equal(text(tails[3].querySelector(".job-m-none")), "No output.");
+  // DOM-safe: spec strings never become markup.
+  assert.equal(el.querySelector("script, i, b b"), null);
+  assert.equal(text(rows[0].querySelector("b")), "<b>build</b>");
+  assert.equal(text(rows[0].querySelector(".job-cmd")), "npm run <i>build</i>");
+  // A click with no page does nothing (no throw, no modal).
+  rows[0].dispatchEvent(new window.Event("click"));
+  assert.equal(render.renderJobs({}).className, "k-muted jobs-none");
+});
+
+// A running row ticks its elapsed time while attached and stops for good once removed: a bubble
+// re-rendered often must not leave intervals behind. A hidden list skips its update.
+test("renderJobs' ticker runs while attached, skips while hidden, and stops once removed", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.parse("2026-10-31T12:00:00Z") });
+  const spec = { jobs: [{ ...JOBS_SPEC.jobs[0], started: "2026-10-31T11:59:00Z", ended: null }] };
+  const el = render.renderJobs(spec);
+  const since = el.querySelector("[data-since]");
+  assert.ok(since, "a running row has a ticking time");
+  document.body.append(el);
+  t.mock.timers.tick(1000);
+  const first = since.textContent;
+  t.mock.timers.tick(60_000);
+  assert.notEqual(since.textContent, first, "ticks while attached");
+  el.checkVisibility = () => false; // as a display:none bubble reports
+  const hidden = since.textContent;
+  t.mock.timers.tick(60_000);
+  assert.equal(since.textContent, hidden, "a hidden list skips its update");
+  delete el.checkVisibility;
+  el.remove();
+  t.mock.timers.tick(1000); // the tick that notices and clears the interval
+  const gone = since.textContent;
+  t.mock.timers.tick(120_000);
+  assert.equal(since.textContent, gone, "stopped once removed");
+  document.body.append(el); // re-attached later: the interval is gone for good
+  t.mock.timers.tick(60_000);
+  assert.equal(since.textContent, gone, "no interval left behind");
+  el.remove();
+});
+
+test("renderJobs hands a row's click or Enter to the page's onOpen", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const seen = [];
+  const el = render.renderJobs(JOBS_SPEC, { onOpen: (i, jobs) => seen.push([i, jobs.length]) });
+  const rows = [...el.querySelectorAll(".job")];
+  assert.ok(rows.every((r) => r.getAttribute("role") === "button" && r.tabIndex === 0));
+  assert.equal(el.querySelector("details"), null, "the page shows logs in its modal");
+  rows[2].dispatchEvent(new window.Event("click"));
+  rows[1].dispatchEvent(new window.KeyboardEvent("keydown", { key: "Enter" }));
+  assert.deepEqual(seen, [[2, 4], [1, 4]]);
+});
+
+test("the page draws jobs with render.mjs's renderer, styled by render.css", () => {
+  const read = (f) => readFileSync(new URL(`../extensions/canvas/${f}`, import.meta.url), "utf8");
+  const page = read("page.mjs");
+  const css = read("render.css");
+  assert.match(page, /import \{[^}]*\brenderJobs\b[^}]*\} from "\/assets\/render\.mjs"/);
+  assert.match(page, /case "jobs":\n\s*return renderJobs\(followJobs\([^\n]*\{ onOpen: jobDetail \}\);/);
+  assert.doesNotMatch(page, /function (renderJobs|jobState|jobTime|elapsedText)\b|const (jobDot|jobLog|fullDate) =/, "no copy of its own");
+  for (const rule of [".jobs", ".job", ".job-el", ".job-cmd", ".job .pulse.ok", ".job-m-log", ".job-m-none"]) {
+    assert.ok(css.includes(`\n${rule} {`), `render.css styles ${rule}`);
+    assert.ok(!page.includes(`\n${rule} {`), `page.mjs leaves ${rule} to render.css`);
   }
 });

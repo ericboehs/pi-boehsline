@@ -7,7 +7,7 @@ import { asQuote, boardMarks, cardKey, cardPrompt, dismissPipe, optionsText, own
 // The renderers themselves live in render.mjs (with render.css): the page passes
 // what only it has (its copy buttons, highlight.js loading, the kanban modal,
 // owner links, remembered folds, talk-back) through each one's opts.
-import { clock, counts, dayLabel, diffBlock, diffFileList, h, highlightInto, HL_CLEAN, inline, langFor, noteParas, parsePatch, pipelineChips, pipelineNow, pipelineRunning, renderChart, renderCode, renderJson, renderKanban, renderMarkdown as renderMd, renderMermaid, renderOptions, renderPipeline, renderStats, renderSteps, renderTable, renderTerminal, renderTimeline, renderTracker, renderTree, svg, tilde, tip, toneVar } from "/assets/render.mjs";
+import { clock, counts, dayLabel, diffBlock, diffFileList, elapsedText, fullDate, h, highlightInto, HL_CLEAN, inline, jobDot, jobLog, jobTime, langFor, noteParas, parsePatch, pipelineChips, pipelineNow, pipelineRunning, renderChart, renderCode, renderJobs, renderJson, renderKanban, renderMarkdown as renderMd, renderMermaid, renderOptions, renderPipeline, renderStats, renderSteps, renderTable, renderTerminal, renderTimeline, renderTracker, renderTree, svg, tilde, tip, toneVar } from "/assets/render.mjs";
 
 const CSS = `
 :root { color-scheme: light dark; --bg:#f7f5f0; --card:#fff; --ink:#1c1b19; --dim:#8a8578; --line:#e6e1d6; --soft:#f0ece3; --accent:#b4541f; --ok:#1f7a52; --warn:#a86a00; --bad:#c0392b; --code:#f3f0e8; --tint:#fbf3ec; --hl-kw:#285880; --hl-str:#42632a; --hl-num:#805424; --hl-com:#5b6a7f; --hl-title:#68448b; --c1:#3b7dd8; --c2:#e0703a; --c3:#2f9e72; --c4:#c4475b; --c5:#8a63c9; --c6:#b8901c; --c7:#2e9bb0; --c8:#8c8577; }
@@ -138,26 +138,16 @@ iframe.pdf { width: 100%; height: 80vh; border: 1px solid var(--line); border-ra
 video.vid { display: block; max-width: 100%; max-height: 80vh; margin: 0 auto; border-radius: 6px; background: #000; }
 a.kb-owner:hover { color: var(--accent); text-decoration: underline; }
 a.kb-owner.ended { opacity: 0.8; }
-/* Background jobs (auto-jobs) */
-.jobs { display: flex; flex-direction: column; margin: -4px -6px; }
-.job { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; column-gap: 7px; row-gap: 2px; align-items: center; padding: 6px; border-radius: 6px; font-size: 13px; cursor: pointer; }
-.job + .job { border-top: 1px solid var(--line); border-radius: 0 0 6px 6px; }
-.job:hover, .job:focus-visible { background: var(--soft); outline: none; }
-.job > b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.job .pulse.ok, .job-m-time .pulse.ok { background: transparent; border: 1.5px solid var(--ok); }
-.job-el { font: 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
-.job-el.ok { color: var(--ok); }
-.job-el.bad { color: var(--bad); }
-.job-cmd { grid-column: 2 / 4; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--dim); background: none; padding: 0; }
+/* Background jobs (auto-jobs): the rows' styles are in render.css; the full-screen log is page-only */
 dialog.modal.job-log { height: min(92vh, 960px); }
 dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: hidden; }
 .job-m-time { display: inline-flex; align-items: center; gap: 7px; margin-right: 4px; }
+.job-m-time .pulse.ok { background: transparent; border: 1.5px solid var(--ok); }
 .job-m { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .job-m-cmd { display: block; padding: 10px 16px 4px; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; background: none; }
 .job-m-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 0 16px 10px; font-size: 12px; color: var(--dim); border-bottom: 1px solid var(--line); }
 .job-m-logbox { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.job-m-log { flex: 1; min-height: 0; margin: 0; overflow: auto; padding: 12px 16px; background: var(--soft); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; }
-.job-m-none { margin: 0; padding: 18px 16px; color: var(--dim); font-size: 13px; }
+.job-m-logbox .job-m-log { flex: 1; min-height: 0; }
 /* Meeting (auto-meeting): meeting-capture's live meeting, on every session's page */
 .meet { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .m-status { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
@@ -587,12 +577,6 @@ function ago(t) {
   return `${Math.round(s / 86400)}d ago`;
 }
 
-const fullDate = (iso) => {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
-};
-
-/** A relative time that the ticker below keeps current. */
 const agoEl = (iso) => h("time", { "data-at": iso, datetime: iso, title: fullDate(iso) }, ago(iso));
 // <time class="rel"> in generated markdown (Agents): relative within 18 h,
 // else the absolute text it came with.
@@ -878,7 +862,7 @@ async function sectionBody(id, sec) {
     case "kanban":
       return sectionKanban(JSON.parse(await (await fetch(url)).text()), sec);
     case "jobs":
-      return renderJobs(JSON.parse(await (await fetch(url)).text()));
+      return renderJobs(followJobs(JSON.parse(await (await fetch(url)).text())), { onOpen: jobDetail });
     case "json":
       return renderJson(await (await fetch(url)).text(), { copyButton, copyText });
     case "timeline":
@@ -2060,34 +2044,13 @@ function cardDetail(items, i, { todo, board, moves }) {
   });
 }
 
-// ── Background jobs (auto-jobs): bg.ts's jobs, one compact row each; a click opens the job's log full screen ──
+// ── Background jobs (auto-jobs): render.mjs's renderJobs draws the rows; the page adds a click that opens the job's log full screen ──
 let jobsLatest = []; // the newest spec's jobs: the modal follows them as the card is rewritten
 let jobView = null; // { id, refresh(job) } while the modal shows a job
-function elapsedText(ms) {
-  const s = Math.max(0, Math.round(ms / 1000));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  return m < 60 ? `${m}m${String(s % 60).padStart(2, "0")}s` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
-}
+// The rows tick themselves (render.mjs); the modal's running time ticks here.
 setInterval(() => {
-  for (const t of document.querySelectorAll("[data-since]")) t.textContent = elapsedText(Date.now() - Date.parse(t.dataset.since));
+  for (const t of document.querySelectorAll(".job-m-time [data-since]")) t.textContent = elapsedText(Date.now() - Date.parse(t.dataset.since));
 }, 1000);
-
-function jobState(j) {
-  const live = !j.ended;
-  const ok = !live && j.exit === 0 && !j.signal;
-  return live ? "live" : j.stopped ? "stopped" : ok ? "ok" : "bad";
-}
-/** Elapsed time while running (ticking), else ✓ / ✗ with the exit and how long it took. */
-function jobTime(j) {
-  const state = jobState(j);
-  if (state === "live") return h("span", { class: "job-el", "data-since": j.started, title: `Started ${fullDate(j.started)}` }, elapsedText(Date.now() - Date.parse(j.started)));
-  const took = elapsedText(Date.parse(j.ended) - Date.parse(j.started));
-  return h("span", { class: `job-el ${state}`, title: `Ended ${fullDate(j.ended)}` }, state === "stopped" ? `stopped · ${took}` : state === "ok" ? `✓ ${took}` : `✗ ${j.signal || `exit ${j.exit}`} · ${took}`);
-}
-const jobDot = (j) => h("span", { class: `pulse ${{ live: "working", ok: "ok", bad: "error" }[jobState(j)] || "idle"}` });
-const jobLog = (j) =>
-  j.hidden ? h("p", { class: "job-m-none" }, "Output not shown: the command may print secrets.") : j.tail ? h("pre", { class: "job-m-log" }, j.tail) : h("p", { class: "job-m-none" }, j.ended ? "No output." : "No output yet.");
 
 /** The job's log tail full screen, kept current while the card is rewritten; ← / → step through the jobs. */
 function jobDetail(i) {
@@ -2128,29 +2091,15 @@ function jobDetail(i) {
   });
 }
 
-function renderJobs(spec) {
+/** The newest jobs spec: remembered for the modal, which follows it while open. */
+function followJobs(spec) {
   const jobs = spec.jobs || [];
   jobsLatest = jobs;
   if (jobView?.log.isConnected) {
     const j = jobs.find((x) => x.id === jobView.id);
     if (j) jobView.refresh(j);
   }
-  if (!jobs.length) return h("p", { class: "k-muted" }, "No background jobs.");
-  return h(
-    "div",
-    { class: "jobs" },
-    jobs.map((j, i) => {
-      const row = h("div", { class: `job ${jobState(j)}`, "data-job": j.id, tabindex: "0", role: "button", title: "Open the log" }, jobDot(j), h("b", {}, j.name), jobTime(j), h("code", { class: "job-cmd" }, j.command));
-      row.addEventListener("click", () => jobDetail(i));
-      row.addEventListener("keydown", (e) => {
-        if (e.key !== "Enter" && e.key !== " ") return;
-        e.preventDefault();
-        e.stopPropagation();
-        jobDetail(i);
-      });
-      return row;
-    }),
-  );
+  return spec;
 }
 
 // ── Meeting (auto-meeting): meeting-capture's live meeting, from the daemon's meeting feed ──
