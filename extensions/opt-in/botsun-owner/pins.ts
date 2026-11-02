@@ -19,6 +19,8 @@
  * downgrade it to v1 (whose ask answers don't cover the question text). It's a file of its own so
  * a pi session still running the pins.ts from before the ratchet (which rewrites pins.json with
  * only the sections it knows) can't clear it. Deleting sign-versions.json resets the ratchets.
+ * v3 ("botsun-sign-v3", host-scoped) ratchets the same way, to sign_version 3: from then on v2 and
+ * v1 from that device are refused (a ratchet only goes up).
  *
  * What this can't do: anything running as Eric's user can rewrite pins.json (or this file).
  */
@@ -49,11 +51,12 @@ export const keyFingerprint = (raw: Buffer): string => createHash("sha256").upda
 export const shortFingerprint = (fp: string): string => fp.slice(0, 16).match(/.{4}/g)!.join(" ");
 
 interface PinEntry { sha256: string; at: string }
-interface RatchetEntry { sign_version: 2; at: string }
+export type SignVersion = 1 | 2 | 3;
+interface RatchetEntry { sign_version: 2 | 3; at: string }
 interface PinFile { version: 1; devices: Record<string, PinEntry>; call_devices: Record<string, PinEntry> }
 interface SignVersionsFile {
 	version: 1;
-	/** device id → the signing version it has moved to (only 2 so far): v1 from it is refused. */
+	/** device id → the signing version it has moved to (2 or 3): anything older from it is refused. */
 	sign_versions: Record<string, RatchetEntry>;
 }
 
@@ -106,14 +109,15 @@ function pick(o: unknown): Record<string, PinEntry> {
 	return out;
 }
 
-/** The ratchet section: every entry must be {sign_version: 2}, or the whole file is refused. */
+/** The ratchet section: every entry must be {sign_version: 2 | 3}, or the whole file is refused. */
 function pickRatchets(o: unknown): Record<string, RatchetEntry> {
 	const out: Record<string, RatchetEntry> = {};
 	if (o === undefined) return out;
 	if (!o || typeof o !== "object" || Array.isArray(o)) throw malformed(SIGN_VERSIONS);
 	for (const [id, e] of Object.entries(o as Record<string, unknown>)) {
-		if (!e || typeof e !== "object" || (e as RatchetEntry).sign_version !== 2) throw malformed(SIGN_VERSIONS);
-		out[id] = { sign_version: 2, at: String((e as RatchetEntry).at ?? "") };
+		const v = (e as RatchetEntry | null)?.sign_version;
+		if (!e || typeof e !== "object" || (v !== 2 && v !== 3)) throw malformed(SIGN_VERSIONS);
+		out[id] = { sign_version: v, at: String((e as RatchetEntry).at ?? "") };
 	}
 	return out;
 }
@@ -318,21 +322,24 @@ export function checkPin(kind: KeyKind, deviceId: string, raw: Buffer): PinCheck
 	}
 }
 
-/** The signing version a device has ratcheted to (2), or 1 when none. Throws on an unreadable sign-versions file. */
-export function signVersionOf(deviceId: string): 1 | 2 {
-	return Object.hasOwn(readSignVersions().sign_versions, deviceId) ? 2 : 1;
+const versionIn = (file: SignVersionsFile, deviceId: string): SignVersion =>
+	Object.hasOwn(file.sign_versions, deviceId) ? file.sign_versions[deviceId]!.sign_version : 1;
+
+/** The signing version a device has ratcheted to (2 or 3), or 1 when none. Throws on an unreadable sign-versions file. */
+export function signVersionOf(deviceId: string): SignVersion {
+	return versionIn(readSignVersions(), deviceId);
 }
 
 /**
- * Records that a device signs v2 (re-read under the lock; written only when it isn't recorded
- * yet). Throws when the file can't be read or written.
+ * Records that a device signs at version (2 or 3; re-read under the lock; written only when the
+ * device is recorded below it: a ratchet never goes down). Throws when the file can't be read or written.
  */
-export function ratchet(deviceId: string): void {
-	if (signVersionOf(deviceId) === 2) return;
+export function ratchet(deviceId: string, version: 2 | 3 = 2): void {
+	if (signVersionOf(deviceId) >= version) return;
 	withLock(() => {
 		const file = readSignVersions();
-		if (Object.hasOwn(file.sign_versions, deviceId)) return;
-		file.sign_versions[deviceId] = { sign_version: 2, at: new Date().toISOString() };
+		if (versionIn(file, deviceId) >= version) return;
+		file.sign_versions[deviceId] = { sign_version: version, at: new Date().toISOString() };
 		writeAtomic(signVersionsPath(), file);
 	});
 }

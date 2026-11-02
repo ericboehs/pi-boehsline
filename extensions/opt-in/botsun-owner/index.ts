@@ -9,12 +9,14 @@
 // checks the signature itself against the paired devices' public keys
 // (owner-keys.json, written by Botsun) before the text goes in as Eric's own
 // message. A stolen Botsun token or a peer agent can't speak as Eric here.
-// Signing v1 ("botsun-decide-v1") and v2 ("botsun-sign-v2", sig_v: 2;
-// lib/signing-v2.ts) are both taken, and each device's key is pinned on first
-// use (pins.ts): a changed key, or a new device once one is pinned, needs a
-// yes at the keyboard. A device's first verified v2 request ratchets it: v1
-// from it is refused after that (recorded in sign-versions.json, next to pins.json). A sensitive
-// prompt takes only a v2 answer.
+// Signing v1 ("botsun-decide-v1"), v2 ("botsun-sign-v2", sig_v: 2) and v3
+// ("botsun-sign-v3", sig_v: 3: v2 plus this host's authority, the top-level
+// "host" in owner-keys.json; lib/signing-v2.ts) are all taken, and each
+// device's key is pinned on first use (pins.ts): a changed key, or a new device
+// once one is pinned, needs a yes at the keyboard. A device's first verified v2
+// (or v3) request ratchets it: anything older from it is refused after that
+// (recorded in sign-versions.json, next to pins.json). A sensitive prompt takes
+// only a v2-or-newer answer.
 //
 // Best effort throughout: a missing socket or a refused connection is normal
 // (Botsun not running), so it retries quietly with backoff and never logs
@@ -30,7 +32,7 @@ import { basename, delimiter, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { optIn } from "../../../lib/opt-in.ts";
 import { canonicalAnswer, canonicalAnswerV2, invalidAnswer, onPromptsChange, openPrompts, type RemotePrompt } from "../../../lib/remote-prompts.ts";
-import { messageV2, validScope } from "../../../lib/signing-v2.ts";
+import { messageV2, messageV3, validHost, validScope } from "../../../lib/signing-v2.ts";
 import { checkPin, isPinsError, pin, ratchet, shortFingerprint, signVersionOf, type KeyKind } from "./pins.ts";
 import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
@@ -115,7 +117,7 @@ interface Conn {
 	/** The phone's Close: aborts a running turn ("stopped" / "idle"); the shutdown it returns runs once the reply is sent. */
 	close?: () => { stopped: boolean; shutdown: () => void };
 	/** A call's verified words, held until the voice helper releases them (session-voice plan). */
-	held?: Map<string, { text: string; at: number; proposal?: string; sigV?: 1 | 2; deviceId?: string }>;
+	held?: Map<string, { text: string; at: number; proposal?: string; sigV?: 1 | 2 | 3; deviceId?: string }>;
 	/** A reply whose video frames are still being extracted: later replies wait for it, to keep their order. */
 	framing?: Promise<void>;
 	/** The keyboard's yes/no (ctx.ui.confirm), for pinning a device whose key changed or that's new. */
@@ -326,20 +328,22 @@ function imagesOf(raw: unknown): Image[] | string {
 }
 
 /**
- * Paired devices' raw public keys from Botsun's file; refuses a file others could have written.
- * kind "call": the phone's call key, which signs a call's audio (T5).
+ * A paired device's raw public key from Botsun's file (null: none), and the file's top-level
+ * "host" (this host's authority, which v3 signs; null when missing or not a valid one). Refuses
+ * a file others could have written. kind "call": the phone's call key, which signs a call's audio (T5).
  */
-function deviceKey(deviceId: string, kind: "decide" | "call" = "decide"): Buffer | null {
+function deviceKey(deviceId: string, kind: "decide" | "call" = "decide"): { key: Buffer | null; host: string | null } {
 	const path = keysPath();
 	const st = lstatSync(path);
 	if (!st.isFile() || (st.mode & 0o022) !== 0 || (typeof process.getuid === "function" && st.uid !== process.getuid())) {
 		throw new Error("owner-keys.json must be a regular file only Eric can write");
 	}
 	const file = JSON.parse(readFileSync(path, "utf8"));
+	const host = validHost(file?.host) ? file.host : null;
 	const raw = (kind === "call" ? file?.call_devices : file?.devices)?.[deviceId];
-	if (typeof raw !== "string") return null;
+	if (typeof raw !== "string") return { key: null, host };
 	const key = Buffer.from(raw, "base64");
-	return key.length === 65 && key[0] === 4 ? key : null;
+	return { key: key.length === 65 && key[0] === 4 ? key : null, host };
 }
 
 function takeNonce(c: Conn, nonce: string): boolean {
@@ -366,16 +370,20 @@ function newNonce(c: Conn): string {
 const deviceIdOf = (r: Record<string, unknown>): string =>
 	typeof r.device_id === "number" || typeof r.device_id === "string" ? String(r.device_id) : "";
 
-/** The signing version a request says it was signed with: absent or 1 = v1, 2 = v2, else null. */
-export function sigVersion(r: Record<string, unknown>): 1 | 2 | null {
+/** The signing version a request says it was signed with: absent or 1 = v1, 2 = v2, 3 = v3, else null. */
+export function sigVersion(r: Record<string, unknown>): 1 | 2 | 3 | null {
 	if (r.sig_v === undefined || r.sig_v === 1) return 1;
-	return r.sig_v === 2 ? 2 : null;
+	return r.sig_v === 2 || r.sig_v === 3 ? r.sig_v : null;
 }
+
+/** Whether a request is signed v2 or newer (what "v2 only" means: v3 is v2 plus the host). */
+const atLeastV2 = (r: Record<string, unknown>): boolean => (sigVersion(r) ?? 1) >= 2;
 
 /**
  * What a request is signed over. v1: "botsun-decide-v1" … "session", session id, decision,
  * digest(). v2 (sig_v: 2): "botsun-sign-v2" … kind, scope = the session id, decision,
- * sha256(payload()).
+ * sha256(payload()). v3 (sig_v: 3): "botsun-sign-v3", this host's authority (owner-keys.json's
+ * "host"), then v2's lines.
  */
 interface SignSpec {
 	decision: string;
@@ -396,26 +404,30 @@ function verifyDevice(c: Conn, r: Record<string, unknown>, spec: SignSpec, keyKi
 	if (!c.sessionId) return "this session has no id yet";
 	if (!takeNonce(c, nonce)) return "nonce is expired or used";
 	let key: Buffer | null;
+	let host: string | null;
 	try {
-		key = deviceKey(deviceId, keyKind);
+		({ key, host } = deviceKey(deviceId, keyKind));
 	} catch (e) {
 		return (e as Error).message.startsWith("owner-keys") ? (e as Error).message : "no device keys";
 	}
 	if (!key) return "unknown device";
-	if (v === 2 && !validScope(c.sessionId)) return "this session's id can't be signed (v2)";
+	if (v >= 2 && !validScope(c.sessionId)) return `this session's id can't be signed (v${v})`;
+	if (v === 3 && !host) return V3_NO_HOST;
 	let verified = false;
 	try {
-		const text = v === 2
-			? messageV2({ deviceId, nonce, kind: spec.v2.kind, scope: c.sessionId, decision: spec.v2.decision, payload: spec.v2.payload() })
+		const m = { deviceId, nonce, kind: spec.v2.kind, scope: c.sessionId, decision: spec.v2.decision, payload: v >= 2 ? spec.v2.payload() : "" };
+		const text = v === 3 ? messageV3({ ...m, host: host! })
+			: v === 2 ? messageV2(m)
 			: ["botsun-decide-v1", deviceId, nonce, "session", c.sessionId, spec.decision, spec.digest()].join("\n");
 		const pub = createPublicKey({ key: Buffer.concat([P256_SPKI, key]), format: "der", type: "spki" });
 		verified = verifySignature("sha256", Buffer.from(text, "utf8"), { key: pub, dsaEncoding: "der" }, Buffer.from(signature, "base64"));
 	} catch {}
 	if (!verified) return "signature does not verify";
-	if (v === 1) {
-		// The ratchet (pins.ts): a device that has signed v2 isn't taken at v1 again (a downgrade).
+	if (v < 3) {
+		// The ratchet (pins.ts): a device that has signed v2 (v3) isn't taken at an older version again (a downgrade).
 		try {
-			if (signVersionOf(deviceId) === 2) return V1_REFUSED;
+			const refused = downgrade(signVersionOf(deviceId), v);
+			if (refused) return refused;
 		} catch (e) {
 			return isPinsError(e) ? (e as Error).message : "couldn't read the device's signing version";
 		}
@@ -425,9 +437,9 @@ function verifyDevice(c: Conn, r: Record<string, unknown>, spec: SignSpec, keyKi
 		if (pinCheck.ask) askPin(c, keyKind, deviceId, pinCheck.ask);
 		return pinCheck.error;
 	}
-	if (v === 2) {
+	if (v >= 2) {
 		try {
-			ratchet(deviceId);
+			ratchet(deviceId, v as 2 | 3);
 		} catch (e) {
 			return isPinsError(e) ? (e as Error).message : "couldn't record the device's signing version";
 		}
@@ -437,6 +449,19 @@ function verifyDevice(c: Conn, r: Record<string, unknown>, spec: SignSpec, keyKi
 
 /** A v1 request from a device that has signed v2 (the ratchet). */
 export const V1_REFUSED = "this phone signs v2: v1 is refused (update Botsun and the app)";
+/** A v2 request from a device that has signed v3 (the ratchet). */
+export const V2_REFUSED = "this phone signs v3: v2 is refused (update Botsun and the app)";
+/** A v1 request from a device that has signed v3 (the ratchet). */
+export const V1_REFUSED_V3 = "this phone signs v3: v1 is refused (update Botsun and the app)";
+/** A v3 request when owner-keys.json names no (valid) host: there's nothing to check it against. */
+export const V3_NO_HOST = "owner-keys.json has no valid host: v3 is refused (update Botsun)";
+
+/** The ratchet's refusal for a request signed at v from a device at have, or null when it's taken. */
+export function downgrade(have: number, v: number): string | null {
+	if (v >= have) return null;
+	if (have >= 3) return v === 2 ? V2_REFUSED : V1_REFUSED_V3;
+	return V1_REFUSED;
+}
 /** A v1-signed close: close takes v2 only. */
 export const CLOSE_V1_REFUSED = "close needs a v2 signature: v1 is refused (update Botsun and the app)";
 /** A v1 answer to a sensitive prompt: v1 doesn't bind the card's text. */
@@ -551,7 +576,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 function sayCall(c: Conn, r: Record<string, unknown>): Record<string, unknown> | Promise<Record<string, unknown>> {
 	if (r.key !== "call") return { error: "bad request" };
 	if (r.images !== undefined || r.files !== undefined || r.attachments !== undefined) return { error: "a call-key reply is text only" };
-	if (sigVersion(r) !== 2) return { error: "a call-key reply must be signed v2" };
+	if (!atLeastV2(r)) return { error: "a call-key reply must be signed v2" };
 	const { text } = r;
 	if (typeof text !== "string" || !text.trim() || text.length > TEXT_MAX) return { error: "text must be 1 to 20000 characters" };
 	// Words only from a locked phone: no slash command (/bypass on, /model, a skill or a template)
@@ -707,7 +732,7 @@ function confirmHeld(c: Conn, r: Record<string, unknown>): Record<string, unknow
 	if (!h.proposal) return { error: "his words weren't a reply to a proposal" };
 	// v2: the answer's hash covers the prompt's own questions, so find the prompt first.
 	const prompt = isText ? undefined : openPrompts().find((p) => p.id === askId);
-	const v2 = !isText && h.sigV === 2;
+	const v2 = !isText && (h.sigV ?? 1) >= 2;
 	let digest: string | null = null;
 	try {
 		if (isText) digest = proposalTextHash(text);
@@ -719,10 +744,12 @@ function confirmHeld(c: Conn, r: Record<string, unknown>): Record<string, unknow
 	// Whatever happens next, these words are spent: a failed confirm never leaves them to retry.
 	c.held?.delete(id);
 	writeHeld(c);
-	// The ratchet, again: v1 words held from before the device's first v2 don't count after it.
-	if (h.sigV !== 2) {
+	// The ratchet, again: words held from before the device's first v2 (v3) don't count after it.
+	if ((h.sigV ?? 1) < 3) {
 		try {
-			if (!h.deviceId || signVersionOf(h.deviceId) === 2) return { error: V1_REFUSED };
+			if (!h.deviceId && (h.sigV ?? 1) < 2) return { error: V1_REFUSED };
+			const refused = h.deviceId ? downgrade(signVersionOf(h.deviceId), h.sigV ?? 1) : null;
+			if (refused) return { error: refused };
 		} catch (e) {
 			return { error: isPinsError(e) ? (e as Error).message : "couldn't read the device's signing version" };
 		}
@@ -816,8 +843,8 @@ function answerAsk(c: Conn, r: Record<string, unknown>): Record<string, unknown>
 	};
 	// A secret's approval (op-broker) binds its card text only in v2: a v1 answer is refused,
 	// ratchet or not.
-	if (prompt?.sensitive && sigVersion(r) !== 2) return spend(SENSITIVE_V1_REFUSED);
-	if (sigVersion(r) === 2) {
+	if (prompt?.sensitive && !atLeastV2(r)) return spend(SENSITIVE_V1_REFUSED);
+	if (atLeastV2(r)) {
 		if (!prompt) return spend("that question was already answered");
 		const bad = invalidAnswer(prompt.questions, answers);
 		if (bad) return spend(bad);
@@ -882,7 +909,7 @@ function closeRequest(c: Conn, r: Record<string, unknown>): Record<string, unkno
 	if (denied) return { error: denied };
 	// v2 only (scoped to this session), ratchet or not: even a v1 signature that verifies is
 	// refused (checked after verifyDevice, so its nonce is spent and its errors stay alike).
-	if (sigVersion(r) !== 2) return { error: CLOSE_V1_REFUSED };
+	if (!atLeastV2(r)) return { error: CLOSE_V1_REFUSED };
 	if (!c.close) return { error: "this session can't close from the phone yet; run /reload" };
 	const { shutdown } = c.close();
 	return { ok: true, [AFTER_REPLY]: shutdown };
@@ -1044,7 +1071,7 @@ function featureList(c: Conn): string[] {
 	const hasStash = (() => {
 		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 	})();
-	return ["say", "say_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "ask_v2", "close",
+	return ["say", "say_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close",
 		...(hasStash ? ["stash"] : [])];
 }
 

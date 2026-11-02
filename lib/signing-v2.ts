@@ -10,6 +10,10 @@
  *   <decision>    the verb ("say", "answer", "stop", …)
  *   <sha256hex(payload)>
  *
+ * v3 ("botsun-sign-v3", botsun docs/plans/host-signing.md; pinned by test/fixtures/signing-v3.json)
+ * is the same with the host's authority ("fqdn:port", lowercase, port always written) on the line
+ * after the magic, so a signature made for one host never verifies on another.
+ *
  * Every hash is SHA-256, lowercase hex, over the exact UTF-8 bytes (no Unicode normalization).
  * Pure functions only; botsun-owner decides what kind/scope/decision/payload a request means.
  */
@@ -44,6 +48,21 @@ export function messageV2(m: MessageV2): string {
 	}
 	if (!validScope(m.scope)) throw new Error(`bad scope: ${JSON.stringify(m.scope)}`);
 	return [SIGN_MAGIC, m.deviceId, m.nonce, m.kind, m.scope, m.decision, digestHex(m.payload)].join("\n");
+}
+
+export const SIGN_MAGIC_V3 = "botsun-sign-v3";
+/** A host's authority as v3 signs it: lowercase "fqdn:port", the port always written. */
+export const VALID_HOST = /^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?:[0-9]{1,5}$/;
+
+export const validHost = (host: unknown): host is string => typeof host === "string" && VALID_HOST.test(host);
+
+export interface MessageV3 extends MessageV2 { host: string }
+
+/** v3: v2's message with "<host>" (VALID_HOST) on the line after the magic. Throws like messageV2, and on a bad host. */
+export function messageV3(m: MessageV3): string {
+	if (!validHost(m.host)) throw new Error(`bad host: ${JSON.stringify(m.host)}`);
+	const v2 = messageV2(m);
+	return [SIGN_MAGIC_V3, m.host, v2.slice(SIGN_MAGIC.length + 1)].join("\n");
 }
 
 /**

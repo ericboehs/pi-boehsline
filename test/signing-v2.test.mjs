@@ -8,7 +8,7 @@ import { createHash, createPublicKey, verify } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 import { canonicalAnswerV2 } from "../lib/remote-prompts.ts";
-import { digestHex, fieldsPayload, messageV2 } from "../lib/signing-v2.ts";
+import { digestHex, fieldsPayload, messageV2, messageV3, validHost } from "../lib/signing-v2.ts";
 
 const FIXTURE = new URL("./fixtures/signing-v2.json", import.meta.url);
 /** sha256 of the fixture as copied from Botsun; a change here means re-copying it on purpose. */
@@ -69,4 +69,57 @@ test("messageV2 and canonicalAnswerV2 refuse fields that could smuggle a line", 
 	assert.throws(() => canonicalAnswerV2("id1", q, [{ picks: ["0"] }]));
 	assert.notEqual(canonicalAnswerV2("id1", q, [{ picks: [0] }]),
 		canonicalAnswerV2("id1", [{ ...q[0], options: [{ label: "B" }] }], [{ picks: [0] }]), "the options are signed");
+});
+
+// ---- v3 (botsun-sign-v3: v2 plus the host's authority) ----------------------
+
+const FIXTURE_V3 = new URL("./fixtures/signing-v3.json", import.meta.url);
+/** sha256 of the v3 fixture as copied from Botsun; a change here means re-copying it on purpose. */
+const FIXTURE_V3_SHA256 = "041c5ef18ecc86bb8c59977b622f1136104d54182931457e48d16d01d4f6f5b1";
+const BOTSUN_FIXTURE_V3 = "/Users/ericboehs/Code/github.com/ericboehs/botsun/test/fixtures/signing-v3.json";
+const bytesV3 = readFileSync(FIXTURE_V3);
+const fixtureV3 = JSON.parse(bytesV3.toString("utf8"));
+const pubV3 = createPublicKey({ key: Buffer.concat([P256_SPKI, Buffer.from(fixtureV3.public_key_b64, "base64")]), format: "der", type: "spki" });
+
+test("v3: the fixture is the pinned copy", () => {
+	assert.equal(createHash("sha256").update(bytesV3).digest("hex"), FIXTURE_V3_SHA256);
+});
+
+test("v3: the fixture is byte-identical to Botsun's, when Botsun is checked out here", { skip: !existsSync(BOTSUN_FIXTURE_V3) && "no Botsun checkout" }, () => {
+	assert.ok(readFileSync(BOTSUN_FIXTURE_V3).equals(bytesV3), "re-copy botsun/test/fixtures/signing-v3.json");
+});
+
+test("v3: every vector's message matches Ruby's and verifies; with another host (or as v2) it doesn't", () => {
+	assert.equal(fixtureV3.version, 3);
+	assert.equal(fixtureV3.vectors.length, 23);
+	const hosts = new Set(fixtureV3.vectors.map((v) => v.host));
+	assert.ok(hosts.has("botsun.boehs.com:8443") && hosts.has("coop.botsun.boehs.com:8443"));
+	for (const v of fixtureV3.vectors) {
+		const payload = payloadOf(v);
+		if ("expect_payload_b64" in v) assert.equal(Buffer.from(payload).toString("base64"), v.expect_payload_b64, v.name);
+		else assert.equal(payload, v.expect_payload, v.name);
+		assert.equal(digestHex(payload), v.expect_digest, v.name);
+		const m = { deviceId: String(fixtureV3.device_id), nonce: fixtureV3.nonce, kind: v.kind, scope: v.scope, decision: v.decision, payload };
+		const msg = messageV3({ ...m, host: v.host });
+		assert.equal(msg, v.expect_message, v.name);
+		assert.equal(msg.split("\n")[1], v.host, v.name);
+		const sig = Buffer.from(v.signature_der_b64, "base64");
+		const ok = (text) => verify("sha256", Buffer.from(text, "utf8"), { key: pubV3, dsaEncoding: "der" }, sig);
+		assert.equal(ok(msg), true, v.name);
+		const other = v.host === "botsun.boehs.com:8443" ? "coop.botsun.boehs.com:8443" : "botsun.boehs.com:8443";
+		assert.equal(ok(messageV3({ ...m, host: other })), false, `${v.name}: another host`);
+		assert.equal(ok(messageV2(m)), false, `${v.name}: as v2`);
+	}
+});
+
+test("v3: invalid hosts are refused (no message is built)", () => {
+	assert.ok(fixtureV3.invalid.length >= 3);
+	for (const v of fixtureV3.invalid) {
+		assert.equal(v.expect_error, true, v.name);
+		assert.equal(validHost(v.host), false, v.name);
+		assert.throws(() => messageV3({ deviceId: String(fixtureV3.device_id), nonce: fixtureV3.nonce, kind: v.kind, scope: v.scope,
+			decision: v.decision, payload: payloadOf(v), host: v.host }), /bad host/, v.name);
+	}
+	for (const host of ["botsun.boehs.com:8443\n", "", ":8443", "-a.b:1", "a.b:123456", "a b:1", undefined]) assert.equal(validHost(host), false, JSON.stringify(host));
+	for (const host of ["botsun.boehs.com:8443", "a:1", "127.0.0.1:8443"]) assert.equal(validHost(host), true, host);
 });

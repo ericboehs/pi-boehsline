@@ -1211,7 +1211,7 @@ test("v2: the nonce reply advertises sign_v2 and ask_v2; say, stash and stop ver
 	assert.equal((await ask({ type: "say", text, nonce, device_id: 7, sig_v: 2, signature: signed(key, 7, nonce, "sid-a", text) })).error,
 		"signature does not verify", "nor the other way round");
 	({ nonce } = await ask({ type: "nonce" }));
-	assert.equal((await ask({ type: "say", text, nonce, device_id: 7, sig_v: 3, signature: v2sig })).error, "bad request");
+	assert.equal((await ask({ type: "say", text, nonce, device_id: 7, sig_v: 4, signature: v2sig })).error, "bad request");
 	({ nonce } = await ask({ type: "nonce" }));
 	const other = signV2(key, nonce, "session", "say", `botsun-propose-text-v1\n${text}`, { scope: "sid-b" });
 	assert.equal((await ask({ type: "say", text, nonce, device_id: 7, sig_v: 2, signature: other })).error, "signature does not verify", "scoped to this session");
@@ -1829,4 +1829,130 @@ test("ratchet: a v1 reply held before the device's first v2 can't be confirmed a
 	assert.equal((await readSignVersions())["7"].sign_version, 2);
 	assert.equal((await confirm(stale.held)).error, "this phone signs v2: v1 is refused (update Botsun and the app)");
 	assert.equal((await confirm(stale.held)).error, `not waiting: ${stale.held}`, "spent");
+});
+
+// ---- v3 (botsun-sign-v3: v2 plus this host's authority) ---------------------
+
+const HOST = "botsun.boehs.com:8443";
+/** A v3 signature: "botsun-sign-v3", the host, then v2's lines. */
+function signV3(key, nonce, kind, decision, payload, { host = HOST, scope = "sid-a", deviceId = "7" } = {}) {
+	const msg = ["botsun-sign-v3", host, deviceId, nonce, kind, scope, decision, sha(payload)].join("\n");
+	return cryptoSign("sha256", Buffer.from(msg, "utf8"), { key: key.privateKey, dsaEncoding: "der" }).toString("base64");
+}
+
+function writeKeysWithHost(devices, host = HOST, extra = {}) {
+	writeFileSync(keysFile, JSON.stringify({ ...(host === null ? {} : { host }), devices, ...extra }));
+	chmodSync(keysFile, 0o600);
+}
+
+/** A v3 say from device id, signed with key for host. */
+async function sayV3(key, text, { host = HOST, deviceId = 7 } = {}) {
+	const { nonce } = await ask({ type: "nonce" });
+	const signature = signV3(key, nonce, "session", "say", `botsun-propose-text-v1\n${text}`, { host, deviceId: String(deviceId) });
+	return ask({ type: "say", text, nonce, device_id: deviceId, sig_v: 3, signature });
+}
+
+test("v3: verifies against owner-keys.json's host; a signature for another host, or as v2, is refused", async () => {
+	const key = phoneKey();
+	writeKeysWithHost({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	m.ctx.isIdle = () => false;
+	m.ctx.abort = () => {};
+	const { features } = await ask({ type: "nonce" });
+	assert.ok(features.includes("sign_v3"));
+	assert.equal((await sayV3(key, "elsewhere", { host: "coop.botsun.boehs.com:8443" })).error, "signature does not verify", "another host's signature");
+	let { nonce } = await ask({ type: "nonce" });
+	const v2sig = signV2(key, nonce, "session", "say", "botsun-propose-text-v1\nas v2");
+	assert.equal((await ask({ type: "say", text: "as v2", nonce, device_id: 7, sig_v: 3, signature: v2sig })).error, "signature does not verify", "a v2 signature isn't v3");
+	({ nonce } = await ask({ type: "nonce" }));
+	const v3sig = signV3(key, nonce, "session", "say", "botsun-propose-text-v1\nas v3");
+	assert.equal((await ask({ type: "say", text: "as v3", nonce, device_id: 7, sig_v: 2, signature: v3sig })).error, "signature does not verify", "nor a v3 one v2");
+	assert.equal(existsSync(signVersionsFile()), false, "nothing ratcheted yet");
+	assert.deepEqual(await sayV3(key, "here"), { ok: true, delivered: "prompt" });
+	assert.equal(m.sent.at(-1).content, "here");
+	assert.equal((await readSignVersions())["7"].sign_version, 3);
+	({ nonce } = await ask({ type: "nonce" }));
+	assert.deepEqual(await ask({ type: "stop", nonce, device_id: 7, sig_v: 3, signature: signV3(key, nonce, "session", "stop", "stop") }), { ok: true, stopped: true });
+	({ nonce } = await ask({ type: "nonce" }));
+	assert.equal((await ask({ type: "stop", nonce, device_id: 7, sig_v: 3, signature: signV3(key, nonce, "session", "stop", "stop", { scope: "sid-b" }) })).error,
+		"signature does not verify", "still scoped to this session");
+	let shutdowns = 0;
+	m.ctx.shutdown = () => shutdowns++;
+	({ nonce } = await ask({ type: "nonce" }));
+	assert.deepEqual(await ask({ type: "close", nonce, device_id: 7, sig_v: 3, signature: signV3(key, nonce, "session", "close", "close") }), { ok: true },
+		"close's v2-only means v2 or newer");
+	await until(() => shutdowns === 1);
+});
+
+test("v3: refused when owner-keys.json has no host, or not a valid one (v2 still works)", async () => {
+	const key = phoneKey();
+	writeKeysWithHost({ 7: key.raw.toString("base64") }, null); // no "host" at all
+	const m = await owner();
+	assert.equal((await sayV3(key, "x")).error, "owner-keys.json has no valid host: v3 is refused (update Botsun)");
+	for (const host of ["Botsun.Boehs.com:8443", "botsun.boehs.com", `${HOST}\nevil.example:8443`, 8443]) {
+		writeKeysWithHost({ 7: key.raw.toString("base64") }, host);
+		assert.equal((await sayV3(key, "x", { host: String(host) })).error, "owner-keys.json has no valid host: v3 is refused (update Botsun)", String(host));
+	}
+	assert.equal(existsSync(signVersionsFile()), false, "a refused v3 ratchets nothing");
+	assert.equal((await sayAs(key, 7, "v2")).ok, true);
+	assert.deepEqual(m.sent.map((s) => s.content), ["v2"]);
+});
+
+test("v3 ratchet: 2 goes to 3 on the first verified v3; then v2 and v1 (either key) are refused", async () => {
+	const { readFileSync } = await import("node:fs");
+	const { keyFingerprint, pin, signVersionOf, ratchet } = await import("../extensions/opt-in/botsun-owner/pins.ts");
+	const key = phoneKey();
+	const call = phoneKey();
+	writeKeysWithHost({ 7: key.raw.toString("base64") }, HOST, { call_devices: { 7: call.raw.toString("base64") } });
+	pin("decide", "7", keyFingerprint(key.raw));
+	pin("call", "7", keyFingerprint(call.raw));
+	const m = await owner();
+	assert.equal((await sayAs(key, 7, "v2")).ok, true);
+	assert.equal((await readSignVersions())["7"].sign_version, 2);
+	assert.equal((await sayV3(key, "v3", { host: "coop.botsun.boehs.com:8443" })).error, "signature does not verify");
+	assert.equal((await readSignVersions())["7"].sign_version, 2, "a v3 that doesn't verify doesn't ratchet");
+	assert.equal((await sayV3(key, "v3")).ok, true);
+	assert.equal((await readSignVersions())["7"].sign_version, 3);
+	assert.equal((await sayAs(key, 7, "v2 again")).error, "this phone signs v3: v2 is refused (update Botsun and the app)");
+	let { nonce } = await ask({ type: "nonce" });
+	assert.equal((await ask({ type: "say", text: "v1", nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", "v1") })).error,
+		"this phone signs v3: v1 is refused (update Botsun and the app)");
+	({ nonce } = await ask({ type: "nonce" }));
+	const wav = sha("RIFF…audio");
+	assert.equal((await ask({ type: "say_audio", text: "hi", nonce, device_id: 7, sig_v: 2, wav_sha256: wav, signature: signV2(call, nonce, "session", "say_audio", wav) })).error,
+		"this phone signs v3: v2 is refused (update Botsun and the app)", "the call key shares the ratchet");
+	({ nonce } = await ask({ type: "nonce" }));
+	assert.equal((await ask({ type: "say_audio", text: "hi", nonce, device_id: 7, sig_v: 3, wav_sha256: wav, signature: signV3(call, nonce, "session", "say_audio", wav) })).ok, true);
+	ratchet("7", 2);
+	assert.equal(signVersionOf("7"), 3, "a ratchet never goes down");
+	const file = signVersionsFile();
+	writeFileSync(file, JSON.stringify({ version: 1, sign_versions: { 7: { sign_version: 4 } } }));
+	assert.equal((await sayV3(key, "x")).error, "device pins sign-versions file is malformed");
+	assert.equal(JSON.parse(readFileSync(join(pinDir, "pins.json"), "utf8")).sign_versions, undefined);
+	assert.deepEqual(m.sent.map((s) => s.content), ["v2", "v3", "hi"]);
+});
+
+test("v3 ratchet: a v2 reply held before the device's first v3 can't be confirmed after it", async () => {
+	const call = phoneKey();
+	writeKeysWithHost({}, HOST, { call_devices: { 7: call.raw.toString("base64") } });
+	const m = await owner();
+	m.ctx.isIdle = () => true;
+	const { proposalTextHash } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const wav = sha("RIFF…audio");
+	const proposal = proposalTextHash("Run the tests.");
+	const holdV2 = async (text) => {
+		const { nonce } = await ask({ type: "nonce" });
+		const signature = signV2(call, nonce, "session", "say_audio", `${wav}\n${proposal}`);
+		return ask({ type: "say_audio", text, nonce, device_id: 7, sig_v: 2, wav_sha256: wav, signature, hold: true, proposal_sha256: proposal });
+	};
+	const confirm = (id) => ask({ type: "confirm", id, text: "Run the tests.", mode: "steer" });
+	const before = await holdV2("yes");
+	const stale = await holdV2("yeah do it");
+	assert.ok(before.held && stale.held, JSON.stringify(before));
+	assert.deepEqual(await confirm(before.held), { ok: true, delivered: "prompt" }, "before the v3 ratchet, a v2 yes counts");
+	const { nonce } = await ask({ type: "nonce" });
+	assert.equal((await ask({ type: "say_audio", text: "hello", nonce, device_id: 7, sig_v: 3, wav_sha256: wav, signature: signV3(call, nonce, "session", "say_audio", wav) })).ok, true);
+	assert.equal((await readSignVersions())["7"].sign_version, 3);
+	assert.equal((await confirm(stale.held)).error, "this phone signs v3: v2 is refused (update Botsun and the app)");
+	assert.ok(m.sent.length >= 1);
 });
