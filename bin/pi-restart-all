@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# pi-restart-all: restart every pi running in tmux and resume each where it was.
+#
+# Each pi with the restart extension (extensions/restart) keeps a record in
+# ~/.local/state/pi-restart/live/<pid>.json: session file, cwd, tmux pane and socket, whether the
+# approval guardian is bypassed. For each one, in parallel:
+#   1. SIGUSR2: pi shuts down once it is idle (a running turn finishes first).
+#   2. In the same pane: `pi --session <file>` (typed into the pane's shell, or the pane is
+#      respawned with "$SHELL -ic 'pi --session <file>; exec $SHELL -i'" when it died with pi).
+#   3. If the guardian was bypassed when pi left: types `/approval-guardian bypass` into the new
+#      pi once it is up and idle in that pane.
+# A record counts only when it is a regular file of ours named <pid>.json and that pid is a "pi"
+# process on the pane's tty. Sessions without the extension are listed: /reload them once.
+# --reload-old types /reload into those that agent-link shows idle (~/.claude/sessions/<pid>.json);
+# text left unsent in such a pane's editor would be sent along with it.
+#
+# Usage: pi-restart-all [--dry-run] [--foreground] [--wait SECONDS] [--only PANE] [--reload-old]
+#   Runs detached by default (it may restart the pi that started it); the log is
+#   ~/.local/state/pi-restart/last.log.
+set -u
+
+state="${XDG_STATE_HOME:-$HOME/.local/state}/pi-restart"
+live="$state/live"
+log="$state/last.log"
+dry=0 fg=0 wait_s=900 only="" reload_old=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry=1 ;;
+    --foreground) fg=1 ;;
+    --reload-old) reload_old=1 ;;
+    --wait) wait_s="${2:?--wait needs seconds}"; shift ;;
+    --only) only="${2:?--only needs a pane id like %12}"; shift ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "pi-restart-all: unknown option $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+case "$wait_s" in ''|*[!0-9]*) echo "pi-restart-all: --wait takes whole seconds" >&2; exit 2 ;; esac
+case "$only" in '') ;; %*) case "${only#%}" in ''|*[!0-9]*) echo "pi-restart-all: --only takes a pane id like %12" >&2; exit 2 ;; esac ;; *) echo "pi-restart-all: --only takes a pane id like %12" >&2; exit 2 ;; esac
+
+mkdir -p "$state" && chmod 700 "$state"
+self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+if [ "$dry" = 0 ] && [ "$fg" = 0 ]; then
+  args=(--foreground --wait "$wait_s")
+  [ -n "$only" ] && args+=(--only "$only")
+  [ "$reload_old" = 1 ] && args+=(--reload-old)
+  # Under the tmux server when there is one: outlives the pi (and its tool) that started it.
+  # The tmux server's environment isn't ours: pass the bits the run depends on.
+  cmd="env $(printf '%q ' "PATH=$PATH" "SHELL=${SHELL:-/bin/zsh}" "XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}" "$self" "${args[@]}") >$(printf '%q' "$log") 2>&1 </dev/null"
+  if tmux run-shell -b "$cmd" 2>/dev/null; then
+    echo "pi-restart-all: restarting in the background (tmux run-shell); log: $log"
+  else
+    nohup "$self" "${args[@]}" >"$log" 2>&1 </dev/null &
+    echo "pi-restart-all: restarting in the background (pid $!); log: $log"
+  fi
+  exit 0
+fi
+
+command -v jq >/dev/null || { echo "pi-restart-all: needs jq" >&2; exit 1; }
+say() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*"; }
+field() { jq -r --arg k "$2" '.[$k] // empty' "$1" 2>/dev/null; }
+alive() { kill -0 "$1" 2>/dev/null; }
+
+# A record file we can trust as far as files go: ours, regular (no symlink), named <pid>.json for
+# the pid inside, with a pane id and a socket path that are just that.
+sane_record() {
+  local f="$1" pid pane socket
+  [ -f "$f" ] && [ ! -L "$f" ] && [ -O "$f" ] || return 1
+  pid=$(field "$f" pid); pane=$(field "$f" pane); socket=$(field "$f" socket)
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$(basename "$f")" = "$pid.json" ] || return 1
+  case "$pane" in %*) case "${pane#%}" in ''|*[!0-9]*) return 1 ;; esac ;; *) return 1 ;; esac
+  case "$socket" in /*) ;; *) return 1 ;; esac
+  [ -S "$socket" ]
+}
+
+# Whether pid is a running pi in that pane: process title "pi", on the pane's tty.
+pi_in_pane() {
+  local socket="$1" pane="$2" pid="$3" tty args
+  tty=$(tmux -S "$socket" display-message -p -t "$pane" '#{pane_tty}' 2>/dev/null) || return 1
+  args=$(ps -o args= -p "$pid" 2>/dev/null | sed 's/[[:space:]]*$//') || return 1 # pi pads its title
+  [ "$args" = "pi" ] || return 1
+  [ "/dev/$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')" = "$tty" ]
+}
+
+# Waits for the new pi's record in this pane (another pid, the same session file when given),
+# verified as above; prints its path.
+new_record() {
+  local socket="$1" pane="$2" session="$3" old_pid="$4" deadline=$((SECONDS + 90)) f pid
+  while [ $SECONDS -lt $deadline ]; do
+    for f in "$live"/*.json; do
+      sane_record "$f" || continue
+      pid=$(field "$f" pid)
+      [ "$pid" != "$old_pid" ] && [ "$(field "$f" pane)" = "$pane" ] && [ "$(field "$f" exiting)" != true ] || continue
+      [ -z "$session" ] || [ "$(field "$f" sessionFile)" = "$session" ] || continue
+      pi_in_pane "$socket" "$pane" "$pid" && { echo "$f"; return 0; }
+    done
+    sleep 1
+  done
+  return 1
+}
+
+record_bypassed() { [ "$(field "$1" bypass)" = true ]; }
+editor_cleared() { ! tmux -S "$1" capture-pane -p -t "$2" | grep -v "^[[:space:]]*$" | tail -n 3 | grep -qF -- "$3"; }
+
+# Types a slash command into the pane and presses Enter until the check (a function and its
+# arguments) passes: the first Enter can go to the command's autocomplete.
+type_command() {
+  local socket="$1" pane="$2" text="$3"; shift 3
+  tmux -S "$socket" send-keys -t "$pane" -l "$text"
+  for _ in 1 2 3; do
+    sleep 1
+    tmux -S "$socket" send-keys -t "$pane" Enter
+    sleep 2
+    "$@" && return 0
+  done
+  return 1
+}
+
+restart_one() {
+  local rec="$1" pid pane socket session cwd name
+  pid=$(field "$rec" pid); pane=$(field "$rec" pane); socket=$(field "$rec" socket)
+  session=$(field "$rec" sessionFile); cwd=$(field "$rec" cwd)
+  name="$pane ($(basename "$cwd"))"
+  # pi writes the session file with the first reply: before that there's nothing to resume, so a
+  # fresh pi starts in the pane instead.
+  local resume=1
+  [ -f "$session" ] || resume=0
+  if [ "$dry" = 1 ]; then
+    say "$name: would restart pid $pid, $([ $resume = 1 ] && echo "resume $(basename "$session")" || echo "fresh pi (nothing to resume)")$([ "$(field "$rec" bypass)" = true ] && echo ', bypass')"
+    return
+  fi
+
+  pi_in_pane "$socket" "$pane" "$pid" || { say "$name: pid $pid is no longer that pane's pi"; return; }
+  say "$name: asking pid $pid to stop when idle"
+  kill -USR2 "$pid" 2>/dev/null || { say "$name: pid $pid is gone"; return; }
+  local deadline=$((SECONDS + wait_s))
+  while alive "$pid" && [ $SECONDS -lt $deadline ]; do sleep 1; done
+  if alive "$pid"; then say "$name: still busy after ${wait_s}s, left running"; return; fi
+  sleep 0.5
+  # Bypass as pi left (its session_shutdown wrote it last), not as it was when we started.
+  local bypass=false
+  if sane_record "$rec" && [ "$(field "$rec" exiting)" = true ]; then
+    bypass=$(field "$rec" bypass)
+    # A /new or /resume between the signal and the exit: resume the session it left from.
+    session=$(field "$rec" sessionFile); cwd=$(field "$rec" cwd)
+    resume=1; [ -f "$session" ] || resume=0
+  fi
+  rm -f "$rec"
+
+  local sh="${SHELL:-/bin/zsh}" pi_cmd
+  pi_cmd="pi --session $(printf '%q' "$session")"
+  [ $resume = 1 ] || pi_cmd="pi"
+  if ! tmux -S "$socket" display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
+    say "$name: the pane closed with pi, not resumed ($pi_cmd)"
+    return
+  fi
+  if [ "$(tmux -S "$socket" display-message -p -t "$pane" '#{pane_dead}')" = 1 ]; then
+    tmux -S "$socket" respawn-pane -k -t "$pane" -c "$cwd" "$(printf '%q' "$sh") -ic $(printf '%q' "$pi_cmd; exec $(printf '%q' "$sh") -i")"
+  else
+    case "$(tmux -S "$socket" display-message -p -t "$pane" '#{pane_current_command}')" in
+      zsh|bash|sh|-zsh|-bash|login) ;;
+      *) say "$name: the pane runs something else now, not resumed ($pi_cmd)"; return ;;
+    esac
+    tmux -S "$socket" send-keys -t "$pane" -l "$pi_cmd"
+    tmux -S "$socket" send-keys -t "$pane" Enter
+  fi
+
+  local fresh
+  if ! fresh=$(new_record "$socket" "$pane" "$([ $resume = 1 ] && echo "$session")" "$pid"); then
+    say "$name: pi didn't come back within 90s (check the pane)"
+    return
+  fi
+  local new_pid; new_pid=$(field "$fresh" pid)
+  if [ "$bypass" != true ]; then say "$name: resumed as pid $new_pid"; return; fi
+  sleep 2 # let the editor take keys
+  if [ "$(field "$fresh" idle)" = true ] && pi_in_pane "$socket" "$pane" "$new_pid" &&
+     type_command "$socket" "$pane" "/approval-guardian bypass" record_bypassed "$fresh"; then
+    say "$name: resumed as pid $new_pid, guardian bypass restored"
+  else
+    say "$name: resumed as pid $new_pid, but the bypass didn't come back: run /approval-guardian bypass"
+  fi
+}
+
+# One record per pane: the verified, live one.
+records=() panes=" "
+for f in "$live"/*.json; do
+  [ -e "$f" ] || continue
+  if ! sane_record "$f"; then [ -f "$f" ] && [ ! -L "$f" ] && [ -O "$f" ] && ! alive "$(field "$f" pid)" && rm -f "$f"; continue; fi
+  pid=$(field "$f" pid); pane=$(field "$f" pane)
+  if ! alive "$pid"; then rm -f "$f"; continue; fi
+  [ "$(field "$f" exiting)" = true ] && continue # already on its way out
+  [ -n "$only" ] && [ "$pane" != "$only" ] && continue
+  case "$panes" in *" $pane "*) say "$pane: more than one record, skipped"; continue ;; esac
+  pi_in_pane "$(field "$f" socket)" "$pane" "$pid" || continue
+  panes+="$pane "
+  records+=("$f")
+done
+
+# pi processes in tmux panes that have no record (no restart extension yet).
+if [ -z "$only" ] && command -v tmux >/dev/null; then
+  # pi sets its process title to "pi": a pane's shell with a child "pi" runs pi.
+  pis=$(ps -ax -o pid=,ppid=,args= | awk '$3 == "pi" && NF == 3 { print $1, $2 }')
+  sock=$(tmux display-message -p '#{socket_path}' 2>/dev/null)
+  while read -r pane ppid target; do
+    case "$panes" in *" $pane "*) continue ;; esac
+    pi_pid=$(awk -v p="$ppid" '$2 == p { print $1; exit }' <<<"$pis")
+    [ -n "$pi_pid" ] || continue
+    if [ "$reload_old" = 1 ] && [ "$dry" = 0 ]; then
+      status=$(jq -r '.status // empty' "$HOME/.claude/sessions/$pi_pid.json" 2>/dev/null)
+      if [ "$status" = idle ]; then
+        type_command "$sock" "$pane" "/reload" editor_cleared "$sock" "$pane" "/reload" >/dev/null
+        say "$target ($pane): no restart extension yet: sent /reload (rerun pi-restart-all after)"
+      else
+        say "$target ($pane): no restart extension yet, and not idle (${status:-unknown}): /reload it yourself"
+      fi
+    else
+      say "$target ($pane): pi without the restart extension: /reload it once (or --reload-old), then rerun"
+    fi
+  done < <(tmux list-panes -a -F '#{pane_id} #{pane_pid} #{session_name}:#{window_name}' 2>/dev/null)
+fi
+
+[ ${#records[@]} -eq 0 ] && { say "no restartable pi sessions"; exit 0; }
+say "restarting ${#records[@]} pi session(s)$([ "$dry" = 1 ] && echo ' (dry run)')"
+for f in "${records[@]}"; do restart_one "$f" & done
+wait
+say "done"
