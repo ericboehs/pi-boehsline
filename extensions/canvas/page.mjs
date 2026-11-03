@@ -2205,7 +2205,7 @@ function renderMeeting(m) {
   const notes = m.notes && typeof m.notes === "object" ? m.notes : null;
   const alerts = Array.isArray(notes?.alerts) ? notes.alerts.slice(-3).reverse() : [];
   if (alerts.length) {
-    out.push(h("div", { class: "m-alerts", title: "From the meeting copilot" }, alerts.map((a) => h("div", { class: "m-alert" }, a.at ? h("time", {}, meetingClock(a.at)) : null, h("b", {}, a.kind === "action" ? "✅" : "🔔", a.who ? ` ${a.who}` : ""), a.text))));
+    out.push(h("div", { class: "m-alerts", title: "From the meeting copilot" }, alerts.map((a) => h("div", { class: "m-alert" }, a.at ? h("time", {}, meetingClock(a.at)) : null, h("b", {}, a.kind === "action" ? "Action" : "Alert", a.who ? ` ${a.who}` : ""), a.text))));
   }
   const todo = Array.isArray(notes?.actions) ? notes.actions.filter((a) => a.mine) : [];
   if (todo.length) out.push(h("div", { class: "m-h" }, "Your action items"), h("ul", { class: "m-todo" }, todo.map((a) => h("li", {}, a.what))));
@@ -2352,7 +2352,7 @@ function renderWatch(w) {
     ),
   ];
   const doButton = (n) => (n != null ? copyButton(() => `/watch do ${n}`, `Copy /watch do ${n}`, "copy") : null);
-  const offerLine = (o) => h("div", { class: `w-offer${o.level === "held" ? " held" : ""}` }, `${o.level === "held" ? "⏸" : "✦"} ${o.text}`);
+  const offerLine = (o) => h("div", { class: `w-offer${o.level === "held" ? " held" : ""}` }, `${o.level === "held" ? "‖" : "✦"} ${o.text}`);
   for (const r of needs) {
     const link = safeUrl(r.link);
     out.push(
@@ -2380,7 +2380,7 @@ function renderWatch(w) {
       ),
     );
   }
-  for (const o of offers) out.push(h("div", { class: "w-sub" }, h("span", { class: "w-ico" }, o.level === "held" ? "⏸" : "✦"), h("span", {}, o.text), h("span", { class: "w-acts" }, doButton(o.n))));
+  for (const o of offers) out.push(h("div", { class: "w-sub" }, h("span", { class: "w-ico" }, o.level === "held" ? "‖" : "✦"), h("span", {}, o.text), h("span", { class: "w-acts" }, doButton(o.n))));
   if (waits.length) {
     const rows = [];
     for (const x of waits) {

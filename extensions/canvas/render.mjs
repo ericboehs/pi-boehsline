@@ -1357,11 +1357,11 @@ function ansiCss(st) {
 }
 
 const lineTint = (s) =>
-  /(?<!\b0 )\b(error|errors|failed|failure|fatal|panic|exception)\b|✖|✗|^\s*not ok\b|^\s*FAIL\b/i.test(s)
+  /(?<!\b0 )\b(error|errors|failed|failure|fatal|panic|exception)\b|\u2716|✗|^\s*not ok\b|^\s*FAIL\b/i.test(s)
     ? " bad"
     : /\b(warn|warning|deprecated)\b/i.test(s)
       ? " warn"
-      : /✔|✓|^\s*ok\b|^\s*PASS\b|(?<!\b0 )\bpassed\b/.test(s)
+      : /\u2714|✓|^\s*ok\b|^\s*PASS\b|(?<!\b0 )\bpassed\b/.test(s)
         ? " ok"
         : "";
 
