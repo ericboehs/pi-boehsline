@@ -1,6 +1,6 @@
 {
   "name": "pi-context",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A /context command for pi that shows what's consuming your context window — tool schemas grouped by extension, system prompt, context files, skills, and conversation.",
   "keywords": [
     "pi",
