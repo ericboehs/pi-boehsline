@@ -98,7 +98,7 @@ pi-context also gives the agent two tools and a threshold nudge, so it can manag
 - **`compact_context`** compacts the session. It takes optional `instructions` (what the summary must keep, passed to pi as custom compaction instructions). The tool only queues the request: the agent finishes its reply (what it did, what comes next), then pi compacts once it is idle (`agent_settled`) and waits for you. Work does not resume on its own.
 - **Threshold nudge.** When usage crosses the threshold, one notice is added to the session telling the agent it may want to compact. It fires once, and fires again only after the next compaction.
 
-The threshold defaults to 200,000 tokens. Set it with `PI_CONTEXT_NUDGE_TOKENS`, or with `nudgeTokens` in `~/.pi-context/config.json`. The env var wins, and `0` turns the nudge off.
+The threshold defaults to 250,000 tokens. Set it with `PI_CONTEXT_NUDGE_TOKENS`, or with `nudgeTokens` in `~/.pi-context/config.json`. The env var wins, and `0` turns the nudge off.
 
 ```json
 { "nudgeTokens": 150000 }

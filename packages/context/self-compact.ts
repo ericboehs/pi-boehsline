@@ -7,12 +7,12 @@
  *     compaction runs once pi is idle (`agent_settled`). Pi does not resume
  *     work afterwards.
  *   - Threshold nudge   — once usage crosses a configurable token count
- *     (default 200k), a single notice is appended to the session. It re-arms
+ *     (default 250k), a single notice is appended to the session. It re-arms
  *     after the next compaction.
  *
  * Threshold config, first match wins:
  *   PI_CONTEXT_NUDGE_TOKENS env var, then `nudgeTokens` in
- *   ~/.pi-context/config.json, then 200000. 0 disables the nudge.
+ *   ~/.pi-context/config.json, then 250000. 0 disables the nudge.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -22,7 +22,7 @@ import { join } from "node:path";
 import { Type } from "typebox";
 
 const CONFIG_PATH = join(homedir(), ".pi-context", "config.json");
-const DEFAULT_NUDGE_TOKENS = 200_000;
+const DEFAULT_NUDGE_TOKENS = 250_000;
 const NUDGE_TYPE = "pi-context-nudge";
 
 function nudgeTokens(): number {
