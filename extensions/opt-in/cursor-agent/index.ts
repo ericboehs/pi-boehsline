@@ -10,15 +10,19 @@
  * A footer status keeps the session's running Cursor spend, and /cursor-usage
  * shows the billing cycle against the per-user limit.
  *
+ * `background: true` hands the same run to the bg extension as a job running
+ * runner.ts, returns at once, and the bg completion message carries the result
+ * (run.ts holds the code both paths share).
+ *
  * Neutral by default. Org rules (a default model, blocked models, a note in the
  * tool description, extra prompt rules) come from Boehsline config or
  * PI_CURSOR_* env vars; see settings.ts.
  */
 
-import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -26,17 +30,12 @@ import { Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import { optIn } from "../../../lib/opt-in.ts";
 import { cycleText, recordCycleUsage, refreshUsageCache } from "./usage-cache.ts";
-import { cycleUsage, dollars, eventTokens, findUsageEvent, kfmt, type UsageEvent } from "./api.ts";
-import { type CliUsage, RunReducer, short, type ToolStep } from "./events.ts";
-import { blockedBy, type CursorSettings, loadSettings } from "./settings.ts";
-import { applyToRepo, type CursorWorktree, describe, git, listWorktrees, removeWorktree } from "./worktrees.ts";
-
-interface WorktreeInfo {
-	path: string;
-	branch: string;
-	/** `git status --short` lines: what Cursor changed, left uncommitted for review. */
-	changed: string[];
-}
+import { cycleUsage, dollars, eventTokens, kfmt, type UsageEvent } from "./api.ts";
+import { type CliUsage, short, type ToolStep } from "./events.ts";
+import { lookupCharge, prepareRun, type RunSpec, runCursor, type WorktreeInfo } from "./run.ts";
+import { WAKE_CHARS } from "./runner.ts";
+import { type CursorSettings, loadSettings } from "./settings.ts";
+import { applyToRepo, type CursorWorktree, describe, listWorktrees, removeWorktree } from "./worktrees.ts";
 
 interface CursorDetails {
 	model: string;
@@ -81,6 +80,12 @@ function params(s: CursorSettings) {
 		),
 		worktreeBase: Type.Optional(
 			Type.String({ description: "Branch or ref the worktree starts from (default: the repo's current HEAD)" }),
+		),
+		background: Type.Optional(
+			Type.Boolean({
+				description:
+					"Run detached via the bg extension: returns a job id at once, and the result (answer, cost, worktree) arrives as a message when Cursor finishes. Recommended for anything longer than a few minutes; pairs with worktree.",
+			}),
 		),
 	});
 }
@@ -137,9 +142,83 @@ function costLine(d: CursorDetails): string {
 	return [d.model, secs, tok ? `${kfmt(tok)} tokens (CLI count)` : "", `cost not found${why}`].filter(Boolean).join(" · ");
 }
 
+interface BackgroundDetails {
+	background: true;
+	id: string;
+	logPath: string;
+	model: string;
+}
+
+/** The bg extension's event-bus request (extensions/bg, "bg:start"). */
+interface BgStartRequest {
+	command: string;
+	cwd: string;
+	ctx: unknown;
+	name: string;
+	summary: string;
+	tailLines: number;
+	tailMaxChars: number;
+	accepted: boolean;
+	reply: (result: { id: string; logPath: string } | { error: string }) => void;
+}
+
+const RUNNER = join(dirname(fileURLToPath(import.meta.url)), "runner.ts");
+const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+/**
+ * Hand the run to the bg extension as a job running runner.ts, which prints
+ * Cursor's steps into the job log and ends with a result block that the
+ * completion message carries back. The spec goes through a private temp file
+ * the runner deletes on start, so the job's command line stays short.
+ */
+async function startBackground(pi: ExtensionAPI, spec: RunSpec, prompt: string, ctx: ExtensionContext) {
+	const dir = mkdtempSync(join(tmpdir(), "pi-cursor-"));
+	const specPath = join(dir, "spec.json");
+	writeFileSync(specPath, JSON.stringify(spec), { mode: 0o600 });
+	const node = basename(process.execPath).startsWith("node") ? process.execPath : "node";
+	const reply = await new Promise<{ id: string; logPath: string } | { error: string } | null>((done) => {
+		const req: BgStartRequest = {
+			command: `${q(node)} ${q(RUNNER)} ${q(specPath)}`,
+			cwd: spec.cwd,
+			ctx,
+			name: "cursor",
+			summary: `cursor ${spec.model}: ${prompt}`,
+			tailLines: 1000,
+			tailMaxChars: WAKE_CHARS,
+			accepted: false,
+			reply: done,
+		};
+		pi.events.emit("bg:start", req);
+		if (!req.accepted) done(null); // no listener: the bg extension isn't loaded
+	});
+	if (reply === null || "error" in reply) rmSync(dir, { recursive: true, force: true });
+	if (reply === null) {
+		return {
+			content: [
+				{ type: "text" as const, text: "background needs the bg extension (extensions/bg), which is not loaded. Rerun without background." },
+			],
+			details: undefined,
+			isError: true,
+		};
+	}
+	if ("error" in reply) {
+		return { content: [{ type: "text" as const, text: `Cursor background job failed to start: ${reply.error}` }], details: undefined, isError: true };
+	}
+	const details: BackgroundDetails = { background: true, id: reply.id, logPath: reply.logPath, model: spec.model };
+	return {
+		content: [
+			{
+				type: "text" as const,
+				text: `Started in background: cursor ${spec.model} · bg ${reply.id} · log ${reply.logPath}\nThe result (answer, cost, worktree) arrives as a message when Cursor finishes. /bg watches or stops it.`,
+			},
+		],
+		details,
+	};
+}
+
 function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cents: number, ctx: ExtensionContext) => void) {
 	const description = [
-		"Delegate a coding task to Cursor's agent (cursor-agent CLI). Cursor reads, edits and runs commands in the workspace with its own tools, sandboxed by default (workspace writes only, no network), and returns its final answer plus the server-side charged cost. The prompt must be self-contained.",
+		"Delegate a coding task to Cursor's agent (cursor-agent CLI). Cursor reads, edits and runs commands in the workspace with its own tools, sandboxed by default (workspace writes only, no network), and returns its final answer plus the server-side charged cost. The prompt must be self-contained. Runs can take many minutes; background: true returns at once and delivers the result as a message when Cursor finishes.",
 		s.note,
 	]
 		.filter(Boolean)
@@ -149,7 +228,8 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 		name: "cursor",
 		label: "Cursor",
 		description,
-		promptSnippet: "Delegate a self-contained coding task to Cursor's agent; returns its answer and the run's cost",
+		promptSnippet:
+			"Delegate a self-contained coding task to Cursor's agent; returns its answer and the run's cost (background: true for long runs, result arrives as a message)",
 		promptGuidelines: [
 			"Use the cursor tool only when the user asks for Cursor or a Cursor model; every run is billed to their Cursor account.",
 			"After the cursor tool edits files, review its changes (git diff) before reporting them as done.",
@@ -161,74 +241,34 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 		executionMode: "sequential",
 
 		async execute(_id, args, signal, onUpdate, ctx) {
-			const settings = loadSettings(); // fresh, so a config edit applies without /reload
-			const model = args.model?.trim() || settings.defaultModel;
-			const blocked = blockedBy(model, settings);
-			if (blocked) throw new Error(`${model} is blocked (matches "${blocked}"): ${settings.blockedReason}`);
-			const cwd = resolve(ctx.cwd, (args.cwd ?? ".").replace(/^@/, "").replace(/^~(?=$|\/)/, homedir()));
-			if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`Not a directory: ${cwd}`);
-			if (args.worktree) {
-				await git(cwd, ["rev-parse", "--verify", "HEAD"]).catch(() => {
-					throw new Error(`worktree needs a git repo with at least one commit: ${cwd}`);
-				});
-			}
-
-			const cliArgs = ["-p", "--trust", "--output-format", "stream-json", "--stream-partial-output"];
-			cliArgs.push("--sandbox", args.network ? "disabled" : "enabled", "--model", model);
 			// pi-ai 1.5's StringEnum is a plain Schema, which Type.Static widens to {}.
 			const mode = args.mode as "agent" | "plan" | "ask" | undefined;
-			if (mode && mode !== "agent") cliArgs.push("--mode", mode);
-			if (args.worktree) {
-				// --worktree takes an optional name, so without one it would swallow the prompt.
-				cliArgs.push("--worktree", `pi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`);
-				if (args.worktreeBase) cliArgs.push("--worktree-base", args.worktreeBase);
-			}
-			cliArgs.push(args.prompt);
+			// Fresh settings, so a config edit applies without /reload.
+			const spec = await prepareRun({ ...args, mode }, ctx.cwd, loadSettings());
+			if (args.background) return startBackground(pi, spec, args.prompt, ctx);
+			const { model, cwd } = spec;
 
-			const run = new RunReducer(cwd);
-			const started = Date.now();
-			const details = (): CursorDetails => ({ model, cwd, ...run.state, tools: [...run.state.tools], done: false });
 			let lastEmit = 0;
-			const emit = (force: boolean) => {
-				const now = Date.now();
-				if (!force && now - lastEmit < 150) return;
-				lastEmit = now;
-				const text = short(run.state.live, 200) || "Cursor is working…";
-				onUpdate?.({ content: [{ type: "text", text }], details: details() });
-			};
-
-			const stderr: string[] = [];
-			const exitCode = await new Promise<number | null>((done, fail) => {
-				const proc = spawn("cursor-agent", cliArgs, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-				proc.stdout.on("data", (chunk: Buffer) => emit(run.feed(chunk.toString())));
-				proc.stderr.on("data", (chunk: Buffer) => stderr.push(chunk.toString()));
-				proc.on("error", (err: NodeJS.ErrnoException) =>
-					fail(err.code === "ENOENT" ? new Error("cursor-agent not found; install it from https://cursor.com/cli") : err),
-				);
-				proc.on("close", (code) => {
-					run.feed("\n");
-					done(code);
-				});
-				const kill = () => {
-					proc.kill("SIGTERM");
-					setTimeout(() => proc.killed || proc.kill("SIGKILL"), 3_000);
-				};
-				if (signal?.aborted) kill();
-				else signal?.addEventListener("abort", kill, { once: true });
+			const outcome = await runCursor(spec, {
+				signal,
+				onEvent: (run, changed) => {
+					const now = Date.now();
+					if (!changed && now - lastEmit < 150) return;
+					lastEmit = now;
+					const text = short(run.state.live, 200) || "Cursor is working…";
+					onUpdate?.({
+						content: [{ type: "text", text }],
+						details: { model, cwd, ...run.state, tools: [...run.state.tools], done: false },
+					});
+				},
 			});
 
-			const d = details();
-			d.exitCode = exitCode;
-			d.durationMs ??= Date.now() - started;
-			if (stderr.length) d.stderr = truncateTail(stderr.join(""), { maxLines: 40, maxBytes: 4_000 }).content;
-			if (args.worktree && d.workspace && d.workspace !== cwd) {
-				const path = d.workspace;
-				const [branch, status] = await Promise.all([
-					git(path, ["branch", "--show-current"]).catch(() => ""),
-					git(path, ["status", "--short"]).catch(() => ""),
-				]);
-				d.worktree = { path, branch: branch.trim(), changed: status.split("\n").filter(Boolean) };
-			}
+			const d: CursorDetails = { model, cwd, ...outcome.state, done: false };
+			d.exitCode = outcome.exitCode;
+			d.durationMs = outcome.durationMs;
+			if (outcome.stderr) d.stderr = outcome.stderr;
+			if (outcome.worktree) d.worktree = outcome.worktree;
+			const exitCode = outcome.exitCode;
 
 			if (signal?.aborted) {
 				d.done = true;
@@ -242,13 +282,11 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 
 			if (d.sessionId) {
 				onUpdate?.({ content: [{ type: "text", text: "Looking up the run's cost…" }], details: { ...d } });
-				try {
-					d.charge = await findUsageEvent(d.sessionId, started, signal);
-					if (d.charge) addCents(d.charge.chargedCents ?? 0, ctx);
-					else d.chargeError = "no usage event yet";
-				} catch (err) {
-					d.chargeError = (err as Error).message;
-				}
+				const { charge, chargeError } = await lookupCharge(d.sessionId, outcome.started, signal);
+				if (charge) {
+					d.charge = charge;
+					addCents(charge.chargedCents ?? 0, ctx);
+				} else if (chargeError) d.chargeError = chargeError;
 			}
 			d.done = true;
 			void refreshUsageCache(); // for pi-usage; off the result's path, errors swallowed
@@ -280,13 +318,18 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			if (args.mode && args.mode !== "agent") t += theme.fg("muted", ` [${args.mode}]`);
 			if (args.network) t += theme.fg("warning", " [no sandbox]");
 			if (args.worktree) t += theme.fg("muted", " [worktree]");
+			if (args.background) t += theme.fg("muted", " [background]");
 			if (args.prompt) t += ` ${theme.fg("dim", short(args.prompt, 90))}`;
 			return new Text(t, 0, 0);
 		},
 
 		renderResult(result, { expanded, isPartial }, theme) {
-			const d = result.details as CursorDetails | undefined;
-			if (!d) return new Text("", 0, 0);
+			const raw = result.details as CursorDetails | BackgroundDetails | undefined;
+			if (!raw || "background" in raw) {
+				const text = result.content?.[0]?.type === "text" ? result.content[0].text.split("\n")[0] : "";
+				return new Text(text ? theme.fg(raw ? "muted" : "error", `  ${text}`) : "", 0, 0);
+			}
+			const d = raw;
 			const lines: string[] = [];
 			const steps = expanded ? d.tools : d.tools.slice(-5);
 			if (d.tools.length > steps.length) lines.push(theme.fg("dim", `  … ${d.tools.length - steps.length} earlier steps`));

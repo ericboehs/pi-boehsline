@@ -14,6 +14,7 @@
 
 ### Added
 
+- cursor-agent: `background: true` runs Cursor as a bg job (runner.ts) and returns at once. `/bg` shows each step live, and a message brings back the answer, the charge, the worktree and the exit code when it finishes. The foreground and background paths share run.ts.
 - cursor-agent: Cursor's billing-cycle spend goes into pi's shared `usage-cache.json` as `cursor-usage` after each `cursor` run and on `/cursor-usage`, so `pi-usage` lists it with the other providers.
 - cursor-agent: `/cursor-worktrees` lists the `pi-*` worktrees the tool left behind, with their changed files, and applies each to its repo (uncommitted) or removes it.
 - cursor-agent: `worktree` (and `worktreeBase`) runs each call in its own git worktree and branch, so parallel calls can't collide; the result names the path, branch and changed files. The tool also declares an `outputSchema`, so codemode scripts get `{answer, steps, chargedCents, tokens, sessionId, …}` instead of text.
