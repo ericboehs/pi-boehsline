@@ -43,6 +43,7 @@ Each session also listens on its own socket, `~/.local/state/botsun/owner/<pid>.
 | `say` with photos / files | `session` | `say_images` / `say_attach` | the lines v1 hashes: `sha256(text)`, then one per photo / file |
 | `say_audio` (call key) | `session` | `say_audio` | `<wav sha256>` and, with a proposal, `\n<proposal sha256>` |
 | `say` with `key: "call"` (call key, v2 only, text only) | `session` | `say_call` | `botsun-propose-text-v1\n<text>` |
+| `answer` with `key: "call"` (call key, v2 only, one pick) | `session` | `answer_call` | `canonicalAnswerV2` of the open prompt's one question and `[{picks: [i]}]` (as for `answer`), so only kind and decision tell it from a main-key answer |
 | `answer` | `answer` | `answer` | `canonicalAnswerV2`: `botsun-answer-v2`, the ask id, then per question `q<i> <sha(question)> <0\|1 multi>`, its options `o<i>.<j> <sha(label)> <sha(description)>`, and `a<i> <picks> <sha(text)>`, built from the open prompt's own questions (looked up before the digest), so a yes can't carry over to a reworded question or option |
 | `stash` | `session` | `stash` | `push\n<sha256(text)>`, `take\n<id>` or `drop\n<id>` |
 | `stop` | `session` | `stop` | `stop` |
@@ -87,7 +88,7 @@ What pinning can and can't do: it protects against a Botsun whose logic is compr
 | `drop` / `call_end` | forget the held words named, or all of them |
 | `stop` | the phone's Stop button: ends the running turn (or a compaction) as Esc does; signed over `stop` with the decision key; `{ok, stopped}` |
 | `close` | the phone's Close: aborts a running turn if any, replies `{ok}` at once, then shuts pi down gracefully (`ctx.shutdown()`) so the process exits; signed like `stop`, over `close`, but v2 only (a v1 signature is refused, ratchet or not); advertised as `close` in the nonce reply's `features` |
-| `answer` | answers the open `ask` question; the tool takes it as if picked at the keyboard and closes its dialog (a `sensitive` one: v2-signed only) |
+| `answer` | answers the open `ask` question; the tool takes it as if picked at the keyboard and closes its dialog (a `sensitive` one: v2-signed only). With `key: "call"` (feature `answer_call`): a locked phone's pick (the Watch), signed v2 with the call key (decision `answer_call`); taken only for the newest open ask when it isn't `sensitive` and has exactly one single-select question, for exactly one answer `{picks: [i]}` with `i` in range and no text; then answered as a main-key `[i]` would be |
 | `stash` | the message stash (with the stash extension): `push` a draft, `take` one back to the phone, `drop` one; signed over `push\n<sha256(text)>`, `take\n<id>` or `drop\n<id>` |
 | `footer_tap` | flips a display chip (`dir`, `context`, `cost`, `usage`, `rate`, `timers`) as a click on the footer does, and answers with the new row; display only, so not signed |
 

@@ -12,7 +12,7 @@ import { digestHex, fieldsPayload, messageV2, messageV3, validHost } from "../li
 
 const FIXTURE = new URL("./fixtures/signing-v2.json", import.meta.url);
 /** sha256 of the fixture as copied from Botsun; a change here means re-copying it on purpose. */
-const FIXTURE_SHA256 = "69b760e5b74b5e97383b0990bde5fb0b0ae714fdd61ea1aa8ba5e3366122d32b";
+const FIXTURE_SHA256 = "4e56dcbdc3b64b67519a4a1e8d37623993be5465d2c510b2f9bbe2eb07d0fa8d";
 const BOTSUN_FIXTURE = "/Users/ericboehs/Code/github.com/ericboehs/botsun/test/fixtures/signing-v2.json";
 const P256_SPKI = Buffer.from("3059301306072a8648ce3d020106082a8648ce3d030107034200", "hex");
 
@@ -43,7 +43,7 @@ function payloadOf(v) {
 
 test("every vector: payload, digest and message match Ruby's, and the signature verifies", () => {
 	assert.equal(fixture.version, 2);
-	assert.equal(fixture.vectors.length, 22);
+	assert.equal(fixture.vectors.length, 23);
 	for (const v of fixture.vectors) {
 		const payload = payloadOf(v);
 		if ("expect_payload_b64" in v) assert.equal(Buffer.from(payload).toString("base64"), v.expect_payload_b64, v.name);
@@ -54,6 +54,24 @@ test("every vector: payload, digest and message match Ruby's, and the signature 
 		const sig = Buffer.from(v.signature_der_b64, "base64");
 		assert.equal(verify("sha256", Buffer.from(msg, "utf8"), { key: pub, dsaEncoding: "der" }, sig), true, v.name);
 		assert.equal(verify("sha256", Buffer.from(`${msg}x`, "utf8"), { key: pub, dsaEncoding: "der" }, sig), false, `${v.name}: tampered`);
+	}
+});
+
+// A locked phone's pick (call key): kind session, decision answer_call, over the same canonical
+// answer as a main-key answer of one pick, so only the message's kind and decision tell them apart.
+test("the answer_call vector: one single-select question, one pick, no text; not a main-key answer's message", () => {
+	for (const [fx, version] of [[fixture, 2], [fixtureV3, 3]]) {
+		const v = fx.vectors.find((x) => x.decision === "answer_call");
+		assert.ok(v, `v${version} has an answer_call vector`);
+		assert.equal(v.kind, "session");
+		assert.equal(v.answer.questions.length, 1);
+		assert.equal(v.answer.questions[0].multi_select, false);
+		assert.deepEqual(v.answer.answers, [{ picks: [1] }]);
+		assert.match(payloadOf(v), /\na0 1 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855$/);
+		const main = { deviceId: String(fx.device_id), nonce: fx.nonce, kind: "answer", scope: v.scope, decision: "answer", payload: payloadOf(v) };
+		const mainMsg = version === 3 ? messageV3({ ...main, host: v.host }) : messageV2(main);
+		const key = version === 3 ? pubV3 : pub;
+		assert.equal(verify("sha256", Buffer.from(mainMsg, "utf8"), { key, dsaEncoding: "der" }, Buffer.from(v.signature_der_b64, "base64")), false);
 	}
 });
 
@@ -75,7 +93,7 @@ test("messageV2 and canonicalAnswerV2 refuse fields that could smuggle a line", 
 
 const FIXTURE_V3 = new URL("./fixtures/signing-v3.json", import.meta.url);
 /** sha256 of the v3 fixture as copied from Botsun; a change here means re-copying it on purpose. */
-const FIXTURE_V3_SHA256 = "041c5ef18ecc86bb8c59977b622f1136104d54182931457e48d16d01d4f6f5b1";
+const FIXTURE_V3_SHA256 = "3bc34ddcc82d1cb902c751d40f089f6f91e5379285a11a35668b043f14dbda43";
 const BOTSUN_FIXTURE_V3 = "/Users/ericboehs/Code/github.com/ericboehs/botsun/test/fixtures/signing-v3.json";
 const bytesV3 = readFileSync(FIXTURE_V3);
 const fixtureV3 = JSON.parse(bytesV3.toString("utf8"));
@@ -91,7 +109,7 @@ test("v3: the fixture is byte-identical to Botsun's, when Botsun is checked out 
 
 test("v3: every vector's message matches Ruby's and verifies; with another host (or as v2) it doesn't", () => {
 	assert.equal(fixtureV3.version, 3);
-	assert.equal(fixtureV3.vectors.length, 23);
+	assert.equal(fixtureV3.vectors.length, 24);
 	const hosts = new Set(fixtureV3.vectors.map((v) => v.host));
 	assert.ok(hosts.has("botsun.boehs.com:8443") && hosts.has("coop.botsun.boehs.com:8443"));
 	for (const v of fixtureV3.vectors) {

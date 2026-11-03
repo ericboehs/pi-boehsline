@@ -1264,6 +1264,69 @@ test("v2 answer: signed over the prompt's own questions, looked up first", async
 	offered.dispose();
 });
 
+test("a locked phone's pick: call key, v2, decision answer_call, one pick of the open single-select question", async () => {
+	const { offerPrompt, canonicalAnswerV2 } = await import("../lib/remote-prompts.ts");
+	const { ANSWER_CALL_SENSITIVE } = await import("../extensions/opt-in/botsun-owner/index.ts");
+	const decide = phoneKey();
+	const call = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: { 7: decide.raw.toString("base64") }, call_devices: { 7: call.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	await owner();
+	assert.ok((await ask({ type: "nonce" })).features.includes("answer_call"));
+	const questions = [{ question: "Pizza?", options: [{ label: "Pepperoni", description: "classic" }, { label: "Mushrooms" }] }];
+	let offered = offerPrompt(questions);
+	const send = async ({ pick = 1, key = call, kind = "session", decision = "answer_call", qs = questions, id = offered.id, answers, extra = {} } = {}) => {
+		const { nonce } = await ask({ type: "nonce" });
+		const a = answers ?? [{ picks: [pick] }];
+		const signature = signV2(key, nonce, kind, decision, canonicalAnswerV2(id, qs, [{ picks: [pick] }]));
+		return ask({ type: "answer", key: "call", ask_id: id, answers: a, nonce, device_id: 7, sig_v: 2, signature, ...extra });
+	};
+	// Keys and decisions never cross over.
+	assert.equal((await send({ key: decide })).error, "signature does not verify", "the main key isn't the call key");
+	assert.equal((await send({ kind: "answer", decision: "answer" })).error, "signature does not verify", "a main-key answer's message by the call key");
+	assert.equal((await send({ decision: "say_call" })).error, "signature does not verify");
+	assert.equal((await send({ qs: [{ ...questions[0], question: "Delete prod?" }] })).error, "signature does not verify", "a reworded question");
+	assert.equal((await send({ pick: 0, answers: [{ picks: [1] }] })).error, "signature does not verify", "signed for another pick");
+	{
+		// A call-key answer_call signature sent as a main-key answer: checked with the main key, refused.
+		const { nonce } = await ask({ type: "nonce" });
+		const signature = signV2(call, nonce, "session", "answer_call", canonicalAnswerV2(offered.id, questions, [{ picks: [1] }]));
+		assert.equal((await ask({ type: "answer", ask_id: offered.id, answers: [{ picks: [1] }], nonce, device_id: 7, sig_v: 2, signature })).error, "signature does not verify");
+	}
+	// One pick, no text, v2 only.
+	for (const answers of [[{ picks: [1], text: "x" }], [{ picks: [0, 1] }], [{ picks: [] }], [{ picks: ["1"] }], [{ picks: [1] }, { picks: [0] }], [], [{ picks: [1], more: 1 }]]) {
+		assert.equal((await send({ answers })).error, "a call-key answer is exactly one pick, no text", JSON.stringify(answers));
+	}
+	assert.equal((await send({ extra: { sig_v: 1 } })).error, "a call-key answer must be signed v2");
+	assert.equal((await send({ extra: { key: "main" } })).error, "bad request");
+	assert.equal((await send({ pick: 2 })).error, "a pick isn't one of the options");
+	assert.equal((await send({ pick: -1 })).error, "a pick isn't one of the options");
+	assert.equal((await send({ id: "q-other1" })).error, "that question was already answered");
+	// It goes in exactly as a device-key answer of [1] would.
+	assert.deepEqual(await send(), { ok: true });
+	assert.deepEqual(await offered.answered, [{ picks: [1] }]);
+	assert.equal((await send()).error, "that question was already answered");
+	offered.dispose();
+
+	// Only the open one (the newest), only one single-select question, never a sensitive one.
+	const older = offerPrompt(questions);
+	offered = offerPrompt(questions);
+	assert.equal((await send({ id: older.id })).error, "that question was already answered", "not the one the phone was shown");
+	older.dispose();
+	offered.dispose();
+	const two = [questions[0], { question: "Drink?", options: [{ label: "Water" }] }];
+	offered = offerPrompt(two);
+	assert.equal((await send({ qs: [questions[0]] })).error, "a locked phone can answer only one single-choice question");
+	offered.dispose();
+	const multi = [{ ...questions[0], multiSelect: true }];
+	offered = offerPrompt(multi);
+	assert.equal((await send({ qs: multi })).error, "a locked phone can answer only one single-choice question");
+	offered.dispose();
+	offered = offerPrompt(questions, { sensitive: true });
+	assert.equal((await send()).error, ANSWER_CALL_SENSITIVE);
+	offered.dispose();
+});
+
 test("v2 confirm: a v2-signed yes carries the answer-v2 hash; text proposals keep their own", async () => {
 	const { offerPrompt, canonicalAnswer, canonicalAnswerV2 } = await import("../lib/remote-prompts.ts");
 	const call = phoneKey();

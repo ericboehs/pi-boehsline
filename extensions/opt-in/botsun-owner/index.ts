@@ -541,7 +541,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (r.type === "drop") return dropHeld(c, r);
 	if (r.type === "call_end") return dropHeld(c, {});
 	if (r.type === "confirm") return confirmHeld(c, r);
-	if (r.type === "answer") return answerAsk(c, r);
+	if (r.type === "answer") return r.key !== undefined ? answerCall(c, r) : answerAsk(c, r);
 	if (r.type === "stash") return stashRequest(c, r);
 	if (r.type === "stop") return stopRequest(c, r);
 	if (r.type === "close") return closeRequest(c, r);
@@ -861,6 +861,54 @@ function answerAsk(c: Conn, r: Record<string, unknown>): Record<string, unknown>
 	return error ? { error } : { ok: true };
 }
 
+/** A sensitive ask (op-broker's secret approval) picked on a locked phone: refused. */
+export const ANSWER_CALL_SENSITIVE = "answer this one on the unlocked phone or the keyboard";
+
+/**
+ * An ask's option picked on the Watch while the phone is locked, signed with the phone's
+ * call key (key: "call"). v2 (or v3) only, its own decision "answer_call" (kind session, scope the
+ * session id) over canonicalAnswerV2 of the prompt's own one question and one pick: a main-key
+ * "answer" signature never verifies here, nor this one as an "answer". Taken only for the open
+ * ask (askLine's, the one the phone was shown) when it isn't sensitive and has exactly one
+ * single-select question, for exactly one answer of exactly one in-range pick and no text; then
+ * answered exactly as a device-key answer of picks [i] would be.
+ */
+function answerCall(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	// Refused before verifyDevice: spend the nonce anyway (one try per nonce, as there).
+	const spend = (error: string) => {
+		if (typeof r.nonce === "string") takeNonce(c, r.nonce);
+		return { error };
+	};
+	if (r.key !== "call") return spend("bad request");
+	const { ask_id: id, answers } = r;
+	if (typeof id !== "string") return spend("bad request");
+	if (!atLeastV2(r)) return spend("a call-key answer must be signed v2");
+	const a = Array.isArray(answers) && answers.length === 1 ? (answers[0] as Record<string, unknown> | null) : null;
+	const picks = a && typeof a === "object" && !Array.isArray(a) && Object.keys(a).length === 1 ? a.picks : null;
+	if (!Array.isArray(picks) || picks.length !== 1 || !Number.isInteger(picks[0])) return spend("a call-key answer is exactly one pick, no text");
+	const pick = picks[0] as number;
+	const open = openPrompts();
+	const prompt = open[open.length - 1]; // the open one: askLine's
+	if (!prompt || prompt.id !== id) return spend("that question was already answered");
+	if (prompt.sensitive) return spend(ANSWER_CALL_SENSITIVE);
+	const q = prompt.questions.length === 1 ? prompt.questions[0] : undefined;
+	if (!q || q.multiSelect) return spend("a locked phone can answer only one single-choice question");
+	if (pick < 0 || pick >= q.options.length) return spend("a pick isn't one of the options");
+	const picked = [{ picks: [pick] }];
+	const bad = invalidAnswer(prompt.questions, picked);
+	if (bad) return spend(bad);
+	const denied = verifyDevice(c, r, {
+		decision: "answer_call",
+		digest: () => "",
+		v2: { kind: "session", decision: "answer_call", payload: () => canonicalAnswerV2(prompt.id, prompt.questions, picked) },
+	}, "call");
+	if (denied) return { error: denied };
+	const error = prompt.answer(picked);
+	if (error) return { error };
+	debug("owner answer_call answered an ask");
+	return { ok: true };
+}
+
 /**
  * The phone works with this session's message stash (the stash extension's stack): push a draft,
  * take one back into its message box, or drop one. Signed with the decision key over
@@ -1071,7 +1119,7 @@ function featureList(c: Conn): string[] {
 	const hasStash = (() => {
 		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 	})();
-	return ["say", "say_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close",
+	return ["say", "say_call", "answer_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close",
 		...(hasStash ? ["stash"] : [])];
 }
 
