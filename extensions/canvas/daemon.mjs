@@ -172,17 +172,6 @@ function newestMtime(dir) {
   return newest;
 }
 
-export function parseFindings(text) {
-  const out = [];
-  for (const line of String(text || "").split("\n")) {
-    // "- [<iso>] text", or "- [<iso> · auto] text" for ones the status model wrote.
-    const m = line.match(/^- \[([^\]\s]+)(?: · (\w+))?\] (.*)$/);
-    if (m) out.push({ at: m[1], ...(m[2] ? { by: m[2] } : {}), text: m[3] });
-    else if (line.startsWith("  ") && out.length) out[out.length - 1].text += "\n" + line.slice(2);
-  }
-  return out;
-}
-
 const ACTIVITY_STATES = new Set(["working", "blocked", "done", "error", "idle"]);
 export const WATCH_FILE = ".watch.json";
 
@@ -191,10 +180,6 @@ export function sessionState(root, id) {
   const meta = readJson(join(dir, "meta.json"), { id });
   const status = readJson(join(dir, "status.json"), null);
   const sections = readJson(join(dir, "sections.json"), []);
-  let findings = [];
-  try {
-    findings = parseFindings(readFileSync(join(dir, "findings.md"), "utf8"));
-  } catch {}
   const live = !meta.ended && pidAlive(meta.pid);
   // pi's program state (working, blocked, done, error, idle), written by
   // canvas.ts. Only meaningful while the pi process is alive; anything
@@ -207,7 +192,7 @@ export function sessionState(root, id) {
   // The current or last turn, so the page can mark what it touched.
   const t = readJson(join(dir, "turn.json"), null);
   const turn = typeof t?.started === "string" ? { started: t.started, ...(typeof t.ended === "string" ? { ended: t.ended } : {}) } : undefined;
-  return { meta: { ...pageMeta(meta), id }, live, tmux: live && Boolean(tmuxOf(meta)), activity, activityMessage, activityAt, turn, status, reply: readReply(dir), acks: live ? readAcks(dir) : [], sections: Array.isArray(sections) ? sections : [], findings, watch: readWatch(root), updated: newestMtime(dir) };
+  return { meta: { ...pageMeta(meta), id }, live, tmux: live && Boolean(tmuxOf(meta)), activity, activityMessage, activityAt, turn, status, reply: readReply(dir), acks: live ? readAcks(dir) : [], sections: Array.isArray(sections) ? sections : [], watch: readWatch(root), updated: newestMtime(dir) };
 }
 
 /**
@@ -357,7 +342,6 @@ export function listSessions(root) {
       next: Array.isArray(s.status?.next) ? s.status.next.length : 0,
       done: Array.isArray(s.status?.done) ? s.status.done.length : 0,
       sections: s.sections.length,
-      findings: s.findings.length,
     });
   }
   return out.sort((a, b) => Number(b.live) - Number(a.live) || b.updated - a.updated);

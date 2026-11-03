@@ -336,9 +336,6 @@ dialog.modal.job-log .mbody { display: flex; flex-direction: column; overflow: h
 .card.lastturn, .card.lastturn > h2 { box-shadow: inset 3px 0 0 var(--accent); }
 .toc a.lastturn { box-shadow: inset 2px 0 0 var(--accent); }
 .toc a.lastturn .t { color: var(--ink); font-weight: 600; }
-.findings li.lastturn { box-shadow: inset 3px 0 0 var(--accent); }
-/* Findings: the bar marks rows, so the card itself only gets it on the header. */
-#findings.card.lastturn { box-shadow: none; }
 .turn-filter { display: flex; margin: 8px 12px 4px; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; width: max-content; }
 .turn-filter button { font: inherit; font-size: 12px; border: 0; background: var(--card); color: var(--dim); padding: 4px 10px; cursor: pointer; }
 .turn-filter button + button { border-left: 1px solid var(--line); }
@@ -492,12 +489,6 @@ iframe { display: block; width: 100%; border: 0; background: #fff; }
 iframe.fit { background: var(--card); }
 iframe.plan { height: 82vh; }
 img.shot { display: block; max-width: 100%; margin: 0 auto; border-radius: 6px; }
-.findings { margin: 0; padding: 0; list-style: none; }
-.findings li { display: grid; grid-template-columns: 76px 1fr auto; gap: 0 12px; align-items: start; padding: 7px 14px; border-top: 1px solid var(--soft); font-size: 13.5px; line-height: 1.45; }
-.findings li:first-child, .findings li.day + li { border-top: 0; }
-.findings li:hover { background: color-mix(in srgb, var(--soft) 45%, transparent); }
-.findings li time { color: var(--dim); font-size: 12px; text-align: right; padding-top: 1px; }
-.findings li .when { display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
 .tag.auto { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .fold-more { display: block; margin: 6px 0 0; }
 .gallery figure[hidden], details.agent[hidden] { display: none; }
@@ -506,14 +497,6 @@ img.shot { display: block; max-width: 100%; margin: 0 auto; border-radius: 6px; 
 .gallery img { display: block; width: 100%; height: 150px; object-fit: cover; object-position: top left; border: 1px solid var(--line); border-radius: 6px; background: var(--soft); }
 .gallery a:hover img { border-color: var(--accent); }
 .gallery figcaption { margin-top: 4px; font-size: 11.5px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.findings li .btn { opacity: 0; margin: -3px -6px -3px 0; }
-.findings li:hover .btn, .findings li .btn:focus-visible, .findings li .btn.ok { opacity: 1; }
-@media (hover: none) { .findings li .btn { opacity: 1; } }
-.findings li.day { display: block; padding: 10px 14px 4px; border-top: 0; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); }
-.findings li.day:hover { background: none; }
-.findings li.more { display: block; padding: 4px 10px 8px; }
-.findings li.more .btn { opacity: 1; margin: 0; }
-.findings li.more:hover { background: none; }
 .sessions .row { display: grid; grid-template-columns: 1fr auto; gap: 0 16px; padding: 10px 14px 11px; border-top: 1px solid var(--soft); color: inherit; text-decoration: none; }
 .sessions .row:first-child { border-top: 0; }
 .sessions .row:hover { background: color-mix(in srgb, var(--soft) 45%, transparent); }
@@ -1121,7 +1104,7 @@ function pinButton(secId) {
   return h("button", { class: `btn pin${on ? " on" : ""}`, type: "button", "aria-pressed": String(on), title: on ? "Unpin (p)" : "Pin to the top (p)", onclick: () => pageHooks.togglePin?.(secId) }, pinIcon());
 }
 
-/** Status and Findings stay on top. Sections follow, newest change first. */
+/** Status stays on top. Sections follow, newest change first. */
 function sortSections(list) {
   return [...list].sort((a, b) => String(b.at).localeCompare(String(a.at)));
 }
@@ -1233,8 +1216,6 @@ function replyPart(reply) {
     body,
   );
 }
-
-const FINDINGS_SHOWN = 8;
 
 // ── talk-back ──
 // The page writes to its pi: POST /s/<id>/send queues the message in the
@@ -1696,63 +1677,6 @@ function markTurn(card, turn) {
   card.classList.toggle("lastturn", !!turn);
   if (turn) card.dataset.turn = turnTitle(turn);
   else delete card.dataset.turn;
-}
-
-function findingsCard(findings, showAll = false, turn = null) {
-  if (!findings?.length) return null;
-  const list = h("ul", { class: "findings" });
-  const fresh = turn ? findings.filter((f) => f.at >= turn.since).length : 0;
-  const latest = findings[findings.length - 1];
-  const n = findings.length;
-  const card = h(
-    "section",
-    { class: `card${fresh ? " lastturn" : ""}`, id: "findings" },
-    h(
-      "h2",
-      {},
-      h("span", { class: "title" }, "Findings"),
-      h("span", { class: "n" }, String(n)),
-      h(
-        "span",
-        { class: "meta" },
-        latest?.at ? withTip(agoEl(latest.at), () => [`${n} finding${n === 1 ? "" : "s"}${fresh ? `, ${fresh} new in the ${turn.label}` : ""}`, `Newest ${fullDate(latest.at)}`, fresh ? turnTitle(turn) : null]) : null,
-        copyButton(() => findings.map((f) => `- ${f.text}`).join("\n"), "Copy all findings", "copy"),
-      ),
-    ),
-    h("div", { class: "bd flush" }, list),
-  );
-  // Newest first. findings.md is append-only, so file order is time order.
-  const newest = [...findings].reverse();
-  const shown = showAll ? newest : newest.slice(0, FINDINGS_SHOWN);
-  let lastDay = "";
-  for (const f of shown) {
-    const d = new Date(f.at);
-    const valid = !Number.isNaN(d.getTime());
-    const day = valid ? dayLabel(d) : "";
-    if (day && day !== lastDay) list.append(h("li", { class: "day" }, day));
-    lastDay = day || lastDay;
-    list.append(
-      h(
-        "li",
-        turn && f.at >= turn.since ? { class: "lastturn" } : {},
-        h(
-          "span",
-          { class: "when" },
-          h("time", { datetime: f.at, title: fullDate(f.at) }, valid ? clock(d) : f.at || ""),
-          f.by === "auto" ? h("span", { class: "tag auto", title: "Written by the status model" }, "auto") : null,
-        ),
-        renderMarkdown(f.text),
-        copyButton(() => f.text),
-      ),
-    );
-  }
-  const hidden = newest.length - shown.length;
-  if (hidden) {
-    const more = h("button", { class: "btn", type: "button" }, `Show ${hidden} older`);
-    more.addEventListener("click", () => card.replaceWith(findingsCard(findings, true, turn)));
-    list.append(h("li", { class: "more" }, more));
-  }
-  return collapsible(card, "_findings");
 }
 
 const rawUrl = (id, sec, bust = true) => bodyUrl(id, sec, bust);
@@ -2817,14 +2741,13 @@ async function sessionView(id) {
   const pinHead = h("div", { class: "pin-head", hidden: true }, pinIcon(), "Pinned");
   const pinSlot = h("div", { class: "pin-slot" });
   const sectionsSlot = h("div");
-  const findingsSlot = h("div");
   const tocSlot = h("div", { "data-side": "_contents" });
   const pipeSlot = h("div");
   const widgetSlot = h("div", { class: "side-list" }, tocSlot); // Contents and the widgets, in the saved order
   $app.classList.add("session");
   $app.replaceChildren(
     header,
-    h("div", { class: "layout" }, h("div", { class: "main-col" }, statusSlot, pinHead, pinSlot, findingsSlot, sectionsSlot), h("aside", { class: "side" }, pipeSlot, widgetSlot)),
+    h("div", { class: "layout" }, h("div", { class: "main-col" }, statusSlot, pinHead, pinSlot, sectionsSlot), h("aside", { class: "side" }, pipeSlot, widgetSlot)),
   );
   loadChoices(id);
   const cards = new Map(); // section id → { at, el }
@@ -2834,8 +2757,6 @@ async function sessionView(id) {
   let lastReplyAt;
   let liveTmux = false; // live and in a tmux pane, for focusTmux
   let lastState;
-  let lastFindings = -1;
-  let lastFindingsTurn = "";
   let turnNow = null; // { since, ended?, label: "this turn" | "last turn" }
 
   // ── placement: widgets go to the sidebar when the screen is wide ──
@@ -3155,19 +3076,6 @@ async function sessionView(id) {
     turnNow = t?.started ? { since: t.started, ended: t.ended, label: !t.ended && state.live ? "this turn" : "last turn" } : null;
     for (const sec of sections) markTurn(cards.get(sec.id).el, turnNow && String(sec.at) >= turnNow.since ? turnNow : null);
     place();
-
-    const turnKey = turnNow ? `${turnNow.since}|${turnNow.label}` : "";
-    if (state.findings.length !== lastFindings || turnKey !== lastFindingsTurn) {
-      const grew = lastFindings >= 0 && state.findings.length > lastFindings;
-      lastFindings = state.findings.length;
-      lastFindingsTurn = turnKey;
-      const card = findingsCard(state.findings, false, turnNow);
-      if (card && grew) {
-        card.classList.add("fresh");
-        if (card.classList.contains("collapsed")) card.classList.add("unseen");
-      }
-      findingsSlot.replaceChildren(card || "");
-    }
   }
 
   function setAll(shut) {
@@ -3890,7 +3798,7 @@ function moveSideCard(card, dir) {
   card.scrollIntoView({ block: "nearest" });
 }
 
-/** Pin or unpin a section card; Status, Findings and Contents aren't sections, so they stay put. */
+/** Pin or unpin a section card; Status and Contents aren't sections, so they stay put. */
 function pinCard(card) {
   const secId = card?.id?.startsWith("sec-") ? card.id.slice(4) : null;
   if (!secId || !pageHooks.togglePin) return toast("Only sections can be pinned");
@@ -4152,7 +4060,6 @@ async function indexView() {
       s.next ? h("span", { class: "chip next" }, `${s.next} next`) : null,
       s.done ? h("span", { class: "chip" }, `${s.done} done`) : null,
       s.sections ? h("span", { class: "chip" }, plural(s.sections, "section")) : null,
-      s.findings ? h("span", { class: "chip" }, plural(s.findings, "finding")) : null,
     ].filter(Boolean);
     // Live rows say how long ago; ended rows sit under a day heading, so the
     // clock time is enough.

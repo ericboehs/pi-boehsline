@@ -4,6 +4,7 @@
 
 ### Changed
 
+- canvas: findings are gone. The `finding` kind, the guideline asking agents to record them, Haiku's findings field and the Findings card are removed; nothing read them after the fact. Old `findings.md` files are left on disk and ignored.
 - cursor-agent: the footer **Cursor spend** chip shows billing-cycle Cursor spend on the border row (matching `pi-usage`), pace-colored over the cycle, instead of a `cursor` line on the status row. Three modes, cycled by a click: mini `⬡ $113` (default), compact `⬡ $113/$200`, and detailed `⬡ $113.28/$200 (57%)` with a dim `· +$… here` for this session's runs.
 
 ### Fixed

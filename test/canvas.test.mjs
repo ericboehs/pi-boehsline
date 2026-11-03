@@ -15,8 +15,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import canvasExtension, { ActivityTracker, daemonVersion, STATUS_PROMPT, checkChart, compareOptions, normalizeSpec, parseDelimited, diffSkipReason, fileId, filesMarkdown, syncCopies, gitDiff, isSensitivePath, jobsSpec, jobsCard, durableViews, readDurableViews, scheduledSpec, sessionViews, MAX_SCHEDULED, logTail, looksLikeDiff, makePatch, findingLine, findingTexts, isSectionId, newFindings, parseExtras, shotsMarkdown, agentTraffic, agentsMarkdown, bashExit, runSpec, streamable, tailLines, readPeers, resolvePeerName, tallyFiles, lastReply, sessionInfo, uniichatInfo, lastTurn, mergeOps, normalizeCode, normalizeOptions, normalizeTracker, normalizeTree, parseLineRange, nextSteps, claimInbox, ackInbox, withoutNextSteps, leftHalfBounds, openTodos, parseStatus, tmuxMeta, todoBoard, turnDigest, upsertSection, worthStatus } from "../extensions/canvas/index.ts";
-import { allowedHost, byteRange, clipTarget, latestClient, listSessions, parseFindings, prune, queueMessage, readAcks, readReply, readWatch, replyPreview, sessionForPane, sessionState, tmuxOf, withKit, PLAN_JS, SANDBOXED_SECTION_CSP, scriptableType, parseGitStatus, usageRows, gitInfo, sessionInfoOf } from "../extensions/canvas/daemon.mjs";
+import canvasExtension, { ActivityTracker, daemonVersion, STATUS_PROMPT, checkChart, compareOptions, normalizeSpec, parseDelimited, diffSkipReason, fileId, filesMarkdown, syncCopies, gitDiff, isSensitivePath, jobsSpec, jobsCard, durableViews, readDurableViews, scheduledSpec, sessionViews, MAX_SCHEDULED, logTail, looksLikeDiff, makePatch, isSectionId, parseExtras, shotsMarkdown, agentTraffic, agentsMarkdown, bashExit, runSpec, streamable, tailLines, readPeers, resolvePeerName, tallyFiles, lastReply, sessionInfo, uniichatInfo, lastTurn, mergeOps, normalizeCode, normalizeOptions, normalizeTracker, normalizeTree, parseLineRange, nextSteps, claimInbox, ackInbox, withoutNextSteps, leftHalfBounds, openTodos, parseStatus, tmuxMeta, todoBoard, turnDigest, upsertSection, worthStatus } from "../extensions/canvas/index.ts";
+import { allowedHost, byteRange, clipTarget, latestClient, listSessions, prune, queueMessage, readAcks, readReply, readWatch, replyPreview, sessionForPane, sessionState, tmuxOf, withKit, PLAN_JS, SANDBOXED_SECTION_CSP, scriptableType, parseGitStatus, usageRows, gitInfo, sessionInfoOf } from "../extensions/canvas/daemon.mjs";
 
 const msg = (role, content, extra = {}) => ({ type: "message", message: { role, content, ...extra } });
 
@@ -150,7 +150,6 @@ test("lastTurn collects successful edits and writes, and images the agent read",
       { type: "toolCall", id: "r2", name: "read", arguments: { path: "/tmp/shot.PNG" } },
       { type: "toolCall", id: "r3", name: "read", arguments: { path: "notes.md" } },
       { type: "toolCall", id: "r4", name: "read", arguments: { path: "/tmp/gone.png" } },
-      { type: "toolCall", id: "k1", name: "canvas", arguments: { kind: "finding", body: "x" } },
       { type: "toolCall", id: "k2", name: "canvas", arguments: { kind: "markdown", id: "t", body: "x" } },
       { type: "toolCall", id: "k3", name: "canvas", arguments: { kind: "markdown", id: "t", remove: true } },
     ]),
@@ -166,33 +165,14 @@ test("lastTurn collects successful edits and writes, and images the agent read",
   assert.equal(t.canvasSections, 1);
 });
 
-test("parseExtras keeps up to two findings and an auto- prefixed section", () => {
-  const reply = JSON.stringify({
-    goal: "g",
-    findings: ["root cause: x", "", 42, "gotcha: y", "third"],
-    section: { id: "Auto-State Matrix!", title: "States", markdown: "| a | b |\n|---|---|" },
-  });
+test("parseExtras keeps an auto- prefixed section", () => {
+  const reply = JSON.stringify({ goal: "g", section: { id: "Auto-State Matrix!", title: "States", markdown: "| a | b |\n|---|---|" } });
   const x = parseExtras(`\`\`\`json\n${reply}\n\`\`\``);
-  assert.deepEqual(x.findings, ["root cause: x", "gotcha: y"]);
   assert.deepEqual(x.section, { id: "auto-state-matrix", title: "States", markdown: "| a | b |\n|---|---|" });
-  assert.deepEqual(parseExtras('{"goal":"g","findings":[],"section":null}'), { findings: [], section: null });
+  assert.deepEqual(parseExtras('{"goal":"g","section":null}'), { section: null });
   assert.deepEqual(parseExtras('{"section":{"title":"Commands","markdown":"  "}}').section, null);
   assert.equal(parseExtras('{"section":{"title":"Run These","markdown":"x"}}').section.id, "auto-run-these");
-  assert.deepEqual(parseExtras("not json"), { findings: [], section: null });
-});
-
-test("newFindings drops ones already logged, loosely", () => {
-  assert.deepEqual(newFindings(["The `ui_prompt_start` event fires.", "New fact", "new fact!"], ["the ui_prompt_start event fires"]), ["New fact"]);
-});
-
-test("findingTexts and findingLine with a source", () => {
-  const md = findingLine("one\ntwo", "2026-10-07T00:00:00.000Z", "auto") + findingLine("three", "2026-10-07T01:00:00.000Z");
-  assert.ok(md.startsWith("- [2026-10-07T00:00:00.000Z · auto] one"));
-  assert.deepEqual(findingTexts(md), ["one two", "three"]);
-  assert.deepEqual(parseFindings(md), [
-    { at: "2026-10-07T00:00:00.000Z", by: "auto", text: "one\ntwo" },
-    { at: "2026-10-07T01:00:00.000Z", text: "three" },
-  ]);
+  assert.deepEqual(parseExtras("not json"), { section: null });
 });
 
 test("tallyFiles and filesMarkdown keep a running table, newest first", () => {
@@ -441,11 +421,10 @@ test("lastTurn names a canvas post by kind and id, not by its file path", () => 
   const t = lastTurn([
     { type: "message", message: { role: "user", content: "post it" } },
     call({ kind: "table", id: "commits-table", path: "/tmp/commits.json" }),
-    call({ kind: "finding", body: "x" }),
     call({ kind: "markdown", id: "old", remove: true }),
     { type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "/tmp/a.txt" } }] } },
   ]);
-  assert.deepEqual(t.tools.map((x) => x.arg), ["table commits-table", "finding", "remove old", "/tmp/a.txt"]);
+  assert.deepEqual(t.tools.map((x) => x.arg), ["table commits-table", "remove old", "/tmp/a.txt"]);
 });
 
 test("lastTurn counts edits a codemode script made, from the result's nestedCalls", () => {
@@ -490,7 +469,7 @@ test("prompt copy points at the newer kinds and keeps bodies out of context", as
   const rules = tool.promptGuidelines.join("\n");
   // Every rule, by its substance (the wording was tightened to save tokens).
   assert.match(rules, /proactively, unasked/);
-  assert.match(rules, /Record a finding .* root cause, gotcha, non-obvious constraint or API fact, or a decision/);
+  assert.doesNotMatch(rules, /finding/i, "findings are gone");
   assert.match(rules, /plan \(as steps\)/);
   assert.match(rules, /lightest canvas kind that fits/);
   assert.match(rules, /subagents, agent-link handoffs, a pstack run\): post a pipeline section/);
@@ -620,14 +599,6 @@ test("upsertSection replaces by id and moves it last", () => {
   assert.deepEqual(list.map((s) => `${s.id}:${s.title}`), ["b:B", "a:A2"]);
 });
 
-test("findingLine round-trips through parseFindings", () => {
-  const text = findingLine("first line\nsecond line", "2026-10-07T00:00:00.000Z") + findingLine("other", "2026-10-07T01:00:00.000Z");
-  assert.deepEqual(parseFindings(text), [
-    { at: "2026-10-07T00:00:00.000Z", text: "first line\nsecond line" },
-    { at: "2026-10-07T01:00:00.000Z", text: "other" },
-  ]);
-});
-
 test("leftHalfBounds reads display 1 from wrangle displays", () => {
   const out = "0  x=0       y=30      1440x2530\n1  x=-1920   y=351     1920x1080\n";
   assert.deepEqual(leftHalfBounds(out), [-1920, 351, -960, 1431]);
@@ -659,14 +630,13 @@ test("listSessions puts live sessions first and summarizes them", () => {
     mk("live1", { name: "now", pid: process.pid }, {
       "status.json": JSON.stringify({ goal: "g", now: "n", open: ["a", "b"], done: ["c"] }),
       "sections.json": JSON.stringify([{ id: "a", file: "a.md" }]),
-      "findings.md": "- [t] x\n",
     });
     mkdirSync(join(root, ".vendor"));
     const list = listSessions(root);
     assert.deepEqual(list.map((s) => s.id), ["live1", "dead1"]);
     assert.equal(list[0].live, true);
     assert.equal(list[0].sections, 1);
-    assert.equal(list[0].findings, 1);
+    assert.equal("findings" in list[0], false, "no findings count any more");
     assert.deepEqual([list[0].open, list[0].next, list[0].done], [2, 0, 1]);
     assert.deepEqual([list[1].open, list[1].next, list[1].done], [0, 0, 0]);
     assert.equal(list[1].live, false);

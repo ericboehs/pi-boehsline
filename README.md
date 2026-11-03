@@ -26,7 +26,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [aa-info](extensions/aa-info/README.md) | An Artificial Analysis briefing line whenever you switch models |  |
 | [auto-session-name](extensions/auto-session-name/README.md) | Names a fresh session after its first turn | `/auto-name` |
 | [bg](extensions/bg/README.md) | Background jobs through a `background` flag on `bash`, with a widget and logs | `/bg` |
-| [canvas](extensions/canvas/README.md) | A live local web page per session for tables, charts, diffs and findings | `canvas` tool, `/canvas` |
+| [canvas](extensions/canvas/README.md) | A live local web page per session for tables, charts, diffs and diagrams | `canvas` tool, `/canvas` |
 | [code-lint](extensions/code-lint/README.md) | Runs your linters after `edit`/`write` and feeds errors back |  |
 | [color](extensions/color/README.md) | Tints the session's editor border, like Claude Code | `/color` |
 | [compact-progress](extensions/compact-progress/README.md) | Progress bar and learned ETA while compaction runs |  |

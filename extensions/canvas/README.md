@@ -2,7 +2,7 @@
 
 <img width="2864" height="1690" alt="Screenshot 2026-10-29 at 14 02 20@2x" src="https://github.com/user-attachments/assets/af4f7034-fa7d-4c40-924a-a99b40eea7cc" />
 
-A live local web page for each session, where the agent posts tables, charts, diffs, checklists, timelines and findings beside the terminal. **Tool:** `canvas`. **Command:** `/canvas`.
+A live local web page for each session, where the agent posts tables, charts, diffs, checklists and timelines beside the terminal. **Tool:** `canvas`. **Command:** `/canvas`.
 
 Gives each pi session a live local web page for output
 that is too wide or long for the terminal. One shared daemon
@@ -87,8 +87,7 @@ the review prompt — so a renderer never reaches for a page global.
   (GFM, with ```` ```mermaid ```` fences), `html` (a page in a frame that fits
   its height), `html-plan` (a packed `/html-plan` file), `image`, `mermaid`,
   `chart`, `terminal`, `stats`, `table`, `compare`, `steps`, `pipeline`, `kanban`, `json`,
-  `timeline`, `diff`, `code`, `tree`, `options`, `tracker`, `pdf`, `video`, and `finding`
-  (one append-only line in the findings log).
+  `timeline`, `diff`, `code`, `tree`, `options`, `tracker`, `pdf` and `video`.
   The tool's guidelines tell the agent to pick the lightest kind that fits:
   markdown for short tables, table for data, stats for headline numbers,
   chart for numbers over time, mermaid for flows, html only for
@@ -209,8 +208,7 @@ the review prompt — so a renderer never reaches for a page global.
   its first frame. The daemon streams both from disk and answers byte
   ranges (206), which Safari needs to play video. `/html-plan` now puts
   its packed page here instead of opening Safari. The tool's guidelines tell
-  the main agent to use it without being asked: a finding for each confirmed
-  root cause, gotcha or decision, a section for tables, diagrams and
+  the main agent to use it without being asked: a section for tables, diagrams and
   command lists, plans as a `steps` checklist, work run through other agents
   (subagents, agent-link handoffs, pstack) as a `pipeline` kept current as
   each one starts, finishes or sends work back (independent items that move
@@ -219,8 +217,8 @@ the review prompt — so a renderer never reaches for a page global.
   an inline body over ~2 KB so the data stays out of its context. The status
   digest names each canvas post by kind and id, and lists the page's
   sections with their kinds so Haiku doesn't restate one in another form.
-- **Auto content.** The same Haiku call may add up to two findings and one
-  `auto-*` section per turn. Findings are tagged `auto` and deduplicated.
+- **Auto content.** The same Haiku call may add one `auto-*` section per
+  turn.
   Haiku's section is skipped when the agent wrote one that turn, and only the
   newest six are kept. After every turn the page also updates a **Files
   changed** table (paths and edit counts from tool calls, with the last change
@@ -442,9 +440,8 @@ the review prompt — so a renderer never reaches for a page global.
   16 KB a block, output cut down to `<span class>`). No diff is kept for binary files,
   files over 1 MB, or secret-looking names (`.env`, `*.pem`, `~/.ssh/…`,
   `*token*`); their row says why. Changes made through `bash` aren't tracked.
-- **Layout.** Status and Findings stay on top, and findings read newest first.
-  Sections follow, newest change first. **Pinned** sections sit between Status
-  and Findings, in the order they were pinned: the pin in a card's header,
+- **Layout.** Status stays on top. Sections follow, newest change first.
+  **Pinned** sections sit right under Status, in the order they were pinned: the pin in a card's header,
   `p` on the current section, or Pin in Cmd-K. Pins are per browser and per
   session (localStorage, dropped after 60 days unused, shared by the page's
   tabs), a pinned Tasks or Files changed card leaves the side panel for the
@@ -458,7 +455,7 @@ the review prompt — so a renderer never reaches for a page global.
   A section's header is the title and its pin (filled when pinned, shown on
   hover otherwise), then the age and three quiet icons: copy source, Clippy
   and open in a new tab. ⌥-click on any copy button (the source, a code
-  block, a finding, a prompt) copies the text as a markdown blockquote, `> `
+  block, a prompt) copies the text as a markdown blockquote, `> `
   on every line. ⇧-click copies it as plain text for a chat composer or
   anywhere markdown doesn't render (`**b**`, `*i*`, `_i_`, `~~s~~` lose their
   marks, a heading becomes its text, `-` items → `•`, `[t](u)` → `t (u)`, a
@@ -473,8 +470,7 @@ the review prompt — so a renderer never reaches for a page global.
   tap (touch has no hover): the kind, "kept up to date by the canvas" for the
   extension's own sections (Tasks, Agents, Files changed, Screenshots), the
   exact time, and the last-turn note. Status's age tells which model wrote
-  it; Findings' age is the newest finding's, and its tooltip counts the ones
-  new this turn. Copy all is a copy icon there too.
+  it.
   Click a card's header to collapse it.
   Each browser remembers that choice per session, and Collapse all / Expand all
   sit in the page header. A section nobody has opened or collapsed starts
@@ -490,7 +486,7 @@ the review prompt — so a renderer never reaches for a page global.
   section title names the tracker.
   Canvas does not know which tracker it is. Narrower, those widgets sit among
   the sections in time order.
-- **Last turn.** Sections, findings and side cards written since the current
+- **Last turn.** Sections and side cards written since the current
   (or last) turn began get an accent bar down the left edge, and the age's
   tooltip says when that turn ran ("Changed in the last turn (7:10–7:24
   PM)"). Contents bolds those entries and adds an **All N | Last
@@ -585,7 +581,7 @@ the review prompt — so a renderer never reaches for a page global.
   `/canvas off` / `on` pauses status runs for this process.
 
 Files live in `~/.pi/canvas/<session-id>/` (`meta.json`, `status.json`,
-`sections.json`, section bodies, `findings.md`). A session gets a folder only
+`sections.json`, section bodies). A session gets a folder only
 on its first status or section. The daemon deletes folders idle for 30 days
 whose pi process is gone (`PI_CANVAS_RETAIN_DAYS`).
 
@@ -660,7 +656,7 @@ imports them as `./*.mjs`), plus `theme-boot.js`, `render.css` and
 `vendor/marked.js`, `vendor/purify.js` in the shell, as the daemon's shell
 does. An embedded read-only page asks only for `GET <api>/api/s/<id>` (the
 state: `{ meta: { id, name, cwd }, live, activity, status, reply: { text, at,
-next }, acks, sections: [{ id, title, kind, file, at }], findings, turn,
+next }, acks, sections: [{ id, title, kind, file, at }], turn,
 watch }`, as `sessionState` in `daemon.mjs` builds it), `GET
 <api>/s/<id>/f/<file>?v=<at>` (each section's body, raw; html sections load
 there in a sandboxed frame), and `<assets>themes.json` plus the vendor

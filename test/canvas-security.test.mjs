@@ -362,7 +362,7 @@ test("N6: a session folder is created 700", async () => {
     const pi = new Proxy({}, { get: (_, k) => (k === "registerTool" ? (t) => (tool = t) : k === "getSessionName" ? () => "" : () => {}) });
     await canvas.default(pi);
     const ctx = { cwd: root, sessionManager: { getSessionId: () => "sess-1", getBranch: () => [] }, ui: { notify() {}, setStatus() {} }, hasUI: false };
-    await tool.execute("c1", { kind: "finding", body: "a fact" }, undefined, undefined, ctx);
+    await tool.execute("c1", { kind: "markdown", id: "a-fact", body: "a fact" }, undefined, undefined, ctx);
     // The tool's own ensureDaemon is in flight: let it finish while the fake still answers.
     assert.equal(await canvas.ensureDaemon(), true);
     assert.equal(statSync(join(root, "sess-1")).mode & 0o777, 0o700);

@@ -72,7 +72,6 @@ const STATE = {
   reply: { text: "Done.", at: "2026-10-28T14:00:00.000Z", next: ["Run the tests"] },
   acks: [],
   sections: [FRESH],
-  findings: [],
   watch: null,
   meeting: { kind: "list", id: "", recent: [], at: "2026-10-28T14:00:00.000Z" },
 };

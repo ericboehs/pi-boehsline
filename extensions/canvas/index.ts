@@ -8,24 +8,24 @@
  *   block (goal, now, done, open, next) from a digest of that turn. In-process
  *   modelRegistry.complete(), the same pattern as auto-session-name.ts; the
  *   main model does nothing.
- * - The same Haiku call may add up to two findings and one auto- section per
+ * - The same Haiku call may add one auto- section per
  *   turn. After every turn the page also gets a Files changed table and a
  *   Screenshots gallery of images the agent read, with no model involved.
  * - The `canvas` tool lets the main agent add or replace sections: markdown,
- *   html, html-plan, image, mermaid, and append-only findings.
+ *   html, html-plan, image, mermaid and the rest of the kinds.
  * - Safari never opens by itself. `/canvas` opens or focuses this session's
  *   page on display 1, left half.
  *
  * Env: PI_CANVAS=0 disables everything; PI_CANVAS_STATUS=0 keeps the tool but
  * stops status runs; PI_CANVAS_MODEL=provider/id overrides the status model;
- * PI_CANVAS_AUTO=0 stops the auto findings, sections, Agents, Files changed and
+ * PI_CANVAS_AUTO=0 stops the auto sections, Agents, Files changed and
  * Screenshots widgets; PI_CANVAS_PORT / PI_CANVAS_ROOT move the daemon. Subagent children
  * (PI_SUBAGENT_CHILD=1) skip the canvas.
  */
 
 import { spawn, spawnSync, execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, chmodSync, closeSync, copyFileSync, existsSync, fstatSync, type FSWatcher, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, type FSWatcher, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -180,7 +180,7 @@ export function lastTurn(branch: unknown[]): Turn {
         if (!failed) turn.ops!.push({ tool: p.name, path: a.path, ...(p.id ? { id: p.id } : {}) });
       }
       if (p.name === "read" && !failed && typeof a.path === "string" && IMAGE_EXT.has(extname(a.path).toLowerCase()) && !turn.images!.includes(a.path)) turn.images!.push(a.path);
-      if (p.name === "canvas" && !failed && a.kind !== "finding" && !a.remove) turn.canvasSections = (turn.canvasSections ?? 0) + 1;
+      if (p.name === "canvas" && !failed && !a.remove) turn.canvasSections = (turn.canvasSections ?? 0) + 1;
     }
   }
   for (const op of nested) {
@@ -379,7 +379,7 @@ export function worthStatus(turn: Turn): boolean {
 export function turnDigest(
   turn: Turn,
   prev: Status | null,
-  extra: { name?: string; cwd?: string; todo?: string[]; findings?: string[]; sections?: { id: string; title: string; kind?: string; by?: string }[] } = {},
+  extra: { name?: string; cwd?: string; todo?: string[]; sections?: { id: string; title: string; kind?: string; by?: string }[] } = {},
 ): string {
   const lines: string[] = [];
   lines.push(`Previous status: ${prev ? JSON.stringify({ goal: prev.goal, now: prev.now, done: prev.done, open: prev.open, next: prev.next }) : "none"}`);
@@ -391,31 +391,29 @@ export function turnDigest(
   }
   if (turn.files.length) lines.push("", `Files changed: ${turn.files.slice(0, 20).join(", ")}`);
   if (extra.todo?.length) lines.push("", "Open tasks:", ...extra.todo.slice(0, 10).map((t) => `- ${t}`));
-  lines.push("", "Recent findings (do not repeat these):", ...(extra.findings?.length ? extra.findings.slice(-12).map((f) => `- ${oneLine(f, 200)}`) : ["- none"]));
   lines.push("", "Sections on the page:", ...(extra.sections?.length ? extra.sections.map((x) => `- ${x.id}: ${x.title}${x.kind ? ` [${x.kind}]` : ""}${x.by === "auto" ? " (yours)" : " (agent's)"}`) : ["- none"]));
   lines.push("", `Agent's final reply:\n${turn.reply.slice(0, 4000)}`);
   return lines.join("\n");
 }
 
 export const STATUS_PROMPT = [
-  "You keep a coding-agent session's live web page: a terse status panel, a findings log and reference sections.",
+  "You keep a coding-agent session's live web page: a terse status panel and reference sections.",
   "Given the previous status and the latest turn, reply with JSON only, no prose and no code fence:",
-  '{"goal": string, "now": string, "done": string[], "open": string[], "next": string[], "findings": string[], "section": null | {"id": string, "title": string, "markdown": string}}',
+  '{"goal": string, "now": string, "done": string[], "open": string[], "next": string[], "section": null | {"id": string, "title": string, "markdown": string}}',
   "goal: the overall objective of the session in at most 15 words. Keep the previous goal unless the user clearly changed direction.",
   "now: what the agent just finished or is waiting on, at most 15 words.",
   "done: completed items, newest first, at most 6, merged with the previous list. Each at most 12 words.",
   "open: questions or decisions waiting on the user, at most 4. Drop ones that were answered.",
   "next: at most 3 likely next actions.",
-  "findings: 0 to 2 durable facts learned this turn that someone resuming the work later would need: a root cause, a gotcha, a non-obvious constraint, an API fact, or a decision and its reason. Not progress reports, not plans. Each at most 30 words; `code` allowed. Skip anything already in Recent findings. Usually empty.",
   "section: when the turn produced reference material worth keeping in view, such as a comparison or table, a state or option matrix, a set of commands, or a short design summary, return it as GitHub markdown (tables and ```mermaid fences allowed), at most 2500 characters, with a short title and a lowercase-slug id. To revise one of your own sections, reuse its id. Never copy an agent's section, or restate one on the same topic in another form. Otherwise null; most turns are null.",
   "Plain text in status fields, no markdown. Never include secrets, tokens, passwords or keys anywhere.",
 ].join("\n");
 
-export type Extras = { findings: string[]; section: { id: string; title: string; markdown: string } | null };
+export type Extras = { section: { id: string; title: string; markdown: string } | null };
 
-/** The findings and section a status reply may carry. Section ids get an auto- prefix. */
+/** The section a status reply may carry. Section ids get an auto- prefix. */
 export function parseExtras(text: string): Extras {
-  const out: Extras = { findings: [], section: null };
+  const out: Extras = { section: null };
   const raw = String(text || "").replace(/^```(?:json)?\s*|\s*```$/g, "");
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
@@ -426,7 +424,6 @@ export function parseExtras(text: string): Extras {
   } catch {
     return out;
   }
-  if (Array.isArray(v.findings)) out.findings = v.findings.filter((f) => typeof f === "string" && f.trim()).slice(0, 2).map((f) => oneLine(f, 400));
   const sec = v.section as Record<string, unknown> | null;
   if (sec && typeof sec === "object" && typeof sec.markdown === "string" && sec.markdown.trim()) {
     const slug = String(sec.id || sec.title || "notes").toLowerCase().replace(/^auto-/, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50) || "notes";
@@ -436,19 +433,6 @@ export function parseExtras(text: string): Extras {
 }
 
 const norm = (t: string) => t.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-
-/** New findings that are not already in the log, compared loosely. */
-export function newFindings(candidates: string[], existing: string[]): string[] {
-  const seen = new Set(existing.map(norm));
-  const out: string[] = [];
-  for (const c of candidates) {
-    const n = norm(c);
-    if (!n || seen.has(n)) continue;
-    seen.add(n);
-    out.push(c);
-  }
-  return out;
-}
 
 export type FileStat = { edits: number; writes: number; at: string };
 
@@ -998,22 +982,6 @@ export function upsertSection(list: Section[], sec: Section): Section[] {
   return out;
 }
 
-/** The text of each finding in findings.md, without timestamps. */
-export function findingTexts(md: string): string[] {
-  const out: string[] = [];
-  for (const line of String(md || "").split("\n")) {
-    const m = line.match(/^- \[[^\]]+\] (.*)$/);
-    if (m) out.push(m[1] ?? "");
-    else if (line.startsWith("  ") && out.length) out[out.length - 1] += ` ${line.trim()}`;
-  }
-  return out;
-}
-
-export function findingLine(text: string, at = new Date().toISOString(), by?: "auto"): string {
-  const [first, ...rest] = String(text).trim().split("\n");
-  return `- [${at}${by ? ` · ${by}` : ""}] ${first}${rest.map((l) => `\n  ${l}`).join("")}\n`;
-}
-
 /** Display 1 from `wrangle displays`, as AppleScript bounds for its left half. */
 // ── activity: pi's own program states (OSC 7501), mirrored for the page ─────
 
@@ -1267,7 +1235,7 @@ type Registry = {
   complete?: (model: unknown, req: unknown, opts: Record<string, unknown>) => Promise<CompleteResult>;
 };
 
-const KINDS = ["markdown", "html", "html-plan", "image", "mermaid", "chart", "terminal", "stats", "table", "compare", "steps", "pipeline", "kanban", "json", "timeline", "diff", "code", "tree", "options", "pdf", "video", "tracker", "finding"] as const;
+const KINDS = ["markdown", "html", "html-plan", "image", "mermaid", "chart", "terminal", "stats", "table", "compare", "steps", "pipeline", "kanban", "json", "timeline", "diff", "code", "tree", "options", "pdf", "video", "tracker"] as const;
 
 // Kinds whose body is a JSON spec the page draws, and the extension each is stored under.
 // (Not .json for the json kind: a section called "meta" or "sections" would overwrite the page's own files.)
@@ -1856,7 +1824,7 @@ export default function canvas(pi: ExtensionAPI) {
   }
 
   // The current or last turn (one prompt's run, start to settle): the page
-  // marks sections and findings written since it started.
+  // marks sections written since it started.
   let turn: { n: number; started: string; ended?: string } | null = null;
   /** Edits and writes codemode scripts made this run, from tool_result (the transcript can drop their paths). */
   let liveNested: FileOp[] = [];
@@ -2248,9 +2216,8 @@ export default function canvas(pi: ExtensionAPI) {
     putMarkdown(d, { id: "auto-agents", title: "Agents", body, by: "auto" });
   }
 
-  /** Record Haiku's findings and section, then trim old auto sections. */
-  function applyExtras(d: string, extras: Extras, known: string[], agentWroteSection: boolean) {
-    for (const f of newFindings(extras.findings, known)) appendFileSync(join(d, "findings.md"), findingLine(f, new Date().toISOString(), "auto"));
+  /** Record Haiku's section, then trim old auto sections. */
+  function applyExtras(d: string, extras: Extras, agentWroteSection: boolean) {
     // When the main agent already put this turn's material on the page, a
     // Haiku section would only repeat it.
     if (!extras.section || agentWroteSection) return;
@@ -2382,14 +2349,10 @@ export default function canvas(pi: ExtensionAPI) {
     try {
       todo = openTodos(readFileSync(join(ctx.cwd, ".pi", "TODO.md"), "utf8"));
     } catch {}
-    let known: string[] = [];
-    try {
-      known = findingTexts(readFileSync(join(d, "findings.md"), "utf8"));
-    } catch {}
     const sections = readJson<Section[]>(join(d, "sections.json"), [])
       .filter((x) => !PINNED.has(x.id))
       .map((x) => ({ id: x.id, title: x.title, kind: x.kind, by: x.by }));
-    const digest = turnDigest(turn, prev, { name: pi.getSessionName(), cwd: ctx.cwd, todo, ...(autoOn ? { findings: known, sections } : {}) });
+    const digest = turnDigest(turn, prev, { name: pi.getSessionName(), cwd: ctx.cwd, todo, ...(autoOn ? { sections } : {}) });
 
     inflight?.abort();
     const ac = new AbortController();
@@ -2408,7 +2371,7 @@ export default function canvas(pi: ExtensionAPI) {
       // The session may have switched while Haiku ran.
       if (basename(d) !== sessionId) return "stale";
       writeAtomic(join(d, "status.json"), JSON.stringify({ ...status, model: STATUS_MODEL.split("/").pop(), at: new Date().toISOString(), runs: (prev?.runs ?? 0) + 1 }, null, 2));
-      if (autoOn) await serial(() => applyExtras(d, parseExtras(textOf(res?.content)), known, (turn.canvasSections ?? 0) > 0));
+      if (autoOn) await serial(() => applyExtras(d, parseExtras(textOf(res?.content)), (turn.canvasSections ?? 0) > 0));
       return "updated";
     } catch (e) {
       return `error: ${(e as Error).message}`;
@@ -2655,13 +2618,11 @@ export default function canvas(pi: ExtensionAPI) {
       "- pdf: a document, via path",
       "- html-plan: a packed /html-plan file, via path",
       "- html: only something to interact with (calculator, sliders, what-if). Sandboxed, no network. Pre-styled: vars --ink --dim --line --soft --card --accent --ok --warn --bad --c1..8, light/dark, .primary buttons, inputs, sliders, tables; classes k-row k-col k-grid k-card k-stat(b+span) k-field k-muted k-tag k-ok k-warn k-bad k-bar(>i)",
-      "- finding: one durable line in the findings log; no id",
       "kanban/code text takes `code`, **bold**, [links](https://..). tone/color: ok|warn|bad|accent|dim|c1-c8.",
     ].join("\n"),
-    promptSnippet: "canvas: put tables, charts, checklists, command output, timelines, diagrams, screenshots and findings on this session's live web page",
+    promptSnippet: "canvas: put tables, charts, checklists, command output, timelines, diagrams and screenshots on this session's live web page",
     promptGuidelines: [
       "The user keeps the canvas open and expects it to grow as you work: use it proactively, unasked.",
-      "Record a finding once you confirm a root cause, gotcha, non-obvious constraint or API fact, or a decision and why; not progress.",
       "A table, option or state matrix, diagram, plan (as steps) or command list goes on the canvas as its own section; keep chat short.",
       "Pick the lightest canvas kind that fits (the tool says when each fits).",
       "Work via other agents (subagents, agent-link handoffs, a pstack run): post a pipeline section when it starts, a step per agent or role, and replace that id as each starts, finishes or sends work back.",
@@ -2674,7 +2635,7 @@ export default function canvas(pi: ExtensionAPI) {
       "Never put secrets, tokens or passwords on the canvas.",
     ],
     parameters: Type.Object({
-      id: Type.Optional(Type.String({ description: "Stable slug, e.g. hook-points; not for finding" })),
+      id: Type.Optional(Type.String({ description: "Stable slug, e.g. hook-points" })),
       title: Type.Optional(Type.String()),
       // A plain string enum: a union of literals serializes as 22 {const,type} objects.
       kind: Type.Unsafe<(typeof KINDS)[number]>({ type: "string", enum: [...KINDS] }),
@@ -2692,14 +2653,6 @@ export default function canvas(pi: ExtensionAPI) {
         const d = ensureDir(ctx);
         const url = pageUrl(sessionId);
         void ensureDaemon();
-
-        if (params.kind === "finding") {
-          const text = String(params.body || params.title || "").trim();
-          if (!text) throw new Error("finding needs body text");
-          if (text.length > 4000) throw new Error("finding is over 4000 characters; put long material in a markdown section");
-          appendFileSync(join(d, "findings.md"), findingLine(text));
-          return { content: [{ type: "text" as const, text: `Canvas: finding recorded. Page: ${url}` }], details: { kind: "finding", url } };
-        }
 
         if (!isSectionId(params.id)) throw new Error("id must be a lowercase slug: a-z, 0-9 and '-', at most 64 characters");
         const id = params.id;
@@ -2843,7 +2796,7 @@ export default function canvas(pi: ExtensionAPI) {
     },
     renderCall(args, theme) {
       const a = args as { id?: string; kind?: string; title?: string; remove?: boolean };
-      const what = a.remove ? `remove ${a.id}` : a.kind === "finding" ? "finding" : `${a.kind} ${a.id ?? ""}`;
+      const what = a.remove ? `remove ${a.id}` : `${a.kind} ${a.id ?? ""}`;
       return new Text(`${theme.fg("toolTitle", theme.bold("canvas"))} ${theme.fg("muted", what)}${a.title ? theme.fg("dim", ` · ${a.title}`) : ""}`, 0, 0);
     },
   });
