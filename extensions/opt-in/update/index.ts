@@ -222,12 +222,16 @@ function renderBanner(version: string, theme: Theme): Container {
   return box;
 }
 
-function bannerContent(version: string): string {
-  return [
-    "Update Available",
-    `New version ${version} is available. Run pi update or /update`,
-    `Changelog: ${CHANGELOG_URL}`,
-  ].join("\n");
+// Banners live in the session file, so resuming an old session replays them.
+// One only renders while its version is still newer than the running pi.
+export function isNewer(version: string, than: string): boolean {
+  const parts = (v: string) => v.replace(/^v/, "").split(/[.+-]/).slice(0, 3).map((n) => Number.parseInt(n, 10) || 0);
+  const a = parts(version);
+  const b = parts(than);
+  for (let i = 0; i < 3; i++) {
+    if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
+  }
+  return false;
 }
 
 function summary(result: UpdateResult, ok: boolean): { text: string; level: "info" | "warning" | "error" } {
@@ -251,25 +255,29 @@ function main(pi: ExtensionAPI) {
 
   let announcedFor: string | undefined;
 
+  // A custom entry, not a message: it shows in the chat but never reaches the model.
   const showBanner = (version: string): void => {
-    pi.sendMessage({
-      customType: BANNER_TYPE,
-      content: bannerContent(version),
-      display: true,
-      details: { version },
-    });
+    pi.appendEntry(BANNER_TYPE, { version });
   };
 
+  pi.registerEntryRenderer(BANNER_TYPE, (entry, _options, theme) => {
+    const version = (entry.data as { version?: unknown } | undefined)?.version;
+    if (typeof version !== "string" || !isNewer(version, VERSION)) return undefined;
+    return renderBanner(version, theme);
+  });
+
+  // Sessions from before the switch hold banners as custom messages. An empty
+  // component hides a stale one (undefined would fall back to the raw text).
   pi.registerMessageRenderer(BANNER_TYPE, (message, _options, theme) => {
     const version = (message.details as { version?: unknown } | undefined)?.version;
     if (typeof version !== "string" || version === "") return undefined;
-    return renderBanner(version, theme);
+    return isNewer(version, VERSION) ? renderBanner(version, theme) : new Container();
   });
 
   pi.on("session_start", (_event, ctx) => {
     if (!ctx.hasUI || process.env.PI_OFFLINE || announcedFor) return;
     const announce = (to: string | undefined): void => {
-      if (!to || to === VERSION || announcedFor === to) return;
+      if (!to || !isNewer(to, VERSION) || announcedFor === to) return;
       announcedFor = to;
       showBanner(to);
     };

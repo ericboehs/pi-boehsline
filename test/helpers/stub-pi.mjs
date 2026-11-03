@@ -8,6 +8,8 @@ export function stubPi() {
 	const tools = [];
 	const providers = new Map();
 	const renderers = new Map();
+	const entryRenderers = new Map();
+	const entries = [];
 	const sent = [];
 	const listeners = {};
 	const pi = {
@@ -16,6 +18,8 @@ export function stubPi() {
 		registerTool: (tool) => tools.push(tool),
 		registerProvider: (name, config) => providers.set(name, config),
 		registerMessageRenderer: (type, fn) => renderers.set(type, fn),
+		registerEntryRenderer: (type, fn) => entryRenderers.set(type, fn),
+		appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
 		registerShortcut: () => {},
 		registerFlag: () => {},
 		sendUserMessage: async (content, options) => sent.push({ content, options }),
@@ -35,10 +39,11 @@ export function stubPi() {
 		...tools.map((t) => `tool:${t.name}`),
 		...[...providers.keys()].map((p) => `provider:${p}`),
 		...[...renderers.keys()].map((r) => `renderer:${r}`),
+		...[...entryRenderers.keys()].map((r) => `entry-renderer:${r}`),
 	].sort();
 	/** Run every handler for an event; returns their results. */
 	const fire = async (event, payload, ctx) => Promise.all((handlers.get(event) ?? []).map((fn) => fn(payload, ctx)));
-	return { pi, handlers, commands, tools, providers, renderers, sent, names, fire };
+	return { pi, handlers, commands, tools, providers, renderers, entryRenderers, entries, sent, names, fire };
 }
 
 /** A command/event ctx that records notifications. */
