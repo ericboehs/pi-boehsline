@@ -15,12 +15,14 @@ export const WORKTREE_ROOT = join(homedir(), ".cursor", "worktrees");
 export function git(cwd: string, args: string[], opts: { input?: string; env?: Record<string, string> } = {}): Promise<string> {
 	return new Promise((done, fail) => {
 		const env = opts.env ? { ...process.env, ...opts.env } : process.env;
-		const proc = spawn("git", ["-C", cwd, ...args], { stdio: ["pipe", "pipe", "pipe"], env });
+		// stdin only when there is input: git can exit before reading it (a missing
+		// dir fails at once), and ending a closed pipe throws EPIPE on Linux.
+		const proc = spawn("git", ["-C", cwd, ...args], { stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", "pipe"], env });
 		const out: Buffer[] = [];
 		const err: Buffer[] = [];
 		const timer = setTimeout(() => proc.kill("SIGKILL"), 30_000);
-		proc.stdout.on("data", (b: Buffer) => out.push(b));
-		proc.stderr.on("data", (b: Buffer) => err.push(b));
+		proc.stdout?.on("data", (b: Buffer) => out.push(b));
+		proc.stderr?.on("data", (b: Buffer) => err.push(b));
 		proc.on("error", (e) => {
 			clearTimeout(timer);
 			fail(e);
@@ -30,7 +32,10 @@ export function git(cwd: string, args: string[], opts: { input?: string; env?: R
 			if (code === 0) done(Buffer.concat(out).toString());
 			else fail(new Error(Buffer.concat(err).toString().trim() || `git ${args[0]} exited with code ${code}`));
 		});
-		proc.stdin.end(opts.input ?? "");
+		if (proc.stdin) {
+			proc.stdin.on("error", () => {}); // git's exit code says what went wrong
+			proc.stdin.end(opts.input);
+		}
 	});
 }
 

@@ -196,15 +196,17 @@ export async function clearStale(sock, isAlive) {
 	if (await isAlive()) return "alive";
 	let first;
 	try {
-		first = lstatSync(sock);
+		first = lstatSync(sock, { bigint: true });
 	} catch (e) {
 		return e?.code === "ENOENT" ? "gone" : "error";
 	}
 	if (!first.isSocket()) return "not-socket";
 	if (await isAlive()) return "alive";
 	try {
-		const now = lstatSync(sock);
-		if (now.dev !== first.dev || now.ino !== first.ino) return "replaced";
+		// Linux hands a just-freed inode number to the next file, so a socket another
+		// starter bound in between can share dev+ino. Its change time can't match.
+		const now = lstatSync(sock, { bigint: true });
+		if (now.dev !== first.dev || now.ino !== first.ino || now.ctimeNs !== first.ctimeNs) return "replaced";
 		unlinkSync(sock);
 		return "removed";
 	} catch (e) {

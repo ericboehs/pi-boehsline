@@ -1082,7 +1082,7 @@ export function renderPipeline(spec) {
     const all = [...built.map.querySelectorAll(`.band[data-stage="${i}"]`)]; // a split stage has one per row
     if (!all.length) return;
     const bx = Number(all[0].getAttribute("x"));
-    wrap.scrollTo({ left: Math.max(0, bx * (built.map.getBoundingClientRect().width / built.W) - 24), behavior: "smooth" }); // the map may be drawn smaller
+    wrap.scrollTo?.({ left: Math.max(0, bx * (built.map.getBoundingClientRect().width / built.W) - 24), behavior: "smooth" }); // the map may be drawn smaller
     for (const band of all) {
       band.classList.remove("on");
       void band.getBoundingClientRect();
@@ -1241,13 +1241,15 @@ function tickSince(root) {
   if (!root.querySelector("[data-since], [data-until], [data-ago]")) return;
   let was = false;
   let idle = 0;
+  let stopped = false; // a run after clearInterval (Node 22.18's mock timers) must not tick
   const iv = setInterval(() => {
+    if (stopped) return;
     if (root.isConnected) {
       was = true;
       idle = 0;
       if (root.checkVisibility?.() === false) return; // a display:none bubble: nothing to show
       updateTimes(root);
-    } else if (was || ++idle > 10) clearInterval(iv);
+    } else if (was || ++idle > 10) (stopped = true), clearInterval(iv);
   }, 1000);
 }
 
@@ -1391,13 +1393,15 @@ export function renderTerminal(spec, opts = {}) {
     tick();
     let was = false;
     let idle = 0;
+    let stopped = false;
     const iv = setInterval(() => {
+      if (stopped) return;
       if (label.isConnected) (was = true), (idle = 0), tick();
       // Re-rendered or closed, or rendered but never attached (a 3 s refresh
       // can replace a body before inserting it): stop ticking either way.
-      else if (was || ++idle > 10) clearInterval(iv);
+      else if (was || ++idle > 10) (stopped = true), clearInterval(iv);
     }, 1000);
-    stop = () => clearInterval(iv);
+    stop = () => ((stopped = true), clearInterval(iv));
     clock = h("span", { class: "term-running" }, h("span", { class: "pulse working" }), label);
   }
   const head = h(

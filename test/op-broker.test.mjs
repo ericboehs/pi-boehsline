@@ -594,7 +594,8 @@ test("the extension: a card in the session, then the daemon's value through the 
 	process.env.PI_OP_BROKER_DIR = dir;
 	process.env.PI_OP_BROKER_OP = fakeOp(fake);
 	process.env.PI_OP_BROKER_SCRIPT = join(root, "noscript.sh"); // no pty in tests: run the daemon directly
-	writeFileSync(process.env.PI_OP_BROKER_SCRIPT, '#!/bin/sh\nshift; shift; exec "$@"\n');
+	// macOS: script -q /dev/null cmd...; util-linux: script -q -c 'cmd' /dev/null.
+	writeFileSync(process.env.PI_OP_BROKER_SCRIPT, '#!/bin/sh\n[ "$2" = "-c" ] && exec /bin/sh -c "$3"\nshift; shift; exec "$@"\n');
 	chmodSync(process.env.PI_OP_BROKER_SCRIPT, 0o755);
 	const ext = (await import(join(EXT, "index.ts"))).default;
 	const stub = stubPi();

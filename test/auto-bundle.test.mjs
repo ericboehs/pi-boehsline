@@ -40,7 +40,14 @@ async function withFakeHome(agent, fn) {
 	}
 }
 
-const exited = (child) => new Promise((resolve) => child.on("exit", resolve));
+// rebuildBundle unrefs its detached child. Re-ref it while waiting, or on some
+// Node versions (22.18) the loop drains first and the test is cancelled.
+const exited = (child) =>
+	new Promise((resolve) => {
+		if (child.exitCode !== null || child.signalCode !== null) return resolve(child.exitCode);
+		child.ref();
+		child.on("exit", resolve);
+	});
 
 test("the event name matches the footer's", async () => {
 	const footer = readFileSync(new URL("../extensions/footer/index.ts", import.meta.url), "utf8");
