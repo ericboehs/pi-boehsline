@@ -9,6 +9,9 @@
  *   - Threshold nudge   — once usage crosses a configurable token count
  *     (default 250k), a single notice is appended to the session. It re-arms
  *     after the next compaction.
+ *   - Post-compaction note — after a compaction the agent didn't ask for
+ *     (/compact, idle cache-warm compaction, threshold or overflow), one line
+ *     tells it the new usage, so it doesn't compact again on a stale nudge.
  *
  * Threshold config, first match wins:
  *   PI_CONTEXT_NUDGE_TOKENS env var, then `nudgeTokens` in
@@ -24,6 +27,20 @@ import { Type } from "typebox";
 const CONFIG_PATH = join(homedir(), ".pi-context", "config.json");
 const DEFAULT_NUDGE_TOKENS = 250_000;
 const NUDGE_TYPE = "pi-context-nudge";
+const COMPACTED_TYPE = "pi-context-compacted";
+
+/**
+ * pi-context's own estimate of the context (system prompt, tools, messages):
+ * `raw` is characters / CPT, `total` is that scaled to the measured number or
+ * the model's learned scale.
+ */
+export type EstimateTokens = (ctx: ExtensionContext) => { raw: number; total: number } | undefined;
+
+const REASON_TEXT = {
+	manual: "compacted",
+	threshold: "auto-compacted near the context limit",
+	overflow: "compacted after overflowing the context window",
+} as const;
 
 function nudgeTokens(): number {
 	const env = process.env.PI_CONTEXT_NUDGE_TOKENS;
@@ -68,8 +85,13 @@ function nudgedSinceCompaction(ctx: ExtensionContext): boolean {
 	return false;
 }
 
-export function registerSelfCompact(pi: ExtensionAPI): void {
+export function registerSelfCompact(pi: ExtensionAPI, estimate?: EstimateTokens): void {
 	let pending: { instructions?: string } | undefined;
+	// True from the agent-requested ctx.compact() call until its session_compact(_failed).
+	let agentCompacting = false;
+	// Measured / raw-estimate tokens for this session, taken just before a compaction,
+	// so the post-compaction estimate uses this session's own scale.
+	let scaleBefore: number | undefined;
 
 	pi.registerTool({
 		name: "context_usage",
@@ -113,6 +135,7 @@ export function registerSelfCompact(pi: ExtensionAPI): void {
 		const { instructions } = pending;
 		pending = undefined;
 		const before = ctx.getContextUsage()?.tokens;
+		agentCompacting = true;
 		ctx.compact({
 			customInstructions: instructions,
 			onComplete: () => {
@@ -127,6 +150,62 @@ export function registerSelfCompact(pi: ExtensionAPI): void {
 	// Drop a queued request if the session changes underneath it.
 	pi.on("session_start", async () => {
 		pending = undefined;
+		agentCompacting = false;
+	});
+
+	pi.on("session_compact_failed", async () => {
+		agentCompacting = false;
+		scaleBefore = undefined;
+	});
+
+	// Returns nothing, so another extension's compaction result is kept.
+	pi.on("session_before_compact", async (_event, ctx) => {
+		scaleBefore = undefined;
+		const measured = ctx.getContextUsage()?.tokens;
+		if (measured == null || agentCompacting) return;
+		try {
+			const raw = estimate?.(ctx)?.raw;
+			if (raw && raw > 0) scaleBefore = measured / raw;
+		} catch {
+			// No estimate: fall back to the learned scale after compaction.
+		}
+	});
+
+	// Tell the agent where usage stands after a compaction it didn't ask for.
+	// getContextUsage() has no number until the next response, so the "after"
+	// figure is pi-context's own estimate. Steering without triggerTurn: a
+	// running agent reads it before its next model call; an idle session just
+	// stores it for the next prompt.
+	pi.on("session_compact", async (event, ctx) => {
+		if (agentCompacting) {
+			agentCompacting = false;
+			return;
+		}
+		const before = event.compactionEntry.tokensBefore;
+		const window = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
+		const scale = scaleBefore;
+		scaleBefore = undefined;
+		let after = ctx.getContextUsage()?.tokens ?? undefined;
+		if (after == null) {
+			try {
+				const e = estimate?.(ctx);
+				if (e) after = scale ? Math.round(e.raw * scale) : e.total;
+			} catch {
+				after = undefined;
+			}
+		}
+		const parts = [`[pi-context] Session ${REASON_TEXT[event.reason] ?? "compacted"}`];
+		if (before > 0 || after != null) {
+			const from = before > 0 ? `${k(before)}` : "?";
+			const to = after != null ? `~${k(after)}` : "?";
+			const pct = after != null && window ? ` (${((after / window) * 100).toFixed(0)}% of ${k(window)})` : "";
+			parts[0] += `: ${from} → ${to} tokens${pct}`;
+		}
+		pi.sendMessage({
+			customType: COMPACTED_TYPE,
+			content: `${parts[0]}. No need to compact again.`,
+			display: true,
+		});
 	});
 
 	pi.on("turn_end", async (event, ctx) => {

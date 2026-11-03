@@ -97,6 +97,8 @@ interface ContextReport {
 	conversation: number;
 	overhead: number; // system + tools (everything that isn't conversation)
 	total: number; // grand total shown in the header
+	/** Uncalibrated estimate (characters / CPT), before any scale is applied. */
+	rawTotal: number;
 	groups: GroupStat[];
 	/** Loaded extensions that register no tool schemas (zero context cost). */
 	freeExtensions: Array<{ label: string; commands: number }>;
@@ -342,6 +344,7 @@ function buildReport(pi: ExtensionAPI, ctx: any): ContextReport {
 		conversation,
 		overhead,
 		total,
+		rawTotal,
 		groups,
 		freeExtensions,
 		skillList,
@@ -396,7 +399,10 @@ const PCT_W = 5;
 const LINE_W = LABEL_W + COUNT_W + TOK_W + 2 + BAR_W + PCT_W;
 
 export default function (pi: ExtensionAPI) {
-	registerSelfCompact(pi);
+	registerSelfCompact(pi, (ctx) => {
+		const r = buildReport(pi, ctx);
+		return { raw: r.rawTotal, total: r.total };
+	});
 
 	pi.registerEntryRenderer<ContextReport>(ENTRY_TYPE, (entry, { expanded }, theme) => {
 		const r = entry.data;
