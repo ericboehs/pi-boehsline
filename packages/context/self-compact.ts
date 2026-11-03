@@ -3,8 +3,9 @@
  *
  *   - `context_usage`   — the agent reads current context usage on demand.
  *   - `compact_context` — the agent requests compaction, with optional focus
- *     instructions. It is queued and runs once pi is idle (`agent_settled`);
- *     pi does not resume work afterwards.
+ *     instructions. It is queued; the agent finishes its response, and the
+ *     compaction runs once pi is idle (`agent_settled`). Pi does not resume
+ *     work afterwards.
  *   - Threshold nudge   — once usage crosses a configurable token count
  *     (default 200k), a single notice is appended to the session. It re-arms
  *     after the next compaction.
@@ -99,11 +100,10 @@ export function registerSelfCompact(pi: ExtensionAPI): void {
 				content: [
 					{
 						type: "text",
-						text: `Compaction queued${at}. It runs once this response ends; the session waits for the user afterwards.`,
+						text: `Compaction queued${at}. It runs when this response finishes, so wrap up now: say what you did and what comes next. The session waits for the user afterwards.`,
 					},
 				],
 				details: { instructions: instructions ?? null },
-				terminate: true,
 			};
 		},
 	});

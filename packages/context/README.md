@@ -95,7 +95,7 @@ Extension groups are named after the package that registered them (`npm:`/`git:`
 pi-context also gives the agent two tools and a threshold nudge, so it can manage its own context:
 
 - **`context_usage`** returns tokens used, percent of the window, window size, remaining tokens, and the nudge threshold.
-- **`compact_context`** compacts the session. It takes optional `instructions` (what the summary must keep, passed to pi as custom compaction instructions). The tool only queues the request and ends the response; pi compacts once it is idle (`agent_settled`) and then waits for you. Work does not resume on its own.
+- **`compact_context`** compacts the session. It takes optional `instructions` (what the summary must keep, passed to pi as custom compaction instructions). The tool only queues the request: the agent finishes its reply (what it did, what comes next), then pi compacts once it is idle (`agent_settled`) and waits for you. Work does not resume on its own.
 - **Threshold nudge.** When usage crosses the threshold, one notice is added to the session telling the agent it may want to compact. It fires once, and fires again only after the next compaction.
 
 The threshold defaults to 200,000 tokens. Set it with `PI_CONTEXT_NUDGE_TOKENS`, or with `nudgeTokens` in `~/.pi-context/config.json`. The env var wins, and `0` turns the nudge off.
