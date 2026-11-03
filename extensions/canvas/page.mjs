@@ -152,6 +152,16 @@ dialog.modal > header .sub { color: var(--dim); font-size: 12px; white-space: no
 dialog.modal > header .tools { margin-left: auto; display: flex; gap: 2px; align-items: center; flex: none; }
 dialog.modal > header .pos { color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; padding: 0 4px; }
 dialog.modal .mbody { overflow: auto; min-height: 0; flex: 1; }
+dialog.modal .mwrap { position: relative; display: flex; flex-direction: column; min-height: 0; flex: 1; }
+dialog.modal .mstep { position: absolute; top: 50%; transform: translateY(-50%); width: 44px; height: 64px; border: 0; border-radius: 8px; background: rgba(0, 0, 0, .38); color: #fff; font-size: 34px; line-height: 1; cursor: pointer; opacity: .55; transition: opacity .15s; }
+dialog.modal .mstep:hover, dialog.modal .mstep:focus-visible { opacity: 1; }
+dialog.modal .mstep.prev { left: 10px; }
+dialog.modal .mstep.next { right: 10px; }
+dialog.modal .mhelp { position: absolute; right: 12px; top: 48px; z-index: 2; padding: 10px 14px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); box-shadow: 0 10px 30px rgba(0, 0, 0, .25); font-size: 13px; }
+dialog.modal .mhelp .keys-hd { display: flex; align-items: center; justify-content: space-between; gap: 16px; font-weight: 600; margin-bottom: 6px; }
+dialog.modal .mhelp td { padding: 2px 10px 2px 0; vertical-align: top; }
+dialog.modal .mhelp td + td { color: var(--dim); }
+dialog.modal .mhelp kbd { display: inline-block; min-width: 1.3em; padding: 0 5px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; background: var(--soft); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; }
 dialog.modal .mbody > .empty, dialog.modal .mbody > .err { padding: 18px; }
 dialog.modal.image .mbody { background: var(--soft); display: flex; align-items: center; justify-content: center; }
 dialog.modal img.lightbox { display: block; max-width: 94vw; max-height: calc(92vh - 42px); object-fit: contain; }
@@ -2506,6 +2516,14 @@ function showModal(items, i, render) {
     d.className = `modal ${kind}`;
     const step = (n, label, tip) => h("button", { class: "btn", type: "button", title: tip, onclick: () => show(i + n) }, label);
     const box = h("div", { class: "mbody" }, h("div", { class: "empty" }, "Loading…"));
+    // Images get big ‹ › at their edges too, like /meeting's slide zoom.
+    const edges =
+      kind === "image" && items.length > 1
+        ? [
+            h("button", { class: "mstep prev", type: "button", title: "Previous (← or h)", "aria-label": "Previous", onclick: () => show(i - 1) }, "‹"),
+            h("button", { class: "mstep next", type: "button", title: "Next (→ or l)", "aria-label": "Next", onclick: () => show(i + 1) }, "›"),
+          ]
+        : null;
     const raw = h("a", { class: "btn open", href, target: "_blank", rel: "noopener", title: "Open in a new tab" }, "↗");
     d.replaceChildren(
       h(
@@ -2519,10 +2537,11 @@ function showModal(items, i, render) {
           extra ?? null,
           items.length > 1 ? [step(-1, "←", "Previous (←)"), h("span", { class: "pos" }, `${i + 1} / ${items.length}`), step(1, "→", "Next (→)")] : null,
           href ? [clipButton(() => raw.href), raw] : null,
-          h("button", { class: "btn", type: "button", title: "Close (Esc)", onclick: () => d.close() }, "✕"),
+          h("button", { class: "btn", type: "button", title: "Keys (?)", onclick: () => modalHelp(d, items.length) }, "?"),
+          h("button", { class: "btn", type: "button", title: "Close (Esc or q)", onclick: () => d.close() }, "✕"),
         ),
       ),
-      box,
+      h("div", { class: "mwrap" }, box, edges),
     );
     Promise.resolve(body).then(
       (node) => box.replaceChildren(node),
@@ -2531,13 +2550,36 @@ function showModal(items, i, render) {
   };
   if (dlgKeys) document.removeEventListener("keydown", dlgKeys);
   dlgKeys = (e) => {
-    if (items.length < 2 || e.metaKey || e.ctrlKey || e.altKey) return;
-    if (e.key === "ArrowLeft") (e.preventDefault(), show(i - 1));
-    if (e.key === "ArrowRight") (e.preventDefault(), show(i + 1));
+    if (e.metaKey || e.ctrlKey || e.altKey || e.target?.closest?.("input, textarea, select")) return;
+    if (e.key === "?") return void (e.preventDefault(), modalHelp(d, items.length));
+    if (e.key === "q") return void (e.preventDefault(), d.querySelector(".mhelp") ? modalHelp(d) : d.close());
+    if (items.length < 2) return;
+    if (e.key === "ArrowLeft" || e.key === "h") (e.preventDefault(), show(i - 1));
+    if (e.key === "ArrowRight" || e.key === "l") (e.preventDefault(), show(i + 1));
   };
   document.addEventListener("keydown", dlgKeys);
   if (!d.open) d.showModal();
   show(i);
+}
+
+/** The popup's own key list, drawn inside the dialog (the page's ? box would sit under its top layer); again closes it. */
+function modalHelp(d, count = 1) {
+  const open = d.querySelector(".mhelp");
+  if (open) return void open.remove();
+  const row = (keys, text) => h("tr", {}, h("td", {}, keys.flatMap((k, j) => [j ? " " : "", h("kbd", {}, k)])), h("td", {}, text));
+  const box = h(
+    "div",
+    { class: "mhelp", role: "dialog", "aria-label": "Keyboard shortcuts", onclick: (e) => e.target.closest("button") && box.remove() },
+    h("div", { class: "keys-hd" }, "Keyboard shortcuts", h("button", { class: "btn", type: "button", title: "Close (? or q)" }, "✕")),
+    h(
+      "table",
+      {},
+      count > 1 ? row(["←", "→", "h", "l"], "previous / next (‹ › at an image's edges too)") : null,
+      row(["Esc", "q"], "close"),
+      row(["?"], "this list"),
+    ),
+  );
+  d.append(box);
 }
 
 // ── session info: a click on the session name, or I ──
@@ -2616,6 +2658,9 @@ function infoRefresh(id) {
       .catch(() => {});
   }, 400);
 }
+
+/** The session's image sections in page order, folded ones too (theirs load only when opened), for the popup's ← →. */
+let pageShots = [];
 
 const imageItem = (a) => ({
   kind: "image",
@@ -2733,7 +2778,12 @@ document.addEventListener("click", (e) => {
     return showModal(links, links.indexOf(a), fileItem);
   }
   const shot = e.target.closest?.("img.shot");
-  if (shot) showModal([shot], 0, (img) => ({ kind: "image", title: img.alt || "Image", href: img.src, body: h("img", { class: "lightbox", src: img.src, alt: "" }) }));
+  if (!shot) return;
+  // Every screenshot on the page, so ← → step through them all.
+  const listed = pageShots.findIndex((x) => x.src === shot.src);
+  const shots = listed >= 0 ? pageShots : [...document.querySelectorAll("img.shot")].map((x) => ({ src: x.src, alt: x.alt || "Image" }));
+  const at = listed >= 0 ? listed : Math.max(0, shots.findIndex((x) => x.src === shot.src));
+  showModal(shots, at, (img) => ({ kind: "image", title: img.alt, href: img.src, body: h("img", { class: "lightbox", src: img.src, alt: "" }) }));
 });
 
 // ── session view ─────────────────────────────────────────────────────────────
@@ -3053,6 +3103,7 @@ async function sessionView(id) {
     }
 
     const sections = sortSections(withMeeting(withWatch(state.sections, state.watch), state.meeting));
+    pageShots = sections.filter((s) => s.kind === "image").map((s) => ({ src: new URL(bodyUrl(id, s), location.href).href, alt: s.title || "Image" }));
     const keep = new Set(sections.map((s) => s.id));
     for (const [sid, c] of cards) if (!keep.has(sid)) (c.el.remove(), cards.delete(sid));
     for (const sec of sections) {

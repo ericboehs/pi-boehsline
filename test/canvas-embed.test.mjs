@@ -176,3 +176,38 @@ test("page, read-only with a host bridge: Next steps post {text} to it, still no
   assert.deepEqual(JSON.parse(JSON.stringify(sent)), [{ text: "Run the tests" }]);
   assert.ok(fetches.every((f) => f.method === "GET"), "never a POST");
 });
+
+test("page, image popup: every screenshot on the page, ‹ › and h/l step, a counter, ? lists the keys, q closes", async () => {
+  const { w, doc } = await runPage({ url: "http://127.0.0.1:8790/s/s1" });
+  // jsdom has no showModal: open/close with the attribute and fire "close" like a browser.
+  w.HTMLDialogElement.prototype.showModal = function () {
+    this.setAttribute("open", "");
+  };
+  w.HTMLDialogElement.prototype.close = function () {
+    this.removeAttribute("open");
+    this.dispatchEvent(new w.Event("close"));
+  };
+  for (const n of [1, 2, 3]) doc.body.append(Object.assign(doc.createElement("img"), { className: "shot", src: `/s/s1/f/shot-${n}.png`, alt: `Shot ${n}` }));
+  const key = (k) => doc.dispatchEvent(new w.KeyboardEvent("keydown", { key: k, bubbles: true }));
+  doc.querySelectorAll("img.shot")[1].dispatchEvent(new w.MouseEvent("click", { bubbles: true, button: 0 }));
+  const d = doc.querySelector("dialog.modal");
+  const pos = () => d.querySelector(".pos").textContent;
+  const title = () => d.querySelector("header .title").textContent;
+  assert.equal(d.hasAttribute("open"), true);
+  assert.deepEqual([title(), pos()], ["Shot 2", "2 / 3"]);
+  assert.equal(d.querySelectorAll(".mstep").length, 2, "‹ › at the image's edges");
+  d.querySelector(".mstep.next").click();
+  assert.deepEqual([title(), pos()], ["Shot 3", "3 / 3"]);
+  key("l");
+  assert.equal(pos(), "1 / 3", "wraps around");
+  key("h");
+  key("ArrowLeft");
+  assert.equal(pos(), "2 / 3");
+  key("?");
+  assert.match(d.querySelector(".mhelp")?.textContent ?? "", /previous \/ next/);
+  key("q");
+  assert.equal(d.querySelector(".mhelp"), null, "q closes the key list first");
+  assert.equal(d.hasAttribute("open"), true);
+  key("q");
+  assert.equal(d.hasAttribute("open"), false, "then the popup");
+});
