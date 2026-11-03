@@ -174,7 +174,9 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 
 			const cliArgs = ["-p", "--trust", "--output-format", "stream-json", "--stream-partial-output"];
 			cliArgs.push("--sandbox", args.network ? "disabled" : "enabled", "--model", model);
-			if (args.mode && args.mode !== "agent") cliArgs.push("--mode", args.mode);
+			// pi-ai 1.5's StringEnum is a plain Schema, which Type.Static widens to {}.
+			const mode = args.mode as "agent" | "plan" | "ask" | undefined;
+			if (mode && mode !== "agent") cliArgs.push("--mode", mode);
 			if (args.worktree) {
 				// --worktree takes an optional name, so without one it would swallow the prompt.
 				cliArgs.push("--worktree", `pi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`);

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Typecheck against the pi packages pi supplies at runtime.
 #
-# Locally, link the pi you actually run (mise install, else npm -g), the same
-# way dotfiles' bin/pi-ext-check does. That way the types match the runtime,
+# Locally, link the pi you actually run: a fork checkout when the `pi` on PATH
+# is a wrapper that execs one (or PI_FORK_DIR names it), else the mise install,
+# else npm -g, the same way dotfiles' bin/pi-ext-check does. That way the types match the runtime,
 # and an npm release-age cooldown (min-release-age) can't block it.
 # In CI, or with PI_VERSION set, install that pi version into .typecheck/.
 # Those packages are optional peers, and npm 11 won't install optional peers
@@ -15,7 +16,26 @@ cd "$(dirname "$0")/.."
 [ -d node_modules ] || npm install --no-audit --no-fund
 
 pi_pkg="" pi_deps=""
+
+# A fork checkout: the monorepo root, whose node_modules holds pi-tui, pi-ai and
+# typebox (workspace links). Its types come from dist/, so it must be built.
+fork_root() {
+  if [ -n "${PI_FORK_DIR:-}" ]; then echo "$PI_FORK_DIR"; return; fi
+  local bin
+  bin="$(command -v pi 2>/dev/null || true)"
+  [ -n "$bin" ] && [ -f "$bin" ] && head -c 4096 "$bin" | LC_ALL=C grep -q '^#!.*sh' || return 0
+  sed -n 's|^exec node \(.*\)/packages/coding-agent/dist/.*|\1|p' "$bin" | head -1
+}
+
 if [ -z "${PI_VERSION:-}" ]; then
+  root="$(fork_root)"
+  if [ -n "$root" ] && [ -f "$root/packages/coding-agent/dist/index.d.ts" ] && [ -d "$root/node_modules/@earendil-works/pi-tui" ]; then
+    pi_pkg="$root/packages/coding-agent"
+    pi_deps="$root/node_modules"
+  fi
+fi
+
+if [ -z "${PI_VERSION:-}" ] && [ -z "$pi_pkg" ]; then
   if command -v mise >/dev/null; then
     root="$(mise where npm:@earendil-works/pi-coding-agent 2>/dev/null || true)"
     if [ -n "$root" ] && [ -d "$root/node_modules/@earendil-works/pi-coding-agent" ]; then
