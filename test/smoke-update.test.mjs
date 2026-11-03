@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { stubCtx, stubPi } from "./helpers/stub-pi.mjs";
 
-// No mise config under this HOME, and the agent dir (update-check.json) is a temp one too.
+// A temp HOME and agent dir (update-check.json), so nothing real is read or written.
 const home = mkdtempSync(join(tmpdir(), "update-home-"));
 process.env.HOME = home;
 process.env.PI_CODING_AGENT_DIR = home;
@@ -15,7 +16,7 @@ process.env.BOEHSLINE_ENABLE = "update";
 delete process.env.PI_SKIP_VERSION_CHECK;
 delete process.env.PI_OFFLINE;
 
-const { default: update, projectRoot, isNewer } = await import("../extensions/opt-in/update/index.ts");
+const { default: update, forkRoot, findCheckout, upstreamStatus, isNewer } = await import("../extensions/opt-in/update/index.ts");
 
 test("update registers /update, the banner renderer and a startup check; it silences pi's own check", () => {
 	const s = stubPi();
@@ -56,15 +57,69 @@ test("a banner renders only while its version is newer than the running pi", () 
 	assert.ok(message({ details: { version: "999.0.0" } }, {}, theme).children.length > 0);
 });
 
-test("/update without a mise project says how to set update.dir; with one, projectRoot finds it", async () => {
+const sh = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+
+/** An "upstream" repo and a fork clone of it, with the sync script and coding-agent's package.json. */
+function forkFixture(version = "1.5.0") {
+	const base = realpathSync(mkdtempSync(join(tmpdir(), "update-fork-")));
+	const up = join(base, "upstream");
+	mkdirSync(join(up, "scripts"), { recursive: true });
+	mkdirSync(join(up, "packages", "coding-agent", "dist", "bundle"), { recursive: true });
+	writeFileSync(join(up, "scripts", "sync-upstream.sh"), "#!/bin/sh\n");
+	writeFileSync(join(up, "packages", "coding-agent", "dist", "bundle", "cli.js"), "");
+	const pkg = (v) => writeFileSync(join(up, "packages", "coding-agent", "package.json"), JSON.stringify({ version: v }));
+	pkg(version);
+	sh(base, "init", "-q", "-b", "main", up);
+	sh(up, "-c", "user.name=t", "-c", "user.email=t@t", "add", ".");
+	sh(up, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init");
+	const fork = join(base, "fork");
+	sh(base, "clone", "-q", up, fork);
+	sh(fork, "remote", "add", "upstream", up);
+	const release = (v) => {
+		pkg(v);
+		sh(up, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", `release ${v}`);
+	};
+	return { fork, release };
+}
+
+test("/update without a fork checkout says how to set update.dir", async () => {
 	const s = stubPi();
 	update(s.pi);
-	const { ctx, notes } = stubCtx();
-	await s.commands.get("update").handler("check", ctx);
-	assert.equal(notes.at(-1)[0], "error");
-	assert.match(notes.at(-1)[1], /"update": \{ "dir"/);
-	writeFileSync(config, JSON.stringify({ update: { dir: home } }));
-	assert.equal(await projectRoot(), home, "not a git checkout, so the dir itself");
+	const saved = process.argv[1];
+	process.argv[1] = join(home, "nowhere", "cli.js");
+	try {
+		const { ctx, notes } = stubCtx();
+		await s.commands.get("update").handler("check", ctx);
+		assert.equal(notes.at(-1)[0], "error");
+		assert.match(notes.at(-1)[1], /"update": \{ "dir"/);
+	} finally {
+		process.argv[1] = saved;
+	}
+});
+
+test("forkRoot: the checkout the running pi was started from, or update.dir", () => {
+	const { fork } = forkFixture();
+	const cli = join(fork, "packages", "coding-agent", "dist", "bundle", "cli.js");
+	assert.equal(findCheckout(join(fork, "packages", "coding-agent")), fork);
+	assert.equal(forkRoot(cli), fork, "walks up from the entry script");
+	assert.equal(forkRoot(join(home, "missing.js")), null);
+	writeFileSync(config, JSON.stringify({ update: { dir: fork } }));
+	try {
+		assert.equal(forkRoot(undefined), fork, "update.dir wins");
+	} finally {
+		writeFileSync(config, "{}");
+	}
+});
+
+test("upstreamStatus: how far behind main is, and upstream's version", async () => {
+	const { fork, release } = forkFixture("1.5.0");
+	assert.deepEqual({ ...(await upstreamStatus(fork)), sha: "" }, { behind: 0, version: "1.5.0", sha: "" });
+	release("1.6.0");
+	const st = await upstreamStatus(fork);
+	assert.equal(st.behind, 1);
+	assert.equal(st.version, "1.6.0");
+	assert.match(st.sha, /^[0-9a-f]{7,}$/);
+	assert.equal(sh(fork, "rev-list", "--count", "HEAD"), "1", "main itself is untouched");
 });
 
 test("no UI: the startup check does nothing", async () => {

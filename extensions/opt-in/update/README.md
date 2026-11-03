@@ -2,15 +2,15 @@
 
 *Opt-in:* `/boehsline enable update`.
 
-`/update` for a pi that mise installs from a pin, which `pi update` refuses to touch. **Command:** `/update [check]`.
+`/update` for a pi that runs from a fork checkout (`~/.pi/agent/bin/pi` execs the checkout's `dist/`), which `pi update` can't touch. **Command:** `/update [check]`.
 
-The work is a mise task you own (default `update:pi`): move the pin to the latest release, install it, then update packages. `/update` finds the project that holds the pin and runs that task; `/update check` reports the available version and changes nothing.
+`/update` runs the fork's `scripts/sync-upstream.sh`: merge `upstream/main`, `npm ci` when the lockfile moved, build, test, and push `main` so other machines pull the same merge. A merge that conflicts or a build or test that fails stops there and leaves the tree to inspect. Once it merges, restart pi to run the new build. `/update check` fetches upstream and says how many commits the fork is behind, changing nothing.
 
-It also replaces pi's startup "Update Available" banner, whose only advice is `pi update`, with one that names `/update`. The check runs at most every 6 hours, shared across sessions through `update-check.json` in the agent directory.
+It also replaces pi's startup "Update Available" banner, which compares against npm and only says `pi update`, with one that compares the running pi against `upstream/main`'s version and names `/update`. The check runs at most every 6 hours, shared across sessions through `update-check.json` in the agent directory. Banners are saved as UI-only entries (never sent to the model) and hide themselves once the running pi catches up.
 
 ```jsonc
 // ~/.pi/agent/boehsline.json
-{ "update": { "dir": "~/dotfiles", "task": "update:pi" } }
+{ "update": { "dir": "~/Code/github.com/ericboehs/pi", "args": ["--quick-tests", "--push"] } }
 ```
 
-With no `dir`, the project is the git checkout that `~/.config/mise/config.toml` lives in (or links into). The task must print the JSON result line the extension parses, and change nothing when `PI_UPDATE_CHECK=1`. `PI_OFFLINE` turns the startup check off.
+With no `dir`, the checkout is the one the running pi was started from. `args` go to `sync-upstream.sh` (`--quick-tests`, `--skip-tests`, `--push`; drop `--quick-tests` for the full suite). `PI_OFFLINE` turns the startup check off.

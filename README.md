@@ -64,7 +64,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [sc](extensions/opt-in/sc/README.md) | Attach the newest screenshot from iCloud Downloads | `/sc` |
 | [skill-modes](extensions/opt-in/skill-modes/README.md) | Sticky skill modes: a `mode: true` skill stays on until `/mode off` | `/mode` |
 | [tmux-attention](extensions/opt-in/tmux-attention/README.md) | Highlights the tmux window when pi needs you |  |
-| [update](extensions/opt-in/update/README.md) | `/update` for a mise-pinned pi | `/update` |
+| [update](extensions/opt-in/update/README.md) | `/update` merges upstream pi into the fork checkout and rebuilds | `/update` |
 | [wiki-session-log](extensions/opt-in/wiki-session-log/README.md) | Runs a command with the session file after each turn |  |
 
 ### Bundled packages
@@ -117,7 +117,7 @@ Everything below goes in `~/.pi/agent/boehsline.json`, or comes from a package t
   "meeting": { "model": "github-copilot/claude-haiku-5.5", "qmdCollections": ["notes"], "dailyDir": "~/Notes/daily", "owner": "earl", "slideSummaries": true },
   "image-prune": { "thresholdMB": 5, "keepTurns": 2, "shrinkMaxPx": 1568, "shrinkMinKB": 512 },  // "enabled": false pauses it; /image-prune now still works
   "scheduler-tool": { "exposure": "deferred" },  // "direct" puts the schedule tool in every prompt
-  "update": { "dir": "~/dotfiles", "task": "update:pi" },  // no dir: the checkout that holds ~/.config/mise/config.toml
+  "update": { "dir": "~/Code/github.com/ericboehs/pi", "args": ["--quick-tests", "--push"] },  // no dir: the checkout pi runs from
   "wiki-session-log": { "command": ["~/bin/pi-session-sync"] }
 }
 ```

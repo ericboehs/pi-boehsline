@@ -1,26 +1,24 @@
-// /update — bring a mise-managed pi current, since `pi update` can't.
+// /update — bring the fork checkout pi runs from current with upstream.
 //
-// pi here is installed by mise from the pin in .config/mise/config.toml, so
-// `pi update` refuses ("not managed by a global npm install") and only adds
-// "Extensions are skipped. Run pi update --extensions". The real work is a
-// mise concern: move the pin to the current npm release, install that exact
-// version, then reconverge packages. That work is a mise task you own (the
-// `update:pi` task by default) in the project that holds the pin; this command
-// finds that project and runs the task.
+// pi here runs from a fork checkout (github.com/ericboehs/pi) through
+// ~/.pi/agent/bin/pi, which execs the checkout's dist/. `pi update` can't
+// update that: there is no npm install to move. The fork's own
+// scripts/sync-upstream.sh is the update: merge upstream/main, reinstall when
+// the lockfile moved, build, test, and (with --push) push main so the other
+// machines pull the same merge. This command finds the checkout and runs it.
 //
 // Settings (Boehsline config, ~/.pi/agent/boehsline.json):
-//   "update": { "dir": "~/path/to/the/project/with/the/pin", "task": "update:pi" }
-// With no "dir", the project is the git checkout that ~/.config/mise/config.toml
-// lives in (or symlinks into). The task must print the JSON result line that
-// parseResult() reads; PI_UPDATE_CHECK=1 asks it to change nothing.
+//   "update": { "dir": "~/Code/github.com/ericboehs/pi", "args": ["--quick-tests", "--push"] }
+// With no "dir", the checkout is the one the running pi was started from.
 //
-// /update check reports the available version and changes nothing, as the same
-// banner pi shows at startup. That banner only says `pi update`, which cannot
-// self-update this install, so this extension suppresses it and draws one that
-// also names /update.
+// /update check fetches upstream and reports how far behind main is, changing
+// nothing. The startup banner says the same when upstream's version is newer
+// than the running pi. pi's own banner compares against npm and only says
+// `pi update`, which can't update this install, so this extension turns it off.
 
 import { spawn } from "node:child_process";
-import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -29,24 +27,24 @@ import { Container, Text, getCapabilities, hyperlink, type AutocompleteItem } fr
 import { settingsFor } from "../../../lib/config.ts";
 import { optIn } from "../../../lib/opt-in.ts";
 
-const UPDATE_DEFAULTS = { dir: "", task: "update:pi" };
-function updateSettings(): { dir: string; task: string } {
+const SYNC_SCRIPT = join("scripts", "sync-upstream.sh");
+const UPDATE_DEFAULTS = { dir: "", args: ["--quick-tests", "--push"] as string[] };
+
+function updateSettings(): { dir: string; args: string[] } {
   const s = settingsFor("update", UPDATE_DEFAULTS);
   const dir = typeof s.dir === "string" ? s.dir : "";
-  return {
-    dir: dir === "~" || dir.startsWith("~/") ? join(homedir(), dir.slice(1)) : dir,
-    task: typeof s.task === "string" && s.task ? s.task : UPDATE_DEFAULTS.task,
-  };
+  const args = Array.isArray(s.args) && s.args.every((a) => typeof a === "string") ? s.args : UPDATE_DEFAULTS.args;
+  return { dir: dir === "~" || dir.startsWith("~/") ? join(homedir(), dir.slice(1)) : dir, args };
 }
 
 const BANNER_TYPE = "pi-update-available";
 const CHANGELOG_URL = "https://pi.dev/changelog";
 
-// The startup availability check spawns `mise run update:pi`, which starts a
-// whole npm process (~350ms of CPU). Run inline at session_start, that work
-// competes with pi's own first paint. So it waits until boot is done and runs
-// at most once per window across every pane, with the result in a stamp
-// file. A launch inside the window shows the cached banner without spawning.
+// The startup check fetches upstream (a network round trip plus git). Run
+// inline at session_start, it competes with pi's own first paint. So it waits
+// until boot is done and runs at most once per window across every pane, with
+// the result in a stamp file. A launch inside the window shows the cached
+// banner without fetching.
 const STARTUP_CHECK_DELAY_MS = 15_000;
 const STARTUP_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STAMP_FILE = join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "update-check.json");
@@ -75,59 +73,77 @@ async function writeStamp(stamp: CheckStamp): Promise<void> {
   }
 }
 
-interface UpdateResult {
-  from: string;
-  to: string;
-  published: string;
-  restart: boolean;
-  changed: boolean;
-  check: boolean;
+/** The nearest directory at or above `start` that holds the fork's sync script. */
+export function findCheckout(start: string): string | null {
+  let dir = start;
+  for (;;) {
+    if (existsSync(join(dir, SYNC_SCRIPT))) return dir;
+    const up = dirname(dir);
+    if (up === dir) return null;
+    dir = up;
+  }
 }
 
-// The project that holds the pin and the task: update.dir, else the checkout
-// that ~/.config/mise/config.toml lives in. mise run from the project that
-// happens to be open would not find the task.
-export async function projectRoot(): Promise<string | null> {
+// The fork checkout: update.dir, else the one this pi was started from
+// (process.argv[1] is the checkout's dist/bundle/cli.js, through the wrapper).
+export function forkRoot(entry: string | undefined = process.argv[1]): string | null {
   const { dir } = updateSettings();
-  if (dir) return (await gitTop(dir)) ?? dir;
-  const config = join(homedir(), ".config", "mise", "config.toml");
+  if (dir) return findCheckout(dir);
+  if (!entry) return null;
   let resolved: string;
   try {
-    resolved = await realpath(config);
+    resolved = realpathSync(entry);
   } catch {
-    resolved = "";
+    return null;
   }
-
-  return resolved ? gitTop(dirname(resolved)) : null;
+  return findCheckout(dirname(resolved));
 }
 
-function gitTop(dir: string): Promise<string | null> {
+function git(cwd: string, args: string[]): Promise<{ code: number; out: string }> {
   return new Promise((resolve) => {
-    const child = spawn("git", ["-C", dir, "rev-parse", "--show-toplevel"], {
-      stdio: ["ignore", "pipe", "ignore"],
-    });
+    const child = spawn("git", ["-C", cwd, ...args], { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     child.stdout?.on("data", (chunk: Buffer) => {
       out += chunk.toString("utf8");
     });
-    child.on("error", () => resolve(null));
-    child.on("close", (code) => resolve(code === 0 ? out.trim() || null : null));
+    child.on("error", () => resolve({ code: 127, out: "" }));
+    child.on("close", (code) => resolve({ code: code ?? 1, out: out.trim() }));
   });
 }
 
-function runTask(
-  cwd: string,
-  check: boolean,
+export interface UpstreamStatus {
+  /** Commits on upstream/main that main doesn't have. */
+  behind: number;
+  /** coding-agent's version on upstream/main. */
+  version: string;
+  sha: string;
+}
+
+/** Fetch upstream and compare. Changes no branch, only the upstream/main ref. */
+export async function upstreamStatus(root: string): Promise<UpstreamStatus | null> {
+  if ((await git(root, ["fetch", "--quiet", "upstream", "main"])).code !== 0) return null;
+  const behind = await git(root, ["rev-list", "--count", "main..upstream/main"]);
+  const pkg = await git(root, ["show", "upstream/main:packages/coding-agent/package.json"]);
+  const sha = await git(root, ["rev-parse", "--short", "upstream/main"]);
+  if (behind.code !== 0 || pkg.code !== 0) return null;
+  let version = "";
+  try {
+    version = String((JSON.parse(pkg.out) as { version?: unknown }).version ?? "");
+  } catch {
+    return null;
+  }
+  return { behind: Number.parseInt(behind.out, 10) || 0, version, sha: sha.out };
+}
+
+function runSync(
+  root: string,
+  args: string[],
   onLine: (line: string) => void,
 ): Promise<{ code: number; output: string }> {
-  const env = { ...process.env };
-  if (check) env.PI_UPDATE_CHECK = "1";
-
   return new Promise((resolve) => {
-    const task = updateSettings().task;
-    const child = spawn("mise", ["run", task], {
-      cwd,
-      env,
+    const child = spawn("bash", [SYNC_SCRIPT, ...args], {
+      cwd: root,
+      env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let output = "";
@@ -140,7 +156,8 @@ function runTask(
       resolve({ code, output });
     };
     const take = (chunk: Buffer) => {
-      const text = chunk.toString("utf8");
+      // Strip the script's bold/red escapes: the status line and the record are plain text.
+      const text = chunk.toString("utf8").replace(/\x1b\[[0-9;]*m/g, "");
       output += text;
       buf += text;
       let nl = buf.indexOf("\n");
@@ -154,57 +171,20 @@ function runTask(
     child.stdout?.on("data", take);
     child.stderr?.on("data", take);
     child.on("error", (err) => {
-      const missing = err.message.includes("ENOENT");
-      output += missing
-        ? `${task}: mise is not on PATH\n`
-        : `${task}: failed to start mise: ${err.message}\n`;
-      finish(missing ? 127 : 1);
+      output += `sync-upstream: failed to start: ${err.message}\n`;
+      finish(1);
     });
     child.on("close", (code) => finish(code ?? 1));
   });
-}
-
-function parseResult(output: string): UpdateResult | null {
-  const line = output.match(/^update:pi: result (.+)$/m)?.[1];
-  if (!line) return null;
-  const fields = new Map<string, string>();
-  for (const token of line.split(/\s+/)) {
-    const eq = token.indexOf("=");
-    if (eq > 0) fields.set(token.slice(0, eq), token.slice(eq + 1));
-  }
-  const from = fields.get("from");
-  const to = fields.get("to");
-  if (!from || !to) return null;
-  return {
-    from,
-    to,
-    published: fields.get("published") ?? "",
-    restart: fields.get("restart") === "yes",
-    changed: fields.get("changed") === "yes",
-    check: fields.get("check") === "yes",
-  };
-}
-
-// The publish timestamp tells whether a release is still inside the window
-// mise's minimum_release_age would normally hide — worth seeing before a restart.
-function age(iso: string): string {
-  const then = Date.parse(iso);
-  if (Number.isNaN(then)) return "";
-  const seconds = Math.round((Date.now() - then) / 1000);
-  if (seconds < 90) return `${seconds}s ago`;
-  if (seconds < 5400) return `${Math.round(seconds / 60)}m ago`;
-  if (seconds < 129600) return `${Math.round(seconds / 3600)}h ago`;
-  return `${Math.round(seconds / 86400)}d ago`;
 }
 
 function bannerLines(version: string, theme: Theme): { title: string; changelog: string } {
   const title =
     theme.bold(theme.fg("warning", "Update Available")) +
     "\n" +
-    theme.fg("muted", `New version ${version} is available. Run `) +
-    theme.fg("accent", "pi update") +
-    theme.fg("muted", " or ") +
-    theme.fg("accent", "/update");
+    theme.fg("muted", `Upstream pi is at ${version}. Run `) +
+    theme.fg("accent", "/update") +
+    theme.fg("muted", " to merge it into the fork and rebuild");
   const url = getCapabilities().hyperlinks
     ? hyperlink(theme.fg("accent", CHANGELOG_URL), CHANGELOG_URL)
     : theme.fg("accent", CHANGELOG_URL);
@@ -234,23 +214,13 @@ export function isNewer(version: string, than: string): boolean {
   return false;
 }
 
-function summary(result: UpdateResult, ok: boolean): { text: string; level: "info" | "warning" | "error" } {
-  if (!ok) return { text: "pi update failed", level: "error" };
-  const fresh = result.published && result.published !== "none" ? age(result.published) : "";
-  const when = fresh ? `, published ${fresh}` : "";
-  if (result.restart) {
-    return {
-      text: `pi ${result.to} installed${when} — restart pi to run it; the pin change is uncommitted`,
-      level: "warning",
-    };
-  }
-  return { text: `pi ${result.from} is current; packages reconverged`, level: "info" };
+/** The last `n` lines: a full run with tests is far longer than the record needs. */
+function tail(text: string, n: number): string {
+  const lines = text.trim().split("\n");
+  return lines.length > n ? [`… ${lines.length - n} earlier lines`, ...lines.slice(-n)].join("\n") : lines.join("\n");
 }
 
 function main(pi: ExtensionAPI) {
-  // pi draws its own "Update Available" banner from run(), after extensions
-  // load. Its instruction is only `pi update`, which refuses on this install.
-  // Skip that check so the banner below is the one that shows.
   if (!process.env.PI_OFFLINE) process.env.PI_SKIP_VERSION_CHECK = "1";
 
   let announcedFor: string | undefined;
@@ -297,13 +267,13 @@ function main(pi: ExtensionAPI) {
           return;
         }
         await writeStamp({ at: Date.now(), from: VERSION });
-        const root = await projectRoot();
+        const root = forkRoot();
         if (!root) return;
-        const { code, output } = await runTask(root, true, () => {});
-        const result = code === 0 ? parseResult(output) : null;
-        if (!result) return;
-        await writeStamp({ at: Date.now(), from: VERSION, to: result.changed ? result.to : undefined });
-        if (result.changed) announce(result.to);
+        const status = await upstreamStatus(root);
+        if (!status) return;
+        const to = isNewer(status.version, VERSION) ? status.version : undefined;
+        await writeStamp({ at: Date.now(), from: VERSION, to });
+        announce(to);
       } catch {
         // A failed availability check is not worth a startup error. /update still works.
       }
@@ -311,12 +281,12 @@ function main(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("update", {
-    description: "Update pi and its packages (mise-managed install)",
+    description: "Merge upstream pi into the fork, rebuild and test (scripts/sync-upstream.sh)",
     getArgumentCompletions: (prefix: string): AutocompleteItem[] => {
       const item: AutocompleteItem = {
         value: "check",
         label: "check",
-        description: "Show what would change, touch nothing",
+        description: "Fetch upstream and say how far behind the fork is, touch nothing",
       };
       return item.value.startsWith(prefix) ? [item] : [];
     },
@@ -327,51 +297,62 @@ function main(pi: ExtensionAPI) {
         return;
       }
 
-      const check = args.trim() === "check";
-      const root = await projectRoot();
+      const root = forkRoot();
       if (!root) {
-        if (ctx.hasUI) ctx.ui.notify(`Can't find the mise project that pins pi. Set "update": { "dir": "…" } in ~/.pi/agent/boehsline.json`, "error");
+        if (ctx.hasUI) {
+          ctx.ui.notify(`Can't find the pi fork checkout (no ${SYNC_SCRIPT}). Set "update": { "dir": "…" } in ~/.pi/agent/boehsline.json`, "error");
+        }
         return;
       }
 
       stash.__piUpdateRunning = true;
-      if (ctx.hasUI) ctx.ui.setStatus("update", check ? "pi update: checking…" : "pi update: running…");
       try {
-        const { code, output } = await runTask(root, check, (line) => {
-          if (ctx.hasUI) ctx.ui.setStatus("update", line);
-        });
-
-        const result = parseResult(output);
-        if (code === 0 && result?.check) {
-          if (result.changed) {
-            announcedFor = result.to;
-            showBanner(result.to);
-          } else if (ctx.hasUI) {
-            ctx.ui.notify(`pi ${result.from} is current`, "info");
+        if (args.trim() === "check") {
+          if (ctx.hasUI) ctx.ui.setStatus("update", "pi update: fetching upstream…");
+          const status = await upstreamStatus(root);
+          if (!status) {
+            if (ctx.hasUI) ctx.ui.notify(`Couldn't fetch upstream in ${root}`, "error");
+            return;
+          }
+          await writeStamp({ at: Date.now(), from: VERSION, to: isNewer(status.version, VERSION) ? status.version : undefined });
+          if (isNewer(status.version, VERSION)) {
+            announcedFor = status.version;
+            showBanner(status.version);
+          }
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              status.behind === 0
+                ? `pi ${VERSION}: the fork has everything on upstream/main (${status.sha})`
+                : `pi ${VERSION}: ${status.behind} upstream commit${status.behind === 1 ? "" : "s"} to merge (upstream at ${status.version}, ${status.sha})`,
+              status.behind === 0 ? "info" : "warning",
+            );
           }
           return;
         }
 
-        const { text, level } = result
-          ? summary(result, code === 0)
-          : { text: code === 0 ? "pi update done" : "pi update failed", level: code === 0 ? "info" as const : "error" as const };
-        if (ctx.hasUI) ctx.ui.notify(text, level);
+        const before = (await git(root, ["rev-parse", "HEAD"])).out;
+        const { args: syncArgs } = updateSettings();
+        if (ctx.hasUI) ctx.ui.setStatus("update", "pi update: running sync-upstream…");
+        const { code, output } = await runSync(root, syncArgs, (line) => {
+          if (ctx.hasUI) ctx.ui.setStatus("update", line);
+        });
+        const after = (await git(root, ["rev-parse", "HEAD"])).out;
+        const moved = before !== "" && after !== "" && before !== after;
+        if (code === 0) await writeStamp({ at: Date.now(), from: VERSION });
 
-        // The task's own stdout is the record: version jump, the pin diff, and
-        // whether bootstrap:pi converged. A fence keeps the diff's leading
-        // dashes from being read as a markdown list.
+        if (ctx.hasUI) {
+          if (code !== 0) ctx.ui.notify(`sync-upstream failed in ${root}; the tree is left as-is to inspect`, "error");
+          else if (moved) ctx.ui.notify("Fork merged and rebuilt — restart pi to run the new build", "warning");
+          else ctx.ui.notify(`pi ${VERSION}: the fork already has upstream/main`, "info");
+        }
+
+        // The script's own output is the record: what merged, the build, the
+        // tests. A fence keeps leading dashes from being read as a list.
         pi.sendMessage({
           customType: "pi-update",
-          content: ["```", output.trim() || "(no output)", "```"].join("\n"),
+          content: ["```", tail(output, 60) || "(no output)", "```"].join("\n"),
           display: true,
         });
-
-        // A newer pi is on disk but this process is the old one; reloading
-        // would only re-read extensions into the process that needs replacing.
-        // When the version didn't move, a reload picks up reconverged packages.
-        if (code === 0 && result && !result.restart && !result.check) {
-          await ctx.reload();
-        }
       } finally {
         stash.__piUpdateRunning = false;
         if (ctx.hasUI) ctx.ui.setStatus("update", undefined);
@@ -380,4 +361,4 @@ function main(pi: ExtensionAPI) {
   });
 }
 
-export default optIn("update", "/update: update a mise-pinned pi", main);
+export default optIn("update", "/update: merge upstream pi into the fork and rebuild", main);

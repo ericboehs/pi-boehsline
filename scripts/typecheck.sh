@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Typecheck against the pi packages pi supplies at runtime.
 #
-# Locally, link the pi you actually run: a fork checkout when the `pi` on PATH
-# is a wrapper that execs one (or PI_FORK_DIR names it), else the mise install,
-# else npm -g, the same way dotfiles' bin/pi-ext-check does. That way the types match the runtime,
-# and an npm release-age cooldown (min-release-age) can't block it.
+# Locally, link the pi you actually run: the fork checkout (PI_FORK_DIR, else the
+# one ~/.pi/agent/bin/pi or the `pi` on PATH execs), else npm -g, the same
+# lookup as dotfiles' bin/pi-locate. That way the types match the runtime, and
+# an npm release-age cooldown (min-release-age) can't block it.
 # In CI, or with PI_VERSION set, install that pi version into .typecheck/.
 # Those packages are optional peers, and npm 11 won't install optional peers
 # into a project that has real dependencies, so they can't go in node_modules
@@ -21,10 +21,14 @@ pi_pkg="" pi_deps=""
 # typebox (workspace links). Its types come from dist/, so it must be built.
 fork_root() {
   if [ -n "${PI_FORK_DIR:-}" ]; then echo "$PI_FORK_DIR"; return; fi
-  local bin
-  bin="$(command -v pi 2>/dev/null || true)"
-  [ -n "$bin" ] && [ -f "$bin" ] && head -c 4096 "$bin" | LC_ALL=C grep -q '^#!.*sh' || return 0
-  sed -n 's|^exec node \(.*\)/packages/coding-agent/dist/.*|\1|p' "$bin" | head -1
+  local bin root
+  for bin in "$HOME/.pi/agent/bin/pi" "$(command -v pi 2>/dev/null || true)"; do
+    if [ -z "$bin" ] || [ ! -f "$bin" ] || ! head -c 4096 "$bin" | LC_ALL=C grep -q '^#!.*sh'; then continue; fi
+    root="$(sed -n 's|^exec node \(.*\)/packages/coding-agent/dist/.*|\1|p' "$bin" | head -1)"
+    # gfew's wrapper says $HOME literally.
+    root="${root//\$HOME/$HOME}"
+    [ -n "$root" ] && { echo "$root"; return; }
+  done
 }
 
 if [ -z "${PI_VERSION:-}" ]; then
@@ -36,15 +40,6 @@ if [ -z "${PI_VERSION:-}" ]; then
 fi
 
 if [ -z "${PI_VERSION:-}" ] && [ -z "$pi_pkg" ]; then
-  if command -v mise >/dev/null; then
-    root="$(mise where npm:@earendil-works/pi-coding-agent 2>/dev/null || true)"
-    if [ -n "$root" ] && [ -d "$root/node_modules/@earendil-works/pi-coding-agent" ]; then
-      pi_pkg="$root/node_modules/@earendil-works/pi-coding-agent"
-      for d in "$pi_pkg/node_modules" "$root/node_modules/.mise/node_modules" "$root/node_modules"; do
-        [ -d "$d/@earendil-works/pi-tui" ] && { pi_deps="$d"; break; }
-      done
-    fi
-  fi
   if [ -z "$pi_pkg" ] && command -v npm >/dev/null && [ -d "$(npm root -g)/@earendil-works/pi-coding-agent" ]; then
     pi_pkg="$(npm root -g)/@earendil-works/pi-coding-agent"
     pi_deps="$pi_pkg/node_modules"
