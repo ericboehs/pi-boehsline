@@ -30,7 +30,7 @@ function mount({ active = ["read", "bash"], registered = ["read", "bash", "tool_
   const state = { active: [...active] };
   subagent({
     registerTool: (definition) => (tool = definition),
-    on: (name, handler) => handlers.set(name, handler),
+    on: (name, handler) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
     getActiveTools: () => state.active,
     getAllTools: () => registered.map((name) => ({ name })),
     setActiveTools: (names) => (state.active = names),
@@ -40,7 +40,7 @@ function mount({ active = ["read", "bash"], registered = ["read", "bash", "tool_
   return {
     tool,
     state,
-    start: () => handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx),
+    start: () => Promise.all((handlers.get("session_start") ?? []).map((h) => h({ type: "session_start", reason: "startup" }, ctx))),
     run: (params) => tool.execute("test-call", params, undefined, undefined, ctx),
     onBgStart: (listener) => (bgListener = listener),
     ctx,

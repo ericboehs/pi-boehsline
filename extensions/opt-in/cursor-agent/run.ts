@@ -7,9 +7,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { findUsageEvent, type UsageEvent } from "./api.ts";
 import { RunReducer, type RunState } from "./events.ts";
 import { blockedBy, type CursorSettings } from "./settings.ts";
@@ -74,6 +74,20 @@ export async function prepareRun(args: CursorArgs, sessionCwd: string, settings:
 	}
 	cliArgs.push(args.prompt);
 	return { model, cwd, cliArgs, worktree: !!args.worktree, bin: process.env.PI_CURSOR_AGENT_BIN?.trim() || "cursor-agent" };
+}
+
+/** Whether `bin` (a RunSpec's) is an executable file: the path as given, else a file on PATH. */
+export function binFound(bin: string, env: NodeJS.ProcessEnv = process.env): boolean {
+	const executable = (p: string) => {
+		try {
+			accessSync(p, constants.X_OK);
+			return statSync(p).isFile();
+		} catch {
+			return false;
+		}
+	};
+	if (bin.includes("/")) return executable(bin);
+	return (env.PATH ?? "").split(delimiter).some((dir) => dir !== "" && executable(join(dir, bin)));
 }
 
 /** The last `maxLines` lines and `maxBytes` bytes of stderr. */

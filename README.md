@@ -41,7 +41,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [provider-usage](extensions/provider-usage/README.md) | Usage and quota chips for codex, copilot, grok and more | `provider_usage` tool |
 | [restart](extensions/restart/README.md) | `bin/pi-restart-all` restarts every pi in tmux and resumes it, guardian bypass included |  |
 | [stash](extensions/stash/README.md) | Park a draft with Ctrl+S and get it back later | Ctrl+S, `/stash` |
-| [subagent](extensions/subagent/README.md) | Run a separate pi for a focused task | `subagent` tool |
+| [subagent](extensions/subagent/README.md) | Run a separate pi, or Cursor's agent (with cursor-agent on), for a focused task | `subagent` tool |
 | [todo](extensions/todo/README.md) | A shared task list for you and other agents at `.pi/TODO.md`, with locked claims | `todo` tool, `/todo` |
 | [turn-timer](extensions/turn-timer/README.md) | A toast when a run ends, and per-model step and time stats | `/turn stats` |
 | [web](extensions/web/README.md) | Web search across backends you order, and a fetch that escalates until it works | `web_search`, `web_fetch`, `/web` |

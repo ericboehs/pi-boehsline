@@ -19,10 +19,6 @@
  * PI_CURSOR_* env vars; see settings.ts.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -33,7 +29,7 @@ import { cycleText, recordCycleUsage, refreshUsageCache } from "./usage-cache.ts
 import { cycleUsage, dollars, eventTokens, kfmt, type UsageEvent } from "./api.ts";
 import { type CliUsage, short, type ToolStep } from "./events.ts";
 import { lookupCharge, prepareRun, type RunSpec, runCursor, type WorktreeInfo } from "./run.ts";
-import { WAKE_CHARS } from "./runner.ts";
+import { startJob } from "./runner.ts";
 import { type CursorSettings, loadSettings } from "./settings.ts";
 import { applyToRepo, type CursorWorktree, describe, listWorktrees, removeWorktree } from "./worktrees.ts";
 
@@ -149,49 +145,13 @@ interface BackgroundDetails {
 	model: string;
 }
 
-/** The bg extension's event-bus request (extensions/bg, "bg:start"). */
-interface BgStartRequest {
-	command: string;
-	cwd: string;
-	ctx: unknown;
-	name: string;
-	summary: string;
-	tailLines: number;
-	tailMaxChars: number;
-	accepted: boolean;
-	reply: (result: { id: string; logPath: string } | { error: string }) => void;
-}
-
-const RUNNER = join(dirname(fileURLToPath(import.meta.url)), "runner.ts");
-const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-
 /**
  * Hand the run to the bg extension as a job running runner.ts, which prints
  * Cursor's steps into the job log and ends with a result block that the
- * completion message carries back. The spec goes through a private temp file
- * the runner deletes on start, so the job's command line stays short.
+ * completion message carries back.
  */
 async function startBackground(pi: ExtensionAPI, spec: RunSpec, prompt: string, ctx: ExtensionContext) {
-	const dir = mkdtempSync(join(tmpdir(), "pi-cursor-"));
-	const specPath = join(dir, "spec.json");
-	writeFileSync(specPath, JSON.stringify(spec), { mode: 0o600 });
-	const node = basename(process.execPath).startsWith("node") ? process.execPath : "node";
-	const reply = await new Promise<{ id: string; logPath: string } | { error: string } | null>((done) => {
-		const req: BgStartRequest = {
-			command: `${q(node)} ${q(RUNNER)} ${q(specPath)}`,
-			cwd: spec.cwd,
-			ctx,
-			name: "cursor",
-			summary: `cursor ${spec.model}: ${prompt}`,
-			tailLines: 1000,
-			tailMaxChars: WAKE_CHARS,
-			accepted: false,
-			reply: done,
-		};
-		pi.events.emit("bg:start", req);
-		if (!req.accepted) done(null); // no listener: the bg extension isn't loaded
-	});
-	if (reply === null || "error" in reply) rmSync(dir, { recursive: true, force: true });
+	const reply = await startJob(pi.events, spec, { ctx, name: "cursor", summary: `cursor ${spec.model}: ${prompt}` });
 	if (reply === null) {
 		return {
 			content: [

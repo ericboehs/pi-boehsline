@@ -9,20 +9,134 @@
  * Stopping the job (/bg, x) sends SIGTERM to the job's process group; this
  * process also forwards it to cursor-agent and SIGKILLs it after 3s.
  *
+ * The subagent tool's cursor agent (extensions/subagent) starts the same job
+ * with startJob, and its foreground runs use runAndCharge and resultBlock, so
+ * both report a run the same way.
+ *
  * Pure node (no pi imports): it runs outside pi.
  */
 
-import { readFileSync, realpathSync, rmSync } from "node:fs";
-import { dirname } from "node:path";
-import { pathToFileURL } from "node:url";
-import { dollars, eventTokens, kfmt } from "./api.ts";
-import { short } from "./events.ts";
-import { type ChargeLookup, humanDuration, lookupCharge, type RunSpec, runCursor } from "./run.ts";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { dollars, eventTokens, kfmt, type UsageEvent } from "./api.ts";
+import { type RunReducer, short } from "./events.ts";
+import { type ChargeLookup, humanDuration, lookupCharge, type RunOutcome, type RunSpec, runCursor } from "./run.ts";
 
 /** The answer in the result block; longer answers are printed in full above it. */
 export const ANSWER_CHARS = 6_000;
 /** What the completion message carries from the log's end: the result block plus the last steps. */
 export const WAKE_CHARS = 16 * 1024;
+
+/** The bg extension's event-bus request (extensions/bg, "bg:start"). */
+export interface BgStartRequest {
+	command: string;
+	cwd: string;
+	ctx: unknown;
+	name: string;
+	summary: string;
+	tailLines: number;
+	tailMaxChars: number;
+	accepted: boolean;
+	reply: (result: BgReply) => void;
+}
+
+export type BgReply = { id: string; logPath: string } | { error: string };
+
+const RUNNER = fileURLToPath(import.meta.url);
+const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+/**
+ * Start `spec` as a bg job running this file (the cursor tool's `background`
+ * and the subagent tool's cursor agent). The spec goes through a private temp
+ * file the runner deletes on start, so the job's command line stays short.
+ * Resolves to null when the bg extension isn't loaded.
+ */
+export async function startJob(
+	events: { emit(channel: string, data: unknown): void },
+	spec: RunSpec,
+	job: { ctx: unknown; name: string; summary: string },
+): Promise<BgReply | null> {
+	const dir = mkdtempSync(join(tmpdir(), "pi-cursor-"));
+	const specPath = join(dir, "spec.json");
+	writeFileSync(specPath, JSON.stringify(spec), { mode: 0o600 });
+	const node = basename(process.execPath).startsWith("node") ? process.execPath : "node";
+	const reply = await new Promise<BgReply | null>((done) => {
+		const req: BgStartRequest = {
+			command: `${q(node)} ${q(RUNNER)} ${q(specPath)}`,
+			cwd: spec.cwd,
+			ctx: job.ctx,
+			name: job.name,
+			summary: job.summary,
+			tailLines: 1000,
+			tailMaxChars: WAKE_CHARS,
+			accepted: false,
+			reply: done,
+		};
+		events.emit("bg:start", req);
+		if (!req.accepted) done(null); // no listener: the bg extension isn't loaded
+	});
+	if (reply === null || "error" in reply) rmSync(dir, { recursive: true, force: true });
+	return reply;
+}
+
+/** A finished run and its charge. */
+export interface RunResult {
+	outcome: RunOutcome;
+	charge?: UsageEvent;
+	chargeError?: string;
+	/** The signal aborted the run, so there was no cost lookup. */
+	stopped: boolean;
+}
+
+/** Run to completion, then look up the charge unless the run was stopped. Rejects when cursor-agent can't start. */
+export async function runAndCharge(
+	spec: RunSpec,
+	opts: { signal?: AbortSignal; onEvent?: (run: RunReducer, changed: boolean) => void; findCharge?: ChargeLookup } = {},
+): Promise<RunResult> {
+	const outcome = await runCursor(spec, { signal: opts.signal, onEvent: opts.onEvent });
+	const stopped = opts.signal?.aborted === true;
+	const { charge, chargeError } = stopped ? {} : await lookupCharge(outcome.state.sessionId, outcome.started, opts.signal, opts.findCharge);
+	return { outcome, charge, chargeError, stopped };
+}
+
+/**
+ * The result block: a banner, the answer (shortened past `answerChars`, with a
+ * note that the full text is earlier in the log), then the model, duration,
+ * charge, worktree, session, exit code and error.
+ */
+export function resultBlock(spec: RunSpec, r: RunResult, answerChars = ANSWER_CHARS): string[] {
+	const { state, exitCode, durationMs, worktree, stderr } = r.outcome;
+	const { charge, chargeError, stopped } = r;
+	const answer = state.answer.trim();
+	const failed = exitCode !== 0;
+	const lines: string[] = [];
+	const cost = charge
+		? `${dollars(charge.chargedCents ?? 0)}${charge.cursorTokenFee ? ` (incl. ${dollars(charge.cursorTokenFee)} Cursor fee)` : ""} · ${kfmt(eventTokens(charge))} tokens`
+		: `cost not found${chargeError ? `: ${chargeError}` : ""}`;
+	const status = stopped ? "stopped" : failed ? `exit ${exitCode}` : "done";
+	lines.push(`── cursor result · ${status} · ${spec.model} · ${humanDuration(durationMs)} · ${cost} ──`);
+	if (answer.length > answerChars) {
+		lines.push(`${answer.slice(0, answerChars).trimEnd()}…`, `[answer truncated at ${answerChars} of ${answer.length} chars; the full text is above in this log]`);
+	} else {
+		lines.push(answer || "(Cursor returned no answer)");
+	}
+	lines.push("");
+	lines.push(`Model: ${spec.model}${state.modelName && state.modelName !== spec.model ? ` (${state.modelName})` : ""}`);
+	lines.push(`Duration: ${humanDuration(durationMs)} · ${state.tools.length} step(s)`);
+	lines.push(`Charged: ${charge ? `${dollars(charge.chargedCents ?? 0)} (chargedCents ${charge.chargedCents ?? 0})` : cost}`);
+	if (worktree) {
+		lines.push(`Worktree: ${worktree.path} (branch ${worktree.branch || "?"}), ${worktree.changed.length} changed file(s)`);
+		const files = worktree.changed.slice(0, 40).map((l) => `  ${l}`);
+		if (worktree.changed.length > files.length) files.push(`  … ${worktree.changed.length - files.length} more`);
+		lines.push(...files);
+	}
+	if (state.sessionId) lines.push(`Session: ${state.sessionId}`);
+	lines.push(`Exit code: ${exitCode ?? "none (killed)"}${stopped ? " · stopped" : ""}`);
+	if (failed && stderr) lines.push(`Error: ${short(stderr, 1_500)}`);
+	return lines;
+}
 
 export interface BackgroundDeps {
 	/** Prints lines to the log (default: stdout). */
@@ -38,10 +152,11 @@ export async function runBackground(spec: RunSpec, deps: BackgroundDeps = {}): P
 	let announced = false;
 	write(`cursor ${spec.model} · ${spec.cwd}${spec.worktree ? " · new worktree" : ""}`);
 
-	let outcome: Awaited<ReturnType<typeof runCursor>>;
+	let result: RunResult;
 	try {
-		outcome = await runCursor(spec, {
+		result = await runAndCharge(spec, {
 			signal: deps.signal,
+			findCharge: deps.findCharge,
 			onEvent: (run) => {
 				const s = run.state;
 				if (!announced && s.sessionId) {
@@ -63,39 +178,12 @@ export async function runBackground(spec: RunSpec, deps: BackgroundDeps = {}): P
 		return 127;
 	}
 
-	const { state, exitCode, durationMs, worktree, stderr } = outcome;
-	const stopped = deps.signal?.aborted === true;
-	const { charge, chargeError } = stopped ? {} : await lookupCharge(state.sessionId, outcome.started, undefined, deps.findCharge);
-	const answer = state.answer.trim();
-	const failed = exitCode !== 0;
-
+	const answer = result.outcome.state.answer.trim();
 	if (answer.length > ANSWER_CHARS) {
 		write("", `── full answer (${answer.length} chars) ──`, answer);
 	}
-	const cost = charge
-		? `${dollars(charge.chargedCents ?? 0)}${charge.cursorTokenFee ? ` (incl. ${dollars(charge.cursorTokenFee)} Cursor fee)` : ""} · ${kfmt(eventTokens(charge))} tokens`
-		: `cost not found${chargeError ? `: ${chargeError}` : ""}`;
-	const status = stopped ? "stopped" : failed ? `exit ${exitCode}` : "done";
-	write("", `── cursor result · ${status} · ${spec.model} · ${humanDuration(durationMs)} · ${cost} ──`);
-	if (answer.length > ANSWER_CHARS) {
-		write(`${answer.slice(0, ANSWER_CHARS).trimEnd()}…`, `[answer truncated at ${ANSWER_CHARS} of ${answer.length} chars; the full text is above in this log]`);
-	} else {
-		write(answer || "(Cursor returned no answer)");
-	}
-	write("");
-	write(`Model: ${spec.model}${state.modelName && state.modelName !== spec.model ? ` (${state.modelName})` : ""}`);
-	write(`Duration: ${humanDuration(durationMs)} · ${state.tools.length} step(s)`);
-	write(`Charged: ${charge ? `${dollars(charge.chargedCents ?? 0)} (chargedCents ${charge.chargedCents ?? 0})` : cost}`);
-	if (worktree) {
-		write(`Worktree: ${worktree.path} (branch ${worktree.branch || "?"}), ${worktree.changed.length} changed file(s)`);
-		const files = worktree.changed.slice(0, 40).map((l) => `  ${l}`);
-		if (worktree.changed.length > files.length) files.push(`  … ${worktree.changed.length - files.length} more`);
-		if (files.length) write(...files);
-	}
-	if (state.sessionId) write(`Session: ${state.sessionId}`);
-	write(`Exit code: ${exitCode ?? "none (killed)"}${stopped ? " · stopped" : ""}`);
-	if (failed && stderr) write(`Error: ${short(stderr, 1_500)}`);
-	return exitCode ?? 1;
+	write("", ...resultBlock(spec, result));
+	return result.outcome.exitCode ?? 1;
 }
 
 async function main(specPath: string): Promise<void> {
