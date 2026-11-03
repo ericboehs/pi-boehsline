@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -75,15 +75,20 @@ async function mount(t, { mode = "tui", wake = "followUp" } = {}) {
     },
   };
   const bus = new Map();
+  // After /reload pi invalidates the old instance: every pi call throws.
+  let stale = false;
+  const assertActive = () => {
+    if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+  };
   backgroundTasks({
     registerTool: (definition) => tools.set(definition.name, definition),
     registerCommand: (name, definition) => commands.set(name, definition),
     registerShortcut() {},
     on: (name, handler) => handlers.set(name, handler),
-    sendMessage: (message, options) => sent.push({ message, options }),
+    sendMessage: (message, options) => (assertActive(), sent.push({ message, options })),
     events: {
       on: (channel, handler) => (bus.set(channel, handler), () => bus.delete(channel)),
-      emit: (channel, data) => bus.get(channel)?.(data),
+      emit: (channel, data) => (assertActive(), bus.get(channel)?.(data)),
     },
   });
 
@@ -106,7 +111,8 @@ async function mount(t, { mode = "tui", wake = "followUp" } = {}) {
 
   const bash = tools.get("bash");
   return {
-    bash, children, sent, notices, widgets, statuses, theme, shutdown,
+    bash, children, sent, notices, widgets, statuses, theme, shutdown, backgroundTasks,
+    goStale: () => { stale = true; },
     emit: (channel, data) => bus.get(channel)?.(data),
     run: (params) => bash.execute("test-job", params, undefined, undefined, ctx),
     render: (width = 160) => component?.render(width) ?? [],
@@ -319,4 +325,52 @@ test("shutdown clears the widget and stops UI updates without killing detached j
   assert.equal(h.widgets.length, updates);
   assert.equal(h.children[0].ended, false);
   assert.match(h.notices[0].message, /bg job\(s\) still running/);
+});
+
+/** A second bg instance on the same module, as /reload builds one: fresh pi, same process. */
+async function reloaded(backgroundTasks) {
+  const handlers = new Map();
+  const sent = [];
+  const ctx = { mode: "print", hasUI: false, cwd: dir, ui: { notify() {}, setWidget() {} } };
+  backgroundTasks({
+    registerTool() {},
+    registerCommand() {},
+    registerShortcut() {},
+    on: (name, handler) => handlers.set(name, handler),
+    sendMessage: (message, options) => sent.push({ message, options }),
+    events: { on: () => () => {}, emit() {} },
+  });
+  await handlers.get("session_start")({}, ctx);
+  return { sent, shutdown: () => handlers.get("session_shutdown")({}, ctx) };
+}
+
+for (const shutdownFirst of [false, true]) {
+  test(`a job started before /reload wakes the reloaded session instead of crashing pi (${shutdownFirst ? "after shutdown" : "no shutdown"})`, async (t) => {
+    const h = await mount(t);
+    await h.run({ command: "npm run build", background: true });
+    const task = h.children[0];
+    // Old instance goes stale; the reload builds a new one that owns the session.
+    if (shutdownFirst) await h.shutdown();
+    h.goStale();
+    const next = await reloaded(h.backgroundTasks);
+    t.after(() => next.shutdown());
+
+    writeFileSync(task.logPath, "built\n");
+    assert.doesNotThrow(() => task.exit(0), "a stale pi must not throw out of the child exit listener");
+    assert.deepEqual(h.sent, []);
+    assert.equal(next.sent.length, 1, "the reloaded session receives the completion wake");
+    assert.match(next.sent[0].message.content, new RegExp(`\\[bg ${task.id}\\] .*succeeded`));
+    assert.match(next.sent[0].message.content, /built/);
+    assert.deepEqual(next.sent[0].options, { deliverAs: "followUp", triggerTurn: true });
+  });
+}
+
+test("a stale instance with no live session logs the completion instead of throwing", async (t) => {
+  const h = await mount(t);
+  await h.run({ command: "sleep 100", background: true });
+  const task = h.children[0];
+  await h.shutdown();
+  h.goStale();
+  assert.doesNotThrow(() => task.exit(0));
+  assert.match(readFileSync(task.logPath, "utf8"), /completion not delivered: no live pi session/);
 });

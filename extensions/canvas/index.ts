@@ -2089,8 +2089,11 @@ export default function canvas(pi: ExtensionAPI) {
     clearInterval(schedTimer);
     durableKey = "";
     checkDurable(ctx.cwd);
+    const cwd = ctx.cwd; // read once: a stale ctx's getters throw inside the timer
     schedTimer = setInterval(() => {
-      if (checkDurable(ctx.cwd)) void serial(writeJobs).catch(() => {});
+      try {
+        if (checkDurable(cwd)) void serial(writeJobs).catch(() => {});
+      } catch {}
     }, SCHED_EVERY_MS);
     schedTimer.unref?.();
   }
@@ -2178,6 +2181,13 @@ export default function canvas(pi: ExtensionAPI) {
   function drainInbox() {
     const ctx = inboxCtx;
     if (!ctx || !sessionId) return;
+    let idle: boolean;
+    try {
+      idle = ctx.isIdle();
+    } catch {
+      stopInbox(); // stale ctx after reload: leave the inbox for the live instance
+      return;
+    }
     const msgs = claimInbox(dir());
     if (!msgs.length) return;
     const acks: { id: string; how: string }[] = [];
@@ -2185,7 +2195,7 @@ export default function canvas(pi: ExtensionAPI) {
     for (const m of msgs) {
       // Idle: the first message starts a turn and the rest queue behind it.
       // Busy: steer (Enter) or follow-up (⌥Enter), as the page asked.
-      const how = ctx.isIdle() && !started ? "prompt" : started ? "followUp" : m.mode;
+      const how = idle && !started ? "prompt" : started ? "followUp" : m.mode;
       try {
         if (how === "prompt") pi.sendUserMessage(m.text);
         else pi.sendUserMessage(m.text, { deliverAs: how as "steer" | "followUp" });
@@ -2206,12 +2216,23 @@ export default function canvas(pi: ExtensionAPI) {
       const inbox = join(dir(), "inbox");
       if (inboxWatch || !sessionId || !existsSync(inbox)) return;
       try {
-        inboxWatch = watch(inbox, () => drainInbox());
+        inboxWatch = watch(inbox, () => safeDrain());
         inboxWatch.on("error", () => (inboxWatch?.close(), (inboxWatch = undefined)));
         inboxWatch.unref();
       } catch {}
     };
-    inboxTimer = setInterval(() => (tryWatch(), drainInbox()), 1000);
+    // Timer and watcher callbacks must never throw: that kills pi.
+    const safeDrain = () => {
+      try {
+        drainInbox();
+      } catch {}
+    };
+    inboxTimer = setInterval(() => {
+      try {
+        tryWatch();
+      } catch {}
+      safeDrain();
+    }, 1000);
     inboxTimer.unref();
     tryWatch();
     drainInbox();

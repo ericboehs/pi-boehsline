@@ -137,7 +137,11 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWorkingMessage(workingMessage(run));
     ticker = setInterval(() => {
       if (!run) return;
-      ctx.ui.setWorkingMessage(workingMessage(run));
+      try {
+        ctx.ui.setWorkingMessage(workingMessage(run));
+      } catch {
+        stopTicker(); // ctx went stale (reload/session replacement); a throw here would kill pi
+      }
     }, TICK_MS);
   };
 

@@ -170,6 +170,20 @@ interface Job {
 }
 
 /**
+ * The bg instance bound to the live session, shared across /reload. A reload
+ * re-runs this factory with a fresh pi and invalidates the old one, but the
+ * old instance's detached children keep running and their exit listeners
+ * still fire into it. Those completions are forwarded here instead of
+ * throwing "ctx is stale" out of a ChildProcess listener (which kills pi).
+ * globalThis + Symbol.for: survives the module being re-imported on reload.
+ */
+interface BgLive {
+	deliver(job: Job): void;
+}
+const LIVE_KEY = Symbol.for("pi-boehsline.bg.live");
+const liveSlot = globalThis as unknown as { [LIVE_KEY]?: BgLive };
+
+/**
  * "bundle exec rspec spec/foo" -> "rspec". Best-effort label for the widget.
  * Skips shell keywords, wrappers, env assignments, and loop variables so that
  * e.g. `for i in $(seq 1 400); do echo ...` labels as "echo", not "for".
@@ -676,6 +690,15 @@ export default function (pi: ExtensionAPI) {
 	const jobs = new Map<string, Job>();
 	let ctxRef: ExtensionContext | undefined;
 	let ticker: NodeJS.Timeout | undefined;
+	/** Set once this instance's pi is shut down or found stale; completions then go to the live instance. */
+	let disposed = false;
+	const self: BgLive = {
+		deliver(job) {
+			// A job adopted from a reloaded instance: list it here and wake this session.
+			jobs.set(job.id, job);
+			deliver(job);
+		},
+	};
 
 	const running = () => [...jobs.values()].filter((job) => job.endedAt === undefined);
 	/** Jobs the widget surfaces (quiet foreground-race jobs are invisible until adopted). */
@@ -726,7 +749,15 @@ export default function (pi: ExtensionAPI) {
 		// This timer only refreshes the TUI, never wakes the model.
 		const active = ctxRef?.mode === "tui" && adopted().length > 0;
 		if (active && !ticker) {
-			ticker = setInterval(renderWidget, 1000);
+			ticker = setInterval(() => {
+				try {
+					renderWidget();
+				} catch {
+					// stale ctx after a reload: stop refreshing a UI we no longer own
+					clearInterval(ticker);
+					ticker = undefined;
+				}
+			}, 1000);
 			ticker.unref?.();
 		} else if (!active && ticker) {
 			clearInterval(ticker);
@@ -792,14 +823,16 @@ export default function (pi: ExtensionAPI) {
 		// cannot slip through the gap (e.g. `exit 3`).
 		const ready = new Promise<void>((resolve) => {
 			child.once("spawn", () => resolve());
+			// Never let a throw escape a ChildProcess listener: it becomes an
+			// uncaughtException and takes pi down with it.
 			child.once("exit", (code, signal) => {
-				finish(job, code, signal);
+				safeFinish(job, code, signal);
 				resolveExited();
 				resolve();
 			});
 			child.once("error", (error) => {
 				appendLog(job, `pi-bg: failed to start: ${error.message}`);
-				finish(job, 127, null);
+				safeFinish(job, 127, null);
 				resolveExited();
 				resolve();
 			});
@@ -862,13 +895,60 @@ export default function (pi: ExtensionAPI) {
 		job.endedAt = Date.now();
 		job.exitCode = code;
 		job.signal = signal;
+		deliver(job);
+	}
+
+	function safeFinish(job: Job, code: number | null, signal: NodeJS.Signals | null): void {
+		try {
+			finish(job, code, signal);
+		} catch (error) {
+			appendLog(job, `pi-bg: completion handling failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	/**
+	 * Report a finished job to this session, or, when this instance's pi is
+	 * stale (reloaded, replaced), to whichever instance owns the live session.
+	 * Never throws.
+	 */
+	function deliver(job: Job): void {
+		if (!disposed) {
+			try {
+				deliverHere(job);
+				return;
+			} catch {
+				// "ctx is stale after session replacement or reload": hand off below
+				disposed = true;
+				if (ticker) {
+					clearInterval(ticker);
+					ticker = undefined;
+				}
+			}
+		}
+		const live = liveSlot[LIVE_KEY];
+		if (live && live !== self) {
+			try {
+				live.deliver(job);
+				return;
+			} catch (error) {
+				appendLog(job, `pi-bg: completion not delivered: ${error instanceof Error ? error.message : String(error)}`);
+				return;
+			}
+		}
+		appendLog(job, "pi-bg: completion not delivered: no live pi session");
+	}
+
+	function deliverHere(job: Job): void {
+		const code = job.exitCode ?? null;
+		const signal = job.signal ?? null;
+		const endedAt = job.endedAt ?? Date.now();
 		syncTicker();
 
 		// Foreground-race jobs report through their tool result; only adopted
 		// (timed-out) jobs get the completion wake.
 		if (job.quiet) return;
 
-		const elapsed = humanDuration(job.endedAt - job.startedAt);
+		const elapsed = humanDuration(endedAt - job.startedAt);
 		const outcome =
 			signal !== null ? `killed (${signal})` : code === 0 ? "succeeded" : `exited ${code}`;
 
@@ -924,7 +1004,7 @@ export default function (pi: ExtensionAPI) {
 			}, 5000).unref?.();
 			return true;
 		} catch {
-			finish(job, null, "SIGTERM");
+			safeFinish(job, null, "SIGTERM");
 			return false;
 		}
 	}
@@ -1222,6 +1302,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		ctxRef = ctx;
+		disposed = false;
+		liveSlot[LIVE_KEY] = self;
 		setTimeout(() => void pruneLogs(), 5_000).unref();
 		syncTicker();
 	});
@@ -1241,5 +1323,8 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 		ctxRef = undefined;
+		// Jobs still running report to whichever instance takes the next session.
+		disposed = true;
+		if (liveSlot[LIVE_KEY] === self) delete liveSlot[LIVE_KEY];
 	});
 }
