@@ -132,6 +132,8 @@ interface Conn {
 	pinQuietUntil?: number;
 	/** When each recent pin dialog opened (ms), for the cap of PIN_DIALOG_MAX per PIN_DIALOG_WINDOW_MS. */
 	pinDialogs?: number[];
+	/** A sandbox session's VM-tool token from Botsun (sandboxToken), in memory only, until expiresAt (ms). */
+	sandboxToken?: { token: string; expiresAt: number };
 }
 
 const store = globalThis as unknown as { [STORE]?: Conn };
@@ -569,6 +571,51 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (denied) return { error: denied };
 	return deliverSay(c, text, images, files);
 }
+
+/** A sandbox session token as Botsun mints it (lib/botsun/sandbox_tokens.rb, SandboxTokens::FORMAT). */
+export const SANDBOX_TOKEN = /^sandbox\.[A-Za-z0-9_-]{43}$/;
+const SANDBOX_TOKEN_MAX_S = 12 * 3600; // SandboxTokens::MAX_AGE
+/** Where the VM extensions find sessionToken (their turnHeader). */
+export const SESSION_TOKEN = Symbol.for("botsun.sessionToken");
+
+/** The longest line Botsun's end of the connection writes (a sandbox_token line is ~120 bytes). */
+const SERVER_LINE_MAX = 4096;
+
+/**
+ * A line Botsun wrote down this process's own connection to it. Only a sandbox session's VM
+ * bridge writes one: its VM-tool token (vm/owner-bridge.mjs, after Botsun bound this session's
+ * hello to its template and Eric started it); a newer one (a renewal) replaces it. Never taken
+ * from <pid>.sock, where any process of this user could connect. Kept in this process only:
+ * never a file, env, the transcript or a log. Anything else is ignored. Returns whether it took one.
+ */
+export function serverLine(c: Conn, line: string): boolean {
+	let msg: unknown;
+	try {
+		msg = JSON.parse(line);
+	} catch {
+		return false;
+	}
+	if (!msg || typeof msg !== "object" || Array.isArray(msg)) return false;
+	const { v, type, token, expires_in: ttl } = msg as Record<string, unknown>;
+	if (v !== 1 || type !== "sandbox_token") return false;
+	if (typeof token !== "string" || !SANDBOX_TOKEN.test(token)) return false;
+	if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < 1 || ttl > SANDBOX_TOKEN_MAX_S) return false;
+	c.sandboxToken = { token, expiresAt: Date.now() + ttl * 1000 };
+	return true;
+}
+
+/** This session's sandbox token while its connection to Botsun is up and the token unexpired, else undefined. */
+export function sessionToken(): string | undefined {
+	const c = store[STORE];
+	const t = c?.sandboxToken;
+	if (!c || !t || c.closed || !c.connected) return undefined;
+	if (Date.now() >= t.expiresAt) {
+		c.sandboxToken = undefined;
+		return undefined;
+	}
+	return t.token;
+}
+Object.defineProperty(globalThis, SESSION_TOKEN, { value: sessionToken, configurable: true, writable: true });
 
 /**
  * A text reply signed with the phone's call key (key: "call"), so the Watch can answer while the
@@ -1187,13 +1234,31 @@ function connect(c: Conn): void {
 		debug("connected");
 		sendHello(c);
 	});
-	// The server never writes in v1; drain anything so the socket can't stall.
-	sock.on("data", () => {});
+	// Botsun on the Mac never writes; a sandbox VM's bridge writes this session's token
+	// (serverLine). Read line by line, at most SERVER_LINE_MAX each, so the socket can't stall.
+	let buf = "";
+	let skipping = false; // inside a line over SERVER_LINE_MAX: dropped to its newline
+	sock.setEncoding("utf8");
+	sock.on("data", (chunk: string) => {
+		if (c.sock !== sock) return;
+		buf += chunk;
+		let nl;
+		while ((nl = buf.indexOf("\n")) >= 0) {
+			if (!skipping && nl <= SERVER_LINE_MAX) serverLine(c, buf.slice(0, nl));
+			skipping = false;
+			buf = buf.slice(nl + 1);
+		}
+		if (buf.length > SERVER_LINE_MAX) {
+			buf = "";
+			skipping = true;
+		}
+	});
 	sock.on("error", (err) => debug(`socket error: ${(err as NodeJS.ErrnoException).code ?? err.message}`));
 	sock.on("close", () => {
 		if (c.sock !== sock) return;
 		c.sock = undefined;
 		c.connected = false;
+		c.sandboxToken = undefined; // Botsun revoked it with the connection: the next hello gets a new one
 		scheduleRetry(c);
 	});
 }
@@ -1209,6 +1274,7 @@ function close(c: Conn): void {
 	const sock = c.sock;
 	c.sock = undefined;
 	c.connected = false;
+	c.sandboxToken = undefined;
 	if (sock) {
 		try { sock.end(); } catch {}
 		// end() waits on the peer; don't let a stuck server hold the fd.
@@ -1466,6 +1532,7 @@ function main(pi: ExtensionAPI): void {
 			conn.nonces.clear(); // a nonce was for the session it was issued in
 			listenOwner(conn);
 			const changed = info.sessionFile !== conn.sessionFile || info.sessionId !== conn.sessionId || info.cwd !== conn.cwd;
+			if (info.sessionId !== conn.sessionId) conn.sandboxToken = undefined; // it was for the session Botsun bound
 			Object.assign(conn, info);
 			const model = modelOf(ctx);
 			if (JSON.stringify(model) !== JSON.stringify(conn.model)) {

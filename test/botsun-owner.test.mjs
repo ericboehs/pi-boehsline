@@ -381,6 +381,68 @@ test("/reload over a connection from the T1 extension upgrades it in place", asy
 	assert.ok(nonce, "the upgraded session takes replies");
 });
 
+// A sandbox session (Botsun's lib/botsun/sandbox_tokens.rb): the VM's owner bridge writes its
+// VM-tool token down this session's own connection; it lives in this process only, for the VM
+// extensions' turnHeader. Never from <pid>.sock, which any process of the user can open.
+test("a sandbox session token comes only down Botsun's connection, kept in memory while it is up", async () => {
+	const { lstatSync, readFileSync } = await import("node:fs");
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)) && srv.types().includes("hello"));
+	const get = () => globalThis[Symbol.for("botsun.sessionToken")]?.();
+	assert.equal(typeof globalThis[Symbol.for("botsun.sessionToken")], "function");
+	assert.equal(get(), undefined, "none until Botsun sends one");
+	const [bridge] = srv.conns;
+	const send = (line) => bridge.write(`${typeof line === "string" ? line : JSON.stringify(line)}\n`);
+	const settle = () => new Promise((r) => setTimeout(r, 50));
+
+	const token = `sandbox.${"A1_-".repeat(10)}xyz`;
+	assert.deepEqual(await ask({ type: "sandbox_token", token, expires_in: 60 }), { error: "unknown request" }, "never over <pid>.sock");
+	assert.equal(get(), undefined, "a process that connects to <pid>.sock can't plant one");
+
+	for (const bad of [{ token: "sandbox.short", expires_in: 60 }, { token: `${token}x`, expires_in: 60 }, { token: token.replace("sandbox.", "turn."), expires_in: 60 },
+		{ token, expires_in: 0 }, { token, expires_in: 12 * 3600 + 1 }, { token, expires_in: "60" }, { token }]) {
+		send({ v: 1, type: "sandbox_token", ...bad });
+	}
+	send({ v: 2, type: "sandbox_token", token, expires_in: 60 });
+	send({ v: 1, type: "say", token, expires_in: 60 });
+	send("not json");
+	send(`{"v":1,"type":"sandbox_token","token":"${token}","expires_in":60,"pad":"${"x".repeat(5000)}"}`);
+	await settle();
+	assert.equal(get(), undefined, "a malformed, other or oversized line is never kept");
+
+	bridge.write(`{"v":1,"type":"sandbox_token","tok`); // split across writes, as a socket may
+	await settle();
+	bridge.write(`en":"${token}","expires_in":60}\n`);
+	await until(() => get() === token);
+	const renewed = `sandbox.${"b".repeat(43)}`;
+	send({ v: 1, type: "sandbox_token", token: renewed, expires_in: 12 * 3600 });
+	await until(() => get() === renewed);
+
+	// Never sent back to Botsun, never written under HOME (pins, inbox, keys, sockets dir...).
+	assert.ok(!JSON.stringify(srv.lines).includes("sandbox."), "not in any line to Botsun");
+	const walk = (dir) => readdirSync(dir).flatMap((name) => {
+		const p = join(dir, name);
+		const st = lstatSync(p);
+		return st.isDirectory() ? walk(p) : st.isFile() ? [p] : [];
+	});
+	for (const f of walk(home)) assert.ok(!readFileSync(f, "utf8").includes("sandbox."), `not in ${f}`);
+
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	conn.sandboxToken.expiresAt = Date.now() - 1;
+	assert.equal(get(), undefined, "an expired one is gone");
+
+	send({ v: 1, type: "sandbox_token", token, expires_in: 60 });
+	await until(() => get() === token);
+	await srv.stop(); // Botsun (the bridge) hung up: it revoked the token with the connection
+	await until(() => get() === undefined);
+	assert.equal(conn.sandboxToken, undefined, "dropped, not just hidden");
+	await m.fire("session_shutdown", { reason: "quit" });
+	assert.equal(get(), undefined);
+});
+
 test("assistant text streams (throttled) and ends with stream_end", async () => {
 	const srv = await server();
 	process.env.BOTSUN_OWNER_SOCK = srv.path;
