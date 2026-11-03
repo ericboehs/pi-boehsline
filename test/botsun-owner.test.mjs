@@ -84,6 +84,7 @@ process.env.BOTSUN_OWNER_PIN_DIR = pinDir;
 
 beforeEach(() => {
 	delete process.env.PI_SUBAGENT_CHILD;
+	delete globalThis[Symbol.for("botsun-owner.launch")]; // pi's startup session, once per process
 	rmSync(join(home, ".claude"), { recursive: true, force: true });
 	rmSync(pinDir, { recursive: true, force: true });
 });
@@ -176,6 +177,139 @@ test("session change keeps the connection and sends a session line", async () =>
 	assert.equal(srv.lines[1].cwd, "/tmp/work/proj");
 	assert.equal(srv.conns.size, 1, "same connection");
 	await b.fire("session_shutdown", { reason: "quit" });
+	await until(() => srv.types().includes("bye"));
+	await srv.stop();
+});
+
+test("launchOf and helloOnSwitch: a hello only on a switch back to a sandbox template's own conversation", async () => {
+	const { launchOf, helloOnSwitch } = await import(`../extensions/opt-in/botsun-owner/index.ts?l=${Math.random()}`);
+	const own = { sessionId: "sandbox-pal", sessionFile: "/s/pal.jsonl" };
+	const launch = launchOf(own);
+	assert.deepEqual(launch, { id: "sandbox-pal", file: "/s/pal.jsonl" });
+	assert.equal(launchOf({ sessionId: "0193-mac", sessionFile: "/s/m.jsonl" }), null, "a Mac pi has none, even one started with --session-id");
+	assert.equal(launchOf({ sessionId: null, sessionFile: null }), null);
+	const other = { sessionId: "sandbox-other", sessionFile: "/s/other.jsonl" };
+	assert.equal(helloOnSwitch(other, own, launch), true);
+	assert.equal(helloOnSwitch(own, own, launch), false, "no switch");
+	assert.equal(helloOnSwitch(own, other, launch), false, "leaving keeps the session line");
+	assert.equal(helloOnSwitch(other, { sessionId: "sandbox-pal", sessionFile: "/elsewhere/pal.jsonl" }, launch), false, "the same id in another folder isn't its own");
+	assert.equal(helloOnSwitch(other, own, null), false, "not a sandbox template's pi");
+});
+
+test("switching back to its own conversation says hello again, fresh, on the same connection", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const at = (id) => ({ ctx: { sessionManager: { getSessionFile: () => `/tmp/sessions/${id}.jsonl`, getSessionId: () => id } } });
+	const get = () => globalThis[Symbol.for("botsun.sessionToken")]?.();
+	const a = await mount(at("sandbox-pal"));
+	await a.fire("session_start", { reason: "startup" });
+	await until(() => srv.lines.length >= 1);
+	const [bridge] = srv.conns;
+	const token = `sandbox.${"A1_-".repeat(10)}xyz`;
+	bridge.write(`${JSON.stringify({ v: 1, type: "sandbox_token", token, expires_in: 60 })}\n`);
+	await until(() => get() === token);
+	await a.fire("agent_start");
+	await a.fire("ui_prompt_start", { reason: "ui_prompt", kind: "confirm", title: "Other conversation's question?" });
+	await a.fire("session_shutdown", { reason: "resume" });
+	const b = await mount(at("sid-other"));
+	await b.fire("session_start", { reason: "resume" });
+	await until(() => srv.types().includes("session"));
+	assert.equal(get(), undefined, "the token was for its own conversation");
+	bridge.write(`${JSON.stringify({ v: 1, type: "sandbox_token", token, expires_in: 60 })}\n`); // a renewal already on its way
+	await sleep(50);
+	assert.equal(get(), undefined, "a token for a conversation pi has left isn't kept");
+	await b.fire("agent_start");
+	await b.fire("ui_prompt_start", { reason: "ui_prompt", kind: "confirm", title: "Other conversation's question?" });
+	await until(() => srv.types().filter((t) => t === "prompt").length >= 2);
+	await b.fire("session_shutdown", { reason: "resume" });
+	const mark = srv.lines.length;
+	const c = await mount(at("sandbox-pal"));
+	await c.fire("session_start", { reason: "resume" });
+	await until(() => srv.types().filter((t) => t === "hello").length >= 2);
+	await sleep(50);
+	const after = srv.lines.slice(mark);
+	assert.deepEqual(after.map((l) => l.type), ["hello"], "one hello carries it all: no idle, prompt_end or session line");
+	assert.equal(after[0].session_id, "sandbox-pal");
+	assert.equal(after[0].busy, false, "nothing of the conversation it left");
+	assert.equal(after[0].prompt, null);
+	assert.equal(srv.types().filter((t) => t === "session").length, 1, "only the switch away sends a session line");
+	assert.equal(srv.conns.size, 1, "same connection");
+	bridge.write(`${JSON.stringify({ v: 1, type: "sandbox_token", token, expires_in: 60 })}\n`);
+	await until(() => get() === token);
+	await c.fire("session_shutdown", { reason: "quit" });
+	await until(() => srv.types().includes("bye"));
+	await srv.stop();
+});
+
+test("a /reload in its own conversation keeps the token and says no hello; so does a connection from before boundId", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const at = (id) => ({ ctx: { sessionManager: { getSessionFile: () => `/tmp/sessions/${id}.jsonl`, getSessionId: () => id } } });
+	const get = () => globalThis[Symbol.for("botsun.sessionToken")]?.();
+	const a = await mount(at("sandbox-pal"));
+	await a.fire("session_start", { reason: "startup" });
+	await until(() => srv.lines.length >= 1);
+	const [bridge] = srv.conns;
+	const token = `sandbox.${"A1_-".repeat(10)}xyz`;
+	const send = () => bridge.write(`${JSON.stringify({ v: 1, type: "sandbox_token", token, expires_in: 60 })}\n`);
+	send();
+	await until(() => get() === token);
+	await a.fire("session_shutdown", { reason: "reload" });
+	const b = await mount(at("sandbox-pal"));
+	await b.fire("session_start", { reason: "reload" });
+	await sleep(50);
+	assert.equal(get(), token, "kept across a reload");
+	assert.equal(srv.types().filter((t) => t === "hello").length, 1, "no second hello");
+	assert.ok(!srv.types().includes("session"));
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	delete conn.boundId; // as made by the version before boundId
+	await b.fire("session_shutdown", { reason: "reload" });
+	const c = await mount(at("sandbox-pal"));
+	await c.fire("session_start", { reason: "reload" });
+	await sleep(50);
+	assert.equal(get(), token, "an upgraded connection keeps its token");
+	conn.sandboxToken = undefined;
+	send();
+	await until(() => get() === token);
+	await c.fire("session_shutdown", { reason: "quit" });
+	await until(() => srv.types().includes("bye"));
+	await srv.stop();
+});
+
+test("a new connection after pi left its startup conversation doesn't take the current one as its own", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const at = (id) => ({ ctx: { sessionManager: { getSessionFile: () => `/tmp/sessions/${id}.jsonl`, getSessionId: () => id } } });
+	const a = await mount(at("sandbox-pal"));
+	await a.fire("session_start", { reason: "startup" });
+	await until(() => srv.lines.length >= 1);
+	await a.fire("session_shutdown", { reason: "quit" }); // the connection goes (a slow handoff closes it the same way)
+	await until(() => srv.types().includes("bye"));
+	const b = await mount(at("sandbox-other"));
+	await b.fire("session_start", { reason: "resume" });
+	await until(() => srv.types().filter((t) => t === "hello").length >= 2);
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	assert.deepEqual(conn.launch, { id: "sandbox-pal", file: "/tmp/sessions/sandbox-pal.jsonl" }, "still pi's startup session");
+	await b.fire("session_shutdown", { reason: "quit" });
+	await srv.stop();
+});
+
+test("a Mac pi switching back to its first conversation keeps the session line", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const at = (id) => ({ ctx: { sessionManager: { getSessionFile: () => `/tmp/sessions/${id}.jsonl`, getSessionId: () => id } } });
+	const a = await mount(at("sid-a"));
+	await a.fire("session_start", { reason: "startup" });
+	await until(() => srv.lines.length >= 1);
+	await a.fire("session_shutdown", { reason: "resume" });
+	const b = await mount(at("sid-b"));
+	await b.fire("session_start", { reason: "resume" });
+	await b.fire("session_shutdown", { reason: "resume" });
+	const c = await mount(at("sid-a"));
+	await c.fire("session_start", { reason: "resume" });
+	await until(() => srv.types().filter((t) => t === "session").length >= 2);
+	assert.equal(srv.types().filter((t) => t === "hello").length, 1);
+	await c.fire("session_shutdown", { reason: "quit" });
 	await until(() => srv.types().includes("bye"));
 	await srv.stop();
 });

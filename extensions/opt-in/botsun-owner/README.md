@@ -12,7 +12,7 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 
 | type | when | extra fields |
 |---|---|---|
-| `hello` | on every (re)connect | `cwd`, `session_file`, `session_id`, `busy`, `prompt`, `model`, `ask`, `commands`, `models`, `stash`, `footer`, `usage`, `context`, `compacting`, `bypass`, `features` (the nonce reply's list) |
+| `hello` | on every (re)connect, and instead of `session` when a sandbox template's pi switches back to its own conversation (its startup session) | `cwd`, `session_file`, `session_id`, `busy`, `prompt`, `model`, `ask`, `commands`, `models`, `stash`, `footer`, `usage`, `context`, `compacting`, `bypass`, `features` (the nonce reply's list) |
 | `busy` / `idle` | a run starts / pi has settled | |
 | `prompt` / `prompt_end` | a dialog (`ask`, select, confirm, input, editor, custom) opens / closes | `kind`, `title` (≤ 500 chars) |
 | `stream` / `stream_end` | the reply as it's written / done | `text` |
@@ -29,6 +29,8 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 | `held` | call words held, released or dropped | `held` (`[{id, chars, at}]`: no text) |
 | `session` | `/new`, `/resume`, `/fork`: same pid, new transcript | `session_file`, `session_id`, `cwd` |
 | `bye` | pi quits | |
+
+**What it reads back:** Botsun on the Mac never writes on this connection. In a sandbox VM, Botsun's owner bridge listens there instead and writes one kind of line: `{"v":1,"type":"sandbox_token","token":"sandbox.<43 urlsafe base64>","expires_in":<s, at most 43200>}`, the session's VM-tool token, minted only for a session Eric started from the host. It is kept in this process's memory (never a file, env, the transcript or a log), dropped with the connection, when it expires, or when pi leaves the conversation the last hello named (a renewal already on its way included), replaced by a newer one, and offered to the VM extensions through `globalThis[Symbol.for("botsun.sessionToken")]()` for their `X-Botsun-Turn` header. Only this connection is trusted for it: a `sandbox_token` request on `<pid>.sock` (below), where any process of the user can connect, is refused as an unknown request. Any other line, or one over 4 KB, is ignored.
 
 ## Taking input from the phone
 

@@ -134,6 +134,11 @@ interface Conn {
 	pinDialogs?: number[];
 	/** A sandbox session's VM-tool token from Botsun (sandboxToken), in memory only, until expiresAt (ms). */
 	sandboxToken?: { token: string; expiresAt: number };
+	/** A sandbox template's own conversation (`sandbox-<slug>`): pi's startup session's id and file. */
+	launch?: { id: string; file: string | null } | null;
+	/** The conversation the last hello named, cleared by a `session` line naming another: a token is kept only while
+	 * pi is still in it (a renewal on its way during a switch is dropped). */
+	boundId?: string | null;
 }
 
 const store = globalThis as unknown as { [STORE]?: Conn };
@@ -600,6 +605,7 @@ export function serverLine(c: Conn, line: string): boolean {
 	if (v !== 1 || type !== "sandbox_token") return false;
 	if (typeof token !== "string" || !SANDBOX_TOKEN.test(token)) return false;
 	if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < 1 || ttl > SANDBOX_TOKEN_MAX_S) return false;
+	if (c.boundId !== c.sessionId) return true; // for a conversation pi has left: read, not kept
 	c.sandboxToken = { token, expiresAt: Date.now() + ttl * 1000 };
 	return true;
 }
@@ -1177,7 +1183,29 @@ function featureList(c: Conn): string[] {
 		...(hasStash ? ["stash"] : [])];
 }
 
+/** The conversation a sandbox template's pi was started in, from its first session: Botsun starts it
+ * with `--session-id sandbox-<slug>`. Any other first session (a Mac pi) has none. */
+export function launchOf(info: { sessionId: string | null; sessionFile: string | null }): { id: string; file: string | null } | null {
+	return info.sessionId?.startsWith("sandbox-") ? { id: info.sessionId, file: info.sessionFile } : null;
+}
+
+/** A switch back to the conversation a sandbox template's pi was started in (same id and file) says
+ * hello again rather than `session`: the host refuses a connection that left its own conversation,
+ * and only a fresh hello from the pid it armed for that template puts it back. Any other switch keeps
+ * the `session` line. (A reconnect says hello for whatever conversation is current: the host refuses
+ * it while that template's own armed pi is live, and otherwise lists this pi as that template, with
+ * no token and no deliveries, which go only to a template's armed pid.) */
+export function helloOnSwitch(prev: { sessionId: string | null }, next: { sessionId: string | null; sessionFile: string | null },
+	launch: { id: string; file: string | null } | null | undefined): boolean {
+	return !!launch && next.sessionId === launch.id && next.sessionFile === launch.file && prev.sessionId !== next.sessionId;
+}
+
+/** pi's startup session, recorded once per process (it outlives a connection: a slow handoff or a
+ * late opt-in makes a new one, which must not take the conversation pi is in then as its own). */
+const LAUNCH = Symbol.for("botsun-owner.launch");
+
 function sendHello(c: Conn): void {
+	c.boundId = c.sessionId;
 	write(c, "hello", {
 		features: featureList(c),
 		cwd: c.cwd,
@@ -1469,6 +1497,8 @@ function main(pi: ExtensionAPI): void {
 			});
 		}
 		const info = sessionInfo(ctx);
+		const g = globalThis as { [LAUNCH]?: Conn["launch"] };
+		if (!(LAUNCH in g)) g[LAUNCH] = (_event as { reason?: string } | undefined)?.reason === "startup" ? launchOf(info) : null;
 		const sessionName = () => pi.getSessionName();
 		// Eric's own words, as if typed: steer into a running turn, else start one.
 		const inject = (content: string | UserContent[], busy: boolean) => {
@@ -1533,13 +1563,28 @@ function main(pi: ExtensionAPI): void {
 			listenOwner(conn);
 			const changed = info.sessionFile !== conn.sessionFile || info.sessionId !== conn.sessionId || info.cwd !== conn.cwd;
 			if (info.sessionId !== conn.sessionId) conn.sandboxToken = undefined; // it was for the session Botsun bound
+			if (!("boundId" in conn)) conn.boundId = conn.sessionId; // a connection from before boundId: its hello's
+			const rehello = helloOnSwitch(conn, info, conn.launch);
 			Object.assign(conn, info);
+			if (rehello) {
+				// Back in its own conversation: a fresh hello, carrying everything below, and nothing of
+				// the conversation it left (not running, no prompt open).
+				conn.busy = false;
+				conn.prompt = null;
+				conn.promptDepth = 0;
+				conn.model = modelOf(ctx);
+				sendHello(conn);
+				return;
+			}
 			const model = modelOf(ctx);
 			if (JSON.stringify(model) !== JSON.stringify(conn.model)) {
 				conn.model = model;
 				write(conn, "model", { model });
 			}
-			if (changed) write(conn, "session", { session_file: conn.sessionFile, session_id: conn.sessionId, cwd: conn.cwd });
+			if (changed) {
+				if (conn.boundId !== conn.sessionId) conn.boundId = null;
+				write(conn, "session", { session_file: conn.sessionFile, session_id: conn.sessionId, cwd: conn.cwd });
+			}
 			// A reload may have added or dropped commands: the phone's "/" list follows.
 			try { write(conn, "commands", { commands: commands() }); } catch {}
 			try { write(conn, "features", { features: featureList(conn) }); } catch {}
@@ -1554,7 +1599,7 @@ function main(pi: ExtensionAPI): void {
 		}
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
-			busy: false, prompt: null, promptDepth: 0, sessionName, ...info,
+			busy: false, prompt: null, promptDepth: 0, sessionName, ...info, launch: g[LAUNCH],
 			nonces: new Map(), inject, deliver, stop, close, command, commands, models, context, confirm, model: modelOf(ctx),
 		};
 		store[STORE] = conn;
