@@ -103,6 +103,8 @@ What pinning can and can't do: it protects against a Botsun whose logic is compr
 
 **Name:** the agent-link name (`~/.claude/sessions/<pid>.json`), else the pi session name, else the folder name. Re-read on every line, so a rename shows up on the next event.
 
+**Steers in the transcript:** pi records a steer as a plain user message, so each one (typed at the keyboard or sent from the phone) also gets a custom session entry, `{"type": "custom", "customType": "botsun-steer", "data": {"text", "at"}}`: the first 200 characters of its text (never images) and the time in ms. Not sent to the model; Botsun uses it to label steered messages.
+
 **Only interactive sessions:** subagent children (`PI_SUBAGENT_CHILD=1`) and sessions without the TUI (print, JSON and RPC modes, including Botsun's own pi runs) send nothing.
 
 `BOTSUN_OWNER_DEBUG=1` appends connection events to `~/.local/state/botsun/owner-client.log`.

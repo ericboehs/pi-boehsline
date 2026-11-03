@@ -1377,6 +1377,7 @@ function main(pi: ExtensionAPI): void {
 	let held: Array<string | UserContent[]> = [];
 	// Words a stop released: sent once the aborted run has settled, as if typed after Esc.
 	let afterStop: string[] = [];
+	let steerHook = false;
 
 	// The guardian's bypass, as it announces it (on start and on each change): the phone shows it.
 	pi.events?.on(GUARDIAN_BYPASS_STATE_EVENT, (state: unknown) => {
@@ -1388,6 +1389,19 @@ function main(pi: ExtensionAPI): void {
 		// Interactive TUI only: print/json have no UI, and Botsun drives its own
 		// pi over RPC (hasUI is true there), which must not report itself.
 		if (!ctx.hasUI || ctx.mode !== "tui") return;
+		// pi records a steer as a plain user message: mark it in the session file so Botsun can
+		// label it. Covers steers typed in the TUI and sent from here (sendUserMessage deliverAs
+		// steer emits input too). Text only, best effort. Registered once per extension instance.
+		if (!steerHook) {
+			steerHook = true;
+			pi.on("input", (event) => {
+				try {
+					if (event?.streamingBehavior !== "steer") return;
+					const text = typeof event.text === "string" ? event.text : "";
+					pi.appendEntry("botsun-steer", { text: [...text].slice(0, 200).join(""), at: Date.now() });
+				} catch {}
+			});
+		}
 		const info = sessionInfo(ctx);
 		const sessionName = () => pi.getSessionName();
 		// Eric's own words, as if typed: steer into a running turn, else start one.

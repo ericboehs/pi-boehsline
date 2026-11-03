@@ -202,6 +202,30 @@ test("subagent children and sessions without a TUI send nothing", async () => {
 	await srv.stop();
 });
 
+test("a steer is marked in the session file (text only, ≤ 200 chars); other input isn't", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	await m.fire("session_start", { reason: "startup" });
+	await m.fire("session_start", { reason: "new" }); // registers once
+	const image = { type: "image", data: "QUJD", mimeType: "image/png" };
+	await m.fire("input", { type: "input", text: "plain", source: "interactive" });
+	await m.fire("input", { type: "input", text: "later", source: "interactive", streamingBehavior: "followUp" });
+	assert.equal(m.entries.length, 0);
+	const before = Date.now();
+	await m.fire("input", { type: "input", text: "x".repeat(300), images: [image], source: "extension", streamingBehavior: "steer" });
+	assert.equal(m.entries.length, 1);
+	const [e] = m.entries;
+	assert.equal(e.customType, "botsun-steer");
+	assert.deepEqual(Object.keys(e.data).sort(), ["at", "text"]);
+	assert.equal(e.data.text, "x".repeat(200));
+	assert.ok(e.data.at >= before && e.data.at <= Date.now());
+	m.pi.appendEntry = () => { throw new Error("boom"); };
+	await m.fire("input", { type: "input", text: "y", source: "interactive", streamingBehavior: "steer" }); // never throws
+	await m.fire("session_shutdown", { reason: "quit" });
+	await srv.stop();
+});
+
 test("a missing socket doesn't throw, retries quietly, and stops on shutdown", async () => {
 	const path = join(home, `missing${++n}.sock`);
 	process.env.BOTSUN_OWNER_SOCK = path;
