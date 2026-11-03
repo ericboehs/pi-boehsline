@@ -35,9 +35,12 @@ const freePort = await new Promise((resolve) => {
 	});
 });
 process.env.PI_CANVAS_PORT = String(freePort);
+// The root too: scripts/test.mjs sets its own PI_CANVAS_ROOT, and the cleanup below must find the daemon's record.
+const canvasRoot = join(home, ".pi", "canvas");
+process.env.PI_CANVAS_ROOT = canvasRoot;
 after(async () => {
 	// The daemon writes its pid once listening; give a just-spawned one a moment.
-	const pidFile = join(home, ".pi", "canvas", ".daemon.json");
+	const pidFile = join(canvasRoot, ".daemon.json");
 	for (let i = 0; i < 20 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 100));
 	try {
 		const { pid, port } = JSON.parse(readFileSync(pidFile, "utf8"));
