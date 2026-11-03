@@ -161,3 +161,13 @@ test("RunReducer: falls back to .result when no final message arrives", () => {
 	r.apply(RUN[10]);
 	assert.equal(r.state.answer, RUN[10].result);
 });
+
+test("RunReducer: records where Cursor ran (a worktree with --worktree)", () => {
+	const r = new RunReducer("/tmp/ws");
+	r.feed("Using worktree: /Users/x/.cursor/worktrees/ws/main-713\n");
+	r.feed(`${JSON.stringify({ ...RUN[0], cwd: "/Users/x/.cursor/worktrees/ws/main-713" })}\n`);
+	assert.equal(r.state.workspace, "/Users/x/.cursor/worktrees/ws/main-713");
+	assert.equal(r.state.sessionId, "s1");
+	r.apply({ type: "tool_call", subtype: "started", call_id: "t9", tool_call: { readToolCall: { args: { path: "/Users/x/.cursor/worktrees/ws/main-713/fizz.rb" } } } });
+	assert.equal(r.state.tools.at(-1).summary, "read fizz.rb", "step paths are relative to the worktree");
+});

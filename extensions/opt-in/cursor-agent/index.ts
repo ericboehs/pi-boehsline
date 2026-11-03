@@ -15,7 +15,7 @@
  * PI_CURSOR_* env vars; see settings.ts.
  */
 
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -23,16 +23,25 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { type Static, Type } from "typebox";
 import { optIn } from "../../../lib/opt-in.ts";
 import { cycleUsage, dollars, eventTokens, findUsageEvent, kfmt, type UsageEvent } from "./api.ts";
 import { type CliUsage, RunReducer, short, type ToolStep } from "./events.ts";
 import { blockedBy, type CursorSettings, loadSettings } from "./settings.ts";
 
+interface WorktreeInfo {
+	path: string;
+	branch: string;
+	/** `git status --short` lines: what Cursor changed, left uncommitted for review. */
+	changed: string[];
+}
+
 interface CursorDetails {
 	model: string;
 	modelName?: string;
 	cwd: string;
+	workspace?: string;
+	worktree?: WorktreeInfo;
 	sessionId?: string;
 	tools: ToolStep[];
 	answer: string;
@@ -62,7 +71,64 @@ function params(s: CursorSettings) {
 		network: Type.Optional(
 			Type.Boolean({ description: "Run without Cursor's sandbox so commands can reach the network (default false)" }),
 		),
+		worktree: Type.Optional(
+			Type.Boolean({
+				description:
+					"Run in a new git worktree (~/.cursor/worktrees/<repo>/<name>, on its own branch) so parallel calls can't overwrite each other; cwd must be a git repo with a commit. Changes stay uncommitted there for review.",
+			}),
+		),
+		worktreeBase: Type.Optional(
+			Type.String({ description: "Branch or ref the worktree starts from (default: the repo's current HEAD)" }),
+		),
 	});
+}
+
+/** What codemode scripts and other programmatic callers receive instead of the text. */
+const outputSchema = Type.Object({
+	answer: Type.String({ description: "Cursor's final answer" }),
+	steps: Type.Array(
+		Type.Object({ kind: Type.String(), summary: Type.String(), ok: Type.Optional(Type.Boolean()) }),
+		{ description: "Cursor's tool calls, in order" },
+	),
+	chargedCents: Type.Optional(Type.Number({ description: "Server-side charge in cents; absent when it couldn't be found" })),
+	tokens: Type.Number({ description: "Total tokens (server count when found, else the CLI's)" }),
+	sessionId: Type.Optional(Type.String()),
+	model: Type.String(),
+	exitCode: Type.Union([Type.Number(), Type.Null()]),
+	durationMs: Type.Number(),
+	worktree: Type.Optional(
+		Type.Object({ path: Type.String(), branch: Type.String(), changed: Type.Array(Type.String()) }),
+	),
+	error: Type.Optional(Type.String({ description: "Why the run failed (stderr tail), when exitCode is not 0" })),
+});
+
+type CursorOutput = Static<typeof outputSchema>;
+
+function git(cwd: string, args: string[]): Promise<string> {
+	return new Promise((done, fail) =>
+		execFile("git", ["-C", cwd, ...args], { timeout: 15_000 }, (err, stdout, stderr) =>
+			err ? fail(new Error(String(stderr || err.message).trim())) : done(String(stdout)),
+		),
+	);
+}
+
+function cliTokens(u?: CliUsage): number {
+	return u ? (u.inputTokens ?? 0) + (u.outputTokens ?? 0) + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0) : 0;
+}
+
+function structured(d: CursorDetails): CursorOutput {
+	return {
+		answer: d.answer,
+		steps: d.tools.map((t) => ({ kind: t.kind, summary: t.summary, ...(t.ok === undefined ? {} : { ok: t.ok }) })),
+		...(d.charge ? { chargedCents: d.charge.chargedCents ?? 0 } : {}),
+		tokens: d.charge ? eventTokens(d.charge) : cliTokens(d.cliUsage),
+		...(d.sessionId ? { sessionId: d.sessionId } : {}),
+		model: d.model,
+		exitCode: d.exitCode ?? null,
+		durationMs: d.durationMs ?? 0,
+		...(d.exitCode !== 0 && d.stderr ? { error: d.stderr } : {}),
+		...(d.worktree ? { worktree: { path: d.worktree.path, branch: d.worktree.branch, changed: [...d.worktree.changed] } } : {}),
+	};
 }
 
 function costLine(d: CursorDetails): string {
@@ -72,7 +138,7 @@ function costLine(d: CursorDetails): string {
 		return `${d.model} · ${secs} · ${dollars(d.charge.chargedCents ?? 0)}${fee} · ${kfmt(eventTokens(d.charge))} tokens`;
 	}
 	const u = d.cliUsage;
-	const tok = u ? (u.inputTokens ?? 0) + (u.outputTokens ?? 0) + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0) : 0;
+	const tok = cliTokens(u);
 	const why = d.chargeError ? `: ${d.chargeError}` : "";
 	return [d.model, secs, tok ? `${kfmt(tok)} tokens (CLI count)` : "", `cost not found${why}`].filter(Boolean).join(" · ");
 }
@@ -97,6 +163,7 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			...s.rules,
 		],
 		parameters: params(s),
+		outputSchema,
 		executionMode: "sequential",
 
 		async execute(_id, args, signal, onUpdate, ctx) {
@@ -106,10 +173,20 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			if (blocked) throw new Error(`${model} is blocked (matches "${blocked}"): ${settings.blockedReason}`);
 			const cwd = resolve(ctx.cwd, (args.cwd ?? ".").replace(/^@/, "").replace(/^~(?=$|\/)/, homedir()));
 			if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new Error(`Not a directory: ${cwd}`);
+			if (args.worktree) {
+				await git(cwd, ["rev-parse", "--verify", "HEAD"]).catch(() => {
+					throw new Error(`worktree needs a git repo with at least one commit: ${cwd}`);
+				});
+			}
 
 			const cliArgs = ["-p", "--trust", "--output-format", "stream-json", "--stream-partial-output"];
 			cliArgs.push("--sandbox", args.network ? "disabled" : "enabled", "--model", model);
 			if (args.mode && args.mode !== "agent") cliArgs.push("--mode", args.mode);
+			if (args.worktree) {
+				// --worktree takes an optional name, so without one it would swallow the prompt.
+				cliArgs.push("--worktree", `pi-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`);
+				if (args.worktreeBase) cliArgs.push("--worktree-base", args.worktreeBase);
+			}
 			cliArgs.push(args.prompt);
 
 			const run = new RunReducer(cwd);
@@ -148,10 +225,23 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			d.exitCode = exitCode;
 			d.durationMs ??= Date.now() - started;
 			if (stderr.length) d.stderr = truncateTail(stderr.join(""), { maxLines: 40, maxBytes: 4_000 }).content;
+			if (args.worktree && d.workspace && d.workspace !== cwd) {
+				const path = d.workspace;
+				const [branch, status] = await Promise.all([
+					git(path, ["branch", "--show-current"]).catch(() => ""),
+					git(path, ["status", "--short"]).catch(() => ""),
+				]);
+				d.worktree = { path, branch: branch.trim(), changed: status.split("\n").filter(Boolean) };
+			}
 
 			if (signal?.aborted) {
 				d.done = true;
-				return { content: [{ type: "text", text: "Cursor run cancelled." }], details: d, isError: true };
+				return {
+					content: [{ type: "text", text: "Cursor run cancelled." }],
+					details: d,
+					structuredContent: structured(d),
+					isError: true,
+				};
 			}
 
 			if (d.sessionId) {
@@ -168,11 +258,15 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 
 			const failed = exitCode !== 0;
 			const steps = d.tools.map((t) => `- ${t.summary}${t.ok === false ? " (failed)" : ""}`).join("\n");
+			const wt = d.worktree
+				? `\nWorktree: ${d.worktree.path} (branch ${d.worktree.branch || "?"}), ${d.worktree.changed.length} changed file(s)${d.worktree.changed.length ? `:\n${d.worktree.changed.map((l) => `  ${l}`).join("\n")}` : ""}`
+				: "";
 			const text = truncateTail(
 				[
 					failed ? `Cursor exited with code ${exitCode}.` : "",
 					d.answer || "(Cursor returned no answer)",
 					steps ? `\nCursor's steps:\n${steps}` : "",
+					wt,
 					failed && d.stderr ? `\nstderr:\n${d.stderr}` : "",
 					`\n[${costLine(d)}${d.sessionId ? ` · session ${d.sessionId}` : ""}]`,
 				]
@@ -180,7 +274,7 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 					.join("\n"),
 				{ maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES },
 			).content;
-			return { content: [{ type: "text", text }], details: d, isError: failed };
+			return { content: [{ type: "text", text }], details: d, structuredContent: structured(d), isError: failed };
 		},
 
 		renderCall(args, theme) {
@@ -188,6 +282,7 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			t += theme.fg("accent", args.model || s.defaultModel);
 			if (args.mode && args.mode !== "agent") t += theme.fg("muted", ` [${args.mode}]`);
 			if (args.network) t += theme.fg("warning", " [no sandbox]");
+			if (args.worktree) t += theme.fg("muted", " [worktree]");
 			if (args.prompt) t += ` ${theme.fg("dim", short(args.prompt, 90))}`;
 			return new Text(t, 0, 0);
 		},
@@ -211,6 +306,11 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			}
 			if (expanded && d.answer) lines.push("", d.answer);
 			else if (d.answer) lines.push(theme.fg("text", `  ${short(d.answer, 160)}`));
+			if (d.worktree) {
+				lines.push(
+					theme.fg("muted", `  worktree ${d.worktree.branch || "?"} · ${d.worktree.changed.length} changed · ${d.worktree.path}`),
+				);
+			}
 			lines.push(
 				(d.exitCode === 0 ? theme.fg("success", "  ✓ ") : theme.fg("error", `  ✗ exit ${d.exitCode} · `)) +
 					theme.fg(d.charge ? "accent" : "warning", costLine(d)),

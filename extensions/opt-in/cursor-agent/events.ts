@@ -32,6 +32,8 @@ export interface CliUsage {
 export interface RunState {
 	sessionId?: string;
 	modelName?: string;
+	/** Where Cursor actually ran: the init event's cwd (a worktree with -w). */
+	workspace?: string;
 	tools: ToolStep[];
 	answer: string;
 	/** Streamed text since the last flush, else the last flushed segment. */
@@ -70,7 +72,8 @@ export class RunReducer {
 	private pending = new Map<string, number>();
 	private streaming = "";
 	private buf = "";
-	private readonly cwd: string;
+	/** Paths in step summaries are shown relative to this; it moves to the worktree once init names it. */
+	private cwd: string;
 
 	constructor(cwd: string) {
 		this.cwd = cwd;
@@ -84,6 +87,10 @@ export class RunReducer {
 				if (ev.subtype === "init") {
 					s.sessionId = ev.session_id;
 					if (typeof ev.model === "string") s.modelName = ev.model;
+					if (typeof ev.cwd === "string") {
+						s.workspace = ev.cwd;
+						this.cwd = ev.cwd;
+					}
 				}
 				return false;
 			case "thinking":
