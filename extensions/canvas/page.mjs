@@ -2549,8 +2549,19 @@ function showModal(items, i, render) {
     );
   };
   if (dlgKeys) document.removeEventListener("keydown", dlgKeys);
+  let gAt = 0; // gg: two g's within 600 ms
   dlgKeys = (e) => {
-    if (e.metaKey || e.ctrlKey || e.altKey || e.target?.closest?.("input, textarea, select")) return;
+    if (e.metaKey || e.altKey || e.target?.closest?.("input, textarea, select")) return;
+    if (e.ctrlKey && e.key !== "d" && e.key !== "u") return;
+    // j k, Ctrl-d Ctrl-u, gg G scroll a long popup (a diff, an agent's exchange, a job log).
+    const g = e.key === "g" && Date.now() - gAt < 600;
+    gAt = e.key === "g" && !g ? Date.now() : 0;
+    const box = modalScroller(d);
+    const move = { j: 60, k: -60, d: e.ctrlKey ? box.clientHeight / 2 : null, u: e.ctrlKey ? -box.clientHeight / 2 : null }[e.key];
+    if (move != null) return void (e.preventDefault(), box.scrollBy(0, move));
+    if (g) return void (e.preventDefault(), (box.scrollTop = 0));
+    if (e.key === "G") return void (e.preventDefault(), (box.scrollTop = box.scrollHeight));
+    if (e.ctrlKey) return;
     if (e.key === "?") return void (e.preventDefault(), modalHelp(d, items.length));
     if (e.key === "q") return void (e.preventDefault(), d.querySelector(".mhelp") ? modalHelp(d) : d.close());
     if (items.length < 2) return;
@@ -2560,6 +2571,13 @@ function showModal(items, i, render) {
   document.addEventListener("keydown", dlgKeys);
   if (!d.open) d.showModal();
   show(i);
+}
+
+/** What scrolls in the popup: the tallest box that overflows downward (a job log scrolls itself), else the body. */
+function modalScroller(d) {
+  const body = d.querySelector(".mbody");
+  const boxes = [body, ...(body?.querySelectorAll("*") ?? [])].filter((x) => x && x.scrollHeight > x.clientHeight + 1 && /auto|scroll/.test(getComputedStyle(x).overflowY));
+  return boxes.sort((a, b) => b.clientHeight - a.clientHeight)[0] || body || d;
 }
 
 /** The popup's own key list, drawn inside the dialog (the page's ? box would sit under its top layer); again closes it. */
@@ -2575,6 +2593,9 @@ function modalHelp(d, count = 1) {
       "table",
       {},
       count > 1 ? row(["←", "→", "h", "l"], "previous / next (‹ › at an image's edges too)") : null,
+      row(["j", "k"], "scroll down / up"),
+      row(["Ctrl-d", "Ctrl-u"], "half a page down / up"),
+      row(["gg", "G"], "top / bottom"),
       row(["Esc", "q"], "close"),
       row(["?"], "this list"),
     ),

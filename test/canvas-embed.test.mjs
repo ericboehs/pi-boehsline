@@ -203,8 +203,24 @@ test("page, image popup: every screenshot on the page, ‹ › and h/l step, a c
   key("h");
   key("ArrowLeft");
   assert.equal(pos(), "2 / 3");
+  // j k, Ctrl-d Ctrl-u, gg G scroll the popup's body (jsdom has no layout, so the body is the scroller).
+  const scrolled = [];
+  w.Element.prototype.scrollBy = function (_x, y) {
+    scrolled.push([this.className, y]);
+  };
+  key("j");
+  key("k");
+  doc.dispatchEvent(new w.KeyboardEvent("keydown", { key: "d", ctrlKey: true, bubbles: true }));
+  key("d"); // without Ctrl: nothing
+  assert.deepEqual(scrolled.map(([c, y]) => [c, Math.sign(y)]), [["mbody", 1], ["mbody", -1], ["mbody", 0]]);
+  const body = d.querySelector(".mbody");
+  body.scrollTop = 40;
+  key("g");
+  key("g");
+  assert.equal(body.scrollTop, 0, "gg: the top");
   key("?");
   assert.match(d.querySelector(".mhelp")?.textContent ?? "", /previous \/ next/);
+  assert.match(d.querySelector(".mhelp").textContent, /top \/ bottom/);
   key("q");
   assert.equal(d.querySelector(".mhelp"), null, "q closes the key list first");
   assert.equal(d.hasAttribute("open"), true);
