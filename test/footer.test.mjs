@@ -3082,17 +3082,20 @@ test("a saved detailed timers mode is where the click starts from", async () => 
   });
 });
 
-test("renderCursorChip: normal, over-pace color, no limit, malformed stash", () => {
+test("renderCursorChip: three modes, over-pace color, no limit, session suffix, malformed stash", () => {
   const dim = (t) => `[dim]${t}[/dim]`;
-  const cycle = { spentCents: 8160, limitDollars: 200, cycleStart: 0, cycleEnd: 100_000 };
-  const normal = renderCursorChip(cycle, true, dim, 50_000);
-  assert.match(normal, /^⬡ \x1b\[\d+m\$81\.60\/\$200 \(41%\)\x1b\[39m$/);
-  const hot = renderCursorChip(cycle, true, dim, 10_000);
-  assert.match(hot, /\x1b\[31m/, "50% used at 10% elapsed is red");
-  const noLimit = renderCursorChip({ spentCents: 1319 }, true, dim);
-  assert.match(noLimit, /^⬡ \x1b\[32m\$13\.19\x1b\[39m$/);
-  assert.equal(renderCursorChip(undefined, true, dim), "");
-  assert.equal(renderCursorChip({ spentCents: Number.NaN }, true, dim), "");
+  const cycle = { spentCents: 11328, limitDollars: 200, cycleStart: 0, cycleEnd: 100_000, sessionCents: 2 };
+  const plain = (s) => s.replace(/\x1b\[\d+m/g, "");
+  assert.equal(plain(renderCursorChip(cycle, "mini", dim, 60_000)), "⬡ $113");
+  assert.equal(plain(renderCursorChip(cycle, "compact", dim, 60_000)), "⬡ $113/$200");
+  assert.equal(plain(renderCursorChip(cycle, "detailed", dim, 60_000)), "⬡ $113.28/$200 (57%)[dim] · +$0.02 here[/dim]");
+  assert.match(renderCursorChip(cycle, "mini", dim, 10_000), /\x1b\[31m/, "57% used at 10% elapsed is red in every mode");
+  assert.doesNotMatch(renderCursorChip(cycle, "compact", dim, 99_000), /\x1b\[31m/, "57% used at 99% elapsed isn't red");
+  assert.equal(plain(renderCursorChip({ spentCents: 1319 }, "compact", dim)), "⬡ $13");
+  assert.equal(plain(renderCursorChip({ spentCents: 1319 }, "detailed", dim)), "⬡ $13.19");
+  assert.equal(plain(renderCursorChip({ spentCents: 0, sessionCents: 5 }, "mini", dim)), "⬡ +$0.05 here");
+  assert.equal(renderCursorChip(undefined, "compact", dim), "");
+  assert.equal(renderCursorChip({ spentCents: Number.NaN }, "compact", dim), "");
   assert.equal(parseCursorStatusText("cursor $81.60/$200 (41%) · +$0.02 here").sessionCents, 2);
   assert.equal(parseCursorStatusText("not a cursor status"), undefined);
 });
@@ -3137,10 +3140,15 @@ test("cursor billing chip sits on the border row, not the status row", async (t)
     ]),
   });
   const [main, statusRow] = await ui.settled(120);
-  assert.match(main, /⬡ \$81\.60\/\$200 \(41%\)/);
-  assert.match(main, /\+\$0\.02 here/);
+  assert.match(main, /⬡ \$82\/\$200(?! \()/, "compact by default");
+  assert.doesNotMatch(main, /here/);
   assert.equal(statusRow, "3s");
   assert.doesNotMatch(statusRow ?? "", /cursor/i);
+  // A click cycles compact → detailed → mini.
+  ui.click(ui.plain()[0].indexOf("⬡"), 0);
+  assert.match(ui.plain()[0], /⬡ \$81\.60\/\$200 \(41%\) · \+\$0\.02 here/);
+  ui.click(ui.plain()[0].indexOf("⬡"), 0);
+  assert.match(ui.plain()[0], /⬡ \$82(?!\/)/);
 });
 
 test("cursor chip falls back to status text when the stash is empty", async (t) => {
@@ -3148,5 +3156,5 @@ test("cursor chip falls back to status text when the stash is empty", async (t) 
   const ui = await mount({
     statuses: new Map([[CURSOR_STATUS_KEY, "cursor $81.60/$200 (41%)"]]),
   });
-  assert.match((await ui.settled(120))[0], /⬡ \$81\.60\/\$200 \(41%\)/);
+  assert.match((await ui.settled(120))[0], /⬡ \$82\/\$200/);
 });

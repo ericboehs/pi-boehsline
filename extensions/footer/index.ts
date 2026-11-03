@@ -179,7 +179,7 @@ export const FOOTER_CHIPS = [
   { id: "bypass", label: "Bypass", example: "bypass", description: "While Approval Guardian is bypassed: the session name turns red with ⚠ (name), a red bypass chip (chip, or when no name shows), or both. Click either: turn the guardian back on." },
   { id: "context", label: "Context", example: "42k/1m", description: "Context tokens / window, or a percent, coloured as it fills. Click: flip for this session." },
   { id: "cost", label: "Cost", example: "$0.42", description: "Session cost, or a provider budget (ollama, baseten, openrouter) as a percent (compact) or total (detailed). Click: flip for this session." },
-  { id: "cursor", label: "Cursor spend", example: "⬡ $81/$200 (41%)", description: "Cursor billing-cycle spend (cursor-agent): spend vs limit, pace-colored over the cycle. Compact shows the ⬡ glyph; detailed spells cursor. Session tool runs append a dim · +$… here. Click: flip for this session." },
+  { id: "cursor", label: "Cursor spend", example: "⬡ $81/$200", description: "Cursor billing-cycle spend (cursor-agent): spend vs limit, pace-colored over the cycle. Click cycles compact ($81/$200) → detailed ($81.60/$200 (41%)) → mini ($81). Detailed appends this session's tool runs as a dim · +$… here. Clicks last for this session." },
   { id: "usage", label: "Rate limits", example: "57%", description: "Provider usage windows: Copilot premium-request share over workdays (W) with the %/d left per workday, Codex/Grok/Claude windows, compact, detailed, or mini (just ↑ speed up / ↓ slow down, hidden on pace; multi-window chips name the window: ↓6w). Click: cycle for this session." },
   { id: "boot", label: "Boot time", example: "⚡775ms", description: "⚡ startup time, until the first message. Click: recent boot stats." },
   { id: "rate", label: "Token rate", example: "99", description: "Tokens per second of the last reply (live while streaming), alone or with the time to first token. Click: flip for this session." },
@@ -209,7 +209,8 @@ export const CHIP_MODES: Partial<Record<FooterChipId, readonly string[]>> = {
   git: ["full", "branch"],
   context: ["tokens", "percent"],
   cost: ["compact", "detailed"],
-  cursor: ["compact", "detailed"],
+  // compact stays first (the default); a click cycles compact → detailed → mini.
+  cursor: ["compact", "detailed", "mini"],
   // compact stays first (the default); a click cycles compact → detailed → mini.
   usage: ["compact", "detailed", "mini"],
   rate: ["number", "with TTFT"],
@@ -924,39 +925,43 @@ export function parseCursorStatusText(value: string | undefined): CursorChipFigu
   };
 }
 
-function cursorBudgetValue(figures: CursorChipFigures): string {
-  const spent = `$${(figures.spentCents / 100).toFixed(2)}`;
-  if (!figures.limitDollars) return spent;
-  const pct = Math.round((figures.spentCents / (figures.limitDollars * 100)) * 100);
-  const limit = Number.isInteger(figures.limitDollars) ? `$${figures.limitDollars}` : `$${figures.limitDollars.toFixed(2)}`;
-  return `${spent}/${limit} (${pct}%)`;
+/** The cursor chip's three widths: mini `$113`, compact `$113/$200`, detailed `$113.28/$200 (57%)`. */
+export type CursorChipMode = "mini" | "compact" | "detailed";
+
+const wholeDollars = (cents: number) => `$${Math.round(cents / 100)}`;
+const exactDollars = (cents: number) => `$${(cents / 100).toFixed(2)}`;
+const limitLabel = (d: number) => (Number.isInteger(d) ? `$${d}` : `$${d.toFixed(2)}`);
+
+function cursorBudgetValue(figures: CursorChipFigures, mode: CursorChipMode): string {
+  const { spentCents, limitDollars } = figures;
+  if (mode === "mini") return wholeDollars(spentCents);
+  if (mode === "compact") return limitDollars ? `${wholeDollars(spentCents)}/${limitLabel(limitDollars)}` : wholeDollars(spentCents);
+  if (!limitDollars) return exactDollars(spentCents);
+  const pct = Math.round((spentCents / (limitDollars * 100)) * 100);
+  return `${exactDollars(spentCents)}/${limitLabel(limitDollars)} (${pct}%)`;
 }
 
-/** Border chip for cursor-agent billing; empty string hides the chip. */
+/** Pace color over the billing cycle (same ladder as the budget cost chips); green without a limit. */
+function cursorChipColor(figures: CursorChipFigures, nowMs: number): number | string {
+  if (!figures.limitDollars) return GREEN;
+  const percent = (figures.spentCents / (figures.limitDollars * 100)) * 100;
+  const pace = percent - budgetElapsedFraction(figures.cycleEnd, nowMs, figures.cycleStart, figures.cycleEnd) * 100;
+  return Number.isFinite(pace) ? paceColor(pace) : GREEN;
+}
+
+/** Border chip for cursor-agent billing; empty string hides the chip. Session spend shows only in detailed. */
 export function renderCursorChip(
   figures: CursorChipFigures | undefined,
-  compact: boolean,
+  mode: CursorChipMode,
   dim: (text: string) => string,
   nowMs = Date.now(),
 ): string {
   if (!figures) return "";
-  if (figures.spentCents <= 0 && (figures.sessionCents ?? 0) > 0) {
-    const session = `$${((figures.sessionCents ?? 0) / 100).toFixed(2)}`;
-    return color(GREEN, `${compact ? "⬡" : "cursor"} +${session} here`);
-  }
-  if (!Number.isFinite(figures.spentCents) || figures.spentCents < 0) return "";
-  const budgetVal = cursorBudgetValue(figures);
-  const body = renderBudgetUsage(
-    budgetVal,
-    figures.cycleEnd,
-    false,
-    { start: figures.cycleStart, end: figures.cycleEnd },
-    nowMs,
-  );
-  const label = compact ? "⬡" : "cursor";
-  let chip = `${label} ${body}`;
   const sessionCents = figures.sessionCents ?? 0;
-  if (sessionCents > 0) chip += dim(` · +$${(sessionCents / 100).toFixed(2)} here`);
+  if (figures.spentCents <= 0 && sessionCents > 0) return color(GREEN, `⬡ +${exactDollars(sessionCents)} here`);
+  if (!Number.isFinite(figures.spentCents) || figures.spentCents < 0) return "";
+  let chip = `⬡ ${color(cursorChipColor(figures, nowMs), cursorBudgetValue(figures, mode))}`;
+  if (mode === "detailed" && sessionCents > 0) chip += dim(` · +${exactDollars(sessionCents)} here`);
   return chip;
 }
 
@@ -2245,8 +2250,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
   let usageMode = "compact";
   /** The budget-usage cost chip shows its percent-only tail by default ("11%"). */
   let compactCostUsage = true;
-  /** The cursor billing chip uses the ⬡ glyph by default. */
-  let compactCursorUsage = true;
+  /** The cursor billing chip: compact by default; a click cycles compact → detailed → mini. */
+  let cursorMode: CursorChipMode = "compact";
   /**
    * Output-rate chip. TTFT runs from turn_start (request about to go out) to
    * the first streamed delta; the rate runs from that first delta to
@@ -2343,7 +2348,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
     showFullPath = chipMode(shown(), "dir") === "full path";
     contextPercent = chipMode(shown(), "context") === "percent";
     compactCostUsage = chipMode(shown(), "cost") !== "detailed";
-    compactCursorUsage = chipMode(shown(), "cursor") !== "detailed";
+    cursorMode = (chipMode(shown(), "cursor") as CursorChipMode | undefined) ?? "compact";
     usageMode = chipMode(shown(), "usage") ?? "compact";
     detailedRate = chipMode(shown(), "rate") === "with TTFT";
     detailedTimers = chipMode(shown(), "timers") === "detailed";
@@ -2445,7 +2450,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
       compactCostUsage = !compactCostUsage;
       repaint?.();
     } else if (action === "cursor") {
-      compactCursorUsage = !compactCursorUsage;
+      const modes = (CHIP_MODES.cursor ?? ["compact"]) as readonly CursorChipMode[];
+      cursorMode = modes[(modes.indexOf(cursorMode) + 1) % modes.length] ?? "compact";
       repaint?.();
     } else if (action === "name") {
       // The red ⚠ name stands in for the bypass chip, so it acts like it.
@@ -2812,7 +2818,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
             "cursor",
             renderCursorChip(
               resolveCursorChipFigures(readCursorChipStash(), statuses.get(CURSOR_STATUS_KEY)),
-              compactCursorUsage,
+              cursorMode,
               (text) => theme.fg("dim", text),
             ),
           ],

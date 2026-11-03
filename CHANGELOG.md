@@ -4,7 +4,7 @@
 
 ### Changed
 
-- cursor-agent: the footer **Cursor spend** chip shows billing-cycle Cursor spend on the border row (matching `pi-usage`), pace-colored over the cycle, instead of a `cursor` line on the status row; foreground runs still append a dim `· +$… here` when they charged something.
+- cursor-agent: the footer **Cursor spend** chip shows billing-cycle Cursor spend on the border row (matching `pi-usage`), pace-colored over the cycle, instead of a `cursor` line on the status row. Three modes, cycled by a click: compact `⬡ $113/$200` (default), detailed `⬡ $113.28/$200 (57%)` with a dim `· +$… here` for this session's runs, and mini `⬡ $113`.
 
 ### Fixed
 
