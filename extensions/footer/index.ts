@@ -179,7 +179,7 @@ export const FOOTER_CHIPS = [
   { id: "bypass", label: "Bypass", example: "bypass", description: "While Approval Guardian is bypassed: the session name turns red with ⚠ (name), a red bypass chip (chip, or when no name shows), or both. Click either: turn the guardian back on." },
   { id: "context", label: "Context", example: "42k/1m", description: "Context tokens / window, or a percent, coloured as it fills. Click: flip for this session." },
   { id: "cost", label: "Cost", example: "$0.42", description: "Session cost, or a provider budget (ollama, baseten, openrouter) as a percent (compact) or total (detailed). Click: flip for this session." },
-  { id: "cursor", label: "Cursor spend", example: "⬡ $81/$200", description: "Cursor billing-cycle spend (cursor-agent): spend vs limit, pace-colored over the cycle. Click cycles compact ($81/$200) → detailed ($81.60/$200 (41%)) → mini ($81). Detailed appends this session's tool runs as a dim · +$… here. Clicks last for this session." },
+  { id: "cursor", label: "Cursor spend", example: "⬡ $81", description: "Cursor billing-cycle spend (cursor-agent): spend vs limit, pace-colored over the cycle. Click cycles mini ($81) → compact ($81/$200) → detailed ($81.60/$200 (41%)). Detailed appends this session's tool runs as a dim · +$… here. Clicks last for this session." },
   { id: "usage", label: "Rate limits", example: "57%", description: "Provider usage windows: Copilot premium-request share over workdays (W) with the %/d left per workday, Codex/Grok/Claude windows, compact, detailed, or mini (just ↑ speed up / ↓ slow down, hidden on pace; multi-window chips name the window: ↓6w). Click: cycle for this session." },
   { id: "boot", label: "Boot time", example: "⚡775ms", description: "⚡ startup time, until the first message. Click: recent boot stats." },
   { id: "rate", label: "Token rate", example: "99", description: "Tokens per second of the last reply (live while streaming), alone or with the time to first token. Click: flip for this session." },
@@ -209,8 +209,8 @@ export const CHIP_MODES: Partial<Record<FooterChipId, readonly string[]>> = {
   git: ["full", "branch"],
   context: ["tokens", "percent"],
   cost: ["compact", "detailed"],
-  // compact stays first (the default); a click cycles compact → detailed → mini.
-  cursor: ["compact", "detailed", "mini"],
+  // mini first (the default); a click cycles mini → compact → detailed.
+  cursor: ["mini", "compact", "detailed"],
   // compact stays first (the default); a click cycles compact → detailed → mini.
   usage: ["compact", "detailed", "mini"],
   rate: ["number", "with TTFT"],
@@ -2250,8 +2250,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
   let usageMode = "compact";
   /** The budget-usage cost chip shows its percent-only tail by default ("11%"). */
   let compactCostUsage = true;
-  /** The cursor billing chip: compact by default; a click cycles compact → detailed → mini. */
-  let cursorMode: CursorChipMode = "compact";
+  /** The cursor billing chip: mini by default; a click cycles mini → compact → detailed. */
+  let cursorMode: CursorChipMode = "mini";
   /**
    * Output-rate chip. TTFT runs from turn_start (request about to go out) to
    * the first streamed delta; the rate runs from that first delta to
@@ -2348,7 +2348,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
     showFullPath = chipMode(shown(), "dir") === "full path";
     contextPercent = chipMode(shown(), "context") === "percent";
     compactCostUsage = chipMode(shown(), "cost") !== "detailed";
-    cursorMode = (chipMode(shown(), "cursor") as CursorChipMode | undefined) ?? "compact";
+    cursorMode = (chipMode(shown(), "cursor") as CursorChipMode | undefined) ?? "mini";
     usageMode = chipMode(shown(), "usage") ?? "compact";
     detailedRate = chipMode(shown(), "rate") === "with TTFT";
     detailedTimers = chipMode(shown(), "timers") === "detailed";
@@ -2450,8 +2450,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
       compactCostUsage = !compactCostUsage;
       repaint?.();
     } else if (action === "cursor") {
-      const modes = (CHIP_MODES.cursor ?? ["compact"]) as readonly CursorChipMode[];
-      cursorMode = modes[(modes.indexOf(cursorMode) + 1) % modes.length] ?? "compact";
+      const modes = (CHIP_MODES.cursor ?? ["mini"]) as readonly CursorChipMode[];
+      cursorMode = modes[(modes.indexOf(cursorMode) + 1) % modes.length] ?? "mini";
       repaint?.();
     } else if (action === "name") {
       // The red ⚠ name stands in for the bypass chip, so it acts like it.

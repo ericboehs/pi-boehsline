@@ -108,10 +108,10 @@ stands for it: `a` is Anthropic's Claude Opus 5.5, `gh` Copilot's Claude Opus
 When [cursor-agent](../opt-in/cursor-agent/README.md) is enabled, the **Cursor
 spend** chip (`⬡`, a nod to Cursor's cube logo) shows billing-cycle spend,
 coloured by budget pace over that cycle (same ladder as dollar budget cost
-chips). It has three modes: `compact` (`⬡ $113/$200`, the default), `detailed`
-(`⬡ $113.28/$200 (57%)`, plus a dim `· +$… here` for this session's foreground
-`cursor` tool runs) and `mini` (`⬡ $113`). A click cycles compact → detailed →
-mini for the session; `/footer` sets the default. The chip is hideable and
+chips). It has three modes: `mini` (`⬡ $113`, the default), `compact` (`⬡ $113/$200`)
+and `detailed` (`⬡ $113.28/$200 (57%)`, plus a dim `· +$… here` for this
+session's foreground `cursor` tool runs). A click cycles mini → compact →
+detailed for the session; `/footer` sets the default. The chip is hideable and
 reorderable like the others; the old `cursor …` status line no longer appears
 below the prompt.
 

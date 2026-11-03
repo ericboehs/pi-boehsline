@@ -3140,15 +3140,15 @@ test("cursor billing chip sits on the border row, not the status row", async (t)
     ]),
   });
   const [main, statusRow] = await ui.settled(120);
-  assert.match(main, /⬡ \$82\/\$200(?! \()/, "compact by default");
+  assert.match(main, /⬡ \$82(?!\/)/, "mini by default");
   assert.doesNotMatch(main, /here/);
   assert.equal(statusRow, "3s");
   assert.doesNotMatch(statusRow ?? "", /cursor/i);
-  // A click cycles compact → detailed → mini.
+  // A click cycles mini → compact → detailed.
+  ui.click(ui.plain()[0].indexOf("⬡"), 0);
+  assert.match(ui.plain()[0], /⬡ \$82\/\$200(?! \()/);
   ui.click(ui.plain()[0].indexOf("⬡"), 0);
   assert.match(ui.plain()[0], /⬡ \$81\.60\/\$200 \(41%\) · \+\$0\.02 here/);
-  ui.click(ui.plain()[0].indexOf("⬡"), 0);
-  assert.match(ui.plain()[0], /⬡ \$82(?!\/)/);
 });
 
 test("cursor chip falls back to status text when the stash is empty", async (t) => {
@@ -3156,5 +3156,5 @@ test("cursor chip falls back to status text when the stash is empty", async (t) 
   const ui = await mount({
     statuses: new Map([[CURSOR_STATUS_KEY, "cursor $81.60/$200 (41%)"]]),
   });
-  assert.match((await ui.settled(120))[0], /⬡ \$82\/\$200/);
+  assert.match((await ui.settled(120))[0], /⬡ \$82(?!\/)/);
 });
