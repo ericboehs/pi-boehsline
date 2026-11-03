@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- cursor-agent: the footer chip shows billing-cycle Cursor spend (matching `pi-usage`) instead of only this session's tool runs; foreground runs still append `· +$… here` when they charged something.
+
 ### Fixed
 
 - subagent: an answer over the 50 KB cap keeps its `[N bytes over cap omitted]` note; the cut used to remove the note along with the excess.

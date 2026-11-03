@@ -10,10 +10,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+	applyCursorStatusChip,
 	CACHE_KEY,
 	cacheEntry,
 	cycleText,
+	readCycleFromCache,
 	refreshUsageCache,
+	statusChipText,
 	usageCachePath,
 	writeCacheEntry,
 } from "../extensions/opt-in/cursor-agent/usage-cache.ts";
@@ -57,6 +60,44 @@ test("cacheEntry: no limit shows the spend alone and omits limitDollars", () => 
 test("cycleText: adds the session's spend when there is one", () => {
 	assert.match(cycleText(usage(), NOW, 25), / · this session \$0\.2500\n/);
 	assert.doesNotMatch(cycleText(usage(), NOW, 0), /this session/);
+});
+
+test("statusChipText: cycle spend with limit and optional session suffix", () => {
+	assert.equal(statusChipText({ spentCents: 8160, limitDollars: 200 }), "cursor $81.60/$200 (41%)");
+	assert.equal(statusChipText({ spentCents: 8160, limitDollars: 200 }, 0, false), "cursor $81.60/$200");
+	assert.equal(statusChipText({ spentCents: 8160, limitDollars: 200 }, 2), "cursor $81.60/$200 (41%) · +$0.02 here");
+	assert.equal(statusChipText({ spentCents: 1319 }), "cursor $13.19");
+});
+
+test("applyCursorStatusChip: no data, session only, cycle + session", () => {
+	const chip = {};
+	const ctx = { ui: { setStatus(k, v) { chip[k] = v; } } };
+	const session = { sessionCents: 0, lastCycle: undefined };
+	applyCursorStatusChip(ctx, session);
+	assert.equal(chip.cursor, undefined);
+	session.sessionCents = 2;
+	applyCursorStatusChip(ctx, session);
+	assert.equal(chip.cursor, "cursor +$0.02 here");
+	session.lastCycle = { spentCents: 8160, limitDollars: 200 };
+	applyCursorStatusChip(ctx, session);
+	assert.equal(chip.cursor, "cursor $81.60/$200 (41%) · +$0.02 here");
+});
+
+test("readCycleFromCache: quota from file, missing file, malformed", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "cursor-chip-"));
+	const file = join(dir, "usage-cache.json");
+	assert.equal(await readCycleFromCache(file), undefined);
+	writeFileSync(
+		file,
+		JSON.stringify({
+			[CACHE_KEY]: { value: "$0.65 / $200 (0.3%)", quota: { spentCents: 65, limitDollars: 200, cycleStart: 1, cycleEnd: 2 } },
+		}),
+	);
+	assert.deepEqual(await readCycleFromCache(file), { spentCents: 65, limitDollars: 200 });
+	writeFileSync(file, "{");
+	assert.equal(await readCycleFromCache(file), undefined);
+	writeFileSync(file, JSON.stringify({ [CACHE_KEY]: { value: "x" } }));
+	assert.equal(await readCycleFromCache(file), undefined);
 });
 
 test("usageCachePath: follows PI_CODING_AGENT_DIR like provider-usage", () => {

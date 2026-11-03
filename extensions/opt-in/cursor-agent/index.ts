@@ -7,8 +7,9 @@
  * tool streams Cursor's stream-json events into a live view, returns Cursor's
  * final answer, then looks up the run's usage event on Cursor's dashboard API
  * (GetFilteredUsageEvents, matched by session id) for the cents charged.
- * A footer status keeps the session's running Cursor spend, and /cursor-usage
- * shows the billing cycle against the per-user limit.
+ * A footer status shows this billing cycle's Cursor spend (same figure as
+ * pi-usage), optionally with this session's tool runs appended, and
+ * /cursor-usage shows the full breakdown against the per-user limit.
  *
  * `background: true` hands the same run to the bg extension as a job running
  * runner.ts, returns at once, and the bg completion message carries the result
@@ -25,7 +26,14 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import { optIn } from "../../../lib/opt-in.ts";
-import { cycleText, recordCycleUsage, refreshUsageCache } from "./usage-cache.ts";
+import {
+	applyCursorStatusChip,
+	cursorChipSession,
+	cycleText,
+	recordCycleUsage,
+	refreshCursorStatusChip,
+	syncChipFromCacheFile,
+} from "./usage-cache.ts";
 import { cycleUsage, dollars, eventTokens, kfmt, type UsageEvent } from "./api.ts";
 import { type CliUsage, short, type ToolStep } from "./events.ts";
 import { lookupCharge, prepareRun, type RunSpec, runCursor, type WorktreeInfo } from "./run.ts";
@@ -249,7 +257,7 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 				} else if (chargeError) d.chargeError = chargeError;
 			}
 			d.done = true;
-			void refreshUsageCache(); // for pi-usage; off the result's path, errors swallowed
+			void refreshCursorStatusChip(ctx); // pi-usage cache + footer chip; errors swallowed
 
 			const failed = exitCode !== 0;
 			const steps = d.tools.map((t) => `- ${t.summary}${t.ok === false ? " (failed)" : ""}`).join("\n");
@@ -321,23 +329,33 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 }
 
 export default optIn("cursor-agent", "A cursor tool that delegates tasks to Cursor's agent CLI and reports each run's cost", (pi) => {
-	let sessionCents = 0;
 	const addCents = (cents: number, ctx: ExtensionContext) => {
-		sessionCents += cents;
-		if (sessionCents > 0) ctx.ui.setStatus("cursor", `cursor ${dollars(sessionCents)}`);
+		cursorChipSession.sessionCents += cents;
+		applyCursorStatusChip(ctx);
 	};
 
 	// Register at session_start, not load: config sources (a work package)
 	// may load after this one, and the description and rules come from them.
-	pi.on("session_start", () => registerCursorTool(pi, loadSettings(), addCents));
+	pi.on("session_start", (_event, ctx) => {
+		cursorChipSession.sessionCents = 0;
+		registerCursorTool(pi, loadSettings(), addCents);
+		void syncChipFromCacheFile(ctx);
+		void refreshCursorStatusChip(ctx);
+	});
+
+	// Background cursor jobs (and subagent cursor tasks) refresh the cache in runner.ts;
+	// re-read the file when a turn ends so the chip catches up without blocking startup.
+	pi.on("turn_end", (_event, ctx) => {
+		void syncChipFromCacheFile(ctx);
+	});
 
 	pi.registerCommand("cursor-usage", {
 		description: "Cursor spend this billing cycle against the per-user limit",
 		handler: async (_args, ctx) => {
 			try {
 				const u = await cycleUsage(ctx.signal);
-				void recordCycleUsage(u);
-				ctx.ui.notify(cycleText(u, Date.now(), sessionCents), "info");
+				ctx.ui.notify(cycleText(u, Date.now(), cursorChipSession.sessionCents), "info");
+				void recordCycleUsage(u).then(() => refreshCursorStatusChip(ctx, undefined, { fetch: false }));
 			} catch (err) {
 				ctx.ui.notify(`cursor-usage: ${(err as Error).message}`, "error");
 			}

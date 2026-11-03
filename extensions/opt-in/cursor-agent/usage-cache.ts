@@ -24,13 +24,98 @@ export interface CursorCacheEntry {
 	quota: { spentCents: number; limitDollars?: number; cycleStart: number; cycleEnd: number };
 }
 
+/** Billing-cycle figures for the footer chip (from cache quota or API). */
+export interface CycleChipFigures {
+	spentCents: number;
+	limitDollars?: number;
+}
+
+/** Shared session state for the cursor footer chip (cursor tool session spend + last cycle read). */
+export const cursorChipSession: { sessionCents: number; lastCycle?: CycleChipFigures } = { sessionCents: 0 };
+
 /** provider-usage's path: $PI_CODING_AGENT_DIR (default ~/.pi/agent)/usage-cache.json. */
 export function usageCachePath(env: NodeJS.ProcessEnv = process.env): string {
 	return join(env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "usage-cache.json");
 }
 
 const pct = (u: CycleUsage) => ((u.spentCents / ((u.limitDollars ?? 0) * 100)) * 100).toFixed(1);
-const limitText = (d: number) => (Number.isInteger(d) ? `$${d}` : `$${d.toFixed(2)}`);
+const formatLimitDollars = (d: number) => (Number.isInteger(d) ? `$${d}` : `$${d.toFixed(2)}`);
+const chipSpent = (cents: number) => `$${(cents / 100).toFixed(2)}`;
+const chipPct = (spentCents: number, limitDollars: number) =>
+	String(Math.round((spentCents / (limitDollars * 100)) * 100));
+
+function finiteNumber(v: unknown): number | undefined {
+	return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** Footer status text: billing cycle first, optional this-session spend after. */
+export function statusChipText(figures: CycleChipFigures, sessionCents = 0, withPercent = true): string {
+	const spent = chipSpent(figures.spentCents);
+	let text: string;
+	if (figures.limitDollars) {
+		const pctSuffix = withPercent ? ` (${chipPct(figures.spentCents, figures.limitDollars)}%)` : "";
+		text = `cursor ${spent}/${formatLimitDollars(figures.limitDollars)}${pctSuffix}`;
+	} else {
+		text = `cursor ${spent}`;
+	}
+	if (sessionCents > 0) text += ` · +${chipSpent(sessionCents)} here`;
+	return text;
+}
+
+/** Read cycle spend/limit from the shared cache file; never throws. */
+export async function readCycleFromCache(file = usageCachePath()): Promise<CycleChipFigures | undefined> {
+	try {
+		const parsed: unknown = JSON.parse(await readFile(file, "utf8"));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+		const entry = (parsed as Record<string, unknown>)[CACHE_KEY];
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+		const quota = (entry as { quota?: unknown }).quota;
+		if (!quota || typeof quota !== "object" || Array.isArray(quota)) return undefined;
+		const spentCents = finiteNumber((quota as { spentCents?: unknown }).spentCents);
+		if (spentCents === undefined) return undefined;
+		const limitDollars = finiteNumber((quota as { limitDollars?: unknown }).limitDollars);
+		return limitDollars === undefined ? { spentCents } : { spentCents, limitDollars };
+	} catch {
+		return undefined;
+	}
+}
+
+export function applyCursorStatusChip(
+	ctx: { ui: { setStatus(key: string, value?: string): void } },
+	session = cursorChipSession,
+): void {
+	if (!session.lastCycle) {
+		if (session.sessionCents <= 0) ctx.ui.setStatus("cursor", undefined);
+		else ctx.ui.setStatus("cursor", `cursor +${chipSpent(session.sessionCents)} here`);
+		return;
+	}
+	ctx.ui.setStatus("cursor", statusChipText(session.lastCycle, session.sessionCents));
+}
+
+/** Re-read the cache file and paint the chip; never throws. */
+export async function syncChipFromCacheFile(
+	ctx: { ui: { setStatus(key: string, value?: string): void } },
+	session = cursorChipSession,
+	file?: string,
+): Promise<void> {
+	const fig = await readCycleFromCache(file);
+	if (fig) session.lastCycle = fig;
+	applyCursorStatusChip(ctx, session);
+}
+
+/** Re-read the cache and paint the chip; optionally refresh from the API first. Never throws. */
+export async function refreshCursorStatusChip(
+	ctx: { ui: { setStatus(key: string, value?: string): void } },
+	session = cursorChipSession,
+	opts: { file?: string; fetch?: boolean } = {},
+): Promise<void> {
+	try {
+		if (opts.fetch !== false) await refreshUsageCache(undefined, opts.file);
+		await syncChipFromCacheFile(ctx, session, opts.file);
+	} catch {
+		// best-effort
+	}
+}
 
 /** The /cursor-usage notification; `sessionCents` adds this session's spend. */
 export function cycleText(u: CycleUsage, nowMs = Date.now(), sessionCents = 0): string {
@@ -49,7 +134,7 @@ export function cycleText(u: CycleUsage, nowMs = Date.now(), sessionCents = 0): 
 export function cacheEntry(u: CycleUsage, nowMs = Date.now()): CursorCacheEntry {
 	const spent = `$${(u.spentCents / 100).toFixed(2)}`;
 	return {
-		value: u.limitDollars ? `${spent} / ${limitText(u.limitDollars)} (${pct(u)}%)` : spent,
+		value: u.limitDollars ? `${spent} / ${formatLimitDollars(u.limitDollars)} (${pct(u)}%)` : spent,
 		commandText: cycleText(u, nowMs),
 		resetMs: u.end,
 		fetchedAt: nowMs,
