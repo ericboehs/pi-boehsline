@@ -25,6 +25,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import { optIn } from "../../../lib/opt-in.ts";
+import { cycleText, recordCycleUsage, refreshUsageCache } from "./usage-cache.ts";
 import { cycleUsage, dollars, eventTokens, findUsageEvent, kfmt, type UsageEvent } from "./api.ts";
 import { type CliUsage, RunReducer, short, type ToolStep } from "./events.ts";
 import { blockedBy, type CursorSettings, loadSettings } from "./settings.ts";
@@ -250,6 +251,7 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 				}
 			}
 			d.done = true;
+			void refreshUsageCache(); // for pi-usage; off the result's path, errors swallowed
 
 			const failed = exitCode !== 0;
 			const steps = d.tools.map((t) => `- ${t.summary}${t.ok === false ? " (failed)" : ""}`).join("\n");
@@ -331,20 +333,8 @@ export default optIn("cursor-agent", "A cursor tool that delegates tasks to Curs
 		handler: async (_args, ctx) => {
 			try {
 				const u = await cycleUsage(ctx.signal);
-				const day = (ms: number) => new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric" });
-				const left = Math.max(0, Math.ceil((u.end - Date.now()) / 86_400_000));
-				const limit = u.limitDollars
-					? ` of $${u.limitDollars} (${((u.spentCents / (u.limitDollars * 100)) * 100).toFixed(1)}%)`
-					: "";
-				const models = (u.aggregate.aggregations ?? [])
-					.sort((a, b) => b.totalCents - a.totalCents)
-					.map((m) => `${m.modelIntent} ${dollars(m.totalCents)}`)
-					.join(", ");
-				const session = sessionCents ? ` · this session ${dollars(sessionCents)}` : "";
-				ctx.ui.notify(
-					`Cursor ${day(u.start)}–${day(u.end)} (${left}d left): ${dollars(u.spentCents)}${limit}${session}${models ? `\n${models}` : ""}`,
-					"info",
-				);
+				void recordCycleUsage(u);
+				ctx.ui.notify(cycleText(u, Date.now(), sessionCents), "info");
 			} catch (err) {
 				ctx.ui.notify(`cursor-usage: ${(err as Error).message}`, "error");
 			}

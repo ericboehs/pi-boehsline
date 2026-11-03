@@ -8,6 +8,7 @@ Adds a `cursor` tool that hands a coding task to [Cursor's agent CLI](https://cu
 - **Sandboxed by default.** Commands can write only inside the workspace and can't reach the network. `network: true` turns the sandbox off for that run.
 - **Real cost.** After each run, the tool looks up that run on Cursor's dashboard API and reports the cents charged, including Cursor's fee, plus token counts. The footer keeps a running total for the session.
 - **`/cursor-usage`** shows this billing cycle's spend against your per-user limit, broken down by model.
+- **Shared usage cache.** After each run (a background refresh that never delays the result) and on `/cursor-usage`, the cycle's spend is written to pi's `~/.pi/agent/usage-cache.json` under `cursor-usage` (value like `$0.65 / $200 (0.3%)`, reset at cycle end, numbers in `quota`), next to provider-usage's entries, so cache readers like `pi-usage` list Cursor. Only that key is touched. Nothing polls.
 
 Tool arguments: `prompt` (must be self-contained, since Cursor doesn't see the conversation), `model` (default from settings, otherwise `auto`), `mode` (`agent`, `plan` or `ask`; the last two are read-only), `cwd`, `network`, `worktree` and `worktreeBase`.
 

@@ -14,6 +14,7 @@
 
 ### Added
 
+- cursor-agent: Cursor's billing-cycle spend goes into pi's shared `usage-cache.json` as `cursor-usage` after each `cursor` run and on `/cursor-usage`, so `pi-usage` lists it with the other providers.
 - cursor-agent: `/cursor-worktrees` lists the `pi-*` worktrees the tool left behind, with their changed files, and applies each to its repo (uncommitted) or removes it.
 - cursor-agent: `worktree` (and `worktreeBase`) runs each call in its own git worktree and branch, so parallel calls can't collide; the result names the path, branch and changed files. The tool also declares an `outputSchema`, so codemode scripts get `{answer, steps, chargedCents, tokens, sessionId, …}` instead of text.
 - cursor-agent (opt-in): a `cursor` tool that delegates a task to Cursor's agent CLI (`cursor-agent -p`, sandboxed by default), streams its steps, returns its final answer, and reports the run's real charged cost from Cursor's dashboard API (macOS Keychain login). A footer chip keeps the session's Cursor spend; `/cursor-usage` shows the billing cycle against the per-user limit. Neutral by default: a default model, blocked models, a description note and extra prompt rules come from Boehsline config (so a work package can supply them) or `PI_CURSOR_*` env vars.
