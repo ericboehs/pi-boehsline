@@ -1199,8 +1199,15 @@ async function runPage(name, { url, api, before }) {
 const entry = (over = {}) => ({ id: "aaaaaaaaaaaa", title: "Weekly Sync", app: "Microsoft Teams", started_at: new Date().toISOString(), ended_at: new Date().toISOString(), duration: "0:32:10", live: false, people: 3, names: [], slides: 2, captions: 5, thumb: true, notes: { actions: 3, mine: 2, topics: ["Cert rotation", "Canary", "A", "B"] }, ...over });
 
 test("meetings page: live pinned on top, days grouped, rows link to /meeting?id=, load more, search with marks", async () => {
-  const day = (n) => new Date(Date.now() - n * 86_400_000 - 3_600_000).toISOString();
-  const list = [entry({ id: "live00000000", title: "Live <b>one</b>", live: true, ended_at: undefined, duration: "", thumb: false }), entry({ id: "a00000000000", started_at: new Date().toISOString() }), entry({ id: "b00000000000", title: "Yesterday's", started_at: day(1), thumb: false, notes: null }), entry({ id: "c00000000000", title: "Old", started_at: "2026-10-20T09:00:00-05:00" })];
+  // Noon local time n days back: "now minus n days" lands two calendar days back just after
+  // midnight (and across a DST change), and the page groups by local calendar day.
+  const day = (n) => {
+    const d = new Date();
+    d.setDate(d.getDate() - n);
+    d.setHours(12, 0, 0, 0);
+    return d.toISOString();
+  };
+  const list = [entry({ id: "live00000000", title: "Live <b>one</b>", live: true, ended_at: undefined, duration: "", thumb: false }), entry({ id: "a00000000000", started_at: new Date().toISOString() }), entry({ id: "b00000000000", title: "Yesterday's", started_at: day(1), thumb: false, notes: null }), entry({ id: "c00000000000", title: "Old", started_at: "2026-10-20T12:00:00" })];
   const { doc, calls } = await runPage("meetings-page.mjs", {
     url: "http://127.0.0.1:8790/meetings",
     api: (u) => {
