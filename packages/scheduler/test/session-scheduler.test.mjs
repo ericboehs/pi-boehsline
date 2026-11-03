@@ -46,11 +46,12 @@ async function mount({
   const notices = [];
   const statuses = [];
   let isIdle = idle;
+  let idleChecks = 0;
   let registeredTools = 0;
 
   const ctx = {
     hasUI,
-    isIdle: () => isIdle,
+    isIdle: () => (idleChecks++, isIdle),
     sessionManager: {
       getSessionId: () => sessionId,
       getBranch: () => entries,
@@ -101,6 +102,8 @@ async function mount({
     tools,
     tool: (params) => tools[0].execute("call-1", params, undefined, undefined, ctx),
     setIdle: (value) => { isIdle = value; },
+    /** How often the scheduler asked whether the session is idle: once per delivery attempt. */
+    idleChecks: () => idleChecks,
     run: (name, args = "") => commands[name].handler(args, ctx),
     shutdown: () => handlers.session_shutdown({ reason: "quit" }, ctx),
   };
@@ -317,11 +320,18 @@ test("a snapshot with an unparseable cron expression is still rejected", async (
 });
 
 test("a due task waits for agent_settled when the session is busy", async (t) => {
-  const task = { id: "deadbeef", kind: "once", prompt: "wake up", createdAt: Date.now(), nextRunAt: Date.now() + 20 };
+  // Due soon, but not so soon that a slow mount finds it already past due: a
+  // one-shot that is overdue at resume counts as missed and is dropped.
+  const task = { id: "deadbeef", kind: "once", prompt: "wake up", createdAt: Date.now(), nextRunAt: Date.now() + 250 };
   const ui = await mount({ branch: [snapshot("session-a", [task])], idle: false });
   t.after(ui.shutdown);
 
-  await new Promise((resolve) => setTimeout(resolve, 40));
+  // Wait for the scheduler to try delivering and find the session busy (it asks
+  // ctx.isIdle()), not a fixed sleep: under a loaded test run the timer can fire
+  // late, and agent_settled would then find nothing queued yet.
+  const deadline = Date.now() + 5_000;
+  while (ui.idleChecks() === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(ui.idleChecks() > 0, "the scheduler tried to deliver");
   assert.deepEqual(ui.sent, []);
 
   ui.setIdle(true);
@@ -590,10 +600,14 @@ test("a one-shot that fails to deliver is kept, not silently dropped", async (t)
     kind: "once",
     prompt: "the reminder that matters",
     createdAt: Date.now(),
-    nextRunAt: Date.now() + 20,
+    nextRunAt: Date.now() + 250, // past due at resume would count as missed and be dropped
   }]));
   await handlers.session_start({ reason: "resume" }, ctx);
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  // Poll for the failed delivery, not one fixed sleep: a loaded run fires timers late.
+  const deadline = Date.now() + 5_000;
+  while (!/Could not deliver/.test(notices.at(-1)?.message ?? "") && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 
   assert.match(notices.at(-1).message, /Could not deliver/);
 

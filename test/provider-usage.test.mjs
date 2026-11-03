@@ -470,18 +470,24 @@ test("a settle adopts a newer shared-cache value even while the memory copy is f
     for (const handler of handlers.get(name) ?? []) await handler({}, ctx);
   };
   const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
+  // Poll for the status instead of trusting one fixed sleep: under a loaded test
+  // run the handlers' async reads can take longer than 50ms.
+  const statusBecomes = async (want) => {
+    const deadline = Date.now() + 5_000;
+    while (statuses.get("claude-window") !== want && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  };
   try {
     const now = Date.now();
     write("2.5/5H: 50% 3.5/7D: 50%", now);
     providerUsage(pi);
     await fire("session_start");
-    await settle();
+    await statusBecomes("2.5/5H: 50% 3.5/7D: 50%");
     assert.equal(statuses.get("claude-window"), "2.5/5H: 50% 3.5/7D: 50%");
 
     // Another session fetched newer data seconds later, inside the 110s memory TTL.
     write("2.5/5H: 12% 3.5/7D: 18%", now + 5_000);
     await fire("agent_settled");
-    await settle();
+    await statusBecomes("2.5/5H: 12% 3.5/7D: 18%");
     assert.equal(statuses.get("claude-window"), "2.5/5H: 12% 3.5/7D: 18%", "adopted at the settle");
 
     write("2.5/5H: 99% 3.5/7D: 99%", now + 1_000); // older than what we have: ignored
