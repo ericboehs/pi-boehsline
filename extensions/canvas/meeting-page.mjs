@@ -133,7 +133,21 @@ body.has-notes .notes { display: flex; }
 .nbody .foot { margin-top: 18px; color: var(--dim); font-size: 12px; }
 dialog { border: 0; padding: 0; background: transparent; max-width: 96vw; max-height: 96vh; }
 dialog::backdrop { background: rgb(0 0 0 / .8); }
-dialog img { display: block; max-width: 96vw; max-height: 96vh; }
+dialog img { display: block; max-width: 96vw; max-height: 92vh; }
+dialog.keys { padding: 18px 22px; border-radius: 10px; background: var(--card); color: var(--ink); border: 1px solid var(--line); max-width: min(580px, 94vw); outline: none; }
+dialog.keys h2 { margin: 0 0 6px; font-size: 16px; }
+dialog.keys h3 { margin: 12px 0 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+dialog.keys dl { display: grid; grid-template-columns: 150px 1fr; gap: 4px 14px; margin: 0; font-size: 13px; }
+dialog.keys dt { white-space: nowrap; }
+dialog.keys dd { margin: 0; color: var(--dim); }
+dialog.keys kbd { display: inline-block; min-width: 1.4em; margin-right: 4px; padding: 1px 5px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; background: var(--soft); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: center; }
+dialog.zoom { overflow: visible; outline: none; }
+dialog.zoom button { position: fixed; top: 50%; transform: translateY(-50%); width: 48px; height: 72px; border: 0; border-radius: 8px; background: rgb(0 0 0 / .45); color: #fff; font-size: 40px; line-height: 1; cursor: pointer; }
+dialog.zoom button:hover:not(:disabled) { background: rgb(0 0 0 / .7); }
+dialog.zoom button:disabled { opacity: .25; cursor: default; }
+dialog.zoom .zprev { left: 12px; }
+dialog.zoom .znext { right: 12px; }
+dialog.zoom .zcap { position: fixed; left: 50%; bottom: 10px; transform: translateX(-50%); padding: 4px 12px; border-radius: 6px; background: rgb(0 0 0 / .6); color: #fff; font-size: 13px; white-space: nowrap; max-width: 90vw; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 1399px) {
   .side { width: auto; flex: 2 1 0; border-left: 0; }
   body.has-side .side { display: none; }
@@ -192,6 +206,7 @@ let slides = [];
 let live = [];
 let people = null;
 let pinned = null; // a slide n picked by hand; null follows the one on screen
+let zoomed = null; // the slide number in the zoom (null: closed)
 let onScreen = null; // the newest slide or revisit event's n
 const shownAgain = new Map(); // slide n → times it came back (revisits)
 let stick = true; // the transcript follows the bottom until you scroll up
@@ -272,7 +287,14 @@ const ui = {
   chatNone: h("small", {}, "No chat yet"),
   nbody: h("div", { class: "nbody" }),
   empty: h("div", { class: "empty", hidden: true }),
-  dialog: h("dialog", {}, h("img", { alt: "" })),
+  dialog: h(
+    "dialog",
+    { class: "zoom", tabindex: "-1" },
+    h("img", { alt: "" }),
+    h("button", { type: "button", class: "zprev", title: "Previous slide  \u2190", "aria-label": "Previous slide" }, "\u2039"),
+    h("button", { type: "button", class: "znext", title: "Next slide  \u2192", "aria-label": "Next slide" }, "\u203a"),
+    h("div", { class: "zcap" }),
+  ),
 };
 ui.scroll.append(ui.rows, ui.live);
 ui.cscroll.append(ui.chatRows);
@@ -416,7 +438,8 @@ function showSlide() {
     s.reason ? h("span", {}, s.reason) : null,
     h("span", { class: "grow" }),
     pinned != null ? h("button", { type: "button", onclick: () => pickSlide(null) }, "Follow the screen  f") : h("span", {}, state?.recording ? "following the screen" : ""),
-  );
+  );  // Following, the zoom shows what's on screen (a new slide, a revisit); picked by hand, it stays. A new summary fills the caption.
+  if (zoomed != null && ui.dialog.open) zoom(pinned == null ? s.n : zoomed);
 }
 /** Pick a slide (null: follow the newest); jump: scroll the transcript to where it appeared. */
 function pickSlide(n, jump = false) {
@@ -434,12 +457,47 @@ function pickSlide(n, jump = false) {
     row.classList.add("flash");
   }
 }
-ui.img.addEventListener("click", () => {
+// ── zoom: the slide large, paged with ‹ › or the arrow keys; the slide behind follows ──
+function zoom(n) {
+  const i = slides.findIndex((s) => s.n === n);
+  if (i < 0) return;
+  zoomed = n;
   const big = ui.dialog.querySelector("img");
-  big.src = ui.img.src;
-  ui.dialog.showModal();
-});
+  const src = slideUrl(n, false);
+  if (big.getAttribute("src") !== src) big.src = src;
+  big.alt = `Slide ${n}`;
+  ui.dialog.querySelector(".zprev").disabled = i === 0;
+  // Past the newest slide, › goes back to following the screen (when a slide is picked by hand).
+  const last = i === slides.length - 1;
+  const znext = ui.dialog.querySelector(".znext");
+  znext.disabled = last && pinned == null;
+  znext.title = last ? "Follow the screen  \u2192" : "Next slide  \u2192";
+  const title = summaries[n]?.title;
+  const following = pinned == null && state?.recording;
+  ui.dialog.querySelector(".zcap").textContent = `Slide ${n} of ${slides[slides.length - 1].n}${title ? ` \u00b7 ${title}` : ""}${following ? " \u00b7 following the screen" : ""}`;
+  // The neighbours load ahead, so paging is instant.
+  for (const j of [i - 1, i + 1]) if (slides[j]) new Image().src = slideUrl(slides[j].n, false);
+  if (!ui.dialog.open) {
+    ui.dialog.showModal();
+    ui.dialog.focus(); // not the ‹ button, which would wear a focus ring
+  }
+}
+/** Step the zoom by one slide (-1 or 1); the panel behind shows the same slide. */
+function zoomStep(d) {
+  const i = slides.findIndex((s) => s.n === zoomed);
+  const next = slides[i + d];
+  if (!next) {
+    if (d > 0 && pinned != null) pickSlide(null); // → on the newest: follow the screen again (showSlide moves the zoom)
+    return;
+  }
+  pickSlide(next.n, true);
+  zoom(next.n);
+}
+ui.img.addEventListener("click", () => zoom(Number(ui.img.alt.replace(/\D+/g, ""))));
+ui.dialog.querySelector(".zprev").addEventListener("click", (e) => (e.stopPropagation(), zoomStep(-1)));
+ui.dialog.querySelector(".znext").addEventListener("click", (e) => (e.stopPropagation(), zoomStep(1)));
 ui.dialog.addEventListener("click", () => ui.dialog.close());
+ui.dialog.addEventListener("close", () => (zoomed = null));
 
 // ── your name in the transcript ──
 // Same rule as the copilot's: someone other than you says one of your name tokens as a whole word.
@@ -751,21 +809,109 @@ async function pull() {
   if (again) (again = false), pull();
 }
 
-// ── keys ──
+// ── keys (vim-ish; ? lists them) ──
+const KEYS = [
+  ["Slides", [["h  l  ←  →", "previous / next slide (past the newest: follow the screen)"], ["0  $", "first / newest slide"], ["Enter  Space", "zoom the slide (‹ › and h l page it; q or Esc closes)"], ["f", "follow the screen"]]],
+  ["Transcript", [["j  k", "scroll down / up"], ["Ctrl-d  Ctrl-u", "half a page down / up"], ["gg  G", "top / bottom (live)"], ["{  }", "previous / next slide in the transcript"]]],
+  ["Find", [["/", "filter the transcript and chat (Esc clears)"], ["n  N", "next / previous match while filtering"], ["m  M", "next / previous time your name was said"]]],
+  ["Layout", [["1  2  3", "Transcript / Chat / Notes tab (narrow window)"], ["?", "this help"]]],
+];
+const help = h(
+  "dialog",
+  { class: "keys" },
+  h("h2", {}, "Keyboard shortcuts"),
+  ...KEYS.map(([group, rows]) => h("section", {}, h("h3", {}, group), h("dl", {}, rows.flatMap(([k, what]) => [h("dt", {}, k.split(/\s{2,}/).map((x) => h("kbd", {}, x))), h("dd", {}, what)])))),
+);
+document.body.append(help);
+help.addEventListener("click", (e) => e.target === help && help.close());
+
+/** Previous / next slide (d -1 or 1) in the panel; past the newest one picked by hand, follow the screen again. */
+function stepSlide(d) {
+  if (!slides.length) return;
+  const cur = slides.findIndex((s) => s.n === (pinned ?? slides[slides.length - 1].n));
+  if (d > 0 && pinned != null && cur === slides.length - 1) return void pickSlide(null);
+  const next = slides[Math.max(0, Math.min(slides.length - 1, cur + d))];
+  if (next) pickSlide(next.n, true);
+}
+
+// n/N, m/M, { }: step through rows of one kind from the last one jumped to, else from mid-screen; wraps around like vim.
+let jumpAt = null;
+function jumpRow(rows, d) {
+  if (!rows.length) return;
+  let i = rows.indexOf(jumpAt);
+  if (i >= 0) i = (i + d + rows.length) % rows.length;
+  else {
+    const box = ui.scroll.getBoundingClientRect();
+    const mid = box.top + box.height / 2;
+    const top = (r) => r.getBoundingClientRect().top;
+    i = d > 0 ? rows.findIndex((r) => top(r) > mid + 2) : rows.findLastIndex((r) => top(r) < mid - 2);
+    if (i < 0) i = d > 0 ? 0 : rows.length - 1;
+  }
+  const row = rows[i];
+  jumpAt = row;
+  stick = false;
+  row.scrollIntoView({ block: "center" });
+  row.classList.remove("flash");
+  void row.offsetWidth;
+  row.classList.add("flash");
+}
+const shownRows = (sel) => [...ui.rows.querySelectorAll(sel)].filter((r) => !r.hidden);
+
+let gAt = 0; // when g was pressed: gg within 600 ms goes to the top
 document.addEventListener("keydown", (e) => {
-  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.metaKey || e.altKey) return;
+  if (e.ctrlKey && e.key !== "d" && e.key !== "u") return;
   if (e.target === ui.search) {
     if (e.key === "Escape") (ui.search.value = ""), ui.search.dispatchEvent(new Event("input")), ui.search.blur();
+    else if (e.key === "Enter") (e.preventDefault(), ui.search.blur(), jumpRow(shownRows(".row[data-q]"), 1)); // then n / N
     return;
   }
-  if (e.key === "/") (e.preventDefault(), ui.search.focus());
-  else if (e.key === "f") pickSlide(null);
-  else if (e.key === "End" || e.key === "G") (stick = true), followBottom();
-  else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && slides.length) {
-    const cur = slides.findIndex((s) => s.n === (pinned ?? slides[slides.length - 1].n));
-    const next = slides[Math.max(0, Math.min(slides.length - 1, cur + (e.key === "ArrowLeft" ? -1 : 1)))];
-    if (next) pickSlide(next.n, true);
+  if (help.open) {
+    if (e.key === "?" || e.key === "q") (e.preventDefault(), help.close());
+    return;
   }
+  if (ui.dialog.open) {
+    if (e.key === "ArrowLeft" || e.key === "h") (e.preventDefault(), zoomStep(-1));
+    else if (e.key === "ArrowRight" || e.key === "l") (e.preventDefault(), zoomStep(1));
+    else if (e.key === "q" || e.key === "Enter" || e.key === " ") (e.preventDefault(), ui.dialog.close());
+    return; // Escape closes the dialog by itself
+  }
+  if (e.target.closest?.("button, a, input, textarea, select") && (e.key === "Enter" || e.key === " ")) return; // a focused control gets its own Enter / Space
+  const half = ui.scroll.clientHeight / 2;
+  const g = e.key === "g" && Date.now() - gAt < 600;
+  gAt = e.key === "g" && !g ? Date.now() : 0;
+  const act = {
+    "/": () => ui.search.focus(),
+    "?": () => help.showModal(),
+    Enter: () => slides.length && ui.img.click(),
+    " ": () => slides.length && ui.img.click(),
+    f: () => pickSlide(null),
+    h: () => stepSlide(-1),
+    l: () => stepSlide(1),
+    ArrowLeft: () => stepSlide(-1),
+    ArrowRight: () => stepSlide(1),
+    0: () => slides.length && pickSlide(slides[0].n, true),
+    $: () => slides.length && pickSlide(slides[slides.length - 1].n, true),
+    j: () => ui.scroll.scrollBy(0, 60),
+    k: () => ui.scroll.scrollBy(0, -60),
+    d: () => e.ctrlKey && ui.scroll.scrollBy(0, half),
+    u: () => e.ctrlKey && ui.scroll.scrollBy(0, -half),
+    g: () => g && ((stick = false), (ui.scroll.scrollTop = 0)),
+    G: () => ((stick = true), followBottom()),
+    End: () => ((stick = true), followBottom()),
+    "}": () => jumpRow(shownRows(".row.slide-mark"), 1),
+    "{": () => jumpRow(shownRows(".row.slide-mark"), -1),
+    n: () => filter && jumpRow(shownRows(".row[data-q]"), 1),
+    N: () => filter && jumpRow(shownRows(".row[data-q]"), -1),
+    m: () => jumpRow(shownRows(".row.me"), 1),
+    M: () => jumpRow(shownRows(".row.me"), -1),
+    1: () => showView("tx"),
+    2: () => document.body.classList.contains("has-chat") && showView("chat"),
+    3: () => document.body.classList.contains("has-notes") && showView("notes"),
+  }[e.key];
+  if (!act || (e.ctrlKey && e.key !== "d" && e.key !== "u") || (!e.ctrlKey && (e.key === "d" || e.key === "u"))) return;
+  e.preventDefault();
+  act();
 });
 
 // One stream (the daemon's), a "meeting" event per change; hello after a daemon restart.
