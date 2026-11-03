@@ -132,8 +132,12 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     if (!started) return;
     try {
       mkdirSync(summaryCacheDir(), { recursive: true });
+      // sessionFile lets psst pair this pid with its transcript exactly;
+      // several pi processes in one cwd are otherwise ambiguous.
+      let sessionFile: string | undefined;
+      try { sessionFile = lastCtx?.sessionManager.getSessionFile() || undefined; } catch { /* stale ctx */ }
       const body = JSON.stringify({
-        pid, name: selfName, cwd: sessionCwd, status: peerStatus,
+        pid, name: selfName, cwd: sessionCwd, status: peerStatus, sessionFile,
         updatedAt: Date.now(),
       });
       // Atomic write (tmp + rename) so readers never see a torn file.
@@ -344,6 +348,10 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_e, ctx) => {
+    lastCtx = ctx;
+    // Already running (/new, /resume, /fork in the same process): refresh the
+    // mirrored sessionFile so psst follows the switch.
+    if (started) syncSummaryFile();
     void ensureStarted(ctx);
     installAutocomplete(ctx);
   });
