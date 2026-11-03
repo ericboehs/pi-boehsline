@@ -129,3 +129,39 @@ test("/meeting keys: slides with h l 0 $, the newest then following; tabs; ? hel
   key("3");
   assert.equal(doc.body.classList.contains("view-notes"), false, "no notes: no Notes tab");
 });
+
+test("/meeting keys: j k Ctrl-d gg G scroll the pane of the tab open (1 transcript, 2 chat, 3 notes)", async () => {
+  const base = snap();
+  const notes = { session: "earl", at: "2026-11-03T14:03:00Z", ended: false, me: ["eric"], topics: [], decisions: [], actions: [], questions: [], reply: null, alerts: [], slidesOn: false, slidesFailed: [] };
+  const chat = { type: "chat", speaker: "Grace", text: "Runbook link", ts: "2026-11-03T14:01:30Z" };
+  const data = { ...base, entries: [...base.entries, chat], total: base.entries.length + 1, notes };
+  const w = await runMeetingPage(() => data);
+  const doc = w.document;
+  const scrolled = [];
+  w.Element.prototype.scrollBy = function (_x, y) {
+    scrolled.push([this.className, y]);
+  };
+  const key = (k, o = {}) => doc.dispatchEvent(new w.KeyboardEvent("keydown", { key: k, bubbles: true, ...o }));
+  const last = () => scrolled.at(-1)?.[0];
+  key("1");
+  key("j");
+  assert.equal(last(), "scroll");
+  key("2");
+  assert.equal(doc.body.classList.contains("view-chat"), true);
+  key("j");
+  assert.equal(last(), "cscroll");
+  key("d", { ctrlKey: true });
+  assert.equal(last(), "cscroll", "Ctrl-d too");
+  key("3");
+  assert.equal(doc.body.classList.contains("view-notes"), true);
+  key("k");
+  assert.equal(last(), "nbody");
+  const nbody = doc.querySelector(".nbody");
+  nbody.scrollTop = 50;
+  key("g");
+  key("g");
+  assert.equal(nbody.scrollTop, 0, "gg: the notes' top");
+  key("1");
+  key("k");
+  assert.equal(last(), "scroll", "back on the transcript");
+});

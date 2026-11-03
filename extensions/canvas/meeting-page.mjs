@@ -148,6 +148,10 @@ dialog.zoom button:disabled { opacity: .25; cursor: default; }
 dialog.zoom .zprev { left: 12px; }
 dialog.zoom .znext { right: 12px; }
 dialog.zoom .zcap { position: fixed; left: 50%; bottom: 10px; transform: translateX(-50%); padding: 4px 12px; border-radius: 6px; background: rgb(0 0 0 / .6); color: #fff; font-size: 13px; white-space: nowrap; max-width: 90vw; overflow: hidden; text-overflow: ellipsis; }
+@media (min-width: 1400px) {
+  /* No tabs this wide: a thin edge marks the pane 2 or 3 picked for j k. */
+  body.view-chat .chat, body.view-notes .notes { box-shadow: inset 2px 0 0 var(--accent); }
+}
 @media (max-width: 1399px) {
   .side { width: auto; flex: 2 1 0; border-left: 0; }
   body.has-side .side { display: none; }
@@ -812,7 +816,7 @@ async function pull() {
 // ── keys (vim-ish; ? lists them) ──
 const KEYS = [
   ["Slides", [["h  l  ←  →", "previous / next slide (past the newest: follow the screen)"], ["0  $", "first / newest slide"], ["Enter  Space", "zoom the slide (‹ › and h l page it; q or Esc closes)"], ["f", "follow the screen"]]],
-  ["Transcript", [["j  k", "scroll down / up"], ["Ctrl-d  Ctrl-u", "half a page down / up"], ["gg  G", "top / bottom (live)"], ["{  }", "previous / next slide in the transcript"]]],
+  ["Transcript", [["j  k", "scroll down / up (the Chat or Notes tab when it's the one open)"], ["Ctrl-d  Ctrl-u", "half a page down / up"], ["gg  G", "top / bottom (live)"], ["{  }", "previous / next slide in the transcript"]]],
   ["Find", [["/", "filter the transcript and chat (Esc clears)"], ["n  N", "next / previous match while filtering"], ["m  M", "next / previous time your name was said"]]],
   ["Layout", [["1  2  3", "Transcript / Chat / Notes tab (narrow window)"], ["?", "this help"]]],
 ];
@@ -877,7 +881,10 @@ document.addEventListener("keydown", (e) => {
     return; // Escape closes the dialog by itself
   }
   if (e.target.closest?.("button, a, input, textarea, select") && (e.key === "Enter" || e.key === " ")) return; // a focused control gets its own Enter / Space
-  const half = ui.scroll.clientHeight / 2;
+  // j k, Ctrl-d Ctrl-u, gg G move the pane of the tab open (1 2 3): the transcript, the chat or the notes.
+  const pane = view === "chat" ? ui.cscroll : view === "notes" ? ui.nbody : ui.scroll;
+  const half = pane.clientHeight / 2;
+  const toBottom = () => (view === "chat" ? ((cstick = true), followChat()) : view === "notes" ? (pane.scrollTop = pane.scrollHeight) : ((stick = true), followBottom()));
   const g = e.key === "g" && Date.now() - gAt < 600;
   gAt = e.key === "g" && !g ? Date.now() : 0;
   const act = {
@@ -892,13 +899,13 @@ document.addEventListener("keydown", (e) => {
     ArrowRight: () => stepSlide(1),
     0: () => slides.length && pickSlide(slides[0].n, true),
     $: () => slides.length && pickSlide(slides[slides.length - 1].n, true),
-    j: () => ui.scroll.scrollBy(0, 60),
-    k: () => ui.scroll.scrollBy(0, -60),
-    d: () => e.ctrlKey && ui.scroll.scrollBy(0, half),
-    u: () => e.ctrlKey && ui.scroll.scrollBy(0, -half),
-    g: () => g && ((stick = false), (ui.scroll.scrollTop = 0)),
-    G: () => ((stick = true), followBottom()),
-    End: () => ((stick = true), followBottom()),
+    j: () => pane.scrollBy(0, 60),
+    k: () => pane.scrollBy(0, -60),
+    d: () => e.ctrlKey && pane.scrollBy(0, half),
+    u: () => e.ctrlKey && pane.scrollBy(0, -half),
+    g: () => g && (pane === ui.scroll && (stick = false), pane === ui.cscroll && (cstick = false), (pane.scrollTop = 0)),
+    G: toBottom,
+    End: toBottom,
     "}": () => jumpRow(shownRows(".row.slide-mark"), 1),
     "{": () => jumpRow(shownRows(".row.slide-mark"), -1),
     n: () => filter && jumpRow(shownRows(".row[data-q]"), 1),
