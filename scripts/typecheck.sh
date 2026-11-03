@@ -54,7 +54,7 @@ fi
 
 if [ -z "$pi_pkg" ] || [ -z "$pi_deps" ]; then
   # Pin to the pi we target: npm's "latest" tag can lag the newest release.
-  PI_VERSION=${PI_VERSION:-1.3.0}
+  PI_VERSION=${PI_VERSION:-1.5.0}
   if [ "$(cat .typecheck/.pi-version 2>/dev/null)" != "$PI_VERSION" ]; then
     npm install --prefix .typecheck --no-package-lock --no-audit --no-fund --silent \
       typebox @types/node \
