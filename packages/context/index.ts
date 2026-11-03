@@ -24,6 +24,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { registerSelfCompact } from "./self-compact.ts";
 
 // Base characters-per-token divisors used only for a model we've never measured.
 // A single divisor can't fit every tokenizer (Claude counts denser than GPT),
@@ -395,6 +396,8 @@ const PCT_W = 5;
 const LINE_W = LABEL_W + COUNT_W + TOK_W + 2 + BAR_W + PCT_W;
 
 export default function (pi: ExtensionAPI) {
+	registerSelfCompact(pi);
+
 	pi.registerEntryRenderer<ContextReport>(ENTRY_TYPE, (entry, { expanded }, theme) => {
 		const r = entry.data;
 		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));

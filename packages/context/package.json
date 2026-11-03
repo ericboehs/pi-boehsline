@@ -23,18 +23,22 @@
     ]
   },
   "scripts": {
-    "//": "Nothing is declared as a dependency: pi's git installer runs a plain `npm install` in the clone, and npm installs a root package's devDependencies and non-optional peers — which dropped a 200MB copy of pi into ~/.pi/agent/git for a package that ships one .ts file and bundles nothing. The types are fetched on demand instead, by CI and by anyone typechecking locally: npm install --no-save typescript@5 @earendil-works/pi-coding-agent @earendil-works/pi-tui. That install cannot live in the script below, because npm run's nested install reifies the tree against this manifest and prunes what it just added.",
+    "//": "Nothing is declared as a dependency: pi's git installer runs a plain `npm install` in the clone, and npm installs a root package's devDependencies and non-optional peers — which dropped a 200MB copy of pi into ~/.pi/agent/git for a package that ships one .ts file and bundles nothing. The types are fetched on demand instead, by CI and by anyone typechecking locally: npm install --no-save typescript@5 @earendil-works/pi-coding-agent @earendil-works/pi-tui typebox. That install cannot live in the script below, because npm run's nested install reifies the tree against this manifest and prunes what it just added.",
     "typecheck": "tsc -p tsconfig.json"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
       "optional": true
     },
     "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
       "optional": true
     }
   }

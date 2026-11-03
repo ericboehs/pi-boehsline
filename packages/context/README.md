@@ -90,6 +90,22 @@ Only **active** tools are counted (the ones actually sent to the model), so disa
 
 Extension groups are named after the package that registered them (`npm:`/`git:` sources). Loose extension files — the ones pi discovers in `~/.pi/agent/extensions/` — are named after their file, so each one gets its own row instead of all collapsing into a single `auto` group.
 
+## Agent tools: usage and self-compaction
+
+pi-context also gives the agent two tools and a threshold nudge, so it can manage its own context:
+
+- **`context_usage`** returns tokens used, percent of the window, window size, remaining tokens, and the nudge threshold.
+- **`compact_context`** compacts the session. It takes optional `instructions` (what the summary must keep, passed to pi as custom compaction instructions). The tool only queues the request and ends the response; pi compacts once it is idle (`agent_settled`) and then waits for you. Work does not resume on its own.
+- **Threshold nudge.** When usage crosses the threshold, one notice is added to the session telling the agent it may want to compact. It fires once, and fires again only after the next compaction.
+
+The threshold defaults to 200,000 tokens. Set it with `PI_CONTEXT_NUDGE_TOKENS`, or with `nudgeTokens` in `~/.pi-context/config.json`. The env var wins, and `0` turns the nudge off.
+
+```json
+{ "nudgeTokens": 150000 }
+```
+
+If the session is too small to compact, pi refuses and you get an error notification. Compaction always keeps the most recent turns (about 20k tokens by default).
+
 ## Why this is useful
 
 Extensions are convenient, but each one ships tool schemas that live in *every* request. It's easy to accumulate 20–30 tools and quietly spend 25k+ tokens of context before you type anything. `/context` shows you exactly which extensions cost the most, so you can decide what to keep, trim (`--exclude-tools`), or uninstall.
@@ -100,7 +116,7 @@ The package declares no dependencies, so that `pi install` does not clone a copy
 of pi into `~/.pi/agent/git` behind it. Fetch the types on demand to typecheck:
 
 ```bash
-npm install --no-save typescript@5 @earendil-works/pi-coding-agent @earendil-works/pi-tui
+npm install --no-save typescript@5 @earendil-works/pi-coding-agent @earendil-works/pi-tui typebox
 npm run typecheck
 ```
 
