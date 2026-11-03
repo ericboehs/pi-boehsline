@@ -23,6 +23,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { dollars, eventTokens, kfmt, type UsageEvent } from "./api.ts";
 import { type RunReducer, short } from "./events.ts";
 import { type ChargeLookup, humanDuration, lookupCharge, type RunOutcome, type RunSpec, runCursor } from "./run.ts";
+import { refreshUsageCache } from "./usage-cache.ts";
 
 /** The answer in the result block; longer answers are printed in full above it. */
 export const ANSWER_CHARS = 6_000;
@@ -88,17 +89,32 @@ export interface RunResult {
 	chargeError?: string;
 	/** The signal aborted the run, so there was no cost lookup. */
 	stopped: boolean;
+	/**
+	 * The usage cache refresh (`cursor-usage`, for pi-usage), started once the run and
+	 * its cost lookup end, stopped runs included. Never rejects. A short-lived process
+	 * (the bg runner) awaits it before exiting; pi itself can let it finish.
+	 */
+	usage: Promise<void>;
 }
 
 /** Run to completion, then look up the charge unless the run was stopped. Rejects when cursor-agent can't start. */
 export async function runAndCharge(
 	spec: RunSpec,
-	opts: { signal?: AbortSignal; onEvent?: (run: RunReducer, changed: boolean) => void; findCharge?: ChargeLookup } = {},
+	opts: {
+		signal?: AbortSignal;
+		onEvent?: (run: RunReducer, changed: boolean) => void;
+		findCharge?: ChargeLookup;
+		refreshUsage?: () => Promise<void>;
+	} = {},
 ): Promise<RunResult> {
 	const outcome = await runCursor(spec, { signal: opts.signal, onEvent: opts.onEvent });
 	const stopped = opts.signal?.aborted === true;
 	const { charge, chargeError } = stopped ? {} : await lookupCharge(outcome.state.sessionId, outcome.started, opts.signal, opts.findCharge);
-	return { outcome, charge, chargeError, stopped };
+	const refresh = opts.refreshUsage ?? (() => refreshUsageCache());
+	const usage = Promise.resolve()
+		.then(() => refresh())
+		.catch(() => {});
+	return { outcome, charge, chargeError, stopped, usage };
 }
 
 /**
@@ -142,6 +158,8 @@ export interface BackgroundDeps {
 	/** Prints lines to the log (default: stdout). */
 	write?: (...lines: string[]) => void;
 	findCharge?: ChargeLookup;
+	/** Writes the cycle's spend to the usage cache (default: refreshUsageCache). */
+	refreshUsage?: () => Promise<void>;
 	signal?: AbortSignal;
 }
 
@@ -157,6 +175,7 @@ export async function runBackground(spec: RunSpec, deps: BackgroundDeps = {}): P
 		result = await runAndCharge(spec, {
 			signal: deps.signal,
 			findCharge: deps.findCharge,
+			refreshUsage: deps.refreshUsage,
 			onEvent: (run) => {
 				const s = run.state;
 				if (!announced && s.sessionId) {
@@ -183,6 +202,7 @@ export async function runBackground(spec: RunSpec, deps: BackgroundDeps = {}): P
 		write("", `── full answer (${answer.length} chars) ──`, answer);
 	}
 	write("", ...resultBlock(spec, result));
+	await result.usage; // before the process exits, so the cache write lands
 	return result.outcome.exitCode ?? 1;
 }
 

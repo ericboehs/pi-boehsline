@@ -184,6 +184,34 @@ test("the result block: answer, cost in dollars, model, duration, worktree, exit
 	assert.ok(log.slice(log.indexOf("── cursor result")).length < WAKE_CHARS, "the result block fits in the completion message");
 });
 
+test("refreshes the usage cache after every run that started, success or failure, but not when it never started", async () => {
+	const base = { model: "auto", cwd: repo, cliArgs: [], worktree: false };
+	// Counts refreshes, and whether runBackground waited for the (slow) write before resolving.
+	const runs = async (env, bin = fake) => {
+		fakeEnv(env);
+		const seen = { started: 0, finished: 0 };
+		await runBackground(
+			{ ...base, bin },
+			{
+				write: () => {},
+				refreshUsage: async () => {
+					seen.started++;
+					await new Promise((r) => setTimeout(r, 50));
+					seen.finished++;
+				},
+			},
+		);
+		return seen;
+	};
+	assert.deepEqual(await runs({ FAKE_CURSOR_ANSWER: "done" }), { started: 1, finished: 1 }, "once, awaited before the runner resolves");
+	assert.deepEqual(await runs({ FAKE_CURSOR_EXIT: "3", FAKE_CURSOR_STDERR: "boom" }), { started: 1, finished: 1 }, "failed runs too");
+	assert.deepEqual(await runs({}, path.join(scratch, "no-such-cursor-agent")), { started: 0, finished: 0 }, "no run, no spend to record");
+	// A failing refresh never changes the run's outcome.
+	fakeEnv({ FAKE_CURSOR_ANSWER: "done" });
+	const code = await runBackground({ ...base, bin: fake }, { write: () => {}, refreshUsage: async () => { throw new Error("offline"); } });
+	assert.equal(code, 0);
+});
+
 test("the result block: a long answer is shortened, with the full text earlier in the log; failures carry the error", async () => {
 	const answer = `${"x".repeat(ANSWER_CHARS)}END-OF-ANSWER`;
 	fakeEnv({ FAKE_CURSOR_ANSWER: answer, FAKE_CURSOR_EXIT: "3", FAKE_CURSOR_STDERR: "boom: model overloaded" });
