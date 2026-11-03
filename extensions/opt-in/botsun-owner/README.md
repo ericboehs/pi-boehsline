@@ -12,7 +12,7 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 
 | type | when | extra fields |
 |---|---|---|
-| `hello` | on every (re)connect | `cwd`, `session_file`, `session_id`, `busy`, `prompt`, `model`, `ask`, `commands`, `models`, `stash`, `footer`, `context`, `compacting`, `bypass`, `features` (the nonce reply's list) |
+| `hello` | on every (re)connect | `cwd`, `session_file`, `session_id`, `busy`, `prompt`, `model`, `ask`, `commands`, `models`, `stash`, `footer`, `usage`, `context`, `compacting`, `bypass`, `features` (the nonce reply's list) |
 | `busy` / `idle` | a run starts / pi has settled | |
 | `prompt` / `prompt_end` | a dialog (`ask`, select, confirm, input, editor, custom) opens / closes | `kind`, `title` (≤ 500 chars) |
 | `stream` / `stream_end` | the reply as it's written / done | `text` |
@@ -23,6 +23,7 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 | `stash` | the message stash changed (Ctrl+S, `/stash`, the phone; also in `hello`) | `stash` (`[{id, text, ts}]`, oldest first) |
 | `context` | after each run, after a compaction, after `/reload` | `context` (`{tokens, window, percent}`) |
 | `footer` | the footer's chips changed (at most once a second) | `footer` (`[{id, segments: [{text, fg?, dim?}]}]`, from `lib/footer-snapshot.ts`) |
+| `usage` | the provider's usage windows changed | `usage` (`{provider, windows: [{label, percent, resets_at?}], extra_usage?, stale?}` or null, from `lib/usage-snapshot.ts`: provider-usage's numbers, whether or not the footer shows its usage chip) |
 | `compacting` | a compaction starts (`/compact` or pi's own) / ends or fails | `reason` (`manual`, `threshold`, `overflow`; `null` when it ends) |
 | `bypass` | the approval guardian's bypass turns on or off | `active` |
 | `held` | call words held, released or dropped | `held` (`[{id, chars, at}]`: no text) |

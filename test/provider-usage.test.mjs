@@ -28,6 +28,10 @@ import {
   parseOpencodeGoUsage,
   resolveUsageDriver,
   summarizeUsageCache,
+  claudeShortLabel,
+  usageSnapshotFor,
+  usageSpanLabel,
+  USAGE_STALE_MS,
 } from "../extensions/provider-usage/index.ts";
 import providerUsage from "../extensions/provider-usage/index.ts";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -499,4 +503,30 @@ test("a settle adopts a newer shared-cache value even while the memory copy is f
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
   }
+});
+
+test("window drivers carry their numbers as snapshot windows (botsun's phone line)", () => {
+  const resetMs = Date.parse("2023-11-20T08:15:30.000Z");
+  const grok = grokUsageDisplay({ used_percent: 18.4, reset_at: resetMs / 1000, limit_window_seconds: 7 * 86_400 }, NOW);
+  assert.deepEqual(grok.windows, [{ label: "week", percent: 18, resets_at: "2023-11-20T08:15:30.000Z" }]);
+  const copilot = copilotUsageDisplay({ percent_remaining: 8, reset_date: "2023-12-01" }, undefined, NOW);
+  assert.deepEqual(copilot.windows, [{ label: "premium", percent: 92, resets_at: "2023-12-01" }]);
+  assert.equal(copilotUsageDisplay({ unlimited: true }, "2023-12-01", NOW).windows, undefined, "unlimited has no window");
+  assert.equal(usageSpanLabel(5 * 3600), "5h");
+  assert.equal(usageSpanLabel(7 * 86_400), "week");
+  assert.equal(usageSpanLabel(12 * 3600), "12h");
+  assert.equal(claudeShortLabel("5h session"), "5h");
+  assert.equal(claudeShortLabel("Weekly (all models)"), "week");
+  assert.equal(claudeShortLabel("Weekly Opus"), "opus week");
+});
+
+test("usageSnapshotFor names the provider, flags stale and extra usage, and skips chips without windows", () => {
+  const display = { value: "2/5H: 47%", windows: [{ label: "5h", percent: 47 }] };
+  assert.deepEqual(usageSnapshotFor("anthropic", display, { fetchedAt: NOW, nowMs: NOW }), { provider: "Claude", windows: [{ label: "5h", percent: 47 }] });
+  assert.deepEqual(usageSnapshotFor("anthropic", display, { fetchedAt: NOW, nowMs: NOW, extraUsage: true, failed: true }),
+    { provider: "Claude", windows: [{ label: "5h", percent: 47 }], extra_usage: true, stale: true });
+  assert.equal(usageSnapshotFor("anthropic", display, { fetchedAt: NOW - USAGE_STALE_MS - 1, nowMs: NOW }).stale, true, "old numbers are stale");
+  assert.equal(usageSnapshotFor("github-copilot", display, { fetchedAt: NOW, nowMs: NOW }).provider, "Copilot");
+  assert.equal(usageSnapshotFor("cerebras", display, { fetchedAt: NOW, nowMs: NOW }), null);
+  assert.equal(usageSnapshotFor("anthropic", { value: "x" }, { fetchedAt: NOW, nowMs: NOW }), null);
 });

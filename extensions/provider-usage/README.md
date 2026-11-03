@@ -14,6 +14,8 @@ Usage and quota chips for your providers, shown by the [footer](../footer/README
 | baseten | spend this month | `BASETEN_API_KEY`; `BASETEN_MONTHLY_BUDGET` sets the bar |
 | openrouter | spend | `OPENROUTER_API_KEY`; `OPENROUTER_MONTHLY_BUDGET` sets the bar |
 
+The window providers (Claude, Copilot, Codex, Grok) also publish their numbers as data through `lib/usage-snapshot.ts` (`{provider, windows: [{label, percent, resets_at?}], extra_usage?, stale?}`), whether or not the footer shows the chip: [botsun-owner](../opt-in/botsun-owner/README.md) sends them to the phone. Claude publishes every meter with a reset (`5h`, `week`, `opus week`, ...), and `extra_usage` while the overage alarm is on; `stale` means the last fetch failed or nothing refreshed in 15 minutes.
+
 Keys come from the environment, then the secret command (`secrets.command` in `boehsline.json`, `fnox get` by default). Reading Safari's cookie store needs Full Disk Access for your terminal; only the one cookie is read.
 
 A chip shows only while you're on that provider. Fetches never block startup or the model picker: each refresh is fire-and-forget, and a late response is discarded if a newer one started. A failed fetch keeps the last value and warns once.

@@ -32,6 +32,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readSecret, secretSourceLabel } from "../../lib/secrets.ts";
 import { activateToolSearch } from "../../lib/tool-search.ts";
+import { latestUsage, publishUsage, type ProviderUsageSnapshot, type UsageWindowSnapshot } from "../../lib/usage-snapshot.ts";
 
 const REQUEST_TIMEOUT_MS = 10_000;
 const SLOW_BILLING_TIMEOUT_MS = 30_000;
@@ -74,6 +75,8 @@ interface CachedEntry {
   resetDate?: string;
   /** The numbers behind `value`, so tools (botsun's budget) needn't parse it. */
   quota?: CopilotQuotaMeta;
+  /** The windows behind `value`, as data (usage-snapshot: botsun's phone line and pushes). */
+  windows?: UsageWindowSnapshot[];
   fetchedAt: number;
 }
 
@@ -110,6 +113,7 @@ async function writeSharedEntry(driverId: string, display: UsageDisplay, fetched
       ...(display.resetMs !== undefined ? { resetMs: display.resetMs } : {}),
       ...(display.resetDate !== undefined ? { resetDate: display.resetDate } : {}),
       ...(display.quota !== undefined ? { quota: display.quota } : {}),
+      ...(display.windows !== undefined ? { windows: display.windows } : {}),
       fetchedAt,
     };
     // Atomic write: tmp + rename so concurrent readers never see half a JSON doc.
@@ -168,6 +172,8 @@ interface UsageDisplay {
   resetDate?: string;
   /** Copilot only: the same numbers `value` formats, as data. */
   quota?: CopilotQuotaMeta;
+  /** The windows `value` formats, as data, for usage-snapshot (absent: not published). */
+  windows?: UsageWindowSnapshot[];
 }
 
 interface Driver {
@@ -282,6 +288,85 @@ function safeSetStatus(ctx: ExtensionContext, key: string, value: string | undef
     if (isStaleCtxError(err)) return false;
     throw err;
   }
+}
+
+// ---------- usage snapshot (structured windows for botsun-owner) ----------
+
+/** Window providers by display name; the others publish nothing. */
+const USAGE_PROVIDER_NAMES: Record<string, string> = {
+  anthropic: "Claude",
+  "github-copilot": "Copilot",
+  "openai-codex": "Codex",
+  xai: "Grok",
+};
+/** Numbers older than this read as stale on the phone (an idle session stops fetching). */
+export const USAGE_STALE_MS = 15 * 60 * 1000;
+/** Claude's overage alarm (after_provider_response): requests billed to extra usage. */
+let claudeExtraUsage = false;
+
+/** A window's short name from its span: "5h", "week", "12h", "30d". */
+export function usageSpanLabel(spanSeconds: number | undefined): string {
+  if (!spanSeconds || !Number.isFinite(spanSeconds)) return "window";
+  if (spanSeconds === FIVE_HOURS_SECONDS) return "5h";
+  if (spanSeconds === SEVEN_DAYS_SECONDS) return "week";
+  if (spanSeconds < 86_400) return `${Math.round(spanSeconds / 3_600)}h`;
+  return `${Math.round(spanSeconds / 86_400)}d`;
+}
+
+/** A paced UsageWindow as snapshot data; undefined without a percent. */
+export function usageWindowSnapshot(label: string, window: UsageWindow, nowMs = Date.now()): UsageWindowSnapshot | undefined {
+  if (typeof window.used_percent !== "number" || !Number.isFinite(window.used_percent)) return undefined;
+  const reset = resetAtMs(window, nowMs);
+  return {
+    label,
+    percent: Math.round(Math.max(0, Math.min(100, window.used_percent))),
+    ...(reset !== undefined ? { resets_at: new Date(reset).toISOString() } : {}),
+  };
+}
+
+/** A Claude meter's detail label as the phone's short one. */
+export function claudeShortLabel(label: string): string {
+  if (label === "5h session") return "5h";
+  if (label === "Weekly (all models)") return "week";
+  const family = /^Weekly (\w+)$/.exec(label);
+  if (family) return `${family[1]!.toLowerCase()} week`;
+  return label.toLowerCase().slice(0, 24);
+}
+
+/** What usage-snapshot gets for one driver's display, or null when it has no windows. */
+export function usageSnapshotFor(
+  provider: string,
+  display: UsageDisplay | undefined,
+  opts: { fetchedAt: number; failed?: boolean; extraUsage?: boolean; nowMs?: number },
+): ProviderUsageSnapshot | null {
+  const name = USAGE_PROVIDER_NAMES[provider];
+  if (!name || !display?.windows) return null;
+  const nowMs = opts.nowMs ?? Date.now();
+  const stale = opts.failed === true || !Number.isFinite(opts.fetchedAt) || nowMs - opts.fetchedAt > USAGE_STALE_MS;
+  return {
+    provider: name,
+    windows: display.windows,
+    ...(opts.extraUsage ? { extra_usage: true } : {}),
+    ...(stale ? { stale: true } : {}),
+  };
+}
+
+/** Publish a painted window chip's numbers; a driver without windows clears its own. */
+function publishUsageFor(driver: Driver, display: UsageDisplay, fetchedAt: number): void {
+  const state = stateFor(driver);
+  const snap = usageSnapshotFor(driver.provider, display, {
+    fetchedAt,
+    failed: state.lastFailureMs > state.lastFetchMs,
+    extraUsage: driver.provider === "anthropic" && claudeExtraUsage,
+  });
+  if (snap) publishUsage(snap);
+  else clearUsageFor(driver);
+}
+
+/** Clear the snapshot when it is this driver's (another provider's stays). */
+function clearUsageFor(driver: Driver): void {
+  const name = USAGE_PROVIDER_NAMES[driver.provider];
+  if (name && latestUsage()?.provider === name) publishUsage(null);
 }
 
 /** pi.events.emit that swallows stale-pi errors after session replacement. */
@@ -578,7 +663,10 @@ async function fetchCodex(ctx: ExtensionContext): Promise<UsageDisplay> {
     .map((window) => formatReset(window, nowMs))
     .filter((formatted): formatted is string => formatted !== undefined)
     .join(" ");
-  return { value, commandText: `${value}\nResets: ${resetSummary}` };
+  const snapshots = windows
+    .map((window) => usageWindowSnapshot(usageSpanLabel(windowSeconds(window)), window, nowMs))
+    .filter((entry): entry is UsageWindowSnapshot => entry !== undefined);
+  return { value, commandText: `${value}\nResets: ${resetSummary}`, windows: snapshots };
 }
 
 // ---------- claude ----------
@@ -836,14 +924,19 @@ async function fetchClaudeUsage(token: string, expiredMessage: string, family?: 
   const detail = claudeDetail(usage, nowMs);
   // Every meter idle is a normal state (nothing used yet this session), not a
   // failed fetch: say so instead of throwing and retrying on a backoff.
-  if (!value) return { value: "idle", commandText: detail.length > 0 ? detail : "idle" };
+  // Every meter with a reset, not just the chip's family pick: the phone's line and its 90%
+  // pushes want the all-models week too.
+  const snapshots = everyWindow
+    .map((entry) => usageWindowSnapshot(claudeShortLabel(entry.label), entry.window, nowMs))
+    .filter((entry): entry is UsageWindowSnapshot => entry !== undefined);
+  if (!value) return { value: "idle", commandText: detail.length > 0 ? detail : "idle", windows: snapshots };
 
   const resetSummary = windows
     .map((entry) => formatReset(entry.window, nowMs))
     .filter((formatted): formatted is string => formatted !== undefined)
     .join(" ");
   const commandText = detail.length > 0 ? detail : value;
-  return { value, commandText: resetSummary ? `${commandText}\nResets: ${resetSummary}` : commandText };
+  return { value, commandText: resetSummary ? `${commandText}\nResets: ${resetSummary}` : commandText, windows: snapshots };
 }
 
 // ---------- copilot ----------
@@ -1150,9 +1243,15 @@ export function copilotUsageDisplay(
   const resetValue = quota.reset_date ?? resetDateValue;
   const reset = parseResetDate(resetValue);
   if (!reset) return undefined;
-  return /^\d{4}-\d{2}-\d{2}$/.test(resetValue ?? "")
-    ? { value, resetDate: resetValue, quota: meta }
-    : { value, resetMs: reset.getTime(), quota: meta };
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(resetValue ?? "");
+  const used = meta.usedPercent;
+  const windows: UsageWindowSnapshot[] = typeof used === "number" && Number.isFinite(used)
+    ? [{ label: "premium", percent: Math.round(Math.max(0, Math.min(100, used))),
+        resets_at: dateOnly ? (resetValue as string) : reset.toISOString() }]
+    : [];
+  return dateOnly
+    ? { value, resetDate: resetValue, quota: meta, windows }
+    : { value, resetMs: reset.getTime(), quota: meta, windows };
 }
 
 async function fetchCopilot(ctx: ExtensionContext): Promise<UsageDisplay> {
@@ -1312,7 +1411,8 @@ function formatGrokWindow(window: GrokUsageWindow, nowMs = Date.now()): string |
 export function grokUsageDisplay(window: GrokUsageWindow, nowMs = Date.now()): UsageDisplay | undefined {
   const value = formatGrokWindow(window, nowMs);
   if (!value) return undefined;
-  return { value, resetMs: window.reset_at * 1000 };
+  const snap = usageWindowSnapshot(usageSpanLabel(window.limit_window_seconds), window, nowMs);
+  return { value, resetMs: window.reset_at * 1000, windows: snap ? [snap] : [] };
 }
 
 async function fetchGrok(ctx: ExtensionContext): Promise<UsageDisplay> {
@@ -2448,6 +2548,7 @@ async function refreshDriver(
   // paints every status key, so lighting grok while on another model is wrong.
   if (!active && !options.allowInactive) {
     if (driver.statusKey && !safeSetStatus(ctx, driver.statusKey, undefined)) return undefined;
+    clearUsageFor(driver);
     return undefined;
   }
 
@@ -2463,22 +2564,22 @@ async function refreshDriver(
   // inside the memory TTL kept painting the older value.
   if ((options.cacheOnly || cached) && !options.force) {
     const entry = (await readSharedCache())[cacheKey];
-    if (!entry || typeof entry.value !== "string" || !Number.isFinite(entry.fetchedAt)) return state.last;
-    if (state.last && entry.fetchedAt <= state.lastFetchMs) return state.last;
+    if (!entry || typeof entry.value !== "string" || !Number.isFinite(entry.fetchedAt) ||
+        (state.last && entry.fetchedAt <= state.lastFetchMs)) {
+      // Nothing newer: the same numbers, but an idle session's grow stale.
+      if (state.last && state.lastCacheKey === cacheKey) publishUsageFor(driver, state.last, state.lastFetchMs);
+      return state.last;
+    }
     if (generation !== state.generation) return undefined;
     const stillActive = safeIsActive(driver, ctx);
     if (stillActive === undefined || !stillActive) return undefined;
-    const display: UsageDisplay = {
-      value: entry.value,
-      ...(entry.commandText !== undefined ? { commandText: entry.commandText } : {}),
-      ...(entry.resetMs !== undefined ? { resetMs: entry.resetMs } : {}),
-      ...(entry.resetDate !== undefined ? { resetDate: entry.resetDate } : {}),
-    };
+    const display = displayFromEntry(entry);
     state.last = display;
     state.lastCacheKey = cacheKey;
     state.lastFetchMs = entry.fetchedAt;
     if (driver.stashKey) writeStash(driver, display);
     if (driver.statusKey && !safeSetStatus(ctx, driver.statusKey, display.value)) return undefined;
+    publishUsageFor(driver, display, state.lastFetchMs);
     if (driver.updateEvent) safeEmit(pi, driver.updateEvent);
     return state.last;
   }
@@ -2498,17 +2599,13 @@ async function refreshDriver(
           const stillActive = safeIsActive(driver, ctx);
           if (stillActive === undefined) return undefined;
           if (!stillActive) return undefined;
-          const display: UsageDisplay = {
-            value: entry.value,
-            ...(entry.commandText !== undefined ? { commandText: entry.commandText } : {}),
-            ...(entry.resetMs !== undefined ? { resetMs: entry.resetMs } : {}),
-            ...(entry.resetDate !== undefined ? { resetDate: entry.resetDate } : {}),
-          };
+          const display = displayFromEntry(entry);
           state.last = display;
           state.lastCacheKey = cacheKey;
           state.lastFetchMs = entry.fetchedAt;
           if (driver.stashKey) writeStash(driver, display);
           if (driver.statusKey && !safeSetStatus(ctx, driver.statusKey, display.value)) return undefined;
+          publishUsageFor(driver, display, state.lastFetchMs);
           if (driver.updateEvent) safeEmit(pi, driver.updateEvent);
         }
         return state.last;
@@ -2541,17 +2638,13 @@ async function refreshDriver(
         if (generation !== state.generation) return undefined;
         const stillActive = safeIsActive(driver, ctx);
         if (stillActive === undefined || !stillActive) return undefined;
-        const display: UsageDisplay = {
-          value: entry.value,
-          ...(entry.commandText !== undefined ? { commandText: entry.commandText } : {}),
-          ...(entry.resetMs !== undefined ? { resetMs: entry.resetMs } : {}),
-          ...(entry.resetDate !== undefined ? { resetDate: entry.resetDate } : {}),
-        };
+        const display = displayFromEntry(entry);
         state.last = display;
         state.lastCacheKey = cacheKey;
         state.lastFetchMs = entry.fetchedAt;
         if (driver.stashKey) writeStash(driver, display);
         if (driver.statusKey && !safeSetStatus(ctx, driver.statusKey, display.value)) return undefined;
+        publishUsageFor(driver, display, state.lastFetchMs);
         if (driver.updateEvent) safeEmit(pi, driver.updateEvent);
         return state.last;
       }
@@ -2598,6 +2691,7 @@ async function refreshDriver(
       if (locked) await releaseCacheLock();
       return undefined;
     }
+    if (stillActive) publishUsageFor(driver, display, fetchedAt);
     if (options.allowInactive) {
       await writeSharedEntry(cacheKey, display, fetchedAt);
       if (locked) await releaseCacheLock();
@@ -2625,6 +2719,11 @@ async function refreshDriver(
     state.rateLimited = err instanceof Error && isRateLimitError(err);
     if (driver.statusKey && !state.last && !options.allowInactive) {
       safeSetStatus(ctx, driver.statusKey, undefined);
+      clearUsageFor(driver);
+    }
+    // Still painting the last value: the phone says it is stale.
+    if (state.last && !options.allowInactive && safeIsActive(driver, ctx)) {
+      publishUsageFor(driver, state.last, state.lastFetchMs);
     }
     // Log only the first failure of a streak (and the recovery) so a dead
     // token doesn't spam the console on every settle.
@@ -2647,6 +2746,17 @@ export interface UsageCacheRow {
   resetMs?: number;
   resetDate?: string;
   fetchedAt?: number;
+}
+
+/** A shared-cache entry as a display (what an adopting session paints and publishes). */
+function displayFromEntry(entry: CachedEntry): UsageDisplay {
+  return {
+    value: entry.value,
+    ...(entry.commandText !== undefined ? { commandText: entry.commandText } : {}),
+    ...(entry.resetMs !== undefined ? { resetMs: entry.resetMs } : {}),
+    ...(entry.resetDate !== undefined ? { resetDate: entry.resetDate } : {}),
+    ...(Array.isArray(entry.windows) ? { windows: entry.windows } : {}),
+  };
 }
 
 function cachedEntry(raw: unknown): CachedEntry | undefined {
@@ -2850,6 +2960,10 @@ export default function providerUsage(pi: ExtensionAPI): void {
       );
     }
     claudeAlarm = alarm;
+    claudeExtraUsage = alarm?.includes("extra usage") === true;
+    const claudeDriver = DRIVERS.find((candidate) => candidate.id === "claude-window");
+    const claudeLast = claudeDriver ? stateFor(claudeDriver).last : undefined;
+    if (claudeDriver && claudeLast) publishUsageFor(claudeDriver, claudeLast, stateFor(claudeDriver).lastFetchMs);
     safeSetStatus(ctx, CLAUDE_BILLING_STATUS, alarm ? `\x1b[31m${alarm}\x1b[39m` : undefined);
   });
 
@@ -2861,6 +2975,7 @@ export default function providerUsage(pi: ExtensionAPI): void {
     lastTurnMs = undefined;
     if (claudeAlarm && ctx.hasUI) safeSetStatus(ctx, CLAUDE_BILLING_STATUS, undefined);
     claudeAlarm = undefined;
+    claudeExtraUsage = false;
     for (const driver of DRIVERS) {
       const state = stateFor(driver);
       state.generation += 1;
@@ -2868,6 +2983,7 @@ export default function providerUsage(pi: ExtensionAPI): void {
         if (driver.statusKey && ctx.hasUI) {
           ctx.ui.setStatus(driver.statusKey, undefined);
         }
+        clearUsageFor(driver);
       } catch (err) {
         if (!isStaleCtxError(err)) throw err;
       }

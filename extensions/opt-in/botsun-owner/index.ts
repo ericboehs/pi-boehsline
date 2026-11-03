@@ -1,7 +1,8 @@
 // Report this interactive session's state to Botsun over a local Unix socket
 // (protocol: botsun-owner v1, client side). Botsun's web process listens; we
 // only ever write newline-delimited JSON to it: hello on every (re)connect with
-// the full current state, then busy/idle/prompt/prompt_end/session/bye.
+// the full current state, then busy/idle/prompt/prompt_end/session/bye (and
+// footer/usage on change: the usage windows are provider-usage's numbers).
 //
 // T2, reply as Eric: each session also listens on its own owner socket
 // (~/.local/state/botsun/owner/<pid>.sock, 0600). Botsun asks it for a nonce,
@@ -36,6 +37,7 @@ import { messageV2, messageV3, validHost, validScope } from "../../../lib/signin
 import { checkPin, isPinsError, pin, ratchet, shortFingerprint, signVersionOf, type KeyKind } from "./pins.ts";
 import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
+import { latestUsage, onUsageChange, type ProviderUsageSnapshot } from "../../../lib/usage-snapshot.ts";
 
 type PromptKind = "select" | "confirm" | "input" | "editor" | "custom";
 interface Prompt { kind: PromptKind; title: string }
@@ -1031,6 +1033,11 @@ function closeOwner(c: Conn): void {
 /** The footer chips the phone shows (Eric's pick): no model, provider or name, which it has. */
 const PHONE_FOOTER = new Set(["dir", "worktree", "git", "context", "cost", "usage", "rate", "timers"]);
 
+/** The provider's usage windows (provider-usage's numbers, chip shown or not), or null. */
+export function usageLine(): ProviderUsageSnapshot | null {
+	return latestUsage();
+}
+
 /** The footer's chips as painted (footer.json order and modes), for the phone's chip row. */
 export function footerLine(): FooterChip[] {
 	return latestFooter()
@@ -1141,6 +1148,7 @@ function sendHello(c: Conn): void {
 		})(),
 		stash: stashLine(c),
 		footer: footerLine(),
+		usage: usageLine(),
 		compacting,
 		bypass: bypassed,
 		context: (() => {
@@ -1551,10 +1559,21 @@ function main(pi: ExtensionAPI): void {
 		}, 1_000);
 		footerTimer.unref?.();
 	});
+	// The provider's usage windows, on change (the phone's usage line and its 90% push).
+	let lastUsage = JSON.stringify(usageLine());
+	const stopUsage = onUsageChange(() => {
+		if (!conn || conn.closed) return;
+		const usage = usageLine();
+		const key = JSON.stringify(usage);
+		if (key === lastUsage) return;
+		lastUsage = key;
+		write(conn, "usage", { usage });
+	});
 	pi.on("session_shutdown", () => {
 		stopAsk();
 		stopStash();
 		stopFooter();
+		stopUsage();
 		clearTimeout(footerTimer);
 	});
 

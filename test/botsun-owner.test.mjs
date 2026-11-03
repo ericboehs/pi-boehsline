@@ -826,6 +826,26 @@ test("the footer's chips go to the phone, only the ones it shows, at most once a
 	assert.deepEqual(srv.lines.find((l) => l.type === "footer").footer.map((c) => c.id), ["dir", "git"]);
 });
 
+test("the provider's usage windows go in hello and on change, whether or not the footer shows the chip", async () => {
+	const { publishUsage } = await import("../lib/usage-snapshot.ts");
+	const { publishFooter } = await import("../lib/footer-snapshot.ts");
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	publishFooter([{ id: "dir", text: "botsun" }]); // no usage chip painted (hidden on pace)
+	const first = { provider: "Claude", windows: [{ label: "5h", percent: 47, resets_at: "2026-05-01T12:00:00.000Z" }, { label: "week", percent: 23 }] };
+	publishUsage(first);
+	const m = await mount();
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	assert.deepEqual(srv.lines.find((l) => l.type === "hello").usage, first);
+	publishUsage({ ...first, windows: [{ label: "5h", percent: 92 }], extra_usage: true });
+	await until(() => srv.types().includes("usage"));
+	assert.deepEqual(srv.lines.find((l) => l.type === "usage").usage, { provider: "Claude", windows: [{ label: "5h", percent: 92 }], extra_usage: true });
+	publishUsage(null);
+	await until(() => srv.lines.filter((l) => l.type === "usage").length === 2);
+	assert.equal(srv.lines.filter((l) => l.type === "usage")[1].usage, null);
+});
+
 test("a chip tap from the phone flips the footer's display, display chips only", async () => {
 	const { onFooterTap, publishFooter } = await import("../lib/footer-snapshot.ts");
 	const tapped = [];
