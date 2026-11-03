@@ -42,6 +42,12 @@ import footer, {
   LAYOUT_ROWS,
   formatTimersChip,
   parseTimerStatus,
+  renderCursorChip,
+  parseCursorStatusText,
+  resolveCursorChipFigures,
+  readCursorChipStash,
+  CURSOR_CHIP_STASH_KEY,
+  CURSOR_STATUS_KEY,
   nameTopBorder,
   readFooterConfig,
   topBorderLayout,
@@ -3074,4 +3080,73 @@ test("a saved detailed timers mode is where the click starts from", async () => 
     ui.click(line.indexOf("◷"), 0);
     assert.match(ui.plain()[0], /◷ 1(?! timer)/);
   });
+});
+
+test("renderCursorChip: normal, over-pace color, no limit, malformed stash", () => {
+  const dim = (t) => `[dim]${t}[/dim]`;
+  const cycle = { spentCents: 8160, limitDollars: 200, cycleStart: 0, cycleEnd: 100_000 };
+  const normal = renderCursorChip(cycle, true, dim, 50_000);
+  assert.match(normal, /^⬡ \x1b\[\d+m\$81\.60\/\$200 \(41%\)\x1b\[39m$/);
+  const hot = renderCursorChip(cycle, true, dim, 10_000);
+  assert.match(hot, /\x1b\[31m/, "50% used at 10% elapsed is red");
+  const noLimit = renderCursorChip({ spentCents: 1319 }, true, dim);
+  assert.match(noLimit, /^⬡ \x1b\[32m\$13\.19\x1b\[39m$/);
+  assert.equal(renderCursorChip(undefined, true, dim), "");
+  assert.equal(renderCursorChip({ spentCents: Number.NaN }, true, dim), "");
+  assert.equal(parseCursorStatusText("cursor $81.60/$200 (41%) · +$0.02 here").sessionCents, 2);
+  assert.equal(parseCursorStatusText("not a cursor status"), undefined);
+});
+
+test("readCursorChipStash: structured stash and malformed input", () => {
+  const key = CURSOR_CHIP_STASH_KEY;
+  delete globalThis[key];
+  assert.equal(readCursorChipStash(), undefined);
+  globalThis[key] = { spentCents: 100, limitDollars: 200, cycleStart: 1, cycleEnd: 2, sessionCents: 3 };
+  assert.deepEqual(readCursorChipStash(), { spentCents: 100, limitDollars: 200, cycleStart: 1, cycleEnd: 2, sessionCents: 3 });
+  globalThis[key] = { sessionCents: 5 };
+  assert.deepEqual(readCursorChipStash(), { spentCents: 0, sessionCents: 5 });
+  globalThis[key] = "nope";
+  assert.equal(readCursorChipStash(), undefined);
+  delete globalThis[key];
+});
+
+test("resolveCursorChipFigures: no status means no chip; stash wins when status is set", () => {
+  const stash = { spentCents: 100, limitDollars: 200, cycleStart: 0, cycleEnd: 1, sessionCents: 0 };
+  assert.equal(resolveCursorChipFigures(stash, undefined), undefined);
+  assert.equal(resolveCursorChipFigures(stash, ""), undefined);
+  assert.deepEqual(resolveCursorChipFigures(stash, "cursor $1.00/$200 (0%)"), stash);
+  assert.deepEqual(
+    resolveCursorChipFigures(undefined, "cursor $81.60/$200 (41%)"),
+    parseCursorStatusText("cursor $81.60/$200 (41%)"),
+  );
+});
+
+test("cursor billing chip sits on the border row, not the status row", async (t) => {
+  globalThis[CURSOR_CHIP_STASH_KEY] = {
+    spentCents: 8160,
+    limitDollars: 200,
+    cycleStart: 0,
+    cycleEnd: 1e12,
+    sessionCents: 2,
+  };
+  t.after(() => delete globalThis[CURSOR_CHIP_STASH_KEY]);
+  const ui = await mount({
+    statuses: new Map([
+      [CURSOR_STATUS_KEY, "cursor $81.60/$200 (41%) · +$0.02 here"],
+      ["turn-timer", "3s"],
+    ]),
+  });
+  const [main, statusRow] = await ui.settled(120);
+  assert.match(main, /⬡ \$81\.60\/\$200 \(41%\)/);
+  assert.match(main, /\+\$0\.02 here/);
+  assert.equal(statusRow, "3s");
+  assert.doesNotMatch(statusRow ?? "", /cursor/i);
+});
+
+test("cursor chip falls back to status text when the stash is empty", async (t) => {
+  t.after(() => delete globalThis[CURSOR_CHIP_STASH_KEY]);
+  const ui = await mount({
+    statuses: new Map([[CURSOR_STATUS_KEY, "cursor $81.60/$200 (41%)"]]),
+  });
+  assert.match((await ui.settled(120))[0], /⬡ \$81\.60\/\$200 \(41%\)/);
 });

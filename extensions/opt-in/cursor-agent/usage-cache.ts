@@ -28,7 +28,12 @@ export interface CursorCacheEntry {
 export interface CycleChipFigures {
 	spentCents: number;
 	limitDollars?: number;
+	cycleStart?: number;
+	cycleEnd?: number;
 }
+
+/** Same key as extensions/footer/index.ts CURSOR_CHIP_STASH_KEY. */
+export const CURSOR_CHIP_STASH_KEY = "__piCursorChip";
 
 /** Shared session state for the cursor footer chip (cursor tool session spend + last cycle read). */
 export const cursorChipSession: { sessionCents: number; lastCycle?: CycleChipFigures } = { sessionCents: 0 };
@@ -74,10 +79,30 @@ export async function readCycleFromCache(file = usageCachePath()): Promise<Cycle
 		const spentCents = finiteNumber((quota as { spentCents?: unknown }).spentCents);
 		if (spentCents === undefined) return undefined;
 		const limitDollars = finiteNumber((quota as { limitDollars?: unknown }).limitDollars);
-		return limitDollars === undefined ? { spentCents } : { spentCents, limitDollars };
+		const cycleStart = finiteNumber((quota as { cycleStart?: unknown }).cycleStart);
+		const cycleEnd = finiteNumber((quota as { cycleEnd?: unknown }).cycleEnd);
+		const base = { spentCents, ...(limitDollars === undefined ? {} : { limitDollars }) };
+		if (cycleStart === undefined || cycleEnd === undefined) return base;
+		return { ...base, cycleStart, cycleEnd };
 	} catch {
 		return undefined;
 	}
+}
+
+function publishCursorChipStash(session: typeof cursorChipSession): void {
+	const g = globalThis as Record<string, unknown>;
+	if (!session.lastCycle && session.sessionCents <= 0) {
+		delete g[CURSOR_CHIP_STASH_KEY];
+		return;
+	}
+	const entry: Record<string, number> = { sessionCents: session.sessionCents };
+	if (session.lastCycle) {
+		entry.spentCents = session.lastCycle.spentCents;
+		if (session.lastCycle.limitDollars !== undefined) entry.limitDollars = session.lastCycle.limitDollars;
+		if (session.lastCycle.cycleStart !== undefined) entry.cycleStart = session.lastCycle.cycleStart;
+		if (session.lastCycle.cycleEnd !== undefined) entry.cycleEnd = session.lastCycle.cycleEnd;
+	}
+	g[CURSOR_CHIP_STASH_KEY] = entry;
 }
 
 export function applyCursorStatusChip(
@@ -87,9 +112,11 @@ export function applyCursorStatusChip(
 	if (!session.lastCycle) {
 		if (session.sessionCents <= 0) ctx.ui.setStatus("cursor", undefined);
 		else ctx.ui.setStatus("cursor", `cursor +${chipSpent(session.sessionCents)} here`);
+		publishCursorChipStash(session);
 		return;
 	}
 	ctx.ui.setStatus("cursor", statusChipText(session.lastCycle, session.sessionCents));
+	publishCursorChipStash(session);
 }
 
 /** Re-read the cache file and paint the chip; never throws. */

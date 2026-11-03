@@ -4,7 +4,7 @@
 
 ### Changed
 
-- cursor-agent: the footer chip shows billing-cycle Cursor spend (matching `pi-usage`) instead of only this session's tool runs; foreground runs still append `· +$… here` when they charged something.
+- cursor-agent: the footer **Cursor spend** chip shows billing-cycle Cursor spend on the border row (matching `pi-usage`), pace-colored over the cycle, instead of a `cursor` line on the status row; foreground runs still append a dim `· +$… here` when they charged something.
 
 ### Fixed
 

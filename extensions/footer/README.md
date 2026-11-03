@@ -5,15 +5,15 @@ saves), `/boot` (startup timing), `/bypass` (the approval guardian's bypass).
 Quota chips come from [provider-usage](../provider-usage/README.md); the
 OpenRouter route from [openrouter-route](../openrouter-route/README.md).
 
-Renders the status line (dir, provider, model, git, context/cost, provider
-quota chips, boot time) plus `/bypass`, `/boot` and `/footer`.
+Renders the status line (dir, provider, model, git, context/cost, Cursor
+billing spend when cursor-agent is enabled, provider quota chips, boot time) plus `/bypass`, `/boot` and `/footer`.
 
 `/footer` opens a checklist of the chips in footer order, each with its live
 value; the selected row's description says what it shows and what a click
 does. Enter or Space cycles the row's value: `shown`/`hidden`, or for chips
 with display modes, each mode then `hidden` (Directory name/full path, Git
-full/branch, Context tokens/percent, Cost and
-Rate limits compact/detailed, Token rate number/with TTFT, Timers
+full/branch, Context tokens/percent, Cost and Cursor spend
+compact/detailed, Rate limits compact/detailed, Token rate number/with TTFT, Timers
 count/detailed, Session name border/footer). A Git condition
 row under Git can hide the branch on a clean default branch (origin/HEAD's,
 else main or master) with nothing to push or pull. Git status is cached for
@@ -104,6 +104,14 @@ this model starts on: its `modelThinkingLevels` entry, else
 Each provider's current flagship drops the model chip, so the provider letter
 stands for it: `a` is Anthropic's Claude Opus 5.5, `gh` Copilot's Claude Opus
 5.5, and `x` Grok 4.7. Other releases show their model as usual.
+
+When [cursor-agent](../opt-in/cursor-agent/README.md) is enabled, the **Cursor
+spend** chip shows billing-cycle spend vs your limit (`⬡ $81.60/$200
+(41%)`), coloured by budget pace over that cycle (same ladder as dollar
+budget cost chips). Foreground `cursor` tool runs append a dim `· +$… here`.
+Compact shows the `⬡` glyph (a nod to Cursor's cube logo); detailed spells `cursor`. The chip is
+hideable and reorderable in `/footer` like the others; the old `cursor …`
+status line no longer appears below the prompt.
 
 The Rate limits chip has three modes: `compact` (`61.4% 4.3%/d`), `detailed`
 (`12.1/20.2W: 61.4% 4.3%/d`) and `mini`, just an arrow from pace: `↓` slow

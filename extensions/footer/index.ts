@@ -122,6 +122,20 @@ export interface PiVersionEvent {
 /** Statuses rendered inline in the main line (in this order) instead of the status row. */
 const INLINE_STATUS_KEYS = ["codex-window", "copilot-window", "grok-window", "cerebras-window", "claude-window", "opencode-go-window"] as const;
 
+/** cursor-agent's billing chip: painted in the border, not on the status row. */
+export const CURSOR_STATUS_KEY = "cursor";
+
+/** Structured figures for the cursor chip; cursor-agent writes this stash. */
+export const CURSOR_CHIP_STASH_KEY = "__piCursorChip";
+
+export interface CursorChipFigures {
+  spentCents: number;
+  limitDollars?: number;
+  cycleStart?: number;
+  cycleEnd?: number;
+  sessionCents?: number;
+}
+
 /** The scheduler's status key; the timers chip renders it instead of the status row. */
 const TIMERS_STATUS_KEY = "session-scheduler";
 
@@ -165,6 +179,7 @@ export const FOOTER_CHIPS = [
   { id: "bypass", label: "Bypass", example: "bypass", description: "While Approval Guardian is bypassed: the session name turns red with ⚠ (name), a red bypass chip (chip, or when no name shows), or both. Click either: turn the guardian back on." },
   { id: "context", label: "Context", example: "42k/1m", description: "Context tokens / window, or a percent, coloured as it fills. Click: flip for this session." },
   { id: "cost", label: "Cost", example: "$0.42", description: "Session cost, or a provider budget (ollama, baseten, openrouter) as a percent (compact) or total (detailed). Click: flip for this session." },
+  { id: "cursor", label: "Cursor spend", example: "⬡ $81/$200 (41%)", description: "Cursor billing-cycle spend (cursor-agent): spend vs limit, pace-colored over the cycle. Compact shows the ⬡ glyph; detailed spells cursor. Session tool runs append a dim · +$… here. Click: flip for this session." },
   { id: "usage", label: "Rate limits", example: "57%", description: "Provider usage windows: Copilot premium-request share over workdays (W) with the %/d left per workday, Codex/Grok/Claude windows, compact, detailed, or mini (just ↑ speed up / ↓ slow down, hidden on pace; multi-window chips name the window: ↓6w). Click: cycle for this session." },
   { id: "boot", label: "Boot time", example: "⚡775ms", description: "⚡ startup time, until the first message. Click: recent boot stats." },
   { id: "rate", label: "Token rate", example: "99", description: "Tokens per second of the last reply (live while streaming), alone or with the time to first token. Click: flip for this session." },
@@ -194,6 +209,7 @@ export const CHIP_MODES: Partial<Record<FooterChipId, readonly string[]>> = {
   git: ["full", "branch"],
   context: ["tokens", "percent"],
   cost: ["compact", "detailed"],
+  cursor: ["compact", "detailed"],
   // compact stays first (the default); a click cycles compact → detailed → mini.
   usage: ["compact", "detailed", "mini"],
   rate: ["number", "with TTFT"],
@@ -673,7 +689,7 @@ export function viewConfig(config: FooterConfig, view: FooterView): FooterConfig
   return {
     ...rest,
     hidden: new Set(),
-    modes: { ...config.modes, git: "full", cost: "detailed", usage: "detailed", rate: "with TTFT", timers: "detailed" },
+    modes: { ...config.modes, git: "full", cost: "detailed", cursor: "detailed", usage: "detailed", rate: "with TTFT", timers: "detailed" },
     usagePace: "on",
   };
 }
@@ -816,8 +832,17 @@ function cycleStartBefore(resetMs: number): number {
 }
 
 /** Fraction of the billing month already elapsed: from the meter's reset when
- *  known (ollama), else the calendar month (baseten/openrouter). */
-function budgetElapsedFraction(resetMs: number | undefined, nowMs: number): number {
+ *  known (ollama), else the calendar month (baseten/openrouter). When an
+ *  explicit billing cycle is known (Cursor), use cycleStart..cycleEnd. */
+function budgetElapsedFraction(
+  resetMs: number | undefined,
+  nowMs: number,
+  cycleStart?: number,
+  cycleEnd?: number,
+): number {
+  if (cycleStart !== undefined && cycleEnd !== undefined && cycleEnd > cycleStart) {
+    return Math.min(1, Math.max(0, (nowMs - cycleStart) / (cycleEnd - cycleStart)));
+  }
   if (resetMs !== undefined && resetMs > nowMs) {
     const start = cycleStartBefore(resetMs);
     return Math.min(1, Math.max(0, (nowMs - start) / (resetMs - start)));
@@ -836,15 +861,111 @@ function renderBudgetUsage(
   value: string,
   resetMs: number | undefined,
   compact: boolean,
+  cycle?: { start?: number; end?: number },
+  nowMs = Date.now(),
 ): string {
   const tail = costPercentTail(value);
   if (tail === undefined) return color(GREEN, value);
   const percent = Number.parseFloat(tail);
   const pace = Number.isFinite(percent)
-    ? percent - budgetElapsedFraction(resetMs, Date.now()) * 100
+    ? percent - budgetElapsedFraction(resetMs, nowMs, cycle?.start, cycle?.end) * 100
     : undefined;
   const code = pace === undefined ? GREEN : paceColor(pace);
   return color(code, compact ? tail : value);
+}
+
+function finiteChipNumber(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** cursor-agent's structured chip payload; absent or malformed → undefined. */
+export function readCursorChipStash(): CursorChipFigures | undefined {
+  const raw = (globalThis as Record<string, unknown>)[CURSOR_CHIP_STASH_KEY];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const sessionCents = finiteChipNumber((raw as { sessionCents?: unknown }).sessionCents) ?? 0;
+  const spentCents = finiteChipNumber((raw as { spentCents?: unknown }).spentCents);
+  const limitDollars = finiteChipNumber((raw as { limitDollars?: unknown }).limitDollars);
+  const cycleStart = finiteChipNumber((raw as { cycleStart?: unknown }).cycleStart);
+  const cycleEnd = finiteChipNumber((raw as { cycleEnd?: unknown }).cycleEnd);
+  if (spentCents === undefined) {
+    if (sessionCents <= 0) return undefined;
+    return { spentCents: 0, sessionCents };
+  }
+  return {
+    spentCents,
+    ...(limitDollars === undefined ? {} : { limitDollars }),
+    ...(cycleStart === undefined ? {} : { cycleStart }),
+    ...(cycleEnd === undefined ? {} : { cycleEnd }),
+    ...(sessionCents > 0 ? { sessionCents } : {}),
+  };
+}
+
+/** Fallback when the stash is missing: parse cursor-agent's `cursor` status text. */
+export function parseCursorStatusText(value: string | undefined): CursorChipFigures | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  const sessionOnly = /^cursor \+\$(\d+\.\d{2}) here$/.exec(text);
+  if (sessionOnly) {
+    const sessionCents = Math.round(Number.parseFloat(sessionOnly[1]!) * 100);
+    if (!Number.isFinite(sessionCents) || sessionCents <= 0) return undefined;
+    return { spentCents: 0, sessionCents };
+  }
+  const match =
+    /^cursor \$(\d+\.\d{2})\/\$(\d+(?:\.\d{2})?) \((\d+)%\)(?: · \+\$(\d+\.\d{2}) here)?$/.exec(text);
+  if (!match) return undefined;
+  const spentCents = Math.round(Number.parseFloat(match[1]!) * 100);
+  const limitDollars = Number.parseFloat(match[2]!);
+  const sessionCents = match[4] ? Math.round(Number.parseFloat(match[4]) * 100) : 0;
+  if (!Number.isFinite(spentCents) || !Number.isFinite(limitDollars) || limitDollars <= 0) return undefined;
+  return {
+    spentCents,
+    limitDollars,
+    ...(sessionCents > 0 ? { sessionCents } : {}),
+  };
+}
+
+function cursorBudgetValue(figures: CursorChipFigures): string {
+  const spent = `$${(figures.spentCents / 100).toFixed(2)}`;
+  if (!figures.limitDollars) return spent;
+  const pct = Math.round((figures.spentCents / (figures.limitDollars * 100)) * 100);
+  const limit = Number.isInteger(figures.limitDollars) ? `$${figures.limitDollars}` : `$${figures.limitDollars.toFixed(2)}`;
+  return `${spent}/${limit} (${pct}%)`;
+}
+
+/** Border chip for cursor-agent billing; empty string hides the chip. */
+export function renderCursorChip(
+  figures: CursorChipFigures | undefined,
+  compact: boolean,
+  dim: (text: string) => string,
+  nowMs = Date.now(),
+): string {
+  if (!figures) return "";
+  if (figures.spentCents <= 0 && (figures.sessionCents ?? 0) > 0) {
+    const session = `$${((figures.sessionCents ?? 0) / 100).toFixed(2)}`;
+    return color(GREEN, `${compact ? "⬡" : "cursor"} +${session} here`);
+  }
+  if (!Number.isFinite(figures.spentCents) || figures.spentCents < 0) return "";
+  const budgetVal = cursorBudgetValue(figures);
+  const body = renderBudgetUsage(
+    budgetVal,
+    figures.cycleEnd,
+    false,
+    { start: figures.cycleStart, end: figures.cycleEnd },
+    nowMs,
+  );
+  const label = compact ? "⬡" : "cursor";
+  let chip = `${label} ${body}`;
+  const sessionCents = figures.sessionCents ?? 0;
+  if (sessionCents > 0) chip += dim(` · +$${(sessionCents / 100).toFixed(2)} here`);
+  return chip;
+}
+
+export function resolveCursorChipFigures(
+  stash: CursorChipFigures | undefined,
+  statusText: string | undefined,
+): CursorChipFigures | undefined {
+  if (!statusText) return undefined;
+  return stash ?? parseCursorStatusText(statusText);
 }
 
 /**
@@ -2124,6 +2245,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
   let usageMode = "compact";
   /** The budget-usage cost chip shows its percent-only tail by default ("11%"). */
   let compactCostUsage = true;
+  /** The cursor billing chip uses the ⬡ glyph by default. */
+  let compactCursorUsage = true;
   /**
    * Output-rate chip. TTFT runs from turn_start (request about to go out) to
    * the first streamed delta; the rate runs from that first delta to
@@ -2164,6 +2287,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
     | "context"
     | "providerUsage"
     | "cost"
+    | "cursor"
     | "rate"
     | "timers"
     | "name"
@@ -2191,6 +2315,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
     ["gitBehind", "gitPull"],
     ["context", "context"],
     ["cost", "cost"],
+    ["cursor", "cursor"],
     ["usage", "providerUsage"],
     ["rate", "rate"],
     ["timers", "timers"],
@@ -2218,6 +2343,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
     showFullPath = chipMode(shown(), "dir") === "full path";
     contextPercent = chipMode(shown(), "context") === "percent";
     compactCostUsage = chipMode(shown(), "cost") !== "detailed";
+    compactCursorUsage = chipMode(shown(), "cursor") !== "detailed";
     usageMode = chipMode(shown(), "usage") ?? "compact";
     detailedRate = chipMode(shown(), "rate") === "with TTFT";
     detailedTimers = chipMode(shown(), "timers") === "detailed";
@@ -2285,8 +2411,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
   /** Run a chip's click action, from the footer or the editor's top border. */
   // A tap on the phone's chip row (botsun-owner): the display toggles only, as clicks would.
   onFooterTap((id) => {
-    const action = ({ dir: "dir", context: "context", cost: "cost", usage: "providerUsage", rate: "rate", timers: "timers" } as const)[
-      id as "dir" | "context" | "cost" | "usage" | "rate" | "timers"
+    const action = ({ dir: "dir", context: "context", cost: "cost", cursor: "cursor", usage: "providerUsage", rate: "rate", timers: "timers" } as const)[
+      id as "dir" | "context" | "cost" | "cursor" | "usage" | "rate" | "timers"
     ];
     if (!action) return false;
     runChipAction(action, false);
@@ -2317,6 +2443,9 @@ export default function footerExtension(pi: ExtensionAPI): void {
       repaint?.();
     } else if (action === "cost") {
       compactCostUsage = !compactCostUsage;
+      repaint?.();
+    } else if (action === "cursor") {
+      compactCursorUsage = !compactCursorUsage;
       repaint?.();
     } else if (action === "name") {
       // The red ⚠ name stands in for the bypass chip, so it acts like it.
@@ -2679,6 +2808,14 @@ export default function footerExtension(pi: ExtensionAPI): void {
                 ? ""
                 : color(GREEN, formatCost(sessionCost(ctx.sessionManager.getBranch()))),
           ],
+          [
+            "cursor",
+            renderCursorChip(
+              resolveCursorChipFigures(readCursorChipStash(), statuses.get(CURSOR_STATUS_KEY)),
+              compactCursorUsage,
+              (text) => theme.fg("dim", text),
+            ),
+          ],
           ...INLINE_STATUS_KEYS.map((key) => {
             const raw = statuses.get(key);
             const value = raw ? stripAllowanceArrow(raw) : raw;
@@ -2754,6 +2891,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
             case "context":
               return `${color(contextColorCode(42_000, 1_000_000), "42k")}/${color(CYAN, "1m")}`;
             case "cost":
+              return color(GREEN, text);
+            case "cursor":
               return color(GREEN, text);
             case "usage":
               return color(YELLOW, text);
@@ -2925,6 +3064,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
           const extra: string[] = [];
           for (const [key, value] of statuses) {
             if (!value || (INLINE_STATUS_KEYS as readonly string[]).includes(key)) continue;
+            if (key === CURSOR_STATUS_KEY) continue;
             // The timers chip owns the scheduler's status when it can read it.
             if (key === TIMERS_STATUS_KEY && parseTimerStatus(value)) continue;
             extra.push(value);

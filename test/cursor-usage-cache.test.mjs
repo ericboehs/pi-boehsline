@@ -12,6 +12,7 @@ import { test } from "node:test";
 import {
 	applyCursorStatusChip,
 	CACHE_KEY,
+	CURSOR_CHIP_STASH_KEY,
 	cacheEntry,
 	cycleText,
 	readCycleFromCache,
@@ -81,6 +82,12 @@ test("applyCursorStatusChip: no data, session only, cycle + session", () => {
 	session.lastCycle = { spentCents: 8160, limitDollars: 200 };
 	applyCursorStatusChip(ctx, session);
 	assert.equal(chip.cursor, "cursor $81.60/$200 (41%) · +$0.02 here");
+	assert.deepEqual(globalThis[CURSOR_CHIP_STASH_KEY], {
+		spentCents: 8160,
+		limitDollars: 200,
+		sessionCents: 2,
+	});
+	delete globalThis[CURSOR_CHIP_STASH_KEY];
 });
 
 test("readCycleFromCache: quota from file, missing file, malformed", async () => {
@@ -93,7 +100,7 @@ test("readCycleFromCache: quota from file, missing file, malformed", async () =>
 			[CACHE_KEY]: { value: "$0.65 / $200 (0.3%)", quota: { spentCents: 65, limitDollars: 200, cycleStart: 1, cycleEnd: 2 } },
 		}),
 	);
-	assert.deepEqual(await readCycleFromCache(file), { spentCents: 65, limitDollars: 200 });
+	assert.deepEqual(await readCycleFromCache(file), { spentCents: 65, limitDollars: 200, cycleStart: 1, cycleEnd: 2 });
 	writeFileSync(file, "{");
 	assert.equal(await readCycleFromCache(file), undefined);
 	writeFileSync(file, JSON.stringify({ [CACHE_KEY]: { value: "x" } }));
