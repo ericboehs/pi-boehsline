@@ -79,6 +79,12 @@ const cursorFields = {
 			description: "cursor agent only: run in a new git worktree on its own branch (default true, so several can run at once); false runs in cwd",
 		}),
 	),
+	force: Type.Optional(
+		Type.Boolean({
+			description:
+				"cursor agent only: let Cursor run every command without asking (cursor-agent --force; default false). Needed for shell commands when the agent file sets network: true, since print mode can't approve them. Only for trusted tasks and workspaces.",
+		}),
+	),
 };
 
 const TaskItem = Type.Object({
@@ -164,9 +170,11 @@ type Agent = {
 	mode?: CursorMode;
 	worktree?: boolean;
 	network?: boolean;
+	/** cursor-agent --force, user-scope agent files only (like network). */
+	force?: boolean;
 };
 
-type Job = { agent: string; task: string; cwd?: string; model?: string; cursorMode?: CursorMode; worktree?: boolean };
+type Job = { agent: string; task: string; cwd?: string; model?: string; cursorMode?: CursorMode; worktree?: boolean; force?: boolean };
 
 /** What a foreground cursor task reports in details.results[i].cursor. */
 type CursorFacts = {
@@ -286,7 +294,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 								: Array.isArray(frontmatter.tools)
 									? (frontmatter.tools as unknown[]).filter((t): t is string => typeof t === "string").join(",")
 									: undefined;
-						const { mode, worktree, network } = frontmatter;
+						const { mode, worktree, network, force } = frontmatter;
 						out.push({
 							name: frontmatter.name,
 							tools,
@@ -296,6 +304,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 							...(typeof mode === "string" && CURSOR_MODES.includes(mode) ? { mode: mode as CursorMode } : {}),
 							...(typeof worktree === "boolean" ? { worktree } : {}),
 							...(typeof network === "boolean" ? { network } : {}),
+							...(typeof force === "boolean" ? { force } : {}),
 						});
 					} catch {
 						/* skip bad file */
@@ -324,8 +333,8 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					if (parent === cur) break;
 					cur = parent;
 				}
-				// A repo's agent file never turns Cursor's sandbox off: network is user-scope only.
-				if (dir) for (const a of loadDir(dir)) byName.set(a.name, { ...a, network: undefined });
+				// A repo's agent file never turns Cursor's sandbox or approvals off: network and force are user-scope only.
+				if (dir) for (const a of loadDir(dir)) byName.set(a.name, { ...a, network: undefined, force: undefined });
 			}
 			for (const [name, b] of Object.entries(BUILTINS)) if (!byName.has(name)) byName.set(name, { name, ...b });
 
@@ -333,7 +342,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 			// a per-task model wins over the agent's.
 			const single: Job[] =
 				params.agent && params.task
-					? [{ agent: params.agent, task: params.task, cwd: params.cwd, cursorMode: params.cursorMode, worktree: params.worktree }]
+					? [{ agent: params.agent, task: params.task, cwd: params.cwd, cursorMode: params.cursorMode, worktree: params.worktree, force: params.force }]
 					: [];
 			const jobs = (params.tasks ?? single) as Job[];
 			if (jobs.length === 0 || jobs.length > MAX_TASKS || (params.tasks && params.agent)) {
@@ -374,6 +383,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 							mode,
 							cwd: job.cwd,
 							network: agent.network,
+							force: job.force ?? agent.force,
 							worktree,
 						},
 						ctx.cwd,
@@ -517,7 +527,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					return { agent: job.agent, task: job.task, ok: false, output: `could not start Cursor: ${(err as Error).message}` };
 				}
 				const { outcome, charge, chargeError } = r;
-				const failed = outcome.exitCode !== 0 || r.stopped;
+				const failed = outcome.exitCode !== 0 || r.stopped || !!outcome.refused;
 				const cursor: CursorFacts = {
 					model: spec.model,
 					durationMs: outcome.durationMs,
@@ -526,7 +536,9 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					...(chargeError ? { chargeError } : {}),
 					...(outcome.state.sessionId ? { sessionId: outcome.state.sessionId } : {}),
 					...(outcome.worktree ? { worktree: outcome.worktree } : {}),
-					...(failed ? { error: outcome.stderr || (r.stopped ? "stopped" : `exit ${outcome.exitCode ?? "none (killed)"}`) } : {}),
+					...(failed
+						? { error: outcome.refused || outcome.stderr || (r.stopped ? "stopped" : `exit ${outcome.exitCode ?? "none (killed)"}`) }
+						: {}),
 				};
 				return { agent: job.agent, task: job.task, ok: !failed, output: capped(resultBlock(spec, r, Infinity).join("\n")), cursor };
 			};

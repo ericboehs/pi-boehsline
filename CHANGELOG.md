@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- cursor-agent: `runCursor` without an `onEvent` callback never read cursor-agent's output (`onEvent?.(run, run.feed(…))` skipped the feed), so the answer and steps were empty.
 - subagent: an answer over the 50 KB cap keeps its `[N bytes over cap omitted]` note; the cut used to remove the note along with the excess.
 - image-prune: saved images (`~/.pi/agent/tmp/image-prune/`) are owner-only (files 0600, folder 0700) and no longer kept forever: each session start deletes ones older than 7 days and keeps at most the newest 200.
 - auto-bundle: the detached rebuild gets the lock, log, script path and version as positional arguments instead of `JSON.stringify` spliced into shell text, so a `$`, backtick or quote in a path or version is never run.
@@ -19,6 +20,7 @@
 
 ### Added
 
+- cursor-agent: `force` passes cursor-agent `--force`, for shell commands with `network: true` (outside the sandbox every command needs approval, and print mode can't give it). Never implied by `network`. Also on the subagent's cursor runner, per call or as `force: true` in a user-scope agent file (repo agent files can't set it, like `network`). Refused steps now show as refused instead of succeeded, and a run is stopped after 3 refusals with an error naming the fix.
 - cursor-agent: background runs and `cursor` subagent runs refresh the shared usage cache (`cursor-usage`) when they end, like foreground runs, so `pi-usage` shows their spend.
 - subagent: a built-in `cursor` agent (or an agent file with `runner: cursor`) runs Cursor's agent CLI instead of a pi child, through cursor-agent's own run.ts and runner.ts. Foreground tasks return the same result block as a background cursor run (answer, model, duration, charge in dollars, worktree, exit code, error) and put those facts in `details.results[i].cursor`. `background: true` starts the cursor runner as a bg job, so the completion message carries that block. Parallel `tasks` can mix `scout`, `worker` and `cursor`. Each cursor task gets its own git worktree by default; `model`, `cursorMode` and `worktree` override per call or per task (a per-task `model` also applies to pi children). Without cursor-agent enabled or `cursor-agent` installed, only that task fails, with a message saying which. The tool's description says cursor tasks must never carry PII, PHI or secrets, and adds cursor-agent's configured `note` and `rules`.
 - cursor-agent: runner.ts exports `startJob`, `runAndCharge` and `resultBlock`, and run.ts exports `binFound`, so the cursor tool and the subagent tool start and report runs the same way.

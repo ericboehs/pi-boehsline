@@ -9,7 +9,9 @@
  *                        with model_call_id: a segment flush before a tool call
  *                        no timestamp_ms: the final answer, in full
  *   tool_call/started    tool_call.<kind>ToolCall.args
- *   tool_call/completed  same, plus .result.success | .result.error
+ *   tool_call/completed  same, plus .result.success | .result.error |
+ *                        .result.rejected (approval needed and none possible in
+ *                        print mode: the step never ran)
  *   result/success       duration_ms, usage; `result` joins every segment,
  *                        so it's only a fallback for the answer
  *
@@ -20,6 +22,8 @@ export interface ToolStep {
 	kind: string;
 	summary: string;
 	ok?: boolean;
+	/** Cursor refused to run it (result.rejected): it needed approval that print mode can't give. */
+	refused?: boolean;
 }
 
 export interface CliUsage {
@@ -35,6 +39,8 @@ export interface RunState {
 	/** Where Cursor actually ran: the init event's cwd (a worktree with -w). */
 	workspace?: string;
 	tools: ToolStep[];
+	/** Completed steps Cursor refused (see ToolStep.refused). */
+	refusals: number;
 	answer: string;
 	/** Streamed text since the last flush, else the last flushed segment. */
 	live: string;
@@ -63,12 +69,13 @@ export function describeTool(call: Record<string, any>, cwd: string): ToolStep {
 	else if (typeof args.path === "string") summary = `${kind} ${rel(args.path)}`;
 	else if (firstString) summary = `${kind} ${short(rel(firstString), 60)}`;
 	const result = call[key]?.result;
+	if (result?.rejected) return { kind, summary, ok: false, refused: true };
 	const ok = result ? !result.error && (result.success?.exitCode ?? 0) === 0 : undefined;
 	return { kind, summary, ok };
 }
 
 export class RunReducer {
-	readonly state: RunState = { tools: [], answer: "", live: "", thinking: false };
+	readonly state: RunState = { tools: [], refusals: 0, answer: "", live: "", thinking: false };
 	private pending = new Map<string, number>();
 	private streaming = "";
 	private buf = "";
@@ -115,6 +122,7 @@ export class RunReducer {
 					this.pending.set(ev.call_id, s.tools.length);
 					s.tools.push(step);
 				} else {
+					if (step.refused) s.refusals++;
 					const i = this.pending.get(ev.call_id);
 					if (i !== undefined) s.tools[i] = step;
 					else s.tools.push(step);

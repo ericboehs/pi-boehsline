@@ -22,7 +22,7 @@ import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dollars, eventTokens, kfmt, type UsageEvent } from "./api.ts";
 import { type RunReducer, short } from "./events.ts";
-import { type ChargeLookup, humanDuration, lookupCharge, type RunOutcome, type RunSpec, runCursor } from "./run.ts";
+import { type ChargeLookup, humanDuration, lookupCharge, refusalNote, type RunOutcome, type RunSpec, runCursor } from "./run.ts";
 import { refreshUsageCache } from "./usage-cache.ts";
 
 /** The answer in the result block; longer answers are printed in full above it. */
@@ -123,15 +123,15 @@ export async function runAndCharge(
  * charge, worktree, session, exit code and error.
  */
 export function resultBlock(spec: RunSpec, r: RunResult, answerChars = ANSWER_CHARS): string[] {
-	const { state, exitCode, durationMs, worktree, stderr } = r.outcome;
+	const { state, exitCode, durationMs, worktree, stderr, refused } = r.outcome;
 	const { charge, chargeError, stopped } = r;
 	const answer = state.answer.trim();
-	const failed = exitCode !== 0;
+	const failed = exitCode !== 0 || !!refused;
 	const lines: string[] = [];
 	const cost = charge
 		? `${dollars(charge.chargedCents ?? 0)}${charge.cursorTokenFee ? ` (incl. ${dollars(charge.cursorTokenFee)} Cursor fee)` : ""} · ${kfmt(eventTokens(charge))} tokens`
 		: `cost not found${chargeError ? `: ${chargeError}` : ""}`;
-	const status = stopped ? "stopped" : failed ? `exit ${exitCode}` : "done";
+	const status = stopped ? "stopped" : refused ? `refused ${state.refusals}×` : failed ? `exit ${exitCode}` : "done";
 	lines.push(`── cursor result · ${status} · ${spec.model} · ${humanDuration(durationMs)} · ${cost} ──`);
 	if (answer.length > answerChars) {
 		lines.push(`${answer.slice(0, answerChars).trimEnd()}…`, `[answer truncated at ${answerChars} of ${answer.length} chars; the full text is above in this log]`);
@@ -150,7 +150,12 @@ export function resultBlock(spec: RunSpec, r: RunResult, answerChars = ANSWER_CH
 	}
 	if (state.sessionId) lines.push(`Session: ${state.sessionId}`);
 	lines.push(`Exit code: ${exitCode ?? "none (killed)"}${stopped ? " · stopped" : ""}`);
-	if (failed && stderr) lines.push(`Error: ${short(stderr, 1_500)}`);
+	if (!refused) {
+		const note = refusalNote(state, spec);
+		if (note) lines.push(note);
+	}
+	if (refused) lines.push(`Error: ${refused}`);
+	else if (failed && stderr) lines.push(`Error: ${short(stderr, 1_500)}`);
 	return lines;
 }
 

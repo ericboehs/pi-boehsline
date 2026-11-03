@@ -23,6 +23,12 @@ export interface CursorArgs {
 	network?: boolean;
 	worktree?: boolean;
 	worktreeBase?: string;
+	/**
+	 * Pass cursor-agent --force: run every command without asking. Print mode can't
+	 * approve anything, so without it a command Cursor wants approved (every shell
+	 * command once the sandbox is off) is refused. Never implied by `network`.
+	 */
+	force?: boolean;
 }
 
 /** Everything a run needs, JSON-safe so a background job can take it from a file. */
@@ -33,6 +39,9 @@ export interface RunSpec {
 	worktree: boolean;
 	/** The cursor-agent binary: PI_CURSOR_AGENT_BIN, else `cursor-agent` on PATH. */
 	bin: string;
+	/** Whether the sandbox is off and --force is on, for messages (the flags themselves are in cliArgs). */
+	network?: boolean;
+	force?: boolean;
 }
 
 export interface WorktreeInfo {
@@ -49,6 +58,30 @@ export interface RunOutcome {
 	started: number;
 	stderr?: string;
 	worktree?: WorktreeInfo;
+	/** Set when the run was stopped early because Cursor kept refusing its own tools: why, for the caller to show. */
+	refused?: string;
+}
+
+/** Refused steps before a run is stopped: by then it is spinning, not working. */
+export const REFUSAL_LIMIT = 3;
+
+/** For a run that finished with some refused steps (below the stop limit): what happened, and the fix. */
+export function refusalNote(state: Pick<RunState, "refusals">, spec: Pick<RunSpec, "network" | "force">): string | undefined {
+	if (!state.refusals) return undefined;
+	const fix = spec.network ? "pass force: true (or drop network: true)" : "pass force: true";
+	return `Note: Cursor refused ${state.refusals} of its own tool call(s), which never ran; to allow them, ${fix}.`;
+}
+
+/** Why a run stopped after refusals, and how to fix it. */
+export function refusalMessage(state: RunState, spec: Pick<RunSpec, "network" | "force">): string {
+	const kinds = [...new Set(state.tools.filter((t) => t.refused).map((t) => t.kind))].join(", ") || "tool";
+	const why = spec.network
+		? "With the sandbox off (network: true), cursor-agent asks before every command, and print mode can't answer."
+		: "cursor-agent wanted approval for them, and print mode can't answer.";
+	const fix = spec.network
+		? "Pass force: true to let it run commands without asking (only for trusted prompts and workspaces), drop network: true so commands run in the sandbox, or add an allow rule to ~/.cursor/cli-config.json."
+		: "Pass force: true to let it run them without asking, or add an allow rule to ~/.cursor/cli-config.json.";
+	return `Stopped: Cursor refused its own ${kinds} calls ${state.refusals} times, so nothing ran. ${why} ${fix}`;
 }
 
 /** Check the call and build cursor-agent's arguments. Throws on a blocked model or a bad cwd. */
@@ -66,6 +99,7 @@ export async function prepareRun(args: CursorArgs, sessionCwd: string, settings:
 
 	const cliArgs = ["-p", "--trust", "--output-format", "stream-json", "--stream-partial-output"];
 	cliArgs.push("--sandbox", args.network ? "disabled" : "enabled", "--model", model);
+	if (args.force) cliArgs.push("--force");
 	if (args.mode && args.mode !== "agent") cliArgs.push("--mode", args.mode);
 	if (args.worktree) {
 		// --worktree takes an optional name, so without one it would swallow the prompt.
@@ -73,7 +107,15 @@ export async function prepareRun(args: CursorArgs, sessionCwd: string, settings:
 		if (args.worktreeBase) cliArgs.push("--worktree-base", args.worktreeBase);
 	}
 	cliArgs.push(args.prompt);
-	return { model, cwd, cliArgs, worktree: !!args.worktree, bin: process.env.PI_CURSOR_AGENT_BIN?.trim() || "cursor-agent" };
+	return {
+		model,
+		cwd,
+		cliArgs,
+		worktree: !!args.worktree,
+		bin: process.env.PI_CURSOR_AGENT_BIN?.trim() || "cursor-agent",
+		...(args.network ? { network: true } : {}),
+		...(args.force ? { force: true } : {}),
+	};
 }
 
 /** Whether `bin` (a RunSpec's) is an executable file: the path as given, else a file on PATH. */
@@ -104,21 +146,33 @@ export function stderrTail(text: string, maxLines = 40, maxBytes = 4_000): strin
  */
 export async function runCursor(
 	spec: RunSpec,
-	opts: { signal?: AbortSignal; onEvent?: (run: RunReducer, changed: boolean) => void } = {},
+	opts: { signal?: AbortSignal; onEvent?: (run: RunReducer, changed: boolean) => void; refusalLimit?: number } = {},
 ): Promise<RunOutcome> {
 	const { signal, onEvent } = opts;
+	const refusalLimit = opts.refusalLimit ?? REFUSAL_LIMIT;
+	let refusedStop = false;
 	const run = new RunReducer(spec.cwd);
 	const started = Date.now();
 	const stderr: string[] = [];
 	const exitCode = await new Promise<number | null>((done, fail) => {
 		const proc = spawn(spec.bin, spec.cliArgs, { cwd: spec.cwd, stdio: ["ignore", "pipe", "pipe"] });
-		proc.stdout.on("data", (chunk: Buffer) => onEvent?.(run, run.feed(chunk.toString())));
+		proc.stdout.on("data", (chunk: Buffer) => {
+			// Feed first: `onEvent?.(run, run.feed(…))` would skip the feed when there is no onEvent.
+			const changed = run.feed(chunk.toString());
+			onEvent?.(run, changed);
+			// A refused step never ran; after a few, Cursor is just spinning (and billing) until it gives up.
+			if (!refusedStop && refusalLimit > 0 && run.state.refusals >= refusalLimit) {
+				refusedStop = true;
+				kill();
+			}
+		});
 		proc.stderr.on("data", (chunk: Buffer) => stderr.push(chunk.toString()));
 		proc.on("error", (err: NodeJS.ErrnoException) =>
 			fail(err.code === "ENOENT" ? new Error(`${spec.bin} not found; install it from https://cursor.com/cli`) : err),
 		);
 		proc.on("close", (code) => {
-			onEvent?.(run, run.feed("\n"));
+			const changed = run.feed("\n");
+			onEvent?.(run, changed);
 			done(code);
 		});
 		const kill = () => {
@@ -138,6 +192,7 @@ export async function runCursor(
 		started,
 	};
 	if (stderr.length) out.stderr = stderrTail(stderr.join(""));
+	if (refusedStop) out.refused = refusalMessage(out.state, spec);
 	const ws = out.state.workspace;
 	if (spec.worktree && ws && ws !== spec.cwd) {
 		const [branch, status] = await Promise.all([

@@ -36,7 +36,7 @@ import {
 } from "./usage-cache.ts";
 import { cycleUsage, dollars, eventTokens, kfmt, type UsageEvent } from "./api.ts";
 import { type CliUsage, short, type ToolStep } from "./events.ts";
-import { lookupCharge, prepareRun, type RunSpec, runCursor, type WorktreeInfo } from "./run.ts";
+import { lookupCharge, prepareRun, refusalNote, type RunSpec, runCursor, type WorktreeInfo } from "./run.ts";
 import { startJob } from "./runner.ts";
 import { type CursorSettings, loadSettings } from "./settings.ts";
 import { applyToRepo, type CursorWorktree, describe, listWorktrees, removeWorktree } from "./worktrees.ts";
@@ -49,6 +49,7 @@ interface CursorDetails {
 	worktree?: WorktreeInfo;
 	sessionId?: string;
 	tools: ToolStep[];
+	refusals?: number;
 	answer: string;
 	live: string;
 	thinking: boolean;
@@ -58,6 +59,8 @@ interface CursorDetails {
 	charge?: UsageEvent;
 	chargeError?: string;
 	stderr?: string;
+	/** The run was stopped because Cursor kept refusing its own tools: why, and the fix. */
+	refused?: string;
 	done: boolean;
 }
 
@@ -74,7 +77,16 @@ function params(s: CursorSettings) {
 		),
 		cwd: Type.Optional(Type.String({ description: "Workspace directory (default: the session's cwd)" })),
 		network: Type.Optional(
-			Type.Boolean({ description: "Run without Cursor's sandbox so commands can reach the network (default false)" }),
+			Type.Boolean({
+				description:
+					"Run without Cursor's sandbox so commands can reach the network (default false). Outside the sandbox cursor-agent asks before every shell command and print mode can't answer, so commands are refused unless force is also true.",
+			}),
+		),
+		force: Type.Optional(
+			Type.Boolean({
+				description:
+					"Let Cursor run every command without asking (cursor-agent --force; default false). Needed for shell commands with network: true. Only for trusted prompts and workspaces: with the sandbox off, commands run with your full access.",
+			}),
 		),
 		worktree: Type.Optional(
 			Type.Boolean({
@@ -129,7 +141,7 @@ function structured(d: CursorDetails): CursorOutput {
 		model: d.model,
 		exitCode: d.exitCode ?? null,
 		durationMs: d.durationMs ?? 0,
-		...(d.exitCode !== 0 && d.stderr ? { error: d.stderr } : {}),
+		...(d.refused ? { error: d.refused } : d.exitCode !== 0 && d.stderr ? { error: d.stderr } : {}),
 		...(d.worktree ? { worktree: { path: d.worktree.path, branch: d.worktree.branch, changed: [...d.worktree.changed] } } : {}),
 	};
 }
@@ -236,6 +248,7 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			d.durationMs = outcome.durationMs;
 			if (outcome.stderr) d.stderr = outcome.stderr;
 			if (outcome.worktree) d.worktree = outcome.worktree;
+			if (outcome.refused) d.refused = outcome.refused;
 			const exitCode = outcome.exitCode;
 
 			if (signal?.aborted) {
@@ -259,14 +272,15 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			d.done = true;
 			void refreshCursorStatusChip(ctx); // pi-usage cache + footer chip; errors swallowed
 
-			const failed = exitCode !== 0;
-			const steps = d.tools.map((t) => `- ${t.summary}${t.ok === false ? " (failed)" : ""}`).join("\n");
+			const failed = exitCode !== 0 || !!d.refused;
+			const steps = d.tools.map((t) => `- ${t.summary}${t.refused ? " (refused)" : t.ok === false ? " (failed)" : ""}`).join("\n");
 			const wt = d.worktree
 				? `\nWorktree: ${d.worktree.path} (branch ${d.worktree.branch || "?"}), ${d.worktree.changed.length} changed file(s)${d.worktree.changed.length ? `:\n${d.worktree.changed.map((l) => `  ${l}`).join("\n")}` : ""}`
 				: "";
 			const text = truncateTail(
 				[
-					failed ? `Cursor exited with code ${exitCode}.` : "",
+					d.refused ?? (failed ? `Cursor exited with code ${exitCode}.` : ""),
+					d.refused ? "" : (refusalNote({ refusals: d.refusals ?? 0 }, spec) ?? ""),
 					d.answer || "(Cursor returned no answer)",
 					steps ? `\nCursor's steps:\n${steps}` : "",
 					wt,
@@ -285,6 +299,7 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			t += theme.fg("accent", args.model || s.defaultModel);
 			if (args.mode && args.mode !== "agent") t += theme.fg("muted", ` [${args.mode}]`);
 			if (args.network) t += theme.fg("warning", " [no sandbox]");
+			if (args.force) t += theme.fg("warning", " [run everything]");
 			if (args.worktree) t += theme.fg("muted", " [worktree]");
 			if (args.background) t += theme.fg("muted", " [background]");
 			if (args.prompt) t += ` ${theme.fg("dim", short(args.prompt, 90))}`;
@@ -320,7 +335,11 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 				);
 			}
 			lines.push(
-				(d.exitCode === 0 ? theme.fg("success", "  ✓ ") : theme.fg("error", `  ✗ exit ${d.exitCode} · `)) +
+				(d.refused
+					? theme.fg("error", `  ✗ refused ${d.refusals}× · `)
+					: d.exitCode === 0
+						? theme.fg("success", "  ✓ ")
+						: theme.fg("error", `  ✗ exit ${d.exitCode} · `)) +
 					theme.fg(d.charge ? "accent" : "warning", costLine(d)),
 			);
 			return new Text(lines.join("\n"), 0, 0);
