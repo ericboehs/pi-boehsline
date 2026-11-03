@@ -14,6 +14,7 @@
 
 ### Added
 
+- cursor-agent: `/cursor-worktrees` lists the `pi-*` worktrees the tool left behind, with their changed files, and applies each to its repo (uncommitted) or removes it.
 - cursor-agent: `worktree` (and `worktreeBase`) runs each call in its own git worktree and branch, so parallel calls can't collide; the result names the path, branch and changed files. The tool also declares an `outputSchema`, so codemode scripts get `{answer, steps, chargedCents, tokens, sessionId, …}` instead of text.
 - cursor-agent (opt-in): a `cursor` tool that delegates a task to Cursor's agent CLI (`cursor-agent -p`, sandboxed by default), streams its steps, returns its final answer, and reports the run's real charged cost from Cursor's dashboard API (macOS Keychain login). A footer chip keeps the session's Cursor spend; `/cursor-usage` shows the billing cycle against the per-user limit. Neutral by default: a default model, blocked models, a description note and extra prompt rules come from Boehsline config (so a work package can supply them) or `PI_CURSOR_*` env vars.
 - op-broker (opt-in): agents read 1Password through an approval card in the session (Allow once, 1 hour or 8 hours per item), and one shared daemon holds a single 1Password CLI authorization for every session, so it's one Touch ID per 12 hours, not one per command. An `op` shim takes `op read`, `op item get --otp` and `op item get --fields --reveal`, and everything else runs the real `op`. The card is a keyboard yes; the README states the risk.

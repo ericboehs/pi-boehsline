@@ -12,6 +12,7 @@ Adds a `cursor` tool that hands a coding task to [Cursor's agent CLI](https://cu
 Tool arguments: `prompt` (must be self-contained, since Cursor doesn't see the conversation), `model` (default from settings, otherwise `auto`), `mode` (`agent`, `plan` or `ask`; the last two are read-only), `cwd`, `network`, `worktree` and `worktreeBase`.
 
 - **`worktree: true`** runs Cursor in a new git worktree at `~/.cursor/worktrees/<repo>/pi-…`, on its own branch, so parallel calls can't overwrite each other or your checkout. The result names the path, the branch and `git status --short` there. Changes are left uncommitted for you to review, merge or delete (`git worktree remove`). `worktreeBase` picks the starting ref. `cwd` must be a git repo with at least one commit.
+- **`/cursor-worktrees`** reviews the `pi-*` worktrees left behind. Pick one to see its branch and changed files, then apply its changes to the repo (uncommitted, including any commits Cursor made and new files) and remove it, apply and keep it, remove it (asks first when that discards work), or skip it. A patch that doesn't apply cleanly isn't applied at all, and the worktree is kept. `/cursor-worktrees list`, or no UI, only lists them.
 - **Structured output for scripts.** Codemode scripts get an object instead of text: `{ answer, steps: [{kind, summary, ok?}], chargedCents?, tokens, sessionId?, model, exitCode, durationMs, worktree?: {path, branch, changed}, error? }`. `chargedCents` is missing when the server charge couldn't be found, and `error` holds stderr when the run failed.
 
   ```js

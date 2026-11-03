@@ -15,7 +15,7 @@
  * PI_CURSOR_* env vars; see settings.ts.
  */
 
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -28,6 +28,7 @@ import { optIn } from "../../../lib/opt-in.ts";
 import { cycleUsage, dollars, eventTokens, findUsageEvent, kfmt, type UsageEvent } from "./api.ts";
 import { type CliUsage, RunReducer, short, type ToolStep } from "./events.ts";
 import { blockedBy, type CursorSettings, loadSettings } from "./settings.ts";
+import { applyToRepo, type CursorWorktree, describe, git, listWorktrees, removeWorktree } from "./worktrees.ts";
 
 interface WorktreeInfo {
 	path: string;
@@ -103,14 +104,6 @@ const outputSchema = Type.Object({
 });
 
 type CursorOutput = Static<typeof outputSchema>;
-
-function git(cwd: string, args: string[]): Promise<string> {
-	return new Promise((done, fail) =>
-		execFile("git", ["-C", cwd, ...args], { timeout: 15_000 }, (err, stdout, stderr) =>
-			err ? fail(new Error(String(stderr || err.message).trim())) : done(String(stdout)),
-		),
-	);
-}
 
 function cliTokens(u?: CliUsage): number {
 	return u ? (u.inputTokens ?? 0) + (u.outputTokens ?? 0) + (u.cacheReadTokens ?? 0) + (u.cacheWriteTokens ?? 0) : 0;
@@ -355,4 +348,78 @@ export default optIn("cursor-agent", "A cursor tool that delegates tasks to Curs
 			}
 		},
 	});
+	pi.registerCommand("cursor-worktrees", {
+		description: "Review the pi-* worktrees Cursor left behind: apply their changes to the repo, or remove them",
+		handler: async (args, ctx) => {
+			try {
+				await reviewWorktrees(ctx, args.trim() === "list" || !ctx.hasUI);
+			} catch (err) {
+				ctx.ui.notify(`cursor-worktrees: ${(err as Error).message}`, "error");
+			}
+		},
+	});
 });
+
+const APPLY_REMOVE = "Apply changes to the repo, then remove the worktree";
+const APPLY_KEEP = "Apply changes to the repo, keep the worktree";
+const REMOVE = "Remove the worktree (discard its changes)";
+const SKIP = "Skip";
+const DONE = "Done";
+
+function details(wt: CursorWorktree): string {
+	const lines = [wt.path, `branch ${wt.branch || "?"} · repo ${wt.repo ?? "unknown"}`];
+	if (wt.ahead) lines.push(`${wt.ahead} commit(s) not in the repo's HEAD`);
+	const shown = wt.changed.slice(0, 15).map((l) => `  ${l}`);
+	if (wt.changed.length > shown.length) shown.push(`  … ${wt.changed.length - shown.length} more`);
+	lines.push(...(shown.length ? shown : ["  (no uncommitted changes)"]));
+	return lines.join("\n");
+}
+
+async function reviewWorktrees(ctx: ExtensionContext, listOnly: boolean): Promise<void> {
+	let worktrees = await listWorktrees();
+	if (!worktrees.length) {
+		ctx.ui.notify("No pi-* Cursor worktrees left behind.", "info");
+		return;
+	}
+	if (listOnly) {
+		ctx.ui.notify(worktrees.map((wt) => `${describe(wt)}\n${details(wt)}`).join("\n\n"), "info");
+		return;
+	}
+	const skipped = new Set<string>();
+	for (;;) {
+		const open = worktrees.filter((wt) => !skipped.has(wt.path));
+		if (!open.length) return;
+		const labels = open.map(describe);
+		const pick = await ctx.ui.select(`Cursor worktrees (${open.length})`, [...labels, DONE]);
+		if (!pick || pick === DONE) return;
+		const wt = open[labels.indexOf(pick)];
+		if (!wt) return;
+		const canApply = !!wt.repo && !wt.problem && (wt.changed.length > 0 || wt.ahead > 0);
+		const actions = canApply ? [APPLY_REMOVE, APPLY_KEEP, REMOVE, SKIP] : [REMOVE, SKIP];
+		const action = await ctx.ui.select(`${describe(wt)}\n${details(wt)}`, actions);
+		if (!action || action === SKIP) {
+			skipped.add(wt.path);
+			continue;
+		}
+		if (action === APPLY_REMOVE || action === APPLY_KEEP) {
+			try {
+				const { files } = await applyToRepo(wt);
+				ctx.ui.notify(`Applied ${files} file(s) to ${wt.repo} (uncommitted).`, "info");
+			} catch (err) {
+				ctx.ui.notify(`Kept ${wt.name}: ${(err as Error).message}`, "error");
+				skipped.add(wt.path);
+				continue;
+			}
+			if (action === APPLY_KEEP) skipped.add(wt.path);
+			else await removeWorktree(wt);
+		} else {
+			const lost = wt.changed.length + wt.ahead;
+			if (lost && !(await ctx.ui.confirm(`Remove ${wt.name}?`, `This discards ${wt.changed.length} uncommitted change(s)${wt.ahead ? ` and ${wt.ahead} commit(s)` : ""}.`))) {
+				continue;
+			}
+			await removeWorktree(wt);
+			ctx.ui.notify(`Removed ${wt.name}.`, "info");
+		}
+		worktrees = await listWorktrees();
+	}
+}
