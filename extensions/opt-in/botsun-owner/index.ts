@@ -117,7 +117,9 @@ interface Conn {
 	/** Stops the running turn as Esc does: "stopped", or "idle" when nothing is running. */
 	stop?: () => string;
 	/** The phone's Close: aborts a running turn ("stopped" / "idle"); the shutdown it returns runs once the reply is sent.
-	 * idleOnly (a locked phone's close_call): null while a turn or compaction runs, and nothing is aborted. */
+	 * idleOnly (a locked phone's close_call): null while a turn, Botsun's busy, a compaction or a video reply's
+	 * framing runs, a sent prompt hasn't started yet or pi has queued messages, and nothing is aborted; its
+	 * shutdown is skipped if one has started since. */
 	close?: (opts?: { idleOnly?: boolean }) => { stopped: boolean; shutdown: () => void } | null;
 	/** A call's verified words, held until the voice helper releases them (session-voice plan). */
 	held?: Map<string, { text: string; at: number; proposal?: string; sigV?: 1 | 2 | 3; deviceId?: string }>;
@@ -1035,7 +1037,12 @@ function closeCall(c: Conn, r: Record<string, unknown>): Record<string, unknown>
 		v2: { kind: "session", decision: "close_call", payload: () => "close" } }, "call");
 	if (denied) return { error: denied };
 	if (!c.close) return { error: "this session can't close from the phone yet; run /reload" };
-	const closing = c.busy ? null : c.close({ idleOnly: true });
+	// null while anything runs: pi's turn, Botsun's busy, a compaction, a reply whose video frames
+	// are still being extracted, or a sent prompt not started yet or queued (a turn on its way in).
+	// Its shutdown checks the same again. Botsun's busy and framing are also checked here, on this
+	// connection, in case running() ever stops covering them.
+	if (c.busy || c.framing) return { error: CLOSE_CALL_BUSY };
+	const closing = c.close({ idleOnly: true });
 	if (!closing) return { error: CLOSE_CALL_BUSY };
 	debug("owner close_call closed the session");
 	return { ok: true, [AFTER_REPLY]: closing.shutdown };
@@ -1191,6 +1198,17 @@ function write(c: Conn, type: string, extra: Record<string, unknown> = {}): void
 // A compaction under way (its reason): pi refuses a prompt mid-compaction, so the phone's words
 // wait for it to end (held in main), and the phone shows it.
 let compacting: string | null = null;
+// When a prompt was last sent (sendUser, pi's input and before_agent_start events; 0 once a turn
+// starts or settles): pi runs async input and before_agent_start handlers before the turn starts,
+// so for a moment a sent prompt is neither streaming nor busy. A locked phone's close counts it as
+// running for a while.
+let inputAt = 0;
+const PROMPT_STARTING_MS = 10_000;
+// Every prompt this extension sends: marked before pi's input event fires for it.
+function sendUser(pi: ExtensionAPI, content: string | UserContent[], options?: Parameters<ExtensionAPI["sendUserMessage"]>[1]): void {
+	inputAt = Date.now();
+	pi.sendUserMessage(content, options);
+}
 // Whether the approval guardian is bypassed (its state event), for the phone's red title.
 let bypassed = false;
 const GUARDIAN_BYPASS_STATE_EVENT = "approval-guardian:temporary-bypass-state";
@@ -1432,7 +1450,7 @@ function runCommand(pi: ExtensionAPI, ctx: ExtensionContext, text: string, busy:
 	if (BUILTINS.has(name)) return `/${name} only works at the keyboard`;
 	if (pi.getCommands().some((c) => c.name === name)) {
 		if (busy) return wait;
-		pi.sendUserMessage(text.trim(), { expandPromptTemplates: true });
+		sendUser(pi, text.trim(), { expandPromptTemplates: true });
 		return null;
 	}
 	return undefined; // not a command pi knows: plain text, as typing it would send
@@ -1509,9 +1527,12 @@ function main(pi: ExtensionAPI): void {
 		// pi records a steer as a plain user message: mark it in the session file so Botsun can
 		// label it. Covers steers typed in the TUI and sent from here (sendUserMessage deliverAs
 		// steer emits input too). Text only, best effort. Registered once per extension instance.
+		// Every prompt (typed, or any extension's sendUserMessage) also marks inputAt for a locked
+		// phone's close.
 		if (!steerHook) {
 			steerHook = true;
 			pi.on("input", (event) => {
+				inputAt = Date.now();
 				try {
 					if (event?.streamingBehavior !== "steer") return;
 					const text = typeof event.text === "string" ? event.text : "";
@@ -1526,7 +1547,7 @@ function main(pi: ExtensionAPI): void {
 		// Eric's own words, as if typed: steer into a running turn, else start one.
 		const inject = (content: string | UserContent[], busy: boolean) => {
 			if (compacting) held.push(content);
-			else pi.sendUserMessage(content, busy ? { deliverAs: "steer" } : undefined);
+			else sendUser(pi, content, busy ? { deliverAs: "steer" } : undefined);
 		};
 		// Released call words. queue: a follow-up once the turn ends (a prompt when idle). steer: as a
 		// typed message would. stop: abort the run, like Esc, then send them once pi settles.
@@ -1537,11 +1558,11 @@ function main(pi: ExtensionAPI): void {
 				return compacting ? "held" : idle ? "prompt" : "steer";
 			}
 			if (idle) {
-				pi.sendUserMessage(text);
+				sendUser(pi, text);
 				return "prompt";
 			}
 			if (mode === "queue") {
-				pi.sendUserMessage(text, { deliverAs: "followUp" });
+				sendUser(pi, text, { deliverAs: "followUp" });
 				return "queue";
 			}
 			afterStop.push(text);
@@ -1555,10 +1576,22 @@ function main(pi: ExtensionAPI): void {
 			return "stopped";
 		};
 		// The phone's Close: stop what's running, then (after the reply) a graceful exit. idleOnly
-		// (close_call): nothing while a turn or compaction runs.
+		// (close_call): nothing while a turn or compaction runs, a prompt is on its way in (sent,
+		// not started yet) or messages wait in pi's queue, and the same again at shutdown (a typed
+		// prompt, a follow-up or a trigger may have started one since the reply).
+		const running = () =>
+			!ctx.isIdle() || compacting !== null || conn?.busy === true || conn?.framing !== undefined ||
+			(inputAt > 0 && Date.now() - inputAt < PROMPT_STARTING_MS) || ctx.hasPendingMessages?.() === true;
 		const close = (opts?: { idleOnly?: boolean }) => {
-			if (opts?.idleOnly && (!ctx.isIdle() || compacting)) return null;
-			return { stopped: stop() === "stopped", shutdown: () => ctx.shutdown() };
+			if (opts?.idleOnly && running()) return null;
+			const shutdown = () => {
+				if (opts?.idleOnly && running()) {
+					debug("close_call: a turn started before the shutdown; not closing");
+					return;
+				}
+				ctx.shutdown();
+			};
+			return { stopped: stop() === "stopped", shutdown };
 		};
 		const command = (text: string, busy: boolean) =>
 			compacting && /^\//.test(text.trim()) && !/^\/(model|thinking|name|bypass)\b/.test(text.trim()) ? "wait for the compaction to finish" : runCommand(pi, ctx, text, busy);
@@ -1730,20 +1763,27 @@ function main(pi: ExtensionAPI): void {
 		clearTimeout(footerTimer);
 	});
 
+	// A slow input handler can outlast PROMPT_STARTING_MS: the turn's last step before it starts.
+	pi.on("before_agent_start", () => {
+		inputAt = Date.now();
+		return undefined;
+	});
 	pi.on("agent_start", () => {
+		inputAt = 0; // pi's turn counts as running from here
 		if (!conn || conn.closed || conn.busy) return;
 		conn.busy = true;
 		write(conn, "busy");
 	});
 
 	pi.on("agent_settled", () => {
+		inputAt = 0;
 		if (afterStop.length) {
 			// As if typed after Esc; through inject, so a compaction starting now still holds them.
 			const text = afterStop.join("\n\n");
 			afterStop = [];
 			try {
 				if (conn && !conn.closed) conn.inject(text, false);
-				else pi.sendUserMessage(text);
+				else sendUser(pi, text);
 			} catch {}
 		}
 		if (!conn || conn.closed || !conn.busy) return;
@@ -1771,7 +1811,7 @@ function main(pi: ExtensionAPI): void {
 		held = [];
 		out.forEach((content, i) => {
 			const options = i > 0 ? { deliverAs: "followUp" as const } : ctx.isIdle() ? undefined : { deliverAs: "steer" as const };
-			try { pi.sendUserMessage(content, options); } catch {}
+			try { sendUser(pi, content, options); } catch {}
 		});
 	};
 	pi.on("session_compact", (_event, ctx) => {

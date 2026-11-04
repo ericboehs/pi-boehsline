@@ -1279,6 +1279,158 @@ test("a locked phone's close: call key, v2, decision close_call, this session on
 	assert.equal(m.sent.length, 0);
 });
 
+test("a locked phone's close waits out a compaction, even one that runs while pi is idle", async () => {
+	const { CLOSE_CALL_BUSY } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const call = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: {}, call_devices: { 7: call.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	const m = await owner();
+	const log = [];
+	m.ctx.isIdle = () => true;
+	m.ctx.abort = () => log.push("abort");
+	m.ctx.shutdown = () => log.push("shutdown");
+	const callClose = async () => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "close", key: "call", nonce, device_id: 7, sig_v: 2, signature: signV2(call, nonce, "session", "close_call", "close") });
+	};
+	await m.fire("session_before_compact", { reason: "threshold" });
+	assert.equal((await callClose()).error, CLOSE_CALL_BUSY);
+	await m.fire("session_compact", { reason: "threshold" });
+	await sleep(50);
+	assert.deepEqual(log, [], "nothing aborted, nothing shut down");
+	assert.deepEqual(await callClose(), { ok: true });
+	await until(() => log.includes("shutdown"));
+	assert.deepEqual(log, ["shutdown"]);
+});
+
+test("a locked phone's close counts a sent prompt that hasn't started, or pi's queue, as running", async () => {
+	const { CLOSE_CALL_BUSY } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const call = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: {}, call_devices: { 7: call.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	const m = await owner();
+	const log = [];
+	let pending = false;
+	m.ctx.isIdle = () => true; // pi's input and before_agent_start handlers still running
+	m.ctx.hasPendingMessages = () => pending;
+	m.ctx.abort = () => log.push("abort");
+	m.ctx.shutdown = () => log.push("shutdown");
+	const callClose = async () => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "close", key: "call", nonce, device_id: 7, sig_v: 2, signature: signV2(call, nonce, "session", "close_call", "close") });
+	};
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	await m.fire("input", { text: "run the tests", source: "interactive" });
+	assert.equal((await callClose()).error, CLOSE_CALL_BUSY, "sent, not started");
+	await m.fire("agent_start");
+	await m.fire("agent_settled");
+	// Sent after the reply: the shutdown is skipped.
+	const closing = conn.close({ idleOnly: true });
+	await m.fire("input", { text: "one more thing", source: "extension" });
+	closing.shutdown();
+	await m.fire("agent_settled");
+	pending = true;
+	assert.equal((await callClose()).error, CLOSE_CALL_BUSY, "messages in pi's queue");
+	pending = false;
+	await m.fire("input", { text: "a prompt another extension handled", source: "interactive" });
+	const realNow = Date.now;
+	try {
+		Date.now = () => realNow() + 9_000;
+		assert.equal(conn.close({ idleOnly: true }), null, "still within its 10 s");
+		Date.now = () => realNow() + 10_001;
+		await sleep(50);
+		assert.deepEqual(log, [], "nothing aborted, nothing shut down");
+		assert.deepEqual(await callClose(), { ok: true }, "a prompt that never started stops counting after 10 s");
+	} finally {
+		Date.now = realNow;
+	}
+	await until(() => log.includes("shutdown"));
+	assert.deepEqual(log, ["shutdown"]);
+});
+
+test("a locked phone's close counts words this extension released after a stop or a compaction as on their way in", async () => {
+	const { CLOSE_CALL_BUSY } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const call = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: {}, call_devices: { 7: call.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	const m = await owner();
+	const log = [];
+	let idle = false;
+	m.ctx.isIdle = () => idle;
+	m.ctx.abort = () => log.push("abort");
+	m.ctx.shutdown = () => log.push("shutdown");
+	const callClose = async () => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "close", key: "call", nonce, device_id: 7, sig_v: 2, signature: signV2(call, nonce, "session", "close_call", "close") });
+	};
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	const realNow = Date.now;
+	const later = (ms) => { Date.now = () => realNow() + ms; };
+	try {
+		// Stop, then the words once pi settles: sent by this extension, pi's input event not yet run.
+		assert.equal(conn.deliver("try the other fix", "stop"), "stopped");
+		idle = true;
+		await m.fire("agent_settled");
+		assert.deepEqual(m.sent.map((s) => s.content), ["try the other fix"]);
+		assert.equal((await callClose()).error, CLOSE_CALL_BUSY, "released after a stop");
+		later(10_001);
+		// Held through a compaction, then released at its end.
+		await m.fire("session_before_compact", { reason: "threshold" });
+		conn.inject("and this", false);
+		await m.fire("session_compact", { reason: "threshold" });
+		assert.deepEqual(m.sent.map((s) => s.content), ["try the other fix", "and this"]);
+		assert.equal((await callClose()).error, CLOSE_CALL_BUSY, "released after a compaction");
+		later(20_002);
+		assert.equal(conn.deliver("a released call's words", "queue"), "prompt");
+		assert.equal((await callClose()).error, CLOSE_CALL_BUSY, "a released call's words");
+		// pi's before_agent_start: a slow input handler doesn't let the close in before the turn.
+		later(30_003);
+		await m.fire("before_agent_start", { prompt: "and this" });
+		later(39_000);
+		assert.equal((await callClose()).error, CLOSE_CALL_BUSY, "refreshed as the turn starts");
+		await m.fire("agent_start");
+		await m.fire("input", { text: "typed mid-turn", source: "interactive" }); // taken by the turn
+		await m.fire("agent_settled");
+		assert.deepEqual(log, ["abort"], "only the stop's abort");
+		assert.deepEqual(await callClose(), { ok: true });
+	} finally {
+		Date.now = realNow;
+	}
+	await until(() => log.includes("shutdown"));
+	assert.deepEqual(log, ["abort", "shutdown"]);
+});
+
+test("a locked phone's close checks again at shutdown: a turn started since its reply keeps the session", async () => {
+	const m = await owner();
+	let idle = true;
+	const log = [];
+	m.ctx.isIdle = () => idle;
+	m.ctx.abort = () => log.push("abort");
+	m.ctx.shutdown = () => log.push("shutdown");
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	// What closeCall replies with: its shutdown runs once the reply is out, and something starts first.
+	let closing = conn.close({ idleOnly: true });
+	await m.fire("agent_start"); // a typed prompt, a follow-up, a trigger (Botsun's busy)
+	closing.shutdown();
+	await m.fire("agent_settled");
+	closing = conn.close({ idleOnly: true });
+	idle = false; // pi's own word
+	closing.shutdown();
+	idle = true;
+	closing = conn.close({ idleOnly: true });
+	await m.fire("session_before_compact", { reason: "threshold" });
+	closing.shutdown();
+	await m.fire("session_compact", { reason: "threshold" });
+	closing = conn.close({ idleOnly: true });
+	conn.framing = new Promise(() => {}); // a video reply on its way in
+	assert.equal(conn.close({ idleOnly: true }), null, "refused while its frames are extracted");
+	closing.shutdown();
+	conn.framing = undefined;
+	assert.deepEqual(log, [], "nothing aborted, nothing shut down");
+	conn.close({ idleOnly: true }).shutdown();
+	assert.deepEqual(log, ["shutdown"], "still idle at shutdown: closed");
+});
+
 test("a yes on the call answers the ask only with the read-back answer's hash, and never a no", async () => {
 	const { offerPrompt, canonicalAnswer } = await import("../lib/remote-prompts.ts");
 	const { m, hold } = await heldCall();
