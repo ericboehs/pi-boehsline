@@ -1234,6 +1234,51 @@ test("close: Eric's phone aborts a running turn, gets {ok} at once, then pi shut
 	assert.equal(m.sent.length, 0);
 });
 
+test("a locked phone's close: call key, v2, decision close_call, this session only; never ends a running turn", async () => {
+	const { CLOSE_CALL_BUSY } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const decide = phoneKey();
+	const call = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: { 7: decide.raw.toString("base64") }, call_devices: { 7: call.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	const m = await owner();
+	let idle = true;
+	const log = [];
+	m.ctx.isIdle = () => idle;
+	m.ctx.abort = () => log.push("abort");
+	m.ctx.shutdown = () => log.push("shutdown");
+	const callClose = async ({ key = call, decision = "close_call", scope = "sid-a", extra = {} } = {}) => {
+		const { nonce, features } = await ask({ type: "nonce" });
+		assert.ok(features.includes("close_call"));
+		return ask({ type: "close", key: "call", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", decision, "close", { scope }), ...extra });
+	};
+	assert.equal((await callClose({ key: decide })).error, "signature does not verify", "the main key isn't the call key");
+	assert.equal((await callClose({ decision: "close" })).error, "signature does not verify", "a close signature isn't a close_call one");
+	assert.equal((await callClose({ decision: "say_call" })).error, "signature does not verify", "nor a locked reply's");
+	assert.equal((await callClose({ scope: "sid-b" })).error, "signature does not verify", "this session only");
+	assert.equal((await callClose({ extra: { sig_v: 1 } })).error, "a call-key close must be signed v2");
+	assert.equal((await callClose({ extra: { key: "main" } })).error, "bad request");
+	// The other way round: a close_call signature sent as a main-key close.
+	let { nonce } = await ask({ type: "nonce" });
+	assert.equal((await ask({ type: "close", nonce, device_id: 7, sig_v: 2, signature: signV2(call, nonce, "session", "close_call", "close") })).error,
+		"signature does not verify");
+	assert.deepEqual(log, []);
+	// A running turn (or Botsun's busy): refused, nothing aborted, and the nonce stays spent once it settles.
+	idle = false;
+	({ nonce } = await ask({ type: "nonce" }));
+	const signature = signV2(call, nonce, "session", "close_call", "close");
+	assert.equal((await ask({ type: "close", key: "call", nonce, device_id: 7, sig_v: 2, signature })).error, CLOSE_CALL_BUSY);
+	idle = true;
+	assert.equal((await ask({ type: "close", key: "call", nonce, device_id: 7, sig_v: 2, signature })).error, "nonce is expired or used", "no replay");
+	await m.fire("agent_start");
+	assert.equal((await callClose()).error, CLOSE_CALL_BUSY, "busy as Botsun sees it");
+	await m.fire("agent_settled");
+	assert.deepEqual(log, [], "never aborted");
+	assert.deepEqual(await callClose(), { ok: true });
+	await until(() => log.includes("shutdown"));
+	assert.deepEqual(log, ["shutdown"]);
+	assert.equal(m.sent.length, 0);
+});
+
 test("a yes on the call answers the ask only with the read-back answer's hash, and never a no", async () => {
 	const { offerPrompt, canonicalAnswer } = await import("../lib/remote-prompts.ts");
 	const { m, hold } = await heldCall();

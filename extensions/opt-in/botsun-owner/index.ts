@@ -116,8 +116,9 @@ interface Conn {
 	deliver?: (text: string, mode: "queue" | "steer" | "stop") => string;
 	/** Stops the running turn as Esc does: "stopped", or "idle" when nothing is running. */
 	stop?: () => string;
-	/** The phone's Close: aborts a running turn ("stopped" / "idle"); the shutdown it returns runs once the reply is sent. */
-	close?: () => { stopped: boolean; shutdown: () => void };
+	/** The phone's Close: aborts a running turn ("stopped" / "idle"); the shutdown it returns runs once the reply is sent.
+	 * idleOnly (a locked phone's close_call): null while a turn or compaction runs, and nothing is aborted. */
+	close?: (opts?: { idleOnly?: boolean }) => { stopped: boolean; shutdown: () => void } | null;
 	/** A call's verified words, held until the voice helper releases them (session-voice plan). */
 	held?: Map<string, { text: string; at: number; proposal?: string; sigV?: 1 | 2 | 3; deviceId?: string }>;
 	/** A reply whose video frames are still being extracted: later replies wait for it, to keep their order. */
@@ -553,7 +554,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (r.type === "answer") return r.key !== undefined ? answerCall(c, r) : answerAsk(c, r);
 	if (r.type === "stash") return stashRequest(c, r);
 	if (r.type === "stop") return stopRequest(c, r);
-	if (r.type === "close") return closeRequest(c, r);
+	if (r.type === "close") return r.key !== undefined ? closeCall(c, r) : closeRequest(c, r);
 	// Display only (a chip's mode, as a click on the footer flips it): not signed, nothing acts.
 	if (r.type === "footer_tap") return footerTap(String(r.chip ?? ""));
 	if (r.type !== "say") return { error: "unknown request" };
@@ -1014,8 +1015,30 @@ function closeRequest(c: Conn, r: Record<string, unknown>): Record<string, unkno
 	// refused (checked after verifyDevice, so its nonce is spent and its errors stay alike).
 	if (!atLeastV2(r)) return { error: CLOSE_V1_REFUSED };
 	if (!c.close) return { error: "this session can't close from the phone yet; run /reload" };
-	const { shutdown } = c.close();
+	const { shutdown } = c.close()!;
 	return { ok: true, [AFTER_REPLY]: shutdown };
+}
+
+/** A locked phone's close while a turn runs (Botsun refuses it first, naming the session). */
+export const CLOSE_CALL_BUSY = "this session is running a turn: close it once the turn ends, or from the app";
+
+/**
+ * A locked phone's Close session (a reply notification's, the Watch's), signed with the phone's
+ * call key (key: "call"). v2 only, its own decision "close_call" over "close": a main-key "close"
+ * never verifies here, nor this one as a "close". Unlike close it never ends a running turn: refused
+ * while one runs (after verifyDevice, so its nonce is spent and it can't land once the turn ends).
+ */
+function closeCall(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	if (r.key !== "call") return { error: "bad request" };
+	if (!atLeastV2(r)) return { error: "a call-key close must be signed v2" };
+	const denied = verifyDevice(c, r, { decision: "close_call", digest: () => sha256hex(Buffer.from("close", "utf8")),
+		v2: { kind: "session", decision: "close_call", payload: () => "close" } }, "call");
+	if (denied) return { error: denied };
+	if (!c.close) return { error: "this session can't close from the phone yet; run /reload" };
+	const closing = c.busy ? null : c.close({ idleOnly: true });
+	if (!closing) return { error: CLOSE_CALL_BUSY };
+	debug("owner close_call closed the session");
+	return { ok: true, [AFTER_REPLY]: closing.shutdown };
 }
 
 function listenOwner(c: Conn): void {
@@ -1179,7 +1202,7 @@ function featureList(c: Conn): string[] {
 	const hasStash = (() => {
 		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 	})();
-	return ["say", "say_call", "answer_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close",
+	return ["say", "say_call", "answer_call", "close_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close",
 		...(hasStash ? ["stash"] : [])];
 }
 
@@ -1531,8 +1554,12 @@ function main(pi: ExtensionAPI): void {
 			ctx.abort();
 			return "stopped";
 		};
-		// The phone's Close: stop what's running, then (after the reply) a graceful exit.
-		const close = () => ({ stopped: stop() === "stopped", shutdown: () => ctx.shutdown() });
+		// The phone's Close: stop what's running, then (after the reply) a graceful exit. idleOnly
+		// (close_call): nothing while a turn or compaction runs.
+		const close = (opts?: { idleOnly?: boolean }) => {
+			if (opts?.idleOnly && (!ctx.isIdle() || compacting)) return null;
+			return { stopped: stop() === "stopped", shutdown: () => ctx.shutdown() };
+		};
 		const command = (text: string, busy: boolean) =>
 			compacting && /^\//.test(text.trim()) && !/^\/(model|thinking|name|bypass)\b/.test(text.trim()) ? "wait for the compaction to finish" : runCommand(pi, ctx, text, busy);
 		const commands = () => phoneCommands(pi);
