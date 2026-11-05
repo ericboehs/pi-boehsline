@@ -2,7 +2,9 @@
 // (protocol: botsun-owner v1, client side). Botsun's web process listens; we
 // only ever write newline-delimited JSON to it: hello on every (re)connect with
 // the full current state, then busy/idle/prompt/prompt_end/session/bye (and
-// footer/usage on change: the usage windows are provider-usage's numbers).
+// footer/usage on change: the usage windows are provider-usage's numbers), and
+// what /color is (color.ts) on hello, session and each change. Botsun writes
+// back down it only a sandbox session's token and the session's saved color.
 //
 // T2, reply as Eric: each session also listens on its own owner socket
 // (~/.local/state/botsun/owner/<pid>.sock, 0600). Botsun asks it for a nonce,
@@ -38,6 +40,7 @@ import { checkPin, isPinsError, pin, ratchet, shortFingerprint, signVersionOf, t
 import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
 import { latestUsage, onUsageChange, type ProviderUsageSnapshot } from "../../../lib/usage-snapshot.ts";
+import { claimOf, colorPush, type ColorClaim } from "./color.ts";
 
 type PromptKind = "select" | "confirm" | "input" | "editor" | "custom";
 interface Prompt { kind: PromptKind; title: string }
@@ -142,6 +145,15 @@ interface Conn {
 	/** The conversation the last hello named, cleared by a `session` line naming another: a token is kept only while
 	 * pi is still in it (a renewal on its way during a switch is dropped). */
 	boundId?: string | null;
+	/** /color through the color extension's events (extensions/color): what it is now, null when that extension
+	 * isn't loaded; and set it, false when it couldn't. */
+	color?: { claim: () => ColorClaim | null; set: (spec: string, at: number) => boolean };
+	/** The last claim Botsun was told or sent (JSON): a change to it is reported, one Botsun sent is not. */
+	colorSaid?: string;
+	/** Botsun's color as /color last took it, and for which session: the same color at the same time in
+	 * another session was carried there by /color (a /new or /resume), not picked. On the connection,
+	 * so it outlives a /reload. */
+	colorApplied?: { sessionId: string; color: string; at: number };
 }
 
 const store = globalThis as unknown as { [STORE]?: Conn };
@@ -590,11 +602,15 @@ export const SESSION_TOKEN = Symbol.for("botsun.sessionToken");
 const SERVER_LINE_MAX = 4096;
 
 /**
- * A line Botsun wrote down this process's own connection to it. Only a sandbox session's VM
- * bridge writes one: its VM-tool token (vm/owner-bridge.mjs, after Botsun bound this session's
- * hello to its template and Eric started it); a newer one (a renewal) replaces it. Never taken
- * from <pid>.sock, where any process of this user could connect. Kept in this process only:
- * never a file, env, the transcript or a log. Anything else is ignored. Returns whether it took one.
+ * A line Botsun wrote down this process's own connection to it: never taken from <pid>.sock,
+ * where any process of this user could connect. Two kinds, anything else is ignored:
+ * - "color": the session's saved color on Botsun (its phone's pick, or a reset's), for /color
+ *   (applyColor). Botsun on the Mac and a sandbox VM's bridge both send it.
+ * - "sandbox_token": a sandbox session's VM-tool token, from its VM's bridge only
+ *   (vm/owner-bridge.mjs, after Botsun bound this session's hello to its template and Eric started
+ *   it); a newer one (a renewal) replaces it. Kept in this process only: never a file, env, the
+ *   transcript or a log.
+ * Returns whether it took one.
  */
 export function serverLine(c: Conn, line: string): boolean {
 	let msg: unknown;
@@ -605,12 +621,48 @@ export function serverLine(c: Conn, line: string): boolean {
 	}
 	if (!msg || typeof msg !== "object" || Array.isArray(msg)) return false;
 	const { v, type, token, expires_in: ttl } = msg as Record<string, unknown>;
+	if (v === 1 && type === "color") return applyColor(c, msg as Record<string, unknown>);
 	if (v !== 1 || type !== "sandbox_token") return false;
 	if (typeof token !== "string" || !SANDBOX_TOKEN.test(token)) return false;
 	if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < 1 || ttl > SANDBOX_TOKEN_MAX_S) return false;
 	if (c.boundId !== c.sessionId) return true; // for a conversation pi has left: read, not kept
 	c.sandboxToken = { token, expiresAt: Date.now() + ttl * 1000 };
 	return true;
+}
+
+/**
+ * Botsun's color for this session, into /color. Only for the session pi is in now (a line for one
+ * it has left is read, not taken), only a Botsun name, and only through the color extension: without
+ * it, nothing. What Botsun sent is what it is told back, so taking it says nothing new (no echo).
+ */
+function applyColor(c: Conn, msg: Record<string, unknown>): boolean {
+	const push = colorPush(c.sessionId, msg);
+	if (!push || !c.color) return false;
+	const said = c.colorSaid;
+	c.colorSaid = JSON.stringify({ color: push.color, color_at: push.at } satisfies ColorClaim);
+	let ok = false;
+	// pi's events throw once this instance is stale (a /reload or /new mid-handoff); a throw here
+	// would reach the socket's data handler and end pi.
+	try { ok = c.color.set(push.spec, push.at); } catch {}
+	if (ok) c.colorApplied = { sessionId: c.sessionId!, color: push.color, at: push.at };
+	else c.colorSaid = said;
+	return ok;
+}
+
+/** The /color claim for a hello or session line ({color, color_at}), noted as said; none without the color extension. */
+function colorFields(c: Conn): Partial<ColorClaim> & { color_carried?: true } {
+	let claim: ColorClaim | null = null;
+	try { claim = c.color?.claim() ?? null; } catch {}
+	if (!claim) return {};
+	c.colorSaid = JSON.stringify(claim);
+	return carried(c, claim);
+}
+
+/** The claim, with color_carried when it is the color Botsun gave another session: Botsun keeps that one
+ * from becoming this session's pick, even when it no longer remembers sending it (a restart between). */
+function carried(c: Conn, claim: ColorClaim): ColorClaim & { color_carried?: true } {
+	const a = c.colorApplied;
+	return a && a.sessionId !== c.sessionId && a.color === claim.color && a.at === claim.color_at ? { ...claim, color_carried: true } : claim;
 }
 
 /** This session's sandbox token while its connection to Botsun is up and the token unexpired, else undefined. */
@@ -1212,6 +1264,37 @@ function sendUser(pi: ExtensionAPI, content: string | UserContent[], options?: P
 // Whether the approval guardian is bypassed (its state event), for the phone's red title.
 let bypassed = false;
 const GUARDIAN_BYPASS_STATE_EVENT = "approval-guardian:temporary-bypass-state";
+// The color extension's (extensions/color), by name: no import either way.
+const COLOR_SET_EVENT = "color:set";
+const COLOR_STATE_EVENT = "color:state";
+const COLOR_QUERY_EVENT = "color:query";
+
+/** /color through the color extension's events: claim() is null when it isn't loaded, set() false when it couldn't. */
+export function colorHooks(pi: Pick<ExtensionAPI, "events">): NonNullable<Conn["color"]> {
+	return {
+		claim: () => {
+			let state: unknown = null;
+			pi.events?.emit?.(COLOR_QUERY_EVENT, { reply: (s: unknown) => { state = s; } });
+			return claimOf(state as { spec?: unknown; at?: unknown } | null);
+		},
+		set: (spec, at) => {
+			const req: { spec: string; at: number; from: string; handled?: boolean; error?: string } = { spec, at, from: "Botsun" };
+			pi.events?.emit?.(COLOR_SET_EVENT, req);
+			return req.handled === true && !req.error;
+		},
+	};
+}
+
+/** A /color change, for Botsun: reported unless it is what Botsun was last told or sent. */
+export function reportColor(c: Conn | undefined, state: unknown): void {
+	if (!c || c.closed) return;
+	const claim = claimOf(state as { spec?: unknown; at?: unknown } | null);
+	if (!claim) return;
+	const key = JSON.stringify(claim);
+	if (key === c.colorSaid) return;
+	c.colorSaid = key;
+	write(c, "color", { ...carried(c, claim) });
+}
 const GUARDIAN_BYPASS_CONTROL_EVENT = "approval-guardian:set-temporary-bypass";
 
 // What this version takes: the nonce reply's list, also in hello (and after a reload) so the
@@ -1267,6 +1350,7 @@ function sendHello(c: Conn): void {
 		usage: usageLine(),
 		compacting,
 		bypass: bypassed,
+		...colorFields(c),
 		context: (() => {
 			try { return c.context?.() ?? null; } catch { return null; }
 		})(),
@@ -1303,7 +1387,7 @@ function connect(c: Conn): void {
 		debug("connected");
 		sendHello(c);
 	});
-	// Botsun on the Mac never writes; a sandbox VM's bridge writes this session's token
+	// Botsun writes this session's saved color, and a sandbox VM's bridge its token too
 	// (serverLine). Read line by line, at most SERVER_LINE_MAX each, so the socket can't stall.
 	let buf = "";
 	let skipping = false; // inside a line over SERVER_LINE_MAX: dropped to its newline
@@ -1313,7 +1397,9 @@ function connect(c: Conn): void {
 		buf += chunk;
 		let nl;
 		while ((nl = buf.indexOf("\n")) >= 0) {
-			if (!skipping && nl <= SERVER_LINE_MAX) serverLine(c, buf.slice(0, nl));
+			if (!skipping && nl <= SERVER_LINE_MAX) {
+				try { serverLine(c, buf.slice(0, nl)); } catch {} // an uncaught throw in a socket handler ends pi
+			}
 			skipping = false;
 			buf = buf.slice(nl + 1);
 		}
@@ -1519,6 +1605,9 @@ function main(pi: ExtensionAPI): void {
 		bypassed = (state as { active?: unknown } | undefined)?.active === true;
 		if (conn && !conn.closed) try { write(conn, "bypass", { active: bypassed }); } catch {}
 	});
+	// /color, as the color extension announces it: Botsun keeps the session's color the same.
+	pi.events?.on?.(COLOR_STATE_EVENT, (state: unknown) => reportColor(conn, state));
+	const color = colorHooks(pi);
 
 	pi.on("session_start", (_event, ctx) => {
 		// Interactive TUI only: print/json have no UI, and Botsun drives its own
@@ -1616,6 +1705,7 @@ function main(pi: ExtensionAPI): void {
 			conn.models = models;
 			conn.context = context;
 			conn.confirm = confirm;
+			conn.color = color;
 			// A connection made by an older version of this extension (T1, before /reload) has
 			// no nonce map or owner socket yet: upgrade it in place.
 			conn.nonces ??= new Map();
@@ -1643,7 +1733,7 @@ function main(pi: ExtensionAPI): void {
 			}
 			if (changed) {
 				if (conn.boundId !== conn.sessionId) conn.boundId = null;
-				write(conn, "session", { session_file: conn.sessionFile, session_id: conn.sessionId, cwd: conn.cwd });
+				write(conn, "session", { session_file: conn.sessionFile, session_id: conn.sessionId, cwd: conn.cwd, ...colorFields(conn) });
 			}
 			// A reload may have added or dropped commands: the phone's "/" list follows.
 			try { write(conn, "commands", { commands: commands() }); } catch {}
@@ -1660,7 +1750,7 @@ function main(pi: ExtensionAPI): void {
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
 			busy: false, prompt: null, promptDepth: 0, sessionName, ...info, launch: g[LAUNCH],
-			nonces: new Map(), inject, deliver, stop, close, command, commands, models, context, confirm, model: modelOf(ctx),
+			nonces: new Map(), inject, deliver, stop, close, command, commands, models, context, confirm, color, model: modelOf(ctx),
 		};
 		store[STORE] = conn;
 		connect(conn);

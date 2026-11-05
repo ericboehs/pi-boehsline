@@ -19,6 +19,17 @@
 // process.env for every command, so eert-bot-feed can post under an avatar
 // that matches the border. Process env only, so it's still not persisted.
 //
+// Other extensions read and set it over pi.events, with no import either way
+// (botsun-owner keeps it in step with the session's color on Botsun's phone):
+//   - "color:set" {spec, at, from?}: apply spec (anything /color takes but auto,
+//     list and the off words; null is off) as of `at` (ms), unless the color
+//     now is newer. Answered synchronously: the handler sets `handled` (and
+//     `error` if it couldn't), so a sender can tell this extension isn't loaded.
+//   - "color:state" {spec, at, source}: emitted on every change, by /color
+//     ("command") or "color:set" ("set"). spec is what /color was given
+//     ("blue", "#ff0088", "204") or null; at is when (ms), null if never.
+//   - "color:query" {reply}: reply({spec, at}) at once.
+//
 // Two consequences of pi's setThemeInstance(), both intentional trades:
 //   - the theme file watcher stops, so editing the active custom theme's JSON
 //     no longer hot-reloads until /color off;
@@ -83,6 +94,33 @@ interface ColorState {
   baseline?: Theme;
   /** The tinted instance we handed to pi, used to detect a theme change from elsewhere. */
   tinted?: Theme;
+  /** When the color last changed (ms), by /color or "color:set"; undefined if it never did. */
+  at?: number;
+}
+
+/** Set the color from another extension (see the header); no import needed. */
+export const COLOR_SET_EVENT = "color:set";
+/** Announced on every change. */
+export const COLOR_STATE_EVENT = "color:state";
+/** Answered with the current {spec, at}. */
+export const COLOR_QUERY_EVENT = "color:query";
+
+export interface ColorSetRequest {
+  /** What /color takes ("blue", "#ff0088", "204"), or null for off. */
+  spec: string | null;
+  /** When it was chosen (ms): the state's `at` from now on. */
+  at: number;
+  /** Who set it, for the notice ("Botsun"). */
+  from?: string;
+  /** Set synchronously by the handler. */
+  handled?: boolean;
+  error?: string;
+}
+
+export interface ColorStateEvent {
+  spec: string | null;
+  at: number | null;
+  source: "command" | "set";
 }
 
 function stash(): ColorState {
@@ -165,7 +203,7 @@ function fgAnsi(value: ColorValue, mode: string): string {
 function parseColor(input: string): ColorValue | null {
   const token = input.trim().toLowerCase();
   if (!token) return null;
-  if (token in PALETTE) return PALETTE[token]!;
+  if (Object.hasOwn(PALETTE, token)) return PALETTE[token]!;
   if (/^\d{1,3}$/.test(token)) {
     const index = Number.parseInt(token, 10);
     return index <= 255 ? index : null;
@@ -192,7 +230,7 @@ function swatch(value: ColorValue): string {
 
 /** "blue (#5f87ff)", "#ff0088", "xterm 204" — what to echo back after applying. */
 function describe(token: string, value: ColorValue): string {
-  if (token in PALETTE) return `${token} (${value as string})`;
+  if (Object.hasOwn(PALETTE, token)) return `${token} (${value as string})`;
   return typeof value === "number" ? `xterm ${value}` : value;
 }
 
@@ -265,6 +303,13 @@ function liveTheme(ctx: ExtensionContext): Theme {
 
 export default function colorExtension(pi: ExtensionAPI): void {
   const state = stash();
+  /** The session's context, for a "color:set" that comes from outside a command. */
+  let lastCtx: ExtensionContext | undefined;
+
+  function announce(source: ColorStateEvent["source"]): void {
+    const event: ColorStateEvent = { spec: state.spec ?? null, at: state.at ?? null, source };
+    pi.events?.emit?.(COLOR_STATE_EVENT, event);
+  }
   // Re-export after /reload (the stash survives it), so a session colored
   // before this line existed doesn't need /color again for PI_SESSION_COLOR.
   if (state.spec) process.env.PI_SESSION_COLOR = state.spec;
@@ -334,6 +379,7 @@ export default function colorExtension(pi: ExtensionAPI): void {
     },
     handler: async (args, ctx) => {
       if (!ctx.hasUI) return;
+      lastCtx = ctx;
 
       let token = args.trim().toLowerCase();
       if (!token) {
@@ -348,7 +394,9 @@ export default function colorExtension(pi: ExtensionAPI): void {
           return;
         }
         restore(ctx);
+        state.at = Date.now();
         ctx.ui.notify("Session color cleared", "info");
+        announce("command");
         return;
       }
 
@@ -377,15 +425,60 @@ export default function colorExtension(pi: ExtensionAPI): void {
         return;
       }
       state.spec = token;
+      state.at = Date.now();
       process.env.PI_SESSION_COLOR = token;
       ctx.ui.notify(`Session color: ${swatch(value)} ${describe(token, value)}`, "info");
+      announce("command");
     },
+  });
+
+  /** A "color:set": null when it took, else why not. */
+  function setFromEvent(req: ColorSetRequest): string | null {
+    const ctx = lastCtx;
+    if (!ctx?.hasUI) return "no UI to color";
+    if (!Number.isSafeInteger(req.at) || req.at < 0) return "a bad time";
+    if (state.at !== undefined && req.at < state.at) return "older than the color now";
+    const before = state.spec;
+    if (req.spec === null) {
+      if (state.spec) restore(ctx);
+    } else {
+      const token = String(req.spec).trim().toLowerCase();
+      const value = token === "auto" || token === "list" || OFF_WORDS.has(token) ? null : parseColor(token);
+      if (value === null) return `not a color: ${token.slice(0, 20)}`;
+      const error = apply(ctx, value);
+      if (error) return error;
+      state.spec = token;
+      process.env.PI_SESSION_COLOR = token;
+      if (req.from && token !== before) ctx.ui.notify(`Session color: ${swatch(value)} ${describe(token, value)} (from ${req.from})`, "info");
+    }
+    state.at = req.at;
+    return null;
+  }
+
+  pi.events?.on?.(COLOR_SET_EVENT, (data: unknown) => {
+    const req = data as ColorSetRequest | undefined;
+    if (!req || typeof req !== "object" || req.handled) return;
+    req.handled = true; // synchronous: the sender checks it right after emit()
+    try {
+      const error = setFromEvent(req);
+      if (error) req.error = error;
+      else announce("set");
+    } catch (err) {
+      req.error = err instanceof Error ? err.message : String(err); // a context from a replaced session
+    }
+  });
+  pi.events?.on?.(COLOR_QUERY_EVENT, (data: unknown) => {
+    (data as { reply?: (s: { spec: string | null; at: number | null }) => void } | undefined)?.reply?.({
+      spec: state.spec ?? null,
+      at: state.at ?? null,
+    });
   });
 
   // A /reload re-executes this module but leaves the tinted instance installed,
   // so this is mostly a repair hook: it puts the color back if the theme was
   // reinitialized underneath us (new session, resume, light/dark flip).
   pi.on("session_start", async (_event, ctx) => {
+    lastCtx = ctx;
     if (!ctx.hasUI || !state.spec) return;
     if (state.tinted && liveTheme(ctx) === state.tinted) return;
     const value = parseColor(state.spec);

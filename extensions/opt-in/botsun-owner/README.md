@@ -12,7 +12,7 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 
 | type | when | extra fields |
 |---|---|---|
-| `hello` | on every (re)connect, and instead of `session` when a sandbox template's pi switches back to its own conversation (its startup session) | `cwd`, `session_file`, `session_id`, `busy`, `prompt`, `model`, `ask`, `commands`, `models`, `stash`, `footer`, `usage`, `context`, `compacting`, `bypass`, `features` (the nonce reply's list) |
+| `hello` | on every (re)connect, and instead of `session` when a sandbox template's pi switches back to its own conversation (its startup session) | `cwd`, `session_file`, `session_id`, `busy`, `prompt`, `model`, `ask`, `commands`, `models`, `stash`, `footer`, `usage`, `context`, `compacting`, `bypass`, `features` (the nonce reply's list), and `color`, `color_at`, `color_carried` (below) |
 | `busy` / `idle` | a run starts / pi has settled | |
 | `prompt` / `prompt_end` | a dialog (`ask`, select, confirm, input, editor, custom) opens / closes | `kind`, `title` (≤ 500 chars) |
 | `stream` / `stream_end` | the reply as it's written / done | `text` |
@@ -27,10 +27,16 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 | `compacting` | a compaction starts (`/compact` or pi's own) / ends or fails | `reason` (`manual`, `threshold`, `overflow`; `null` when it ends) |
 | `bypass` | the approval guardian's bypass turns on or off | `active` |
 | `held` | call words held, released or dropped | `held` (`[{id, chars, at}]`: no text) |
-| `session` | `/new`, `/resume`, `/fork`: same pid, new transcript | `session_file`, `session_id`, `cwd` |
+| `session` | `/new`, `/resume`, `/fork`: same pid, new transcript | `session_file`, `session_id`, `cwd`, `color`, `color_at`, `color_carried` (below) |
+| `color` | `/color` changed (not when Botsun set it) | `color`, `color_at`, `color_carried` (below) |
 | `bye` | pi quits | |
 
-**What it reads back:** Botsun on the Mac never writes on this connection. In a sandbox VM, Botsun's owner bridge listens there instead and writes one kind of line: `{"v":1,"type":"sandbox_token","token":"sandbox.<43 urlsafe base64>","expires_in":<s, at most 43200>}`, the session's VM-tool token, minted only for a session Eric started from the host. It is kept in this process's memory (never a file, env, the transcript or a log), dropped with the connection, when it expires, or when pi leaves the conversation the last hello named (a renewal already on its way included), replaced by a newer one, and offered to the VM extensions through `globalThis[Symbol.for("botsun.sessionToken")]()` for their `X-Botsun-Turn` header. Only this connection is trusted for it: a `sandbox_token` request on `<pid>.sock` (below), where any process of the user can connect, is refused as an unknown request. Any other line, or one over 4 KB, is ignored.
+**The session's color:** `color` is what [`/color`](../../color/README.md) is, as the nearest name in Botsun's palette (`blue indigo purple pink red orange yellow green mint teal cyan brown gray`; a hex or an xterm index maps to the nearest, by a perceptual RGB distance), or `null` for none; `color_at` is when it was set (ms), `null` if never. Both are left out when the color extension isn't loaded, and then Botsun sends nothing back either. pi's color is the process's, so a `/new` or `/resume` keeps it: a color set with `/color` is saved for the session pi moved to unless that session has a newer one saved, which pi then takes; a color pi took from Botsun for the session it left is not, and the new session's own comes back. To say so even to a Botsun that has restarted since, pi remembers the color it last took from Botsun and for which session (on its connection, so through a `/reload`): that color at that time, said for another session, goes with `color_carried: true`. The later writer wins, by these times: Botsun keeps the newer, and `/color` refuses a color from Botsun older than its own (so this relies on pi's clock and the host's agreeing, as a Lima VM's does).
+
+**What it reads back:** Botsun writes two kinds of line on this connection. Anything else, or a line over 4 KB, is ignored.
+
+- `{"v":1,"type":"color","session_id":"…","color":"teal","at":<ms>}`: the session's saved color on Botsun (a pick on the phone, a reset's automatic color, or one saved there that is newer than pi's). Taken only for the session pi is in now and only a Botsun name; it goes to `/color` through the color extension's `color:set` (a name `/color` has as that name, the others as the phone's hex), with `at` as its time, so it is never reported back as a change. Without the color extension, nothing happens.
+- In a sandbox VM, Botsun's owner bridge listens there instead and also writes `{"v":1,"type":"sandbox_token","token":"sandbox.<43 urlsafe base64>","expires_in":<s, at most 43200>}`, the session's VM-tool token, minted only for a session Eric started from the host. It is kept in this process's memory (never a file, env, the transcript or a log), dropped with the connection, when it expires, or when pi leaves the conversation the last hello named (a renewal already on its way included), replaced by a newer one, and offered to the VM extensions through `globalThis[Symbol.for("botsun.sessionToken")]()` for their `X-Botsun-Turn` header. Only this connection is trusted for it: a `sandbox_token` request on `<pid>.sock` (below), where any process of the user can connect, is refused as an unknown request; so is a color.
 
 ## Taking input from the phone
 

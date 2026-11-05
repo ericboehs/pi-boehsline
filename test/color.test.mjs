@@ -100,7 +100,18 @@ function mount(overrides = {}) {
     },
     commands: {},
     handlers: {},
+    events: {
+      listeners: {},
+      on(name, fn) {
+        (this.listeners[name] ??= []).push(fn);
+      },
+      emit(name, data) {
+        for (const fn of this.listeners[name] ?? []) fn(data);
+      },
+    },
   };
+  const states = [];
+  pi.events.on("color:state", (event) => states.push(event));
 
   color(pi);
 
@@ -110,6 +121,19 @@ function mount(overrides = {}) {
     setThemes,
     complete: (prefix) => pi.commands.color.getArgumentCompletions(prefix),
     run: (args = "") => pi.commands.color.handler(args, ctx),
+    states,
+    /** A "color:set" as another extension sends it; returns the request after the handler saw it. */
+    set: (spec, at, from) => {
+      const req = { spec, at, ...(from ? { from } : {}) };
+      pi.events.emit("color:set", req);
+      return req;
+    },
+    emit: (name, data) => pi.events.emit(name, data),
+    query: () => {
+      let state;
+      pi.events.emit("color:query", { reply: (s) => (state = s) });
+      return state;
+    },
     startSession: (event = {}) => pi.handlers.session_start(event, ctx),
     theme: () => globalThis[THEME_SLOT],
     setTheme: (next) => {
@@ -197,6 +221,11 @@ test("garbage is refused with the list of what works", async () => {
   assert.match(ui.notices.at(-1).message, /Unknown color "chartreuse"/);
   await ui.run("256");
   assert.equal(ui.setThemes.length, 0, "out of the xterm range");
+  for (const inherited of ["constructor", "toString", "__proto__"]) {
+    await ui.run(inherited);
+    assert.equal(ui.setThemes.length, 0, `${inherited}: not a palette name`);
+    assert.match(ui.notices.at(-1).message, /Unknown color/);
+  }
 });
 
 test("off restores the exact theme instance that was live before", async () => {
@@ -338,4 +367,72 @@ test("headless runs (print/pipe mode) skip the UI entirely", async () => {
   await ui.run("blue");
   assert.equal(ui.setThemes.length, 0);
   assert.equal(ui.notices.length, 0);
+});
+
+// The events other extensions drive /color by (botsun-owner's Botsun sync).
+test("color:set applies a color as of its time and announces it", async () => {
+  const ui = mount();
+  await ui.startSession();
+  const req = ui.set("#12b5b0", 900, "Botsun");
+  assert.equal(req.handled, true, "answered synchronously");
+  assert.equal(req.error, undefined);
+  assert.equal(ui.border(), "\x1b[38;2;18;181;176m");
+  assert.equal(process.env.PI_SESSION_COLOR, "#12b5b0");
+  assert.deepEqual(ui.states, [{ spec: "#12b5b0", at: 900, source: "set" }]);
+  assert.deepEqual(ui.query(), { spec: "#12b5b0", at: 900 });
+  assert.match(strip(ui.notices.at(-1).message), /Session color: .*#12b5b0 \(from Botsun\)/);
+
+  const notices = ui.notices.length;
+  ui.set("#12b5b0", 950, "Botsun");
+  assert.equal(ui.notices.length, notices, "no notice when nothing changed");
+  assert.deepEqual(ui.query(), { spec: "#12b5b0", at: 950 });
+  assert.match(ui.set("pink", 940, "Botsun").error, /older/, "the later writer wins");
+  assert.deepEqual(ui.query(), { spec: "#12b5b0", at: 950 });
+
+  ui.set(null, 1000);
+  assert.equal(ui.border(), "\x1b[38;2;100;100;100m", "off puts the theme back");
+  assert.deepEqual(ui.states.at(-1), { spec: null, at: 1000, source: "set" });
+});
+
+test("/color announces each change with when it happened", async () => {
+  const ui = mount();
+  assert.deepEqual(ui.query(), { spec: null, at: null }, "never set");
+  const before = Date.now();
+  await ui.run("pink");
+  const [first] = ui.states;
+  assert.equal(first.spec, "pink");
+  assert.equal(first.source, "command");
+  assert.ok(first.at >= before && first.at <= Date.now());
+  await ui.run("off");
+  assert.equal(ui.states.at(-1).spec, null);
+  await ui.run("off"); // nothing set: no change, no announcement
+  await ui.run("plaid"); // not a color
+  assert.equal(ui.states.length, 2);
+});
+
+test("color:set refuses what it can't apply, and says why", async () => {
+  const ui = mount();
+  assert.match(ui.set("blue", 1).error, /no UI/, "before any session started");
+  await ui.startSession();
+  for (const spec of ["auto", "list", "off", "plaid"]) {
+    const req = ui.set(spec, 1);
+    assert.equal(req.handled, true);
+    assert.match(req.error, /not a color/, spec);
+  }
+  assert.match(ui.set("blue", -1).error, /bad time/);
+  assert.match(ui.set("blue", 1.5).error, /bad time/);
+  assert.deepEqual(ui.states, []);
+  assert.deepEqual(ui.query(), { spec: null, at: null });
+  const taken = { spec: "red", at: 1, handled: true }; // one another listener already took
+  ui.emit("color:set", taken);
+  assert.equal(taken.error, undefined);
+  assert.equal(ui.setThemes.length, 0, "left alone");
+});
+
+test("color:set fails cleanly when the theme can't take it", async () => {
+  const ui = mount({ setThemeFails: true });
+  await ui.startSession();
+  const req = ui.set("blue", 5);
+  assert.equal(req.error, "nope");
+  assert.deepEqual(ui.states, []);
 });

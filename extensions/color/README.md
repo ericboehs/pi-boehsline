@@ -25,6 +25,13 @@ since it says "nobody named this" and a bright color would claim otherwise.
 Like Claude's, the choice is not persisted: it lives in the process (through
 `/reload`, via a `globalThis` stash) and dies with it.
 
+Other extensions drive it over `pi.events`, with no import either way:
+`color:set` `{spec, at, from?}` applies a color (null is off) and marks the
+request `handled` synchronously, `color:state` `{spec, at, source}` is
+announced on every change, and `color:query` `{reply}` answers with the
+current `{spec, at}`. [botsun-owner](../opt-in/botsun-owner/README.md) uses
+them to keep `/color` and the session's color on Botsun's phone the same.
+
 Two side effects of handing pi a theme instance instead of a name, both
 cleared by `/color off`: the theme file watcher stops, so editing the active
 custom theme's JSON no longer hot-reloads, and `light/dark` auto-switching

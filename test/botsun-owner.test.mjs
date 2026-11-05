@@ -241,6 +241,168 @@ test("switching back to its own conversation says hello again, fresh, on the sam
 	await srv.stop();
 });
 
+/** The color extension's events (extensions/color), as it answers them: state is what /color is. */
+function fakeColor(pi, state = { spec: null, at: null }) {
+	const sets = [];
+	const fail = []; // errors for the next sets, in turn
+	pi.events.on("color:query", (d) => d.reply({ ...state }));
+	pi.events.on("color:set", (req) => {
+		req.handled = true;
+		sets.push({ spec: req.spec, at: req.at, from: req.from });
+		if (fail.length) {
+			req.error = fail.shift();
+			return;
+		}
+		Object.assign(state, { spec: req.spec, at: req.at });
+		pi.events.emit("color:state", { ...state, source: "set" });
+	});
+	const command = (spec, at) => {
+		Object.assign(state, { spec, at });
+		pi.events.emit("color:state", { ...state, source: "command" });
+	};
+	return { sets, state, command, fail };
+}
+
+test("/color goes to Botsun on hello, on a session line and on each change, as Botsun's name", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const a = await mount();
+	const color = fakeColor(a.pi, { spec: "#ff0000", at: 100 });
+	await a.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const hello = srv.lines.find((l) => l.type === "hello");
+	assert.deepEqual([hello.color, hello.color_at], ["red", 100]);
+
+	color.command("indigo", 200);
+	await until(() => srv.types().includes("color"));
+	assert.deepEqual(srv.lines.filter((l) => l.type === "color").map((l) => [l.color, l.color_at]), [["indigo", 200]]);
+	color.command("indigo", 200); // the same again (a repaint): nothing new to say
+	color.command(null, 300); // /color off
+	await until(() => srv.types().filter((t) => t === "color").length >= 2);
+	await sleep(30);
+	assert.deepEqual(srv.lines.filter((l) => l.type === "color").map((l) => [l.color, l.color_at]), [["indigo", 200], [null, 300]]);
+
+	await a.fire("session_shutdown", { reason: "new" });
+	const b = await mount({ ctx: { sessionManager: { getSessionFile: () => "/tmp/sessions/b.jsonl", getSessionId: () => "sid-b" } } });
+	fakeColor(b.pi, color.state);
+	await b.fire("session_start", { reason: "new" });
+	await until(() => srv.types().includes("session"));
+	const session = srv.lines.find((l) => l.type === "session");
+	assert.deepEqual([session.session_id, session.color, session.color_at], ["sid-b", null, 300], "pi's color is the process's");
+});
+
+test("without the color extension, no color is said and none is taken", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const a = await mount();
+	const sets = [];
+	a.pi.events.on("color:set", (req) => sets.push(req)); // something listening, but not answering
+	await a.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const hello = srv.lines.find((l) => l.type === "hello");
+	assert.ok(!("color" in hello) && !("color_at" in hello));
+	const [botsun] = srv.conns;
+	botsun.write(`${JSON.stringify({ v: 1, type: "color", session_id: "sid-a", color: "teal", at: 5 })}\n`);
+	await sleep(50);
+	assert.equal(sets.length, 1, "asked");
+	assert.ok(!srv.types().includes("color"), "nothing said back");
+});
+
+// Botsun's saved color: into /color for the session pi is in, and not said back (no echo).
+test("Botsun's color goes into /color, only for this session, and isn't reported back", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const a = await mount();
+	const color = fakeColor(a.pi);
+	await a.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const [botsun] = srv.conns;
+	const push = (over) => botsun.write(`${JSON.stringify({ v: 1, type: "color", session_id: "sid-a", color: "teal", at: 900, ...over })}\n`);
+	push({ session_id: "sid-old" }); // for a session pi has left
+	push({ color: "#ff0000" }); // not a Botsun name
+	push({ color: "chartreuse" });
+	push({ at: -5 });
+	push({ type: "colour" });
+	push();
+	await until(() => color.sets.length >= 1);
+	push({ color: "pink", at: 950 });
+	await until(() => color.sets.length >= 2);
+	await sleep(50);
+	assert.deepEqual(color.sets, [{ spec: "#12b5b0", at: 900, from: "Botsun" }, { spec: "pink", at: 950, from: "Botsun" }]);
+	assert.ok(!srv.types().includes("color"), "what Botsun sent isn't news to it");
+
+	color.command("pink", 960); // and a /color after it is
+	await until(() => srv.types().includes("color"));
+	assert.deepEqual(srv.lines.filter((l) => l.type === "color").map((l) => [l.color, l.color_at]), [["pink", 960]]);
+});
+
+// A color /color refused (older than its own, say) was never taken: pi's own is still news to Botsun.
+test("a color /color refused leaves pi's own to report", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const a = await mount();
+	const color = fakeColor(a.pi);
+	await a.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const [botsun] = srv.conns;
+	color.fail.push("older than the color now");
+	botsun.write(`${JSON.stringify({ v: 1, type: "color", session_id: "sid-a", color: "teal", at: 900 })}\n`);
+	await until(() => color.sets.length >= 1);
+	color.command("#12b5b0", 900); // what pi has, which happens to be what Botsun sent
+	await until(() => srv.types().includes("color"));
+	assert.deepEqual(srv.lines.filter((l) => l.type === "color").map((l) => [l.color, l.color_at]), [["teal", 900]]);
+});
+
+// pi's events throw once the instance is stale (a /reload mid-handoff): a push then must not end pi.
+test("a color that comes while pi's events throw is dropped, and the connection reads on", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const a = await mount();
+	const color = fakeColor(a.pi);
+	await a.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const [botsun] = srv.conns;
+	const emit = a.pi.events.emit;
+	a.pi.events.emit = () => { throw new Error("stale extension instance"); };
+	botsun.write(`${JSON.stringify({ v: 1, type: "color", session_id: "sid-a", color: "teal", at: 900 })}\n`);
+	await sleep(50);
+	a.pi.events.emit = emit;
+	botsun.write(`${JSON.stringify({ v: 1, type: "color", session_id: "sid-a", color: "pink", at: 950 })}\n`);
+	await until(() => color.sets.length >= 1);
+	assert.deepEqual(color.sets, [{ spec: "pink", at: 950, from: "Botsun" }]);
+});
+
+// /color keeps its color through a /new; Botsun's color for the session left isn't the next one's pick.
+test("a color Botsun gave one session is said as carried in the next, and a /color there is not", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const a = await mount();
+	const color = fakeColor(a.pi, { spec: "teal", at: 100 });
+	await a.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	assert.ok(!("color_carried" in srv.lines.find((l) => l.type === "hello")), "pi's own");
+	const [botsun] = srv.conns;
+	botsun.write(`${JSON.stringify({ v: 1, type: "color", session_id: "sid-a", color: "pink", at: 900 })}\n`);
+	await until(() => color.sets.length >= 1);
+	botsun.destroy(); // Botsun restarting: its own color, said back in the session it went to
+	await until(() => srv.types().filter((t) => t === "hello").length >= 2);
+	const again = srv.lines.filter((l) => l.type === "hello").at(-1);
+	assert.deepEqual([again.color, again.color_at, "color_carried" in again], ["pink", 900, false]);
+
+	await a.fire("session_shutdown", { reason: "new" });
+	const b = await mount({ ctx: { sessionManager: { getSessionFile: () => "/tmp/sessions/b.jsonl", getSessionId: () => "sid-b" } } });
+	const carried = fakeColor(b.pi, color.state);
+	await b.fire("session_start", { reason: "new" });
+	await until(() => srv.types().includes("session"));
+	const session = srv.lines.find((l) => l.type === "session");
+	assert.deepEqual([session.session_id, session.color, session.color_at, session.color_carried], ["sid-b", "pink", 900, true]);
+
+	carried.command("pink", 1000); // the same color, picked here
+	await until(() => srv.types().includes("color"));
+	const line = srv.lines.find((l) => l.type === "color");
+	assert.deepEqual([line.color, line.color_at, "color_carried" in line], ["pink", 1000, false]);
+});
+
 test("a /reload in its own conversation keeps the token and says no hello; so does a connection from before boundId", async () => {
 	const srv = await server();
 	process.env.BOTSUN_OWNER_SOCK = srv.path;
@@ -535,6 +697,10 @@ test("a sandbox session token comes only down Botsun's connection, kept in memor
 	const token = `sandbox.${"A1_-".repeat(10)}xyz`;
 	assert.deepEqual(await ask({ type: "sandbox_token", token, expires_in: 60 }), { error: "unknown request" }, "never over <pid>.sock");
 	assert.equal(get(), undefined, "a process that connects to <pid>.sock can't plant one");
+	const sets = [];
+	m.pi.events.on("color:set", (req) => { req.handled = true; sets.push(req); });
+	assert.deepEqual(await ask({ v: 1, type: "color", session_id: "sid-a", color: "teal", at: 900 }), { error: "unknown request" }, "nor a color");
+	assert.equal(sets.length, 0, "nothing reached /color");
 
 	for (const bad of [{ token: "sandbox.short", expires_in: 60 }, { token: `${token}x`, expires_in: 60 }, { token: token.replace("sandbox.", "turn."), expires_in: 60 },
 		{ token, expires_in: 0 }, { token, expires_in: 12 * 3600 + 1 }, { token, expires_in: "60" }, { token }]) {
