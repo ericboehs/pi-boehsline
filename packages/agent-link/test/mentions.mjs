@@ -12,6 +12,7 @@ const {
   mentionHint,
   formatAgentItem,
   isInboundPeerPrompt,
+  nameHandle,
 } = await import("../mentions.ts");
 
 const foo = { name: "foo", pid: 11, cwd: "/Users/eric/Code/foo", status: "idle" };
@@ -87,4 +88,43 @@ test("isInboundPeerPrompt skips framed peer traffic", () => {
   assert.equal(isInboundPeerPrompt("[cross-agent message — from another agent"), true);
   assert.equal(isInboundPeerPrompt("[reply from another agent session"), true);
   assert.equal(isInboundPeerPrompt("@foo check tests"), false);
+});
+
+const tamer = { name: "Chicken Door Tamer", pid: 44, cwd: "/tmp/coop", status: "idle" };
+const plumber = { name: "Canvas Leak Plumber", pid: 55, cwd: "/tmp/canvas", status: "idle" };
+const spaced = [foo, tamer, plumber];
+
+test("nameHandle lowercases and hyphenates spaced names", () => {
+  assert.equal(nameHandle("Chicken Door Tamer"), "chicken-door-tamer");
+  assert.equal(nameHandle("  Flaky  CI_Wrangler "), "flaky-ci-wrangler");
+  assert.equal(nameHandle("bar-agent"), "bar-agent");
+});
+
+test("matchPeer finds spaced names by handle, prefix, or first word", () => {
+  assert.equal(matchPeer("Chicken Door Tamer", spaced), tamer, "the exact name still works");
+  assert.equal(matchPeer("chicken-door-tamer", spaced), tamer);
+  assert.equal(matchPeer("chicken-door", spaced), tamer);
+  assert.equal(matchPeer("Chicken", spaced), tamer);
+  assert.equal(matchPeer("canvas-leak", spaced), plumber);
+  assert.equal(matchPeer("chicken-door", [tamer, { ...tamer, pid: 66 }]), undefined, "duplicates stay unresolved");
+});
+
+test("findAgentMentions resolves hyphenated handles of spaced names", () => {
+  assert.deepEqual(findAgentMentions("@chicken-door-tamer why every morning?", spaced), [
+    { raw: "@chicken-door-tamer", peer: tamer },
+  ]);
+  assert.deepEqual(findAgentMentions("ping @canvas-leak", spaced), [{ raw: "@canvas-leak", peer: plumber }]);
+});
+
+test("filterPeers matches spaced names by their handle", () => {
+  assert.deepEqual(filterPeers(spaced, "chicken-d"), [tamer]);
+  assert.deepEqual(filterPeers(spaced, "Canvas"), [plumber]);
+});
+
+test("formatAgentItem completes spaced names as their handle", () => {
+  assert.deepEqual(formatAgentItem(tamer), {
+    value: "@chicken-door-tamer",
+    label: "Chicken Door Tamer",
+    description: "agent · idle · /tmp/coop",
+  });
 });

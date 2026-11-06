@@ -15,6 +15,9 @@ All notable changes to this project are documented here. The format follows
 - `pending` lists unanswered inbound asks with sender, age, and a short preview.
 - Pi peers now publish live `idle`, `thinking`, and `tool:<name>` status in Claude's
   session registry and `agent-link` session lists.
+- Spaced session names ("Chicken Door Tamer") resolve from their lowercase, hyphenated
+  handle and its unique prefixes (`@chicken-door-tamer`, `@chicken-door`); autocomplete
+  inserts the handle, since a space ends an @mention.
 
 
 ### Removed

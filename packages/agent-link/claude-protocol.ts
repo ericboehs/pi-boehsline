@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
+import { nameHandle } from "./mentions.ts";
 
 export const HOME = homedir();
 export const CLAUDE_REGISTRY = path.join(HOME, ".claude", "sessions");
@@ -205,6 +206,16 @@ export async function resolveTarget(nameOrId: string, opts: { excludeSock?: stri
   const pfx = rows.filter((r) => r.name && r.name.startsWith(nameOrId));
   if (pfx.length === 1) return { target: pfx[0] };
   if (pfx.length > 1) return ambiguous(pfx);
+
+  // Spaced names ("Chicken Door Tamer") also answer to their hyphenated,
+  // lowercase handle and its prefixes: chicken-door-tamer, chicken-door.
+  const handle = nameHandle(nameOrId);
+  const byHandle = rows.filter((r) => r.name && nameHandle(r.name) === handle);
+  if (byHandle.length === 1) return { target: byHandle[0] };
+  if (byHandle.length > 1) return ambiguous(byHandle);
+  const handlePfx = rows.filter((r) => r.name && nameHandle(r.name).startsWith(handle));
+  if (handlePfx.length === 1) return { target: handlePfx[0] };
+  if (handlePfx.length > 1) return ambiguous(handlePfx);
 
   return { error: `no live Claude session matches "${nameOrId}"`, candidates: rows.map((r) => peerLabel(r, rows)) };
 }

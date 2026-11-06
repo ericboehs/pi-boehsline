@@ -44,6 +44,15 @@ export function extractAtQuery(textBeforeCursor: string): { prefix: string; quer
   return { prefix, query: prefix.slice(1) };
 }
 
+/**
+ * A session name as one typeable token: lowercase, spaces to hyphens.
+ * "Chicken Door Alert Tamer" is reachable as @chicken-door-alert-tamer (or
+ * any unique prefix, like @chicken), since an @mention ends at a space.
+ */
+export function nameHandle(name: string): string {
+  return name.trim().toLowerCase().replace(/[\s_]+/g, "-");
+}
+
 /** Resolve a token the way agent-link `to` does: pid, exact name, then unique prefix. */
 export function matchPeer(token: string, peers: MentionPeer[]): MentionPeer | undefined {
   if (!token) return undefined;
@@ -60,18 +69,26 @@ export function matchPeer(token: string, peers: MentionPeer[]): MentionPeer | un
   const ci = peers.filter((p) => p.name.toLowerCase() === lower);
   if (ci.length === 1) return ci[0];
   const ciPfx = peers.filter((p) => p.name.toLowerCase().startsWith(lower));
-  return ciPfx.length === 1 ? ciPfx[0] : undefined;
+  if (ciPfx.length === 1) return ciPfx[0];
+  if (ciPfx.length > 1) return undefined;
+  // Spaced names, typed with hyphens: @chicken-door for "Chicken Door Tamer".
+  const handle = nameHandle(token);
+  const byHandle = peers.filter((p) => nameHandle(p.name) === handle);
+  if (byHandle.length === 1) return byHandle[0];
+  if (byHandle.length > 1) return undefined;
+  const handlePfx = peers.filter((p) => nameHandle(p.name).startsWith(handle));
+  return handlePfx.length === 1 ? handlePfx[0] : undefined;
 }
 
 export function filterPeers(peers: MentionPeer[], query: string): MentionPeer[] {
   if (!query) return [...peers];
-  const q = query.toLowerCase();
+  const q = nameHandle(query);
   const prefix: MentionPeer[] = [];
   const rest: MentionPeer[] = [];
   for (const peer of peers) {
-    const name = peer.name.toLowerCase();
+    const name = nameHandle(peer.name);
     if (name.startsWith(q)) prefix.push(peer);
-    else if (name.includes(q) || peer.cwd.toLowerCase().includes(q)) rest.push(peer);
+    else if (name.includes(q) || peer.cwd.toLowerCase().includes(query.toLowerCase())) rest.push(peer);
   }
   return [...prefix, ...rest];
 }
@@ -107,7 +124,8 @@ export function mentionHint(mentions: AgentMention[]): string {
 export function formatAgentItem(peer: MentionPeer, home?: string): AutocompleteItem {
   const cwd = home && peer.cwd.startsWith(home) ? `~${peer.cwd.slice(home.length)}` : peer.cwd;
   return {
-    value: `@${peer.name}`,
+    // A space would end the @mention, so spaced names complete as their handle.
+    value: `@${/\s/.test(peer.name) ? nameHandle(peer.name) : peer.name}`,
     label: peer.name,
     description: `agent · ${peer.status} · ${cwd}`,
   };

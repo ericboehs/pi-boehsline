@@ -90,6 +90,15 @@ test("labels stay clean when names are unique", async () => {
   assert.equal(peerLabel(solo, rows), "pi-solo");
 });
 
+test("spaced names resolve by their hyphenated handle and its prefixes", async () => {
+  await peer({ pid: 900010, name: "Chicken Door Tamer", startedAt: 10 });
+  await peer({ pid: 900011, name: "Chicken Coop Keeper", startedAt: 11 });
+  assert.equal((await resolveTarget("Chicken Door Tamer")).target.pid, 900010);
+  assert.equal((await resolveTarget("chicken-door-tamer")).target.pid, 900010);
+  assert.equal((await resolveTarget("chicken-door")).target.pid, 900010);
+  assert.match((await resolveTarget("chicken")).error, /matches 2 live sessions/, "a shared first word stays ambiguous");
+});
+
 test("dedupe moves the newer duplicates and leaves everything else alone", () => {
   const rows = [
     { pid: 1, name: "pi-work", startedAt: 10, entrypoint: "pi", nameSource: "derived", sock: "a", cwd: "/w", status: "idle" },
