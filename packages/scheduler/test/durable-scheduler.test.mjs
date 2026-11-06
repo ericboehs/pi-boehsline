@@ -560,6 +560,61 @@ test("/schedule remove takes the task out of the registry", async (t) => {
   assert.deepEqual(readRegistry().tasks, []);
 });
 
+test("/schedule edit swaps the schedule and prompt and keeps everything else", async (t) => {
+  withTempDir(t);
+  const ui = mount();
+
+  await ui.run("--name grades --model cerebras/gpt-oss-120b:low --deliver slack-noti daily 15:30 :: check grades");
+  const [before] = readRegistry().tasks;
+  await ui.run(`pause ${before.id}`);
+  await ui.run(`edit ${before.id} cron 30 7 * * 1-5 :: summarize :: grades\nthen flag anything under 80`);
+  assert.match(ui.last().message, /^Edited /);
+  const [after] = readRegistry().tasks;
+  assert.equal(after.id, before.id);
+  assert.equal(after.kind, "cron");
+  assert.equal(after.cronExpr, "30 7 * * 1-5");
+  assert.equal(after.dailyAt, undefined, "the old schedule's field goes");
+  assert.equal(after.prompt, "summarize :: grades\nthen flag anything under 80", "only the first :: separates");
+  assert.deepEqual([after.name, after.model, after.deliver, after.cwd, after.createdAt, after.paused],
+    [before.name, before.model, before.deliver, before.cwd, before.createdAt, true]);
+
+  await ui.run("edit grades every 45m :: poll");
+  const [interval] = readRegistry().tasks;
+  assert.deepEqual([interval.kind, interval.intervalMs, interval.cronExpr, interval.prompt], ["interval", 2_700_000, undefined, "poll"]);
+
+  const at = new Date(Date.now() + 3_600_000).toISOString();
+  await ui.run(`edit grades once ${at} :: once more`);
+  const [once] = readRegistry().tasks;
+  assert.deepEqual([once.kind, once.intervalMs, once.nextRunAt, once.prompt], ["once", undefined, Date.parse(at), "once more"]);
+});
+
+test("/schedule edit refuses a bad schedule, a missing task and a running one, changing nothing", async (t) => {
+  withTempDir(t);
+  const ui = mount();
+  await ui.run("--name grades daily 15:30 :: check grades");
+  const snapshot = JSON.stringify(readRegistry());
+
+  await ui.run("edit grades every 10s :: too fast");
+  assert.equal(ui.last().level, "error");
+  assert.match(ui.last().message, /at least 1m[\s\S]*Usage: \/schedule edit/);
+  await ui.run("edit grades daily 15:30");
+  assert.equal(ui.last().level, "error");
+  await ui.run("edit nope daily 9a :: x");
+  assert.match(ui.last().message, /No scheduled task matches nope/);
+  await ui.run("edit");
+  assert.match(ui.last().message, /Usage: \/schedule edit <id\|name> <schedule> :: <prompt>/);
+  assert.equal(JSON.stringify(readRegistry()), snapshot);
+
+  const registry = readRegistry();
+  registry.tasks[0] = { ...registry.tasks[0], runningSince: Date.now(), runnerPid: livePid(t) };
+  writeRegistry(registry);
+  const running = JSON.stringify(readRegistry());
+  await ui.run("edit grades daily 9a :: x");
+  assert.equal(ui.last().level, "error");
+  assert.match(ui.last().message, /is running; edit it once this run finishes/);
+  assert.equal(JSON.stringify(readRegistry()), running);
+});
+
 test("selecting a task that does not exist is an error, not a silent no-op", async (t) => {
   withTempDir(t);
   const ui = mount();

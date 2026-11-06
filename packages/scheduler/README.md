@@ -49,10 +49,12 @@ the current conversation.
 /once at 8p check in on this
 /once remind me about the PR in 2h
 /once list | cancel <id>
+/once edit <id> <duration|HH:MM|ISO> <prompt>
 /loop 15m check CI
 /loop review the deploy every 1h
 /loop list | cancel <id> | clear
 /loop pause <id|all> | resume <id|all>
+/loop edit <id> <duration> <prompt>
 ```
 
 `/once` is the one-shot counterpart to `/loop`. The time may lead (`/once 15m
@@ -65,6 +67,13 @@ without firing or drifting. `resume` recomputes the next occurrence rather than
 replaying what was missed: a recurring task advances to its next future slot,
 and a one-shot whose time passed while paused is dropped with a warning instead
 of firing late.
+
+`edit` replaces a timer's time and prompt in place: the id, its place in the
+list and its paused state stay. `/loop edit` takes an interval timer and
+restarts it from now; `/once edit` takes a one-shot and moves it. Each refuses
+the other kind. An edited timer the agent set fires as yours from then on. It
+is read as an edit only when its time parses, so `/loop edit the docs every 1h`
+is still a new timer.
 
 ### Letting the agent set timers: `schedule` tool
 
@@ -122,7 +131,12 @@ depend on a terminal being left running.
 /schedule --misfire always once 8p :: check in on the deploy
 /schedule list [all] | show <id> | runs <id>
 /schedule run <id> | pause <id|all> | resume <id|all> | remove <id>
+/schedule edit <id> <schedule> :: <prompt>
 ```
+
+`/schedule edit` replaces the schedule and prompt and keeps the rest (id,
+name, model, cwd, delivery, history, paused): `pi-scheduler edit --schedule
+--prompt` in one line. It refuses a task that is running.
 
 `/schedule run` fires a task now, exactly as the timer would: **its own pi, its
 own cwd and model, not this conversation and not this conversation's context.**

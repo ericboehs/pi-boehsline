@@ -72,7 +72,7 @@ test("every durable subcommand the CLI has is either in the extension or knowing
   // Deliberately shell-only: they manage the machine, not the tasks. `add` is
   // *not* on this list — creation exists in both surfaces, and it is the most
   // likely thing to drift, since the two applyFlags already differ in shape.
-  const shellOnly = new Set(["check", "install", "uninstall", "prune", "edit", "help"]);
+  const shellOnly = new Set(["check", "install", "uninstall", "prune", "help"]);
   const shapes = extension.slice(extension.indexOf("const SUBCOMMAND_SHAPES"));
 
   for (const command of commands) {

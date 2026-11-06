@@ -516,6 +516,47 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     return task;
   };
 
+  /**
+   * The same timer with a new time and prompt: its id and paused state stay, and so does its
+   * place in the list. An interval restarts from now; a one-shot moves to `when`. Whoever set it,
+   * the prompt is now the user's, so it no longer fires as the agent's own reminder. A fire still
+   * queued behind a busy turn is dropped with the old prompt.
+   */
+  const editTask = (
+    ctx: ExtensionContext,
+    idPrefix: string,
+    kind: "interval" | "once",
+    when: number,
+    promptText: string,
+  ) => {
+    const task = findTask(idPrefix);
+    if (task.kind !== kind) {
+      throw new Error(
+        task.kind === "once"
+          ? `${task.id} is a one-shot; change it with /once edit`
+          : kind === "once"
+            ? `${task.id} repeats; change it with /loop edit`
+            : `${task.id} runs ${describeSchedule(task)}; only an interval timer takes /loop edit`,
+      );
+    }
+    if (kind === "interval" && when < MIN_INTERVAL_MS) {
+      throw new Error("Recurring intervals must be at least 1m (examples: 5m, 1h, 1h30m)");
+    }
+    const prompt = stripPromptDelimiter(promptText);
+    if (!prompt) throw new Error("A prompt is required");
+
+    const { source: _source, ...kept } = task;
+    const updated: ScheduledTask = kind === "interval"
+      ? { ...kept, prompt, intervalMs: when, nextRunAt: Date.now() + when }
+      : { ...kept, prompt, nextRunAt: when };
+    tasks = tasks.map((candidate) => (candidate.id === task.id ? updated : candidate));
+    disarm(task.id);
+    persist();
+    if (!updated.paused) armTask(updated, ctx, generation);
+    updateStatus(ctx);
+    return updated;
+  };
+
   const setPaused = (ctx: ExtensionContext, target: string, paused: boolean) => {
     const all = /^(all|\*)$/i.test(target);
     const selected = all ? tasks.filter((task) => Boolean(task.paused) !== paused) : [findTask(target)];
@@ -559,11 +600,12 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
         "Session timers (this session only, while pi is running):",
         "  /once <duration|HH:MM|ISO> <prompt>",
         "  /once <prompt> in <duration>",
-        "  /once list | cancel <id>",
+        "  /once list | cancel <id> | edit <id> <time> <prompt>",
         "  /loop <duration> <prompt>",
         "  /loop <prompt> every <duration>",
         "  /loop list | cancel <id> | clear",
         "  /loop pause <id|all> | resume <id|all>",
+        "  /loop edit <id> <duration> <prompt>",
         "  (:: before the prompt is optional)",
         "/once help or /loop help explains the forms in full.",
         "Use /schedule for tasks that must run without an open session.",
@@ -600,6 +642,8 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
         "  /once list | cancel <id>              one-shots only",
         "  /loop list | cancel <id> | clear      every timer in this session",
         "  /loop pause <id|all> | resume <id|all>",
+        "  /loop edit <id> <duration> <prompt>   new interval and prompt, same id",
+        "  /once edit <id> <time> <prompt>       new time and prompt, same id",
         "  pause keeps a task but disarms it; resume moves to the next future slot",
         "  rather than firing for everything missed while it was paused.",
         "",
@@ -613,8 +657,10 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
   /**
    * The management verbs, shared by /once and /loop.
    *
-   * /loop gets all five; /once exposes only `list` and `cancel`, since the
-   * others describe a timer that will fire again and a one-shot will not.
+   * /loop gets them all; /once exposes only `list`, `cancel` and `edit`, since
+   * the others describe a timer that will fire again and a one-shot will not.
+   * Each `edit` changes only its own kind: /loop edit an interval, /once edit a
+   * one-shot.
    */
   const handleManagement = async (
     input: string,
@@ -639,6 +685,27 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
       try {
         const task = removeTask(ctx, cancel[1]);
         notice(ctx, `Cancelled session task ${task.id}`);
+      } catch (error) {
+        notice(ctx, error instanceof Error ? error.message : String(error), "error");
+      }
+      return true;
+    }
+
+    // Only when the time reads as one: a new timer whose prompt opens "edit the docs" stays one.
+    const edit = input.match(/^edit\s+(\S+)\s+(\S+)\s+([\s\S]+)$/i);
+    const editWhen = edit?.[2] ? (onlyOnce ? parseOnceTime(edit[2]) : parseDuration(edit[2])) : undefined;
+    if (edit?.[1] && edit[3] && editWhen !== undefined) {
+      try {
+        const task = editTask(ctx, edit[1], onlyOnce ? "once" : "interval", editWhen, edit[3]);
+        const next = new Date(task.nextRunAt).toLocaleString();
+        notice(
+          ctx,
+          task.paused
+            ? `Edited ${task.id} (still paused)`
+            : onlyOnce
+              ? `Edited ${task.id}; once at ${next}`
+              : `Edited ${task.id}; every ${formatDuration(task.intervalMs ?? 0)}, next ${next}`,
+        );
       } catch (error) {
         notice(ctx, error instanceof Error ? error.message : String(error), "error");
       }

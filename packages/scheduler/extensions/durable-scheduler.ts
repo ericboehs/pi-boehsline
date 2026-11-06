@@ -22,6 +22,7 @@ import {
   findTask,
   formatTask,
   isClaimStale,
+  isDurableTask,
   makeTaskId,
   nameTaken,
   parseFeatures,
@@ -168,6 +169,7 @@ const SUBCOMMAND_SHAPES: Record<string, string> = {
   runs: "runs <id|name>",
   history: "runs <id|name>",
   run: "run <id|name>",
+  edit: "edit <id|name> <schedule> :: <prompt>",
   pause: "pause <id|name|all>",
   resume: "resume <id|name|all>",
   remove: "remove <id|name>",
@@ -217,6 +219,7 @@ export default function durableScheduler(pi: ExtensionAPI): void {
         "  /schedule list [all] | show <id> | runs <id>",
         "  /schedule run <id>   run now, in its own pi (not this session)",
         "  /schedule pause <id> | resume <id> | remove <id>",
+        "  /schedule edit <id> <schedule> :: <prompt>",
         "",
         "Options go first: --name --model --cwd --with/--without --deliver",
         "                  --misfire --timeout",
@@ -294,6 +297,9 @@ export default function durableScheduler(pi: ExtensionAPI): void {
         "  pause <id> | resume <id>",
         "                      resume rolls forward to the next future slot rather",
         "                      than replaying what was missed",
+        "  edit <id> <schedule> :: <prompt>",
+        "                      new schedule and prompt; the id, name, model, cwd",
+        "                      and delivery stay. Not while it runs",
         "  remove <id>         delete the task and its history",
         "",
         "EXAMPLE",
@@ -456,6 +462,36 @@ export default function durableScheduler(pi: ExtensionAPI): void {
           })();
 
           if (ctx.hasUI) ctx.ui.setStatus("schedule", `running ${claimed.name ?? claimed.id}`);
+          return;
+        }
+
+        // The same task (id, name, model, cwd, delivery, history, paused) with a new schedule
+        // and prompt: `pi-scheduler edit --schedule --prompt` in one line. Not mid-run: the
+        // run's release would roll the new schedule from the old slot, or retire an edited
+        // one-shot.
+        const edit = input.match(/^edit\s+(\S+)\s+([\s\S]+)$/i);
+        if (edit?.[1] && edit[2]) {
+          const selector = edit[1];
+          const parsed = parseScheduleSpec(edit[2]);
+          if ("error" in parsed) {
+            notice(ctx, `${parsed.error}\nUsage: /schedule ${SUBCOMMAND_SHAPES.edit}`, "error");
+            return;
+          }
+          withRegistry((registry) => {
+            const existing = findTask(registry.tasks, selector);
+            if (existing.runningSince !== undefined && !isClaimStale(existing, Date.now())) {
+              throw new Error(`${existing.name ?? existing.id} is running; edit it once this run finishes`);
+            }
+            const task: DurableTask = { ...existing, prompt: parsed.prompt, nextRunAt: parsed.nextRunAt };
+            delete task.intervalMs;
+            delete task.dailyAt;
+            delete task.cronExpr;
+            Object.assign(task, parsed.schedule);
+            if (!isDurableTask(task)) throw new Error("That edit would leave the task invalid; nothing was changed");
+            registry.tasks[registry.tasks.indexOf(existing)] = task;
+            writeRegistry(registry);
+            notice(ctx, `Edited ${formatTask(task)}`);
+          });
           return;
         }
 

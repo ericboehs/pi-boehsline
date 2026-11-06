@@ -266,6 +266,70 @@ test("list and cancel are handled without waking the model", async (t) => {
   assert.match(ui.notices.at(-1).message, /Cancelled/);
 });
 
+test("/loop edit keeps the id and paused state, and takes a new interval and prompt", async (t) => {
+  const ui = await mount();
+  t.after(ui.shutdown);
+
+  await ui.run("loop", "15m check CI");
+  await ui.run("loop", "1h other");
+  const [first] = latestTasks(ui);
+  await ui.run("loop", `edit ${first.id} 30m :: check CI :: and the deploy\nthen say so`);
+  assert.match(ui.notices.at(-1).message, new RegExp(`^Edited ${first.id}; every 30m`));
+  const [edited, other] = latestTasks(ui);
+  assert.equal(edited.id, first.id, "same id, same place in the list");
+  assert.equal(edited.intervalMs, 1_800_000);
+  assert.equal(edited.prompt, "check CI :: and the deploy\nthen say so", "only the leading :: is the delimiter");
+  assert.ok(edited.nextRunAt > Date.now() + 1_700_000, "restarts from now");
+  assert.equal(other.prompt, "other");
+
+  await ui.run("loop", `pause ${first.id}`);
+  await ui.run("loop", `edit ${first.id} 2h paused still`);
+  assert.equal(latestTasks(ui)[0].paused, true);
+  assert.match(ui.notices.at(-1).message, /still paused/);
+  assert.deepEqual(ui.sent, [], "editing never wakes the model");
+});
+
+test("/once edit moves a one-shot, and each edit refuses the other kind", async (t) => {
+  const ui = await mount();
+  t.after(ui.shutdown);
+
+  await ui.run("once", "15m ping");
+  await ui.run("loop", "15m tick");
+  const [once, loop] = latestTasks(ui);
+  const at = new Date(Date.now() + 7_200_000).toISOString();
+  await ui.run("once", `edit ${once.id} ${at} :: ping later`);
+  assert.deepEqual([latestTasks(ui)[0].nextRunAt, latestTasks(ui)[0].prompt], [Date.parse(at), "ping later"]);
+
+  const before = JSON.stringify(latestTasks(ui));
+  await ui.run("loop", `edit ${once.id} 30m x`);
+  assert.match(ui.notices.at(-1).message, /is a one-shot; change it with \/once edit/);
+  await ui.run("once", `edit ${loop.id} 30m x`);
+  assert.match(ui.notices.at(-1).message, /repeats; change it with \/loop edit/);
+  await ui.run("loop", `edit ${loop.id} 10s x`);
+  assert.match(ui.notices.at(-1).message, /at least 1m/);
+  await ui.run("loop", "edit nope 30m x");
+  assert.match(ui.notices.at(-1).message, /No session task matches nope/);
+  assert.equal(JSON.stringify(latestTasks(ui)), before, "a refused edit changes nothing");
+});
+
+test("an edited agent timer fires as the user's prompt, not the agent's reminder", async (t) => {
+  const task = { id: "a9e47000", kind: "interval", prompt: "agent's", createdAt: Date.now(), nextRunAt: Date.now() + 60_000, intervalMs: 60_000, source: "agent" };
+  const ui = await mount({ branch: [snapshot("session-a", [task])] });
+  t.after(ui.shutdown);
+
+  await ui.run("loop", "edit a9e47000 5m mine now");
+  assert.equal(latestTasks(ui)[0].source, undefined);
+  assert.equal(ui.emitted.at(-1).data[0].source, "session");
+});
+
+test("a /loop whose prompt opens with edit is still a new timer", async (t) => {
+  const ui = await mount();
+  t.after(ui.shutdown);
+
+  await ui.run("loop", "edit the docs every 1h");
+  assert.deepEqual(latestTasks(ui).map((task) => [task.prompt, task.intervalMs]), [["edit the docs", 3_600_000]]);
+});
+
 test("snapshots are bound to the session id, so forks do not inherit jobs", async (t) => {
   const task = { id: "deadbeef", kind: "interval", prompt: "tick", createdAt: Date.now(), nextRunAt: Date.now() + 60_000, intervalMs: 60_000 };
   const ui = await mount({ branch: [snapshot("parent-session", [task])], sessionId: "fork-session" });
