@@ -60,7 +60,10 @@ export function summarizeError(raw?: string | null): string {
   return out.length > 90 ? `${out.slice(0, 89)}…` : out;
 }
 /** Session titles stay this short so they fit tabs, footers, and pickers. */
-const MAX_NAME_CHARS = 20;
+const MAX_NAME_CHARS = 30;
+const MAX_NAME_WORDS = 6;
+/** Lowercase inside a title ("Keeper of the Coop"), capitalized when first. */
+const SMALL_WORDS = new Set(["a", "an", "and", "as", "at", "by", "for", "in", "of", "on", "or", "the", "to", "vs"]);
 
 /** True when the name is one the user (or a previous auto-name) chose. */
 export function isUserGivenName(name?: string | null): boolean {
@@ -70,23 +73,47 @@ export function isUserGivenName(name?: string | null): boolean {
   return true;
 }
 
-export function sanitizeName(raw: string): string {
-  const words = raw
-    .trim()
-    .replace(/^["'`]+/, "")
-    .replace(/["'`]+$/, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
+/**
+ * Title-case one word. Words the model already cased (CI, GitHub, iOS, v4.1)
+ * and words with digits stay as given; plain lowercase words get a capital, each part of a
+ * hyphenated word too (Agent-Link).
+ */
+function titleWord(word: string, first: boolean): string {
+  if (/[A-Z]/.test(word.slice(1)) || /\d/.test(word)) return word;
+  if (!first && SMALL_WORDS.has(word.toLowerCase())) return word.toLowerCase();
+  return word
     .split("-")
+    .map((part) => (part ? part[0]!.toUpperCase() + part.slice(1) : part))
+    .join("-");
+}
+
+/**
+ * A Title Case name with spaces: "Chicken Door Alert Tamer". A kebab-case
+ * reply (an older habit) is split on its hyphens; otherwise hyphens inside a
+ * word stay. Whole words only up to MAX_NAME_CHARS.
+ */
+export function sanitizeName(raw: string): string {
+  let text = raw
+    .trim()
+    .replace(/^[#>*_\s]+|[*_\s]+$/g, "")
+    .replace(/^["'`\u201c\u2018]+|["'`\u201d\u2019.!?:;,]+$/g, "")
+    .trim();
+  if (!/\s/.test(text) && /-/.test(text)) text = text.replace(/-+/g, " ");
+  // Shouted all-caps names are lowercased first, so only real acronyms keep caps.
+  if (/[A-Z]{4,}/.test(text) && !/[a-z]/.test(text) && text.split(/\s+/).length > 1) text = text.toLowerCase();
+  const words = text
+    .replace(/[^A-Za-z0-9.+#&'\-\s]+/g, " ")
+    .split(/\s+/)
+    .map((w) => w.replace(/^[-.']+|[-.']+$/g, ""))
     .filter(Boolean)
-    .slice(0, 6);
+    .slice(0, MAX_NAME_WORDS)
+    .map((w, i) => titleWord(w, i === 0));
   // Whole words only: stop before the word that would exceed the cap, so a
   // tab never shows a clipped fragment. A single over-long first word still
   // hard-truncates rather than leaving the session unnamed.
   let name = "";
   for (const word of words) {
-    const next = name ? `${name}-${word}` : word;
+    const next = name ? `${name} ${word}` : word;
     if (next.length > MAX_NAME_CHARS) break;
     name = next;
   }
@@ -94,8 +121,9 @@ export function sanitizeName(raw: string): string {
   return name;
 }
 
+/** Checked against the name lowercased with spaces turned to hyphens. */
 const INSTRUCTION_ECHO =
-  /at-?most-?\d+-?(short-?)?words|session-?picker|short-?title|coding-?agent-?sessions|the-?user-?wants|plain-?text-?only/i;
+  /at-?most-?\d+-?(short-?)?(words|characters)|session-?picker|short-?title|coding-?agent-?sessions?|the-?user-?wants|plain-?text-?only|role-?noun|title-?case/i;
 
 /** Keep final answer text only — drop thinking blocks and instruction echo. */
 export function titleFromContent(
@@ -105,9 +133,9 @@ export function titleFromContent(
     .filter((c) => c?.type === "text" && c.text)
     .map((c) => c.text as string)
     .join(" ");
-  const first = sanitizeName(raw.split(/\n/)[0] || "");
-  if (!first || INSTRUCTION_ECHO.test(first)) return "";
-  return first;
+  const line = raw.split(/\n/)[0] || "";
+  if (INSTRUCTION_ECHO.test(line.toLowerCase().replace(/[\s-]+/g, "-"))) return "";
+  return sanitizeName(line);
 }
 
 function messageText(content: unknown): string {
@@ -200,6 +228,23 @@ export function candidateModels(
   return out;
 }
 
+/**
+ * Names read like a character on the job: the specific thing being worked on,
+ * then one role noun. Examples steer a small flash model better than rules.
+ */
+export const NAMING_PROMPT = [
+  "Name this conversation like a character on the job: the specific thing being worked on (2-3 words), then one role noun for what is being done to it. Playful but clear; the subject must say what it is about.",
+  "Title Case with spaces. Keep acronyms and brand casing (CI, GitHub, NAS). At most 30 characters.",
+  "Reply with only the name: no quotes, no period, no markdown. Name the conversation as it is now, not the first message alone.",
+  "Examples:",
+  "chicken coop door notifications firing every morning -> Chicken Door Alert Tamer",
+  "a CI test that fails one run in five -> Flaky CI Wrangler",
+  "memory leak in the canvas server -> Canvas Leak Plumber",
+  "upgrading Rails 7.1 to 8 -> Rails 8 Upgrade Sherpa",
+  "rotating an expired GitHub token -> GitHub Token Swapper",
+  "what time is it in Tokyo -> Tokyo Time Teller",
+].join("\n");
+
 /** The session model may spend tokens reasoning even with thinking off; titles stay short anyway. */
 const FALLBACK_MAX_TOKENS = 1024;
 
@@ -236,7 +281,7 @@ export async function generateTitle(
         model,
         {
           systemPrompt:
-            "Reply with only a kebab-case session title: lowercase words joined by hyphens. At most 3 short words, under 20 characters total. No quotes, no period, no markdown. Name the conversation as it is now, not the first message alone.",
+            NAMING_PROMPT,
           messages: [{ role: "user", content: source.slice(0, 2000) }],
         },
         {
@@ -319,7 +364,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("auto-name", {
-    description: "Generate a kebab-case session title from recent context",
+    description: "Generate a Title Case session name from recent context",
     handler: async (_args, ctx) => {
       ctx.ui.notify("naming…", "info");
       try {

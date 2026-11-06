@@ -10,6 +10,7 @@ import test from "node:test";
 import {
   candidateModels,
   DEFAULT_NAME_MODELS,
+  NAMING_PROMPT,
   NO_NAMING_MODEL,
   generateTitle,
   hasHistory,
@@ -36,27 +37,67 @@ test("real titles count as user-given", () => {
   assert.equal(isUserGivenName("psst"), true);
 });
 
-test("sanitizeName lowercases and hyphenates", () => {
-  assert.equal(sanitizeName('  "Fix the footer."  '), "fix-the-footer");
-  assert.equal(sanitizeName("tmux status line"), "tmux-status-line");
+test("sanitizeName makes Title Case with spaces", () => {
+  assert.equal(sanitizeName('  "Fix the footer."  '), "Fix the Footer");
+  assert.equal(sanitizeName("chicken door alert tamer"), "Chicken Door Alert Tamer");
+  assert.equal(sanitizeName("**Canvas Leak Plumber**"), "Canvas Leak Plumber");
+  assert.equal(sanitizeName("\u201cTokyo Time Teller\u201d"), "Tokyo Time Teller");
+});
+
+test("sanitizeName keeps acronyms, brand casing, and version numbers", () => {
+  assert.equal(sanitizeName("Flaky CI Wrangler"), "Flaky CI Wrangler");
+  assert.equal(sanitizeName("github token swapper"), "Github Token Swapper");
+  assert.equal(sanitizeName("GitHub Token Swapper"), "GitHub Token Swapper");
+  assert.equal(sanitizeName("rails 8 upgrade sherpa"), "Rails 8 Upgrade Sherpa");
+  assert.equal(sanitizeName("deepseek v4.1 tester"), "Deepseek v4.1 Tester");
+});
+
+test("sanitizeName splits a kebab reply but keeps hyphens inside spaced words", () => {
+  assert.equal(sanitizeName("fix-tmux-status"), "Fix Tmux Status");
+  assert.equal(sanitizeName("agent-link mention butler"), "Agent-Link Mention Butler");
+});
+
+test("sanitizeName lowercases small words unless first, and calms shouting", () => {
+  assert.equal(sanitizeName("Keeper Of The Coop"), "Keeper of the Coop");
+  assert.equal(sanitizeName("the coop keeper"), "The Coop Keeper");
+  assert.equal(sanitizeName("FLAKY TEST WRANGLER"), "Flaky Test Wrangler");
+});
+
+test("sanitizeName caps at 30 characters on whole words", () => {
+  const name = sanitizeName("Extremely Verbose Session Naming Specialist");
+  assert.ok(name.length <= 30, name);
+  assert.equal(name, "Extremely Verbose Session");
+  assert.equal(sanitizeName("a".repeat(40)), "A" + "a".repeat(29));
 });
 
 test("titleFromContent drops thinking and instruction echo", () => {
   assert.equal(
     titleFromContent([
       { type: "thinking", thinking: "The user wants a short title" },
-      { type: "text", text: "Fix tmux status line" },
+      { type: "text", text: "Tmux Status Color Fixer" },
     ]),
-    "fix-tmux-status-line",
+    "Tmux Status Color Fixer",
   );
   assert.equal(
     titleFromContent([{ type: "text", text: "The user wants a short title (at most 6 words) for a coding-" }]),
     "",
   );
+  assert.equal(titleFromContent([{ type: "text", text: "Title Case with spaces" }]), "");
   assert.equal(
     titleFromContent([{ type: "text", text: "one two three four five six seven eight" }]),
-    "one-two-three-four",
+    "One Two Three Four Five Six",
   );
+});
+
+test("the naming prompt asks for Title Case nouns, with examples", () => {
+  assert.match(NAMING_PROMPT, /Title Case with spaces/);
+  assert.match(NAMING_PROMPT, /-> Flaky CI Wrangler/);
+  assert.doesNotMatch(NAMING_PROMPT, /kebab/);
+  for (const line of NAMING_PROMPT.split("\n").filter((l) => l.includes(" -> "))) {
+    const name = line.split(" -> ")[1];
+    assert.equal(sanitizeName(name), name, "examples survive sanitizing unchanged");
+    assert.ok(name.length <= 30);
+  }
 });
 
 test("recentContext prefers later turns", () => {
@@ -199,7 +240,7 @@ test("generateTitle falls through a 402 error to the next model", async () => {
     models,
     {
       "ollama/glm-5.3-flash": { stopReason: "error", errorMessage: '402: {"message":"not included"}', content: [] },
-      "inco/deepseek-v4.1-flash:fast": { stopReason: "stop", content: [{ type: "text", text: "fix-tmux-status" }] },
+      "inco/deepseek-v4.1-flash:fast": { stopReason: "stop", content: [{ type: "text", text: "Tmux Status Fixer" }] },
     },
     calls,
   );
@@ -208,7 +249,7 @@ test("generateTitle falls through a 402 error to the next model", async () => {
     "ollama/glm-5.3-flash",
     "inco/deepseek-v4.1-flash:fast",
   ]);
-  assert.equal(title, "fix-tmux-status");
+  assert.equal(title, "Tmux Status Fixer");
   assert.equal(state.preferred, "inco/deepseek-v4.1-flash:fast");
   // Models go out unchanged so pi can send their thinking-off value.
   assert.equal(calls[0].reasoning, true);

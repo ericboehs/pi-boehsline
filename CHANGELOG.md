@@ -8,6 +8,7 @@
 
 ### Changed
 
+- auto-session-name: names are Title Case with spaces, read like a character on the job (the thing being worked on plus one role noun: **Chicken Door Alert Tamer**, **Flaky CI Wrangler**), and may run to 30 characters. Acronyms and brand casing (CI, GitHub) are kept; a kebab-case reply is still split and title-cased.
 - footer: a session name saved with outer quotes (`/name "Foo Bar"` before the pi fork stripped them) shows without them.
 - agent-link: a spaced session name answers to its lowercase, hyphenated handle and its prefixes (`@chicken-door` for "Chicken Door Tamer"), in @mentions, autocomplete, and `to`. Autocomplete inserts the handle, since a space ends an @mention.
 - canvas: findings are gone. The `finding` kind, the guideline asking agents to record them, Haiku's findings field and the Findings card are removed; nothing read them after the fact. Old `findings.md` files are left on disk and ignored.
