@@ -131,12 +131,22 @@ depend on a terminal being left running.
 /schedule --misfire always once 8p :: check in on the deploy
 /schedule list [all] | show <id> | runs <id>
 /schedule run <id> | pause <id|all> | resume <id|all> | remove <id>
-/schedule edit <id> <schedule> :: <prompt>
+/schedule edit <id> [--model <model>|--no-model] [--cwd <dir>] <schedule> :: <prompt>
 ```
 
 `/schedule edit` replaces the schedule and prompt and keeps the rest (id,
-name, model, cwd, delivery, history, paused): `pi-scheduler edit --schedule
---prompt` in one line. It refuses a task that is running.
+name, delivery, history, paused): `pi-scheduler edit --schedule --prompt` in
+one line. The model and cwd stay too, unless the edit names them: `--model`
+sets a pattern as pi's `--model` takes it, `--no-model` goes back to pi's
+default, and `--cwd` moves the task to another folder (an absolute path to a
+directory that exists; quote one with spaces, `--cwd "/Users/me/My Project"`).
+These go before the id or right after it, ahead of the schedule; no other
+option is taken here (delivery and the rest: `pi-scheduler edit`). It refuses
+a task that is running.
+
+```text
+/schedule edit grades --model openai/gpt-5-mini --cwd /Users/me/Code/school daily 15:30 :: check the kids' grades
+```
 
 `/schedule run` fires a task now, exactly as the timer would: **its own pi, its
 own cwd and model, not this conversation and not this conversation's context.**

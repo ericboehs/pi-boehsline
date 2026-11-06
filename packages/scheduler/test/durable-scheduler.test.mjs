@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +9,7 @@ import durableScheduler, {
   parseLeadingFlags,
   tokenize,
 } from "../extensions/durable-scheduler.ts";
-import { readRegistry, writeRegistry } from "../extensions/lib/task-registry.ts";
+import { readRegistry, readRuns, settleRun, writeRegistry } from "../extensions/lib/task-registry.ts";
 import { piArgsFor } from "../extensions/lib/runner.ts";
 
 function withTempDir(t) {
@@ -602,7 +602,7 @@ test("/schedule edit refuses a bad schedule, a missing task and a running one, c
   await ui.run("edit nope daily 9a :: x");
   assert.match(ui.last().message, /No scheduled task matches nope/);
   await ui.run("edit");
-  assert.match(ui.last().message, /Usage: \/schedule edit <id\|name> <schedule> :: <prompt>/);
+  assert.match(ui.last().message, /Usage: \/schedule edit <id\|name> \[--model <model>\|--no-model\] \[--cwd <dir>\] <schedule> :: <prompt>/);
   assert.equal(JSON.stringify(readRegistry()), snapshot);
 
   const registry = readRegistry();
@@ -613,6 +613,71 @@ test("/schedule edit refuses a bad schedule, a missing task and a running one, c
   assert.equal(ui.last().level, "error");
   assert.match(ui.last().message, /is running; edit it once this run finishes/);
   assert.equal(JSON.stringify(readRegistry()), running);
+});
+
+test("/schedule edit moves a task's model and folder, before the id or after it, and keeps the rest", async (t) => {
+  const dir = withTempDir(t);
+  const ui = mount();
+  const spaced = join(dir, "My Project :: x");
+  mkdirSync(spaced);
+
+  await ui.run("--name grades --model cerebras/gpt-oss-120b:low --deliver slack-noti daily 15:30 :: check grades");
+  const [before] = readRegistry().tasks;
+  settleRun(before.id, before.nextRunAt, Date.now(), { status: "ok", output: "fine" });
+  const history = readRuns(before.id, 10);
+  assert.equal(history.length, 1);
+
+  await ui.run(`edit ${before.id} --model openai/gpt-5-mini --cwd "${spaced}" every 45m :: poll`);
+  assert.match(ui.last().message, /^Edited /);
+  const [moved] = readRegistry().tasks;
+  assert.deepEqual([moved.id, moved.name, moved.deliver, moved.createdAt, moved.lastStatus],
+    [before.id, before.name, before.deliver, before.createdAt, "ok"]);
+  assert.deepEqual([moved.model, moved.cwd, moved.kind, moved.intervalMs, moved.prompt],
+    ["openai/gpt-5-mini", spaced, "interval", 2_700_000, "poll"], "a quoted folder keeps its spaces and its ::");
+  assert.deepEqual(readRuns(before.id, 10), history, "the run history stays with the id");
+
+  await ui.run(`edit --no-model --cwd '${dir}' grades daily 9a :: check`);
+  const [cleared] = readRegistry().tasks;
+  assert.deepEqual([cleared.id, cleared.model, cleared.cwd, cleared.dailyAt], [before.id, undefined, dir, "09:00"]);
+  assert.equal("model" in cleared, false, "pi's default: no model at all");
+
+  await ui.run(`edit grades --model=anthropic/claude-sonnet-4-5 every 1h :: --cwd /etc stays the prompt`);
+  const [last] = readRegistry().tasks;
+  assert.deepEqual([last.model, last.cwd, last.prompt], ["anthropic/claude-sonnet-4-5", dir, "--cwd /etc stays the prompt"]);
+});
+
+test("/schedule edit refuses a bad model or folder, and any other option, changing nothing", async (t) => {
+  const dir = withTempDir(t);
+  const ui = mount();
+  const file = join(dir, "a-file");
+  writeFileSync(file, "");
+  await ui.run(`--name grades --model m1 --cwd ${dir} daily 15:30 :: check grades`);
+  const snapshot = JSON.stringify(readRegistry());
+
+  for (const [args, why] of [
+    ["--model '' daily 9a :: x", /--model wants one model pattern/],
+    ["--model '--with=none' daily 9a :: x", /--model wants one model pattern/],
+    ["--model 'a b' daily 9a :: x", /--model wants one model pattern/],
+    ["--model \"a\nb\" daily 9a :: x", /--model wants one model pattern/],
+    ["--model m2 --no-model daily 9a :: x", /--model and --no-model together/],
+    ["--cwd relative/dir daily 9a :: x", /--cwd wants an absolute path/],
+    [`--cwd "${dir}\n/bypass on" daily 9a :: x`, /--cwd wants an absolute path/],
+    [`--cwd "${dir}\u2028/bypass on" daily 9a :: x`, /--cwd wants an absolute path/],
+    [`--cwd ${join(dir, "missing")} daily 9a :: x`, /is not a directory/],
+    [`--cwd ${file} daily 9a :: x`, /is not a directory/],
+    ["--deliver 'curl evil' daily 9a :: x", /edit takes --model, --no-model and --cwd, not --deliver/],
+    ["--name other daily 9a :: x", /not --name/],
+    ["--bogus daily 9a :: x", /Unknown option --bogus/],
+    ["--model", /--model needs a value/],
+  ]) {
+    await ui.run(`edit grades ${args}`);
+    assert.equal(ui.last().level, "error", args);
+    assert.match(ui.last().message, why, args);
+    assert.match(ui.last().message, /Usage: \/schedule edit/, args);
+  }
+  await ui.run("edit --model m2");
+  assert.equal(ui.last().level, "error", "options and no task");
+  assert.equal(JSON.stringify(readRegistry()), snapshot);
 });
 
 test("selecting a task that does not exist is an error, not a silent no-op", async (t) => {

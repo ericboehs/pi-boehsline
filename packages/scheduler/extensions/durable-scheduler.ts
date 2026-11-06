@@ -1,3 +1,6 @@
+import { statSync } from "node:fs";
+import { isAbsolute } from "node:path";
+
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -57,7 +60,7 @@ export interface ParsedFlags {
 }
 
 const VALUE_FLAGS = new Set(["name", "model", "cwd", "with", "without", "deliver", "misfire", "timeout"]);
-const BOOLEAN_FLAGS = new Set(["tools", "no-tools", "no-deliver"]);
+const BOOLEAN_FLAGS = new Set(["tools", "no-tools", "no-deliver", "no-model"]);
 
 /**
  * Flags are only recognized at the front, before the schedule.
@@ -108,6 +111,7 @@ function applyFlags(
   const updated = { ...task };
   if (typeof flags.name === "string") updated.name = flags.name;
   if (typeof flags.model === "string") updated.model = flags.model;
+  if (flags["no-model"] === true) delete updated.model;
   if (typeof flags.cwd === "string") updated.cwd = flags.cwd;
   if (flags.tools === true) updated.without = (updated.without ?? []).filter((f) => f !== "tools");
   if (flags["no-tools"] === true) {
@@ -144,6 +148,51 @@ function applyFlags(
   return updated;
 }
 
+/** The options `/schedule edit` takes: where the task runs, never what it delivers. */
+const EDIT_FLAGS = new Set(["model", "no-model", "cwd"]);
+
+/**
+ * An edit's options, checked: a model pattern is one word that pi's --model can't read as
+ * another option, and a folder is an absolute path to a directory that exists now. The runner
+ * would quietly fall back to $HOME for a folder that is gone, which is the wrong time to find
+ * out about a typo.
+ */
+export interface EditFlags {
+  model?: string;
+  clearModel?: boolean;
+  cwd?: string;
+}
+
+export function editFlags(flags: Record<string, string | boolean>): EditFlags | { error: string } {
+  const unknown = Object.keys(flags).find((name) => !EDIT_FLAGS.has(name));
+  if (unknown !== undefined) return { error: `edit takes --model, --no-model and --cwd, not --${unknown}; the rest: pi-scheduler edit` };
+  const out: EditFlags = {};
+  if (flags["no-model"] === true) {
+    if (flags.model !== undefined) return { error: "--model and --no-model together" };
+    out.clearModel = true;
+  }
+  if (flags.model !== undefined) {
+    const model = flags.model;
+    if (typeof model !== "string" || !/^[A-Za-z0-9][^\s\p{C}]{0,199}$/u.test(model)) {
+      return { error: "--model wants one model pattern, such as cerebras/gpt-oss-120b:low" };
+    }
+    out.model = model;
+  }
+  if (flags.cwd !== undefined) {
+    const cwd = flags.cwd;
+    if (typeof cwd !== "string" || !isAbsolute(cwd) || cwd.length > 1024 || /[\p{C}\p{Zl}\p{Zp}]/u.test(cwd)) {
+      return { error: "--cwd wants an absolute path; quote one with spaces" };
+    }
+    try {
+      if (!statSync(cwd).isDirectory()) return { error: `--cwd ${cwd} is not a directory` };
+    } catch {
+      return { error: `--cwd ${cwd} is not a directory` };
+    }
+    out.cwd = cwd;
+  }
+  return out;
+}
+
 function describeMisfire(task: DurableTask): string {
   const policy = task.misfire ?? DEFAULT_MISFIRE_GRACE_MS;
   if (policy === "skip") return "skip if late";
@@ -169,7 +218,7 @@ const SUBCOMMAND_SHAPES: Record<string, string> = {
   runs: "runs <id|name>",
   history: "runs <id|name>",
   run: "run <id|name>",
-  edit: "edit <id|name> <schedule> :: <prompt>",
+  edit: "edit <id|name> [--model <model>|--no-model] [--cwd <dir>] <schedule> :: <prompt>",
   pause: "pause <id|name|all>",
   resume: "resume <id|name|all>",
   remove: "remove <id|name>",
@@ -219,7 +268,7 @@ export default function durableScheduler(pi: ExtensionAPI): void {
         "  /schedule list [all] | show <id> | runs <id>",
         "  /schedule run <id>   run now, in its own pi (not this session)",
         "  /schedule pause <id> | resume <id> | remove <id>",
-        "  /schedule edit <id> <schedule> :: <prompt>",
+        "  /schedule edit <id> [--model <m>|--no-model] [--cwd <dir>] <schedule> :: <prompt>",
         "",
         "Options go first: --name --model --cwd --with/--without --deliver",
         "                  --misfire --timeout",
@@ -297,9 +346,11 @@ export default function durableScheduler(pi: ExtensionAPI): void {
         "  pause <id> | resume <id>",
         "                      resume rolls forward to the next future slot rather",
         "                      than replaying what was missed",
-        "  edit <id> <schedule> :: <prompt>",
-        "                      new schedule and prompt; the id, name, model, cwd",
-        "                      and delivery stay. Not while it runs",
+        "  edit <id> [--model <m>|--no-model] [--cwd <dir>] <schedule> :: <prompt>",
+        "                      new schedule and prompt; the id, name, delivery and",
+        "                      history stay, and the model and cwd too unless given",
+        "                      (--no-model: pi's default; quote a cwd with spaces).",
+        "                      Not while it runs",
         "  remove <id>         delete the task and its history",
         "",
         "EXAMPLE",
@@ -465,16 +516,32 @@ export default function durableScheduler(pi: ExtensionAPI): void {
           return;
         }
 
-        // The same task (id, name, model, cwd, delivery, history, paused) with a new schedule
-        // and prompt: `pi-scheduler edit --schedule --prompt` in one line. Not mid-run: the
+        // The same task (id, name, delivery, history, paused) with a new schedule and prompt,
+        // and a new model or folder if asked (--model, --no-model, --cwd, before the id or
+        // after it): `pi-scheduler edit --schedule --prompt` in one line. Options are read
+        // before the "::", so a quoted folder holding one stays the folder. Not mid-run: the
         // run's release would roll the new schedule from the old slot, or retire an edited
         // one-shot.
-        const edit = input.match(/^edit\s+(\S+)\s+([\s\S]+)$/i);
-        if (edit?.[1] && edit[2]) {
-          const selector = edit[1];
-          const parsed = parseScheduleSpec(edit[2]);
+        const edit = input.match(/^edit\s+([\s\S]+)$/i);
+        const editUsage = `Usage: /schedule ${SUBCOMMAND_SHAPES.edit}`;
+        if (edit?.[1]) {
+          const before = parseLeadingFlags(edit[1]);
+          const target = "error" in before ? undefined : before.rest.match(/^(\S+)\s+([\s\S]+)$/);
+          const after = target?.[2] === undefined ? undefined : parseLeadingFlags(target[2]);
+          if ("error" in before || after === undefined || "error" in after) {
+            const error = "error" in before ? before.error : after !== undefined && "error" in after ? after.error : undefined;
+            notice(ctx, error ? `${error}\n${editUsage}` : editUsage, "error");
+            return;
+          }
+          const options = editFlags({ ...before.flags, ...after.flags });
+          if ("error" in options) {
+            notice(ctx, `${options.error}\n${editUsage}`, "error");
+            return;
+          }
+          const selector = target![1]!;
+          const parsed = parseScheduleSpec(after.rest);
           if ("error" in parsed) {
-            notice(ctx, `${parsed.error}\nUsage: /schedule ${SUBCOMMAND_SHAPES.edit}`, "error");
+            notice(ctx, `${parsed.error}\n${editUsage}`, "error");
             return;
           }
           withRegistry((registry) => {
@@ -487,6 +554,9 @@ export default function durableScheduler(pi: ExtensionAPI): void {
             delete task.dailyAt;
             delete task.cronExpr;
             Object.assign(task, parsed.schedule);
+            if (options.clearModel) delete task.model;
+            if (options.model !== undefined) task.model = options.model;
+            if (options.cwd !== undefined) task.cwd = options.cwd;
             if (!isDurableTask(task)) throw new Error("That edit would leave the task invalid; nothing was changed");
             registry.tasks[registry.tasks.indexOf(existing)] = task;
             writeRegistry(registry);

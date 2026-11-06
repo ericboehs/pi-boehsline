@@ -13,6 +13,10 @@ change behaviour; each one says what it breaks.
   (`"scheduler-tool": { "exposure": "direct" }` to always declare it).
   Agent-set timers are marked `source: "agent"` and fire with a label saying
   so. Nothing changes with it off.
+- `/schedule edit` takes `--model <model>`, `--no-model` (pi's default) and
+  `--cwd <dir>` (absolute, an existing directory; quote one with spaces),
+  before the id or after it, to move a task's model or folder while keeping
+  its id, name, delivery and history. Any other option is refused there.
 
 ### Changed
 
