@@ -365,6 +365,19 @@ export function contextAboveThreshold(threshold: string | undefined, tokens: num
   return match[2] === "k" ? tokens > n * 1000 : !!window && tokens > (window * n) / 100;
 }
 
+const NAME_QUOTE_PAIRS: Record<string, string> = { '"': '"', "'": "'", "`": "`", "\u201c": "\u201d", "\u2018": "\u2019" };
+
+/**
+ * The session name as shown: one matching pair of outer quotes dropped.
+ * `/name "Chicken Door Tamer"` used to store the quotes too (the pi fork's
+ * /name strips them now); this keeps names saved before that clean.
+ */
+export function displaySessionName(name: string | undefined): string {
+  const n = (name || "").trim();
+  const close = n.length >= 2 ? NAME_QUOTE_PAIRS[n[0]!] : undefined;
+  return close && n[n.length - 1] === close ? n.slice(1, -1).trim() : n;
+}
+
 /**
  * The editor's top border with the session name in it, the way Claude Code
  * frames the prompt: `── name ──────── ↑ 3 more ──`. pi's own scroll
@@ -2501,7 +2514,7 @@ export default function footerExtension(pi: ExtensionAPI): void {
     requestRender: () => void,
     untinted: (text: string) => string = (text) => color(CYAN, text),
   ): string {
-    const sessionName = pi.getSessionName();
+    const sessionName = displaySessionName(pi.getSessionName());
     const peerName = sessionName ? "" : peer.read(requestRender);
     // Bypassed: red with ⚠, whatever the tint, so it can't be missed.
     if (bypassMarks("name") && (sessionName || peerName)) return color(BRIGHT_RED, `⚠ ${sessionName || peerName}`);

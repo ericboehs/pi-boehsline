@@ -30,6 +30,7 @@ import footer, {
   contextAboveThreshold,
   defaultChipHidden,
   dirLabel,
+  displaySessionName,
   readChipDefaults,
   paceMark,
   rateChipShown,
@@ -3157,4 +3158,13 @@ test("cursor chip falls back to status text when the stash is empty", async (t) 
     statuses: new Map([[CURSOR_STATUS_KEY, "cursor $81.60/$200 (41%)"]]),
   });
   assert.match((await ui.settled(120))[0], /⬡ \$82(?!\/)/);
+});
+
+test("displaySessionName drops one matching pair of outer quotes", () => {
+  assert.equal(displaySessionName('"Spaced Name Namer"'), "Spaced Name Namer");
+  assert.equal(displaySessionName("\u201cCanvas Leak Plumber\u201d"), "Canvas Leak Plumber");
+  assert.equal(displaySessionName("Flaky CI Wrangler"), "Flaky CI Wrangler");
+  assert.equal(displaySessionName('say "hi"'), 'say "hi"');
+  assert.equal(displaySessionName('"'), '"');
+  assert.equal(displaySessionName(undefined), "");
 });
