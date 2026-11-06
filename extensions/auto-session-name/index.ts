@@ -233,7 +233,8 @@ export function candidateModels(
  * then one role noun. Examples steer a small flash model better than rules.
  */
 export const NAMING_PROMPT = [
-  "Name this conversation like a character on the job: the specific thing being worked on (2-3 words), then one role noun for what is being done to it. Playful but clear; the subject must say what it is about.",
+  "Name this conversation like a character on the job: the specific thing being worked on (2-3 words), then one role noun for what is being done to it. Playful but clear; the subject must say what it is about. Take the subject from the real task, not greetings or setup instructions.",
+  "Pick a vivid, playful role noun (Tamer, Wrangler, Whisperer, Sherpa, Plumber, Sleuth, Herder, Wizard, Janitor, Detective) over plain ones (Fixer, Updater, Finder, Helper, Manager, Remover).",
   "Title Case with spaces. Keep acronyms and brand casing (CI, GitHub, NAS). At most 30 characters.",
   "Reply with only the name: no quotes, no period, no markdown. Name the conversation as it is now, not the first message alone.",
   "Examples:",
@@ -241,8 +242,8 @@ export const NAMING_PROMPT = [
   "a CI test that fails one run in five -> Flaky CI Wrangler",
   "memory leak in the canvas server -> Canvas Leak Plumber",
   "upgrading Rails 7.1 to 8 -> Rails 8 Upgrade Sherpa",
-  "rotating an expired GitHub token -> GitHub Token Swapper",
-  "what time is it in Tokyo -> Tokyo Time Teller",
+  "rotating an expired GitHub token -> GitHub Token Janitor",
+  "what time is it in Tokyo -> Tokyo Clock Whisperer",
 ].join("\n");
 
 /** The session model may spend tokens reasoning even with thinking off; titles stay short anyway. */
