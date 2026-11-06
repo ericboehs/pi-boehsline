@@ -28,7 +28,7 @@
 
 import { createHash, createPublicKey, randomBytes, verify as verifySignature } from "node:crypto";
 import { execFile } from "node:child_process";
-import { accessSync, appendFileSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
@@ -100,6 +100,11 @@ interface Conn {
 	sessionId: string | null;
 	/** Fallback name source: the pi session name, read lazily. */
 	sessionName: () => string | undefined;
+	/** Sets pi's session name (Botsun's rename line); the current instance's. */
+	setSessionName?: (name: string) => void;
+	/** When pi's session name was last set from here (a rename line or a phone /name), ms: newer
+	 * than agent-link's pid file, it is the name every line says. */
+	namedAt?: number;
 	/** The model on screen ("Claude Opus 5.5") and its thinking level, for the phone's header. */
 	model: { name: string; provider: string; id?: string; thinking?: string } | null;
 	/** The models the phone's picker offers; read lazily. */
@@ -622,6 +627,7 @@ export function serverLine(c: Conn, line: string): boolean {
 	if (!msg || typeof msg !== "object" || Array.isArray(msg)) return false;
 	const { v, type, token, expires_in: ttl } = msg as Record<string, unknown>;
 	if (v === 1 && type === "color") return applyColor(c, msg as Record<string, unknown>);
+	if (v === 1 && type === "name") return applyName(c, msg as Record<string, unknown>);
 	if (v !== 1 || type !== "sandbox_token") return false;
 	if (typeof token !== "string" || !SANDBOX_TOKEN.test(token)) return false;
 	if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < 1 || ttl > SANDBOX_TOKEN_MAX_S) return false;
@@ -647,6 +653,37 @@ function applyColor(c: Conn, msg: Record<string, unknown>): boolean {
 	if (ok) c.colorApplied = { sessionId: c.sessionId!, color: push.color, at: push.at };
 	else c.colorSaid = said;
 	return ok;
+}
+
+// What a name never carries: control characters, the line and paragraph separators, and the
+// direction marks and overrides that would make it read other than it is.
+const NAME_BAD = /[\p{Cc}\u2028\u2029\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
+/** A name from Botsun (or the phone's /name) as pi may take it: undefined when nothing is left. */
+export function cleanName(raw: unknown): string | undefined {
+	if (typeof raw !== "string") return undefined;
+	if (NAME_BAD.test(raw)) return undefined; // refused whole, never quietly fixed
+	const name = raw.trim().slice(0, NAME_MAX).trim();
+	return name || undefined;
+}
+
+/**
+ * Botsun's rename (the phone's info sheet, signed there), into pi's session name. Only for the
+ * session pi is in now (a line for one it has left is read, not taken), only a clean name, and only
+ * through pi's own setSessionName: never a shell, tmux or a command line. Then a features line, so
+ * Botsun hears the new name now (every line carries it) rather than at the next state change.
+ */
+function applyName(c: Conn, msg: Record<string, unknown>): boolean {
+	if (msg.session_id !== c.sessionId || !c.sessionId) return false;
+	if (c.boundId !== c.sessionId) return true;
+	const name = cleanName(msg.name);
+	if (!name || !c.setSessionName) return false;
+	// pi's calls throw once this instance is stale (a /reload or /new mid-handoff); a throw here
+	// would reach the socket's data handler and end pi.
+	try { c.setSessionName(name); } catch { return false; }
+	c.namedAt = Date.now();
+	try { write(c, "features", { features: featureList(c) }); } catch {}
+	return true;
 }
 
 /** The /color claim for a hello or session line ({color, color_at}), noted as said; none without the color extension. */
@@ -1228,17 +1265,19 @@ function debug(msg: string): void {
 	} catch {}
 }
 
-/** agent-link's name for this pid, else the pi session name, else the folder. */
-function currentName(c: Conn): string {
+/** agent-link's name for this pid, else the pi session name, else the folder. A name set through
+ * pi from here (Botsun's rename, the phone's /name) after agent-link last wrote its file wins. */
+export function currentName(c: Conn): string {
 	let name: string | undefined;
+	let piName: string | undefined;
+	try { piName = c.sessionName()?.trim() || undefined; } catch {}
 	try {
-		const raw = JSON.parse(readFileSync(join(homedir(), ".claude", "sessions", `${process.pid}.json`), "utf8"));
+		const file = join(homedir(), ".claude", "sessions", `${process.pid}.json`);
+		const raw = JSON.parse(readFileSync(file, "utf8"));
 		if (typeof raw?.name === "string" && raw.name.trim()) name = raw.name.trim();
+		if (name && piName && c.namedAt && c.namedAt > statSync(file).mtimeMs) name = piName;
 	} catch {}
-	if (!name) {
-		try { name = c.sessionName()?.trim() || undefined; } catch {}
-	}
-	return (name || basename(c.cwd) || c.cwd).slice(0, NAME_MAX);
+	return (name || piName || basename(c.cwd) || c.cwd).slice(0, NAME_MAX);
 }
 
 function write(c: Conn, type: string, extra: Record<string, unknown> = {}): void {
@@ -1303,7 +1342,7 @@ function featureList(c: Conn): string[] {
 	const hasStash = (() => {
 		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 	})();
-	return ["say", "say_call", "answer_call", "close_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close",
+	return ["say", "say_call", "answer_call", "close_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close", "name",
 		...(hasStash ? ["stash"] : [])];
 }
 
@@ -1522,7 +1561,11 @@ function runCommand(pi: ExtensionAPI, ctx: ExtensionContext, text: string, busy:
 	}
 	if (name === "name") {
 		if (!args) return "say the name: /name <name>";
-		pi.setSessionName(args.slice(0, 200));
+		const clean = cleanName(args);
+		if (!clean) return "a name can't have control characters or direction marks";
+		pi.setSessionName(clean);
+		const c = store[STORE];
+		if (c) c.namedAt = Date.now(); // what every line says now, over agent-link's older name
 		return null;
 	}
 	if (name === "bypass") {
@@ -1633,6 +1676,7 @@ function main(pi: ExtensionAPI): void {
 		const g = globalThis as { [LAUNCH]?: Conn["launch"] };
 		if (!(LAUNCH in g)) g[LAUNCH] = (_event as { reason?: string } | undefined)?.reason === "startup" ? launchOf(info) : null;
 		const sessionName = () => pi.getSessionName();
+		const setSessionName = (name: string) => pi.setSessionName(name);
 		// Eric's own words, as if typed: steer into a running turn, else start one.
 		const inject = (content: string | UserContent[], busy: boolean) => {
 			if (compacting) held.push(content);
@@ -1696,6 +1740,7 @@ function main(pi: ExtensionAPI): void {
 			prev.handoffTimer = undefined;
 			conn = prev;
 			conn.sessionName = sessionName;
+			conn.setSessionName = setSessionName;
 			conn.inject = inject;
 			conn.deliver = deliver;
 			conn.stop = stop;
@@ -1749,7 +1794,7 @@ function main(pi: ExtensionAPI): void {
 		}
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
-			busy: false, prompt: null, promptDepth: 0, sessionName, ...info, launch: g[LAUNCH],
+			busy: false, prompt: null, promptDepth: 0, sessionName, setSessionName, ...info, launch: g[LAUNCH],
 			nonces: new Map(), inject, deliver, stop, close, command, commands, models, context, confirm, color, model: modelOf(ctx),
 		};
 		store[STORE] = conn;

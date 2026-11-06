@@ -139,6 +139,55 @@ test("name: agent-link registry, else pi session name; re-read per line", async 
 	await srv.stop();
 });
 
+// Botsun's rename (the phone's info sheet): into pi's session name, only for this session and only
+// a clean name; a features line then carries it, and it beats agent-link's older name.
+test("Botsun's name line renames this session in pi and is said back at once", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount({ sessionName: "old" });
+	let piName = "old";
+	const sets = [];
+	m.pi.getSessionName = () => piName;
+	m.pi.setSessionName = (name) => { sets.push(name); piName = name; };
+	mkdirSync(join(home, ".claude", "sessions"), { recursive: true });
+	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "vic" }));
+	await sleep(20); // the registry file is older than the rename
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const hello = srv.lines.find((l) => l.type === "hello");
+	assert.equal(hello.name, "vic", "agent-link's name while nothing renamed it");
+	assert.ok(hello.features.includes("name"), "Botsun sends the line, not /name");
+	const [botsun] = srv.conns;
+	const send = (over) => botsun.write(`${JSON.stringify({ v: 1, type: "name", session_id: "sid-a", name: "Billing fix", ...over })}\n`);
+
+	for (const bad of [{ session_id: "sid-b" }, { name: 7 }, { name: "   " }, { name: "a\u0007b" }, { name: "evil\u202Etxt" }, { name: "two\nlines" }]) send(bad);
+	await sleep(80);
+	assert.deepEqual(sets, [], "another session's, a non-string, an empty one, a control character or a direction mark: nothing");
+	const before = srv.lines.length;
+
+	send({ name: "  Billing fix  " });
+	await until(() => sets.length === 1 && srv.lines.length > before);
+	assert.deepEqual(sets, ["Billing fix"], "trimmed");
+	const said = srv.lines.slice(before).find((l) => l.type === "features");
+	assert.equal(said?.name, "Billing fix", "the next line carries the rename, over agent-link's older name");
+
+	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "vic2" }));
+	await m.fire("agent_start");
+	await until(() => srv.lines.at(-1).type === "busy" || srv.lines.at(-1).name === "vic2");
+	assert.equal(srv.lines.at(-1).name, "vic2", "agent-link naming it again afterwards wins again");
+	await m.fire("session_shutdown", { reason: "quit" });
+	await srv.stop();
+});
+
+test("cleanName refuses control characters and direction marks, trims and caps", async () => {
+	process.env.BOEHSLINE_ENABLE = "botsun-owner";
+	const { cleanName } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	assert.equal(cleanName("  ok  "), "ok");
+	assert.equal(cleanName("x".repeat(250)).length, 200);
+	for (const bad of [undefined, 3, "", "  ", "a\tb", "a\u2028b", "a\u200Fb", "a\u2066b", "a\u061Cb", "a\u007Fb"]) assert.equal(cleanName(bad), undefined, JSON.stringify(bad));
+	assert.equal(cleanName("Café ☕ 日本"), "Café ☕ 日本", "other text is kept");
+});
+
 test("reconnect resends hello with the current state", async () => {
 	let srv = await server();
 	const path = srv.path;

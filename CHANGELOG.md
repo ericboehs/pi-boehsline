@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- botsun-owner: Botsun can rename a session. A `{"type":"name"}` line from Botsun (the phone's info sheet, signed there) sets pi's session name for the session pi is in, through `setSessionName` only, and a features line says the new name back at once. `name` is in the features, so Botsun uses the line instead of sending `/name`. A name with control characters, line separators or direction marks is refused (the phone's `/name` too). A name set through pi from Botsun is what every line says, over an older agent-link name.
+
 ### Changed
 
 - canvas: findings are gone. The `finding` kind, the guideline asking agents to record them, Haiku's findings field and the Findings card are removed; nothing read them after the fact. Old `findings.md` files are left on disk and ignored.
