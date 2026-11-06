@@ -354,6 +354,12 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 
 			const defaultModel = params.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
 
+			// Each child goes on the session's list (lib/children.ts): botsun-owner shows it on
+			// Eric's phone, which can stop it.
+			const kids = await import("../../lib/children.ts");
+			kids.bindChildren(pi.events);
+			const sessionId = kids.sessionOf(ctx);
+
 			const piInvocation = (args: string[]) => {
 				const currentScript = process.argv[1];
 				return currentScript && !currentScript.startsWith("/$bunfs/root/") && fs.existsSync(currentScript)
@@ -427,6 +433,9 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						const reply = await startJob(pi.events, prep.spec, { ctx, name: `sa:${job.agent}`, summary: `subagent ${job.agent}: ${job.task}` });
 						if (reply === null) return noBg;
 						const where = prep.spec.worktree ? "new worktree" : prep.spec.cwd;
+						if (!("error" in reply)) {
+							kids.trackChild({ kind: "cursor", agent: job.agent, task: job.task, model: prep.spec.model, sessionId, bg: reply });
+						}
 						lines.push("error" in reply ? `[${job.agent}] failed: ${reply.error}` : `[${job.agent}] bg ${reply.id} · log ${reply.logPath} · ${prep.spec.model} · ${where}`);
 						continue;
 					}
@@ -454,6 +463,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						if (!req.accepted) resolve(null); // no listener: the bg extension isn't loaded
 					});
 					if (reply === null) return noBg;
+					if (!("error" in reply)) kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, sessionId, bg: reply });
 					lines.push("error" in reply ? `[${job.agent}] failed: ${reply.error}` : `[${job.agent}] bg ${reply.id} · log ${reply.logPath}`);
 				}
 				return {
@@ -510,11 +520,14 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 				const { dollars } = api;
 				let lastEmit = 0;
 				let r: Awaited<ReturnType<typeof runAndCharge>>;
+				const own = new AbortController();
+				const child = kids.trackChild({ kind: "cursor", agent: job.agent, task: job.task, model: spec.model, sessionId, stop: () => own.abort() });
 				try {
 					r = await runAndCharge(spec, {
-						signal,
+						signal: signal ? AbortSignal.any([signal, own.signal]) : own.signal,
 						findCharge: deps.findCharge,
 						onEvent: (run, changed) => {
+							child.cursorState(run.state, spec.worktree ? run.state.workspace : undefined);
 							const now = Date.now();
 							if (!changed && now - lastEmit < 150) return;
 							lastEmit = now;
@@ -524,10 +537,16 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						},
 					});
 				} catch (err) {
+					child.finish("failed", { lastText: `could not start Cursor: ${(err as Error).message}` });
 					return { agent: job.agent, task: job.task, ok: false, output: `could not start Cursor: ${(err as Error).message}` };
 				}
 				const { outcome, charge, chargeError } = r;
 				const failed = outcome.exitCode !== 0 || r.stopped || !!outcome.refused;
+				child.finish(r.stopped ? "stopped" : failed ? "failed" : "done", {
+					lastText: outcome.state.answer || outcome.refused || outcome.stderr || "",
+					...(outcome.worktree ? { worktree: outcome.worktree.path } : {}),
+					...(charge ? { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: (charge.chargedCents ?? 0) / 100 } } : {}),
+				});
 				const cursor: CursorFacts = {
 					model: spec.model,
 					durationMs: outcome.durationMs,
@@ -557,6 +576,8 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 				args.push("--append-system-prompt", tmpFile);
 				args.push(`Task: ${job.task}`);
 				const invocation = piInvocation(args);
+				const own = new AbortController();
+				const child = kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, sessionId, stop: () => own.abort() });
 				try {
 					const usage = newTally();
 					let final = "";
@@ -574,6 +595,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 							} catch {
 								return;
 							}
+							child.piEvent(ev);
 							const m = ev.type === "message_end" ? ev.message : undefined;
 							if (m?.role === "assistant") {
 								usage.turns++;
@@ -600,21 +622,28 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 							spawnError = err.message;
 							resolve(1);
 						});
-						if (signal) {
-							if (signal.aborted) proc.kill("SIGTERM");
-							else signal.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
+						// Esc stops every child; the phone's Stop only this one.
+						for (const s of signal ? [signal, own.signal] : [own.signal]) {
+							if (s.aborted) proc.kill("SIGTERM");
+							else s.addEventListener("abort", () => proc.kill("SIGTERM"), { once: true });
 						}
 					});
 					// Couldn't start, or killed mid-run (abort, OOM, timeout): not ok, even
 					// with a partial reply, which is kept so the work isn't lost.
 					if (spawnError || killedBy) {
-						const why = spawnError ? `could not start pi: ${spawnError}` : `killed by ${killedBy}`;
+						const why = spawnError ? `could not start pi: ${spawnError}` : child.stopping ? "stopped from Botsun" : `killed by ${killedBy}`;
+						child.finish(signal?.aborted ? "stopped" : "failed", { lastText: final || why });
 						const partial = final ? `${final}\n\n` : "";
 						return { agent: job.agent, task: job.task, ok: false, output: `${partial}[${why}]${stderr.length ? `\n${stderr.join("").slice(-2000)}` : ""}`, usage };
 					}
-					if (exitCode !== 0 && !final) return { agent: job.agent, task: job.task, ok: false, output: stderr.join("").slice(-2000) || `exit ${exitCode}`, usage };
+					if (exitCode !== 0 && !final) {
+						child.finish("failed", { lastText: stderr.join("").slice(-600) || `exit ${exitCode}` });
+						return { agent: job.agent, task: job.task, ok: false, output: stderr.join("").slice(-2000) || `exit ${exitCode}`, usage };
+					}
+					child.finish("done", { lastText: final });
 					return { agent: job.agent, task: job.task, ok: true, output: capped(final || "(no output)"), usage };
 				} finally {
+					child.finish("failed"); // an exception above: never left running
 					fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
 				}
 			};

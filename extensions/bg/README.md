@@ -20,7 +20,9 @@ a compatible terminal) opens the job list and live logs; `x` stops a job. The
 session canvas shows the same jobs, with log tails, in a Background jobs card:
 bg emits `bg:jobs` on `pi.events` whenever a job starts, is adopted or
 exits, and answers `bg:list`, so other extensions can follow along without
-importing it.
+importing it. `bg:kill` (`{ id, wake?, reply }`) stops one job as `x` does;
+with `wake: true` the model still gets the "killed" completion (a background
+subagent stopped from Eric's phone, so its parent doesn't wait on it).
 
 There are no periodic model wakeups. Completion still sends the exit status
 and log tail, controlled by `PI_BG_WAKE=followUp|nextTurn|off` (default

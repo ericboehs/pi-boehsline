@@ -52,6 +52,10 @@
  *   logPath, startedAt, endedAt, exitCode, signal, killedByUser; foreground
  *   jobs still racing their budget left out) on every start, adoption and
  *   exit, and answers pi.events.emit("bg:list", { reply }) with the same.
+ *   pi.events.emit("bg:kill", { id, wake?, reply }) stops a running job as
+ *   x in /bg does (sets `accepted`, replies `{ killed }`). `wake: true` still
+ *   wakes the model with "killed", for a stop the model didn't ask for (a
+ *   subagent stopped from Eric's phone), so it doesn't wait on that result.
  *
  * Env knobs:
  *   PI_BG_DIR         log/spool directory (default /tmp/pi-bg-<uid>, mode
@@ -158,6 +162,8 @@ interface Job {
 	exitCode?: number | null;
 	signal?: NodeJS.Signals | null;
 	killedByUser: boolean;
+	/** Killed through bg:kill with wake: the completion wake still applies. */
+	wakeOnKill?: boolean;
 	/** Foreground-race job: its tool result carries the outcome; suppress the wake. */
 	quiet: boolean;
 	/** Wake header text instead of the command (event-bus jobs). */
@@ -952,7 +958,7 @@ export default function (pi: ExtensionAPI) {
 		const outcome =
 			signal !== null ? `killed (${signal})` : code === 0 ? "succeeded" : `exited ${code}`;
 
-		if (job.killedByUser || WAKE === "off") {
+		if ((job.killedByUser && !job.wakeOnKill) || WAKE === "off") {
 			ctxRef?.ui?.notify(`bg ${job.id} ${outcome} after ${elapsed}`, "info");
 			return;
 		}
@@ -1270,6 +1276,15 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- event bus: other extensions start jobs through bg.ts ---------------
 	pi.events.on("bg:list", (data) => (data as { reply?: (jobs: unknown) => void } | undefined)?.reply?.(snapshot()));
+	pi.events.on("bg:kill", (data) => {
+		const req = data as { id?: unknown; wake?: unknown; accepted?: boolean; reply?: (r: { killed: boolean }) => void } | undefined;
+		if (!req || typeof req.id !== "string" || req.accepted) return;
+		const job = jobs.get(req.id);
+		if (!job) return; // another instance (an adopted job's) may hold it
+		req.accepted = true;
+		if (req.wake === true && job.endedAt === undefined) job.wakeOnKill = true;
+		req.reply?.({ killed: kill(job) });
+	});
 	// Subscribing is not a resource (pi tracks and drops it on reload); the job
 	// itself only starts when a request arrives, after session_start.
 	pi.events.on("bg:start", async (data) => {

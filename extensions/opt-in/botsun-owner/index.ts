@@ -40,6 +40,7 @@ import { checkPin, isPinsError, pin, ratchet, shortFingerprint, signVersionOf, t
 import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
 import { latestUsage, onUsageChange, type ProviderUsageSnapshot } from "../../../lib/usage-snapshot.ts";
+import { bindChildren, type ChildInfo, listChildren, onChildrenChange, stopChild } from "../../../lib/children.ts";
 import { claimOf, colorPush, type ColorClaim } from "./color.ts";
 
 type PromptKind = "select" | "confirm" | "input" | "editor" | "custom";
@@ -159,6 +160,8 @@ interface Conn {
 	 * another session was carried there by /color (a /new or /resume), not picked. On the connection,
 	 * so it outlives a /reload. */
 	colorApplied?: { sessionId: string; color: string; at: number };
+	/** The subagents list Botsun was last sent (JSON): a line goes only when it changed. */
+	subagentsSent?: string;
 }
 
 const store = globalThis as unknown as { [STORE]?: Conn };
@@ -573,6 +576,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (r.type === "answer") return r.key !== undefined ? answerCall(c, r) : answerAsk(c, r);
 	if (r.type === "stash") return stashRequest(c, r);
 	if (r.type === "stop") return stopRequest(c, r);
+	if (r.type === "stop_child") return stopChildRequest(c, r);
 	if (r.type === "close") return r.key !== undefined ? closeCall(c, r) : closeRequest(c, r);
 	// Display only (a chip's mode, as a click on the footer flips it): not signed, nothing acts.
 	if (r.type === "footer_tap") return footerTap(String(r.chip ?? ""));
@@ -1091,6 +1095,93 @@ function stopRequest(c: Conn, r: Record<string, unknown>): Record<string, unknow
 	return { ok: true, stopped: c.stop() === "stopped" };
 }
 
+/** A v1-signed stop_child: it takes v2 or newer only. */
+export const STOP_CHILD_V1_REFUSED = "stop_child needs a v2 signature: v1 is refused (update Botsun and the app)";
+/** A subagent id as lib/children.ts makes them, and as Botsun's list keeps them. */
+/** Botsun's CHILD_ID: never "." or "..", since the phone puts the id in a route's path. */
+const CHILD_ID = /^[A-Za-z0-9][\w.-]{0,39}$/;
+
+/**
+ * The phone's Stop on one subagent (its row's detail): aborts that child only, foreground or a
+ * bg job. Signed with the decision key, v2 or newer, over "stop_child\n<id>" (this session's
+ * nonce: single use). Only a child on this session's own list (lib/children.ts) is stopped.
+ */
+function stopChildRequest(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const id = typeof r.child_id === "string" && CHILD_ID.test(r.child_id) ? r.child_id : null;
+	if (!id) return { error: "bad request" };
+	const payload = `stop_child\n${id}`;
+	const denied = verifyDevice(c, r, { decision: "stop_child", digest: () => sha256hex(Buffer.from(payload, "utf8")),
+		v2: { kind: "session", decision: "stop_child", payload: () => payload } });
+	if (denied) return { error: denied };
+	if (!atLeastV2(r)) return { error: STOP_CHILD_V1_REFUSED };
+	const result = stopChild(c.sessionId, id);
+	if (result === "not_found") return { error: "no such subagent in this session" };
+	if (result === "unstoppable") return { error: "this subagent can't be stopped from the phone" };
+	return { ok: true, stopped: result === "stopped" };
+}
+
+/** Under OwnerSessions::MAX_LINE (64 KB) with the line's envelope. */
+export const SUBAGENTS_BYTES = 56 * 1024;
+/** Progress (a new tool, a turn) goes at most this often; a start or an end at once. */
+export const SUBAGENTS_EVERY_MS = 1_000;
+
+/** One child as Botsun takes it (snake_case). */
+function childWire(k: ChildInfo, tail: number, text: number): Record<string, unknown> {
+	return {
+		id: k.id,
+		kind: k.kind,
+		agent: k.agent,
+		task: k.task,
+		...(k.model ? { model: k.model } : {}),
+		state: k.state,
+		started_at: k.startedAt,
+		...(k.endedAt !== undefined ? { ended_at: k.endedAt } : {}),
+		turns: k.turns,
+		activity: k.activity,
+		last_text: k.lastText.slice(0, text),
+		tail: tail > 0 ? k.tail.slice(-tail) : [],
+		...(k.usage
+			? { usage: { input: k.usage.input, output: k.usage.output, cache_read: k.usage.cacheRead, cache_write: k.usage.cacheWrite, cost: k.usage.cost } }
+			: {}),
+		...(k.worktree ? { worktree: k.worktree } : {}),
+	};
+}
+
+/**
+ * The session's children for Botsun, at most `max` bytes as JSON: past it the finished ones'
+ * tails go first, then everyone's tail and text shrink, then the oldest finished ones drop.
+ */
+export function subagentsLine(children: ChildInfo[], max = SUBAGENTS_BYTES): Record<string, unknown>[] {
+	const fits = (list: Record<string, unknown>[]) => Buffer.byteLength(JSON.stringify(list)) <= max;
+	const steps: Array<(k: ChildInfo) => [number, number]> = [
+		() => [30, 600],
+		(k) => (k.state === "running" ? [30, 600] : [5, 600]),
+		(k) => (k.state === "running" ? [10, 300] : [0, 300]),
+		() => [0, 200],
+	];
+	for (const step of steps) {
+		const list = children.map((k) => childWire(k, ...step(k)));
+		if (fits(list)) return list;
+	}
+	const kept = [...children];
+	while (kept.length > 0) {
+		const finished = kept.findIndex((k) => k.state !== "running");
+		kept.splice(finished >= 0 ? finished : 0, 1);
+		const list = kept.map((k) => childWire(k, 0, 200));
+		if (fits(list)) return list;
+	}
+	return [];
+}
+
+/** The session's subagents, when they changed since Botsun was last sent them (or `force`). */
+export function reportSubagents(c: Conn, force = false): void {
+	const children = subagentsLine(c.sessionId ? listChildren(c.sessionId) : []);
+	const key = JSON.stringify(children);
+	if (!force && key === c.subagentsSent) return;
+	c.subagentsSent = key;
+	write(c, "subagents", { children });
+}
+
 /** Runs once the reply carrying it has been written to the owner socket (a symbol, so never sent). */
 export const AFTER_REPLY = Symbol("afterReply");
 
@@ -1343,7 +1434,7 @@ function featureList(c: Conn): string[] {
 		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 	})();
 	return ["say", "say_call", "answer_call", "close_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close", "name",
-		...(hasStash ? ["stash"] : [])];
+		"subagents", ...(hasStash ? ["stash"] : [])];
 }
 
 /** The conversation a sandbox template's pi was started in, from its first session: Botsun starts it
@@ -1394,6 +1485,10 @@ function sendHello(c: Conn): void {
 			try { return c.context?.() ?? null; } catch { return null; }
 		})(),
 	});
+	// A line of its own, not a hello field: hello must stay under the host's line limit. A hello
+	// clears the host's list, so an empty one needs no line.
+	c.subagentsSent = "[]";
+	reportSubagents(c);
 }
 
 function scheduleRetry(c: Conn): void {
@@ -1780,6 +1875,9 @@ function main(pi: ExtensionAPI): void {
 				if (conn.boundId !== conn.sessionId) conn.boundId = null;
 				write(conn, "session", { session_file: conn.sessionFile, session_id: conn.sessionId, cwd: conn.cwd, ...colorFields(conn) });
 			}
+			// The host clears a session's subagents when its id changes: this conversation's go again.
+			if (changed) conn.subagentsSent = "[]";
+			reportSubagents(conn);
 			// A reload may have added or dropped commands: the phone's "/" list follows.
 			try { write(conn, "commands", { commands: commands() }); } catch {}
 			try { write(conn, "features", { features: featureList(conn) }); } catch {}
@@ -1890,12 +1988,32 @@ function main(pi: ExtensionAPI): void {
 		lastUsage = key;
 		write(conn, "usage", { usage });
 	});
+	// The session's subagents (lib/children.ts): a start or an end at once, progress at most once a second.
+	bindChildren(pi.events);
+	let subagentsTimer: ReturnType<typeof setTimeout> | undefined;
+	const stopSubagents = onChildrenChange((immediate) => {
+		if (!conn || conn.closed) return;
+		if (immediate) {
+			clearTimeout(subagentsTimer);
+			subagentsTimer = undefined;
+			reportSubagents(conn);
+			return;
+		}
+		if (subagentsTimer) return;
+		subagentsTimer = setTimeout(() => {
+			subagentsTimer = undefined;
+			if (conn && !conn.closed) reportSubagents(conn);
+		}, SUBAGENTS_EVERY_MS);
+		subagentsTimer.unref?.();
+	});
 	pi.on("session_shutdown", () => {
 		stopAsk();
 		stopStash();
 		stopFooter();
 		stopUsage();
+		stopSubagents();
 		clearTimeout(footerTimer);
+		clearTimeout(subagentsTimer);
 	});
 
 	// A slow input handler can outlast PROMPT_STARTING_MS: the turn's last step before it starts.

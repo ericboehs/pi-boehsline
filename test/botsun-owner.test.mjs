@@ -2671,3 +2671,95 @@ test("v3 ratchet: a v2 reply held before the device's first v3 can't be confirme
 	assert.equal((await confirm(stale.held)).error, "this phone signs v3: v2 is refused (update Botsun and the app)");
 	assert.ok(m.sent.length >= 1);
 });
+
+// ---- Subagents (lib/children.ts): the session's children to Botsun, and the phone's stop ----
+
+const kids = await import("../lib/children.ts");
+
+test("subagents: a start or an end goes at once, progress at most once a second, only this session's", async () => {
+	kids.resetChildren();
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const subs = () => srv.lines.filter((l) => l.type === "subagents");
+	assert.equal(subs().length, 0, "nothing to say: no line");
+	const c = kids.trackChild({ kind: "pi", agent: "scout", task: "look around", model: "anthropic/claude", sessionId: "sid-a" });
+	await until(() => subs().length === 1);
+	const [child] = subs()[0].children;
+	assert.deepEqual(Object.keys(child).sort(), ["activity", "agent", "id", "kind", "last_text", "model", "started_at", "state", "tail", "task", "turns"]);
+	assert.deepEqual([child.id, child.kind, child.agent, child.task, child.state, child.turns], [c.id, "pi", "scout", "look around", "running", 0]);
+	assert.equal(typeof child.started_at, "number");
+	kids.trackChild({ kind: "pi", agent: "other", task: "t", sessionId: "sid-b" });
+	await sleep(50);
+	assert.equal(subs().length, 1, "another session's child is not this session's news");
+	c.piEvent({ type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { path: "/x/a.rb" } });
+	c.piEvent({ type: "tool_execution_end", toolCallId: "1", toolName: "read" });
+	c.piEvent({ type: "tool_execution_start", toolCallId: "2", toolName: "bash", args: { command: "bin/test" } });
+	await sleep(300);
+	assert.equal(subs().length, 1, "progress waits for the debounce");
+	await until(() => subs().length === 2, 2000);
+	const moved = subs()[1].children[0];
+	assert.deepEqual([moved.activity, moved.tail], ["Ran bin/test", ["Read a.rb", "Ran bin/test"]], "one line, the latest");
+	c.finish("done", { lastText: "All fine" });
+	await until(() => subs().length === 3, 300);
+	const done = subs()[2].children[0];
+	assert.deepEqual([done.state, done.last_text, typeof done.ended_at], ["done", "All fine", "number"]);
+	assert.equal(done.usage, undefined);
+	kids.resetChildren();
+});
+
+test("subagentsLine keeps the line under the host's limit, running children's tails last to go", async () => {
+	const { subagentsLine, SUBAGENTS_BYTES } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const kid = (i, state) => ({
+		id: `p-${String(i).padStart(10, "0")}`, kind: "pi", agent: "worker", task: "t".repeat(200), state, startedAt: 1, turns: 3,
+		activity: "a".repeat(120), lastText: "x".repeat(600), tail: Array.from({ length: 30 }, () => "y".repeat(160)), sessionId: "s",
+		...(state === "running" ? {} : { endedAt: 2 }), usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 },
+	});
+	const all = [...Array.from({ length: 8 }, (_, i) => kid(i, "done")), ...Array.from({ length: 8 }, (_, i) => kid(i + 8, "running"))];
+	const line = subagentsLine(all);
+	assert.ok(Buffer.byteLength(JSON.stringify(line)) <= SUBAGENTS_BYTES);
+	assert.equal(line.length, 16, "everyone stays; their tails shrink");
+	const tails = (state) => line.filter((k) => k.state === state).map((k) => k.tail.length);
+	assert.ok(Math.min(...tails("running")) > Math.max(...tails("done")));
+	assert.deepEqual(line[0].usage, { input: 1, output: 2, cache_read: 3, cache_write: 4, cost: 0.5 });
+	assert.deepEqual(subagentsLine(all.slice(0, 2)).map((k) => k.tail.length), [30, 30], "a small list goes whole");
+	const tiny = subagentsLine(all, 2_000);
+	assert.ok(tiny.length > 0 && tiny.length < 16 && tiny.every((k) => k.state === "running"), "past it, finished ones drop first");
+});
+
+test("stop_child: Eric's phone, signed v2, stops only this session's child", async () => {
+	kids.resetChildren();
+	const decide = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: { 7: decide.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	await owner();
+	let aborts = 0;
+	const mine = kids.trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "sid-a", stop: () => aborts++ });
+	const theirs = kids.trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "sid-b", stop: () => assert.fail("another session's child") });
+	const stop = async (id, { key = decide, signedId = id } = {}) => {
+		const { nonce, features } = await ask({ type: "nonce" });
+		assert.ok(features.includes("subagents"));
+		return ask({ type: "stop_child", child_id: id, nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "stop_child", `stop_child\n${signedId}`) });
+	};
+	assert.equal((await stop(mine.id, { key: phoneKey() })).error, "signature does not verify");
+	// v1 (a signature that verifies, from a device that hasn't ratcheted yet): refused, after its check.
+	const { nonce: n1 } = await ask({ type: "nonce" });
+	const digest = createHash("sha256").update(`stop_child\n${mine.id}`, "utf8").digest("hex");
+	const msg = ["botsun-decide-v1", "7", n1, "session", "sid-a", "stop_child", digest].join("\n");
+	const v1 = { type: "stop_child", child_id: mine.id, nonce: n1, device_id: 7, signature: cryptoSign("sha256", Buffer.from(msg), { key: decide.privateKey, dsaEncoding: "der" }).toString("base64") };
+	assert.match((await ask(v1)).error ?? "", /^stop_child needs a v2 signature/);
+	assert.equal((await stop(mine.id, { signedId: theirs.id })).error, "signature does not verify", "signed for another child");
+	assert.equal((await stop(theirs.id)).error, "no such subagent in this session");
+	assert.equal((await ask({ type: "stop_child", child_id: "../x", nonce: "n", device_id: 7 })).error, "bad request");
+	assert.equal((await stop("..")).error, "bad request", "never a path's folder, signed or not");
+	assert.equal((await ask({ type: "stop_child", child_id: mine.id })).error, "bad request", "unsigned");
+	assert.equal(aborts, 0);
+	assert.deepEqual(await stop(mine.id), { ok: true, stopped: true });
+	assert.equal(aborts, 1);
+	mine.finish("failed");
+	assert.equal(kids.listChildren("sid-a")[0].state, "stopped");
+	assert.deepEqual(await stop(mine.id), { ok: true, stopped: false }, "already ended");
+	kids.resetChildren();
+});

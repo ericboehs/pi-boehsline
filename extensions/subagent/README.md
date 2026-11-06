@@ -7,6 +7,7 @@ A minimal subagent tool: runs a separate `pi` process (or Cursor's agent) for a 
 - Agents: `~/.pi/agent/agents/*.md`, plus the project's `.pi/agents/*.md` when `agentScope` is `project` or `both`. Three built-ins need no setup: `scout` (read-only), `worker`, and `cursor`.
 - Children set `PI_SUBAGENT_CHILD`, so a child can't spawn more children.
 - `background: true` hands each child to the [bg extension](../bg/README.md) and returns at once; each result arrives as a message when its child finishes.
+- Every child, foreground or background, goes on its session's subagents list (`lib/children.ts`): its agent, task, state, turns, what it is doing now, its last text and work lines, emitted as `subagents:update` on `pi.events`. [botsun-owner](../opt-in/botsun-owner/README.md) shows the list on Eric's phone, which can stop one child (a foreground one by its own abort, the call's other children keep running; a background one by its bg job's kill). A finished child stays on the list for 10 minutes.
 
 ## The cursor agent
 

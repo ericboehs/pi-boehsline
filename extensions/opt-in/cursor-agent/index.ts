@@ -25,6 +25,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-wo
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
+import { bindChildren, sessionOf, trackChild } from "../../../lib/children.ts";
 import { optIn } from "../../../lib/opt-in.ts";
 import {
 	applyCursorStatusChip,
@@ -184,6 +185,7 @@ async function startBackground(pi: ExtensionAPI, spec: RunSpec, prompt: string, 
 	if ("error" in reply) {
 		return { content: [{ type: "text" as const, text: `Cursor background job failed to start: ${reply.error}` }], details: undefined, isError: true };
 	}
+	trackChild({ kind: "cursor", agent: "cursor", task: prompt, model: spec.model, sessionId: sessionOf(ctx), bg: reply });
 	const details: BackgroundDetails = { background: true, id: reply.id, logPath: reply.logPath, model: spec.model };
 	return {
 		content: [
@@ -225,23 +227,34 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			const mode = args.mode as "agent" | "plan" | "ask" | undefined;
 			// Fresh settings, so a config edit applies without /reload.
 			const spec = await prepareRun({ ...args, mode }, ctx.cwd, loadSettings());
+			// On the session's list (lib/children.ts), so Eric's phone shows the run and can stop it.
+			bindChildren(pi.events);
 			if (args.background) return startBackground(pi, spec, args.prompt, ctx);
 			const { model, cwd } = spec;
 
 			let lastEmit = 0;
-			const outcome = await runCursor(spec, {
-				signal,
-				onEvent: (run, changed) => {
-					const now = Date.now();
-					if (!changed && now - lastEmit < 150) return;
-					lastEmit = now;
-					const text = short(run.state.live, 200) || "Cursor is working…";
-					onUpdate?.({
-						content: [{ type: "text", text }],
-						details: { model, cwd, ...run.state, tools: [...run.state.tools], done: false },
-					});
-				},
-			});
+			const own = new AbortController();
+			const child = trackChild({ kind: "cursor", agent: "cursor", task: args.prompt, model, sessionId: sessionOf(ctx), stop: () => own.abort() });
+			let outcome: Awaited<ReturnType<typeof runCursor>>;
+			try {
+				outcome = await runCursor(spec, {
+					signal: signal ? AbortSignal.any([signal, own.signal]) : own.signal,
+					onEvent: (run, changed) => {
+						child.cursorState(run.state, spec.worktree ? run.state.workspace : undefined);
+						const now = Date.now();
+						if (!changed && now - lastEmit < 150) return;
+						lastEmit = now;
+						const text = short(run.state.live, 200) || "Cursor is working…";
+						onUpdate?.({
+							content: [{ type: "text", text }],
+							details: { model, cwd, ...run.state, tools: [...run.state.tools], done: false },
+						});
+					},
+				});
+			} catch (err) {
+				child.finish("failed", { lastText: (err as Error).message });
+				throw err;
+			}
 
 			const d: CursorDetails = { model, cwd, ...outcome.state, done: false };
 			d.exitCode = outcome.exitCode;
@@ -250,8 +263,25 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			if (outcome.worktree) d.worktree = outcome.worktree;
 			if (outcome.refused) d.refused = outcome.refused;
 			const exitCode = outcome.exitCode;
+			const ended = (state: "done" | "failed" | "stopped") =>
+				child.finish(state, {
+					lastText: d.answer || d.refused || d.stderr || "",
+					...(d.worktree ? { worktree: d.worktree.path } : {}),
+					...(d.charge ? { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: (d.charge.chargedCents ?? 0) / 100 } } : {}),
+				});
 
+			if (own.signal.aborted && !signal?.aborted) {
+				ended("stopped");
+				d.done = true;
+				return {
+					content: [{ type: "text", text: `Cursor run stopped from Botsun.${d.answer ? `\n\n${d.answer}` : ""}` }],
+					details: d,
+					structuredContent: structured(d),
+					isError: true,
+				};
+			}
 			if (signal?.aborted) {
+				ended("stopped");
 				d.done = true;
 				return {
 					content: [{ type: "text", text: "Cursor run cancelled." }],
@@ -263,7 +293,15 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 
 			if (d.sessionId) {
 				onUpdate?.({ content: [{ type: "text", text: "Looking up the run's cost…" }], details: { ...d } });
-				const { charge, chargeError } = await lookupCharge(d.sessionId, outcome.started, signal);
+				child.set({ activity: "Looking up the run's cost…" });
+				let found: Awaited<ReturnType<typeof lookupCharge>>;
+				try {
+					found = await lookupCharge(d.sessionId, outcome.started, signal);
+				} catch (err) {
+					ended(exitCode !== 0 || d.refused ? "failed" : "done");
+					throw err;
+				}
+				const { charge, chargeError } = found;
 				if (charge) {
 					d.charge = charge;
 					addCents(charge.chargedCents ?? 0, ctx);
@@ -273,6 +311,7 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			void refreshCursorStatusChip(ctx); // pi-usage cache + footer chip; errors swallowed
 
 			const failed = exitCode !== 0 || !!d.refused;
+			ended(failed ? "failed" : "done");
 			const steps = d.tools.map((t) => `- ${t.summary}${t.refused ? " (refused)" : t.ok === false ? " (failed)" : ""}`).join("\n");
 			const wt = d.worktree
 				? `\nWorktree: ${d.worktree.path} (branch ${d.worktree.branch || "?"}), ${d.worktree.changed.length} changed file(s)${d.worktree.changed.length ? `:\n${d.worktree.changed.map((l) => `  ${l}`).join("\n")}` : ""}`

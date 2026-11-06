@@ -1,0 +1,316 @@
+/**
+ * lib/children.ts: a session's subagents as one list. Synthetic inputs only: a recorded-style
+ * pi JSON stream written for this test (test/fixtures/subagent-child.jsonl), and bg logs made
+ * here in a temp dir. No child process, no model.
+ */
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, beforeEach, test } from "node:test";
+import {
+	bindChildren,
+	cursorLabel,
+	KEEP_MS,
+	listChildren,
+	MAX_CHILDREN,
+	onChildrenChange,
+	pollOnce,
+	resetChildren,
+	sessionOf,
+	stopChild,
+	toolLabel,
+	trackChild,
+} from "../lib/children.ts";
+
+const dir = mkdtempSync(join(tmpdir(), "pi-children-"));
+after(() => rmSync(dir, { recursive: true, force: true }));
+beforeEach(() => resetChildren());
+
+const fixture = readFileSync(new URL("./fixtures/subagent-child.jsonl", import.meta.url), "utf8").split("\n");
+const one = (id) => listChildren().find((c) => c.id === id);
+
+/** A bus like pi.events: handlers by channel, and what was emitted. */
+function bus({ kill = true, killed = true } = {}) {
+	const handlers = new Map();
+	const emitted = [];
+	return {
+		emitted,
+		handlers,
+		on: (channel, fn) => (handlers.set(channel, fn), () => handlers.delete(channel)),
+		emit(channel, data) {
+			emitted.push([channel, data]);
+			if (channel === "bg:kill" && kill) {
+				data.accepted = true;
+				data.reply({ killed });
+			}
+			handlers.get(channel)?.(data);
+		},
+	};
+}
+
+test("a foreground pi child's JSON events: turns, the tool it runs, its text, usage, masked", () => {
+	const c = trackChild({ kind: "pi", agent: "scout", task: "look at the widget", model: "anthropic/claude", sessionId: "s-1" });
+	const seen = [];
+	for (const line of fixture) {
+		c.piLine(line);
+		seen.push(one(c.id).activity);
+	}
+	const k = one(c.id);
+	assert.equal(k.state, "running");
+	assert.equal(k.turns, 3);
+	assert.ok(seen.includes("Read widget.rb"), "a read is its file");
+	assert.ok(seen.includes("Ran API_TOKEN=••• bin/test"), "a command is its first line, a likely secret masked");
+	assert.ok(seen.includes("Thinking…") && seen.includes("Writing…"));
+	assert.deepEqual(k.tail, [
+		"Read widget.rb",
+		"> Running the tests now.",
+		"✗ Ran API_TOKEN=••• bin/test",
+		"> The widget test fails on line 12. Fix: return nil.",
+	]);
+	assert.equal(k.lastText, "The widget test fails on line 12.\nFix: return nil.");
+	assert.deepEqual({ ...k.usage, cost: Number(k.usage.cost.toFixed(4)) }, { input: 4400, output: 130, cacheRead: 3000, cacheWrite: 0, cost: 0.0038 });
+	assert.equal(k.model, "anthropic/claude");
+	assert.equal(k.sessionId, "s-1");
+	c.finish("done");
+	assert.equal(one(c.id).state, "done");
+	assert.equal(one(c.id).activity, "");
+	assert.ok(one(c.id).endedAt >= k.startedAt);
+	c.piLine(fixture[4]);
+	assert.equal(one(c.id).turns, 3, "nothing moves once it ended");
+
+	const said = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s-1" });
+	said.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Set API_TOKEN=abc123 first." }] } });
+	assert.equal(one(said.id).lastText, "Set API_TOKEN=••• first.", "its words are masked too");
+});
+
+test("labels for pi tools and Cursor steps", () => {
+	assert.equal(toolLabel("read", { path: "/a/b/c.rb" }), "Read c.rb");
+	assert.equal(toolLabel("bash", { command: "bin/test --fast\necho done" }), "Ran bin/test --fast");
+	assert.equal(toolLabel("edit", { path: "x/y.ts" }), "Edited y.ts");
+	assert.equal(toolLabel("grep", { pattern: "TODO" }), "Searched for TODO");
+	assert.equal(toolLabel("mystery"), "Called mystery");
+	const auth = ["Author", "ization: Bea", "rer ", "not-a-real-token-1234567890"].join(""); // built at runtime: the masking test needs no real-looking literal
+	assert.equal(toolLabel("bash", { command: `curl -H "${auth}"` }), `Ran curl -H "Authorization: •••"`);
+	assert.equal(cursorLabel("read src/a.rb"), "Read a.rb");
+	assert.equal(cursorLabel("shell bin/test"), "Ran bin/test");
+	assert.equal(cursorLabel("glob *.rb"), "Searched files *.rb");
+	assert.equal(cursorLabel("mcp thing"), "mcp thing");
+	assert.equal(toolLabel("bash", { command: "x".repeat(500) }).length, 120, "capped");
+});
+
+test("a task is its first 200 characters, masked, on one line", () => {
+	const c = trackChild({ kind: "pi", agent: "worker", task: `Use password=hunter2 then\n${"y".repeat(400)}`, sessionId: "s-1" });
+	const { task } = one(c.id);
+	assert.equal(task.length, 200);
+	assert.match(task, /^Use password=••• then y+…$/);
+});
+
+test("states: done, failed, stopped; a stop asked always ends stopped", () => {
+	const done = trackChild({ kind: "pi", agent: "a", task: "t", sessionId: "s" });
+	const failed = trackChild({ kind: "pi", agent: "b", task: "t", sessionId: "s" });
+	let aborted = 0;
+	const stopped = trackChild({ kind: "pi", agent: "c", task: "t", sessionId: "s", stop: () => aborted++ });
+	done.finish("done", { lastText: "ok" });
+	failed.finish("failed", { lastText: "exit 1" });
+	assert.equal(stopChild("s", stopped.id), "stopped");
+	assert.equal(aborted, 1);
+	assert.equal(stopped.stopping, true);
+	stopped.finish("failed"); // the abort's exit looks like a failure; it was a stop
+	assert.deepEqual(listChildren("s").map((c) => c.state), ["done", "failed", "stopped"]);
+	assert.equal(stopChild("s", stopped.id), "ended");
+	done.finish("failed");
+	assert.equal(one(done.id).state, "done", "an end is final");
+});
+
+test("finished children stay 10 minutes, then go (and say so)", (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 1_000_000 });
+	const changes = [];
+	const off = onChildrenChange((immediate) => changes.push(immediate));
+	t.after(off);
+	const c = trackChild({ kind: "pi", agent: "a", task: "t", sessionId: "s" });
+	const running = trackChild({ kind: "pi", agent: "b", task: "t", sessionId: "s" });
+	assert.deepEqual(changes, [true, true], "a start says so at once");
+	c.finish("done");
+	assert.deepEqual(changes, [true, true, true]);
+	assert.equal(KEEP_MS, 10 * 60_000, "ten minutes");
+	t.mock.timers.tick(KEEP_MS - 1_000);
+	assert.equal(listChildren().length, 2);
+	t.mock.timers.tick(2_000);
+	assert.deepEqual(listChildren().map((k) => k.id), [running.id], "only the finished one went");
+	assert.deepEqual(changes, [true, true, true, true], "its going was told");
+	t.mock.timers.tick(KEEP_MS * 3);
+	assert.equal(listChildren().length, 1, "a running child never expires");
+});
+
+test(`at most ${MAX_CHILDREN}: the oldest finished one goes first`, () => {
+	const first = trackChild({ kind: "pi", agent: "a0", task: "t", sessionId: "s" });
+	const finished = trackChild({ kind: "pi", agent: "a1", task: "t", sessionId: "s" });
+	finished.finish("done");
+	assert.equal(MAX_CHILDREN, 16);
+	for (let i = 2; i < MAX_CHILDREN; i++) trackChild({ kind: "pi", agent: `a${i}`, task: "t", sessionId: "s" });
+	assert.equal(listChildren().length, MAX_CHILDREN);
+	trackChild({ kind: "pi", agent: "new", task: "t", sessionId: "s" });
+	const ids = listChildren().map((c) => c.id);
+	assert.equal(ids.length, MAX_CHILDREN);
+	assert.ok(!ids.includes(finished.id) && ids.includes(first.id), "the finished one went, not the oldest running");
+	trackChild({ kind: "pi", agent: "newer", task: "t", sessionId: "s" });
+	assert.ok(!listChildren().some((c) => c.id === first.id), "none finished: the oldest goes");
+	assert.equal(listChildren().length, MAX_CHILDREN);
+});
+
+test("stop routing: only this session's children, foreground by its abort, background by bg:kill", () => {
+	const events = bus();
+	bindChildren(events);
+	let aborted = 0;
+	const mine = trackChild({ kind: "pi", agent: "a", task: "t", sessionId: "s-mine", stop: () => aborted++ });
+	const theirs = trackChild({ kind: "pi", agent: "b", task: "t", sessionId: "s-other", stop: () => assert.fail("never another session's") });
+	assert.equal(stopChild("s-mine", theirs.id), "not_found");
+	assert.equal(stopChild(null, mine.id), "not_found", "a session without an id stops nothing");
+	assert.equal(stopChild("s-mine", "p-nosuchid"), "not_found");
+	assert.equal(stopChild("s-mine", mine.id), "stopped");
+	assert.equal(aborted, 1);
+
+	const log = join(dir, "kill.log");
+	writeFileSync(log, "");
+	const bg = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s-mine", bg: { id: "abc123", logPath: log } });
+	assert.equal(stopChild("s-other", bg.id), "not_found");
+	assert.ok(!events.emitted.some(([ch]) => ch === "bg:kill"));
+	assert.equal(stopChild("s-mine", bg.id), "stopped");
+	const kill = events.emitted.find(([ch]) => ch === "bg:kill")[1];
+	assert.deepEqual([kill.id, kill.wake], ["abc123", true], "its own job, and the parent still hears it ended");
+	events.handlers.get("bg:jobs")([{ id: "abc123", endedAt: Date.now(), exitCode: null, signal: "SIGTERM", killedByUser: true }]);
+	assert.equal(one(bg.id).state, "stopped");
+
+	const noBg = bus({ kill: false });
+	bindChildren(noBg);
+	const orphan = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s-mine", bg: { id: "def456", logPath: log } });
+	assert.equal(stopChild("s-mine", orphan.id), "unstoppable", "no bg extension took the kill");
+	assert.equal(one(orphan.id).state, "running");
+	assert.equal(stopChild("s-mine", trackChild({ kind: "pi", agent: "x", task: "t", sessionId: "s-mine" }).id), "unstoppable");
+
+	const late = bus({ killed: false });
+	bindChildren(late);
+	const done = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s-mine", bg: { id: "ghi789", logPath: log } });
+	assert.equal(stopChild("s-mine", done.id), "ended", "its job had exited before the kill");
+	late.handlers.get("bg:jobs")([{ id: "ghi789", endedAt: Date.now(), exitCode: 0 }]);
+	assert.equal(one(done.id).state, "done", "it finished on its own, not stopped");
+});
+
+test("a background pi child: the progress filter's log, then bg's exit", () => {
+	const events = bus();
+	bindChildren(events);
+	const log = join(dir, "pi.log");
+	writeFileSync(log, "· turn 1 · read /work/demo/lib/widget.rb\n· turn 2 · bash bin/test | read /work/demo/READ");
+	const c = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s", bg: { id: "aa11bb", logPath: log } });
+	assert.equal(one(c.id).activity, "Starting…");
+	pollOnce();
+	assert.deepEqual([one(c.id).turns, one(c.id).tail], [1, ["Read widget.rb"]], "a partial line waits");
+	writeFileSync(log, "· turn 1 · read /work/demo/lib/widget.rb\n· turn 2 · bash bin/test | read /work/demo/README.md\n· turn 3 · 4 files look fine\n");
+	pollOnce();
+	let k = one(c.id);
+	assert.equal(k.turns, 3);
+	assert.deepEqual(k.tail, ["Read widget.rb", "Ran bin/test", "Read README.md", "> 4 files look fine"]);
+	writeFileSync(
+		log,
+		"· turn 1 · read /work/demo/lib/widget.rb\n· turn 2 · bash bin/test | read /work/demo/README.md\n· turn 3 · 4 files look fine\n" +
+			"── result · 3 turns · 4.4k in (3.0k cached) / 130 out · $0.0038 ──\nThe widget is fine.\nSecond line.\n",
+	);
+	pollOnce();
+	k = one(c.id);
+	assert.deepEqual(k.usage, { input: 4400, cacheRead: 3000, output: 130, cacheWrite: 0, cost: 0.0038 });
+	assert.equal(k.lastText, "The widget is fine.\nSecond line.");
+	assert.equal(k.state, "running", "running until bg says it exited");
+	const list = events.emitted.findLast(([ch]) => ch === "bg:list");
+	assert.ok(list, "each poll asks bg for its jobs");
+	list[1].reply([{ id: "aa11bb", endedAt: Date.now(), exitCode: 0, signal: null, killedByUser: false }]);
+	assert.equal(one(c.id).state, "done");
+	const failed = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s", bg: { id: "cc22dd", logPath: log } });
+	events.handlers.get("bg:jobs")([{ id: "cc22dd", endedAt: Date.now(), exitCode: 1, signal: null, killedByUser: false }]);
+	assert.equal(one(failed.id).state, "failed");
+	const killed = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s", bg: { id: "ee33ff", logPath: log } });
+	events.handlers.get("bg:jobs")([{ id: "ee33ff", endedAt: Date.now(), exitCode: null, signal: null, killedByUser: true }]);
+	assert.equal(one(killed.id).state, "stopped", "killed from /bg, not the phone");
+});
+
+test("a background Cursor run: steps, its worktree and its answer from the runner's log", () => {
+	const events = bus();
+	bindChildren(events);
+	const log = join(dir, "cursor.log");
+	writeFileSync(
+		log,
+		[
+			"cursor gpt-5 · /work/demo · new worktree",
+			"session abc-123 · GPT-5 · in /work/demo-wt/cursor-1",
+			"→ read lib/widget.rb",
+			"✓ read lib/widget.rb",
+			"→ shell bin/test",
+		].join("\n") + "\n",
+	);
+	const c = trackChild({ kind: "cursor", agent: "cursor", task: "fix it", model: "gpt-5", sessionId: "s", bg: { id: "ee33ff", logPath: log } });
+	pollOnce();
+	let k = one(c.id);
+	assert.equal(k.worktree, "/work/demo-wt/cursor-1");
+	assert.equal(k.activity, "Ran bin/test");
+	assert.deepEqual(k.tail, ["Read widget.rb", "Ran bin/test"]);
+	writeFileSync(
+		log,
+		readFileSync(log, "utf8") +
+			[
+				"✗ shell bin/test",
+				"",
+				"── cursor result · done · gpt-5 · 1m 2s · $0.42 · 12k tokens ──",
+				"Fixed the widget.",
+				"",
+				"Second paragraph.",
+				"",
+				"Model: gpt-5",
+				"Duration: 1m 2s · 2 step(s)",
+				"Worktree: /work/demo-wt/cursor-1b (branch cursor/1), 1 changed file(s)",
+				"  M lib/widget.rb",
+				"Exit code: 0",
+			].join("\n") +
+			"\n",
+	);
+	pollOnce();
+	k = one(c.id);
+	assert.deepEqual(k.tail, ["Read widget.rb", "✗ Ran bin/test"]);
+	assert.equal(k.turns, 2);
+	assert.equal(k.lastText, "Fixed the widget.\n\nSecond paragraph.");
+	assert.equal(k.worktree, "/work/demo-wt/cursor-1b", "the result's worktree line wins");
+	events.handlers.get("bg:jobs")([{ id: "ee33ff", endedAt: Date.now(), exitCode: 0, signal: null, killedByUser: false }]);
+	assert.equal(one(c.id).state, "done");
+});
+
+test("a foreground Cursor run's reducer state", () => {
+	const c = trackChild({ kind: "cursor", agent: "cursor", task: "t", sessionId: "s" });
+	c.cursorState({ tools: [{ summary: "read a.rb", ok: true }, { summary: "shell bin/test" }], live: "", thinking: false }, "/wt/one");
+	let k = one(c.id);
+	assert.deepEqual([k.activity, k.turns, k.tail, k.worktree], ["Ran bin/test", 2, ["Read a.rb", "Ran bin/test"], "/wt/one"]);
+	c.cursorState({ tools: [{ summary: "read a.rb", ok: true }, { summary: "shell bin/test", ok: false }], live: "Tests fail", thinking: false });
+	k = one(c.id);
+	assert.deepEqual([k.activity, k.tail.at(-1), k.lastText], ["Writing…", "✗ Ran bin/test", "Tests fail"]);
+});
+
+test("subagents:update goes out on every bound bus; a stale one is dropped", () => {
+	const a = bus();
+	bindChildren(a);
+	bindChildren(a); // once per bus
+	const c = trackChild({ kind: "pi", agent: "a", task: "t", sessionId: "s" });
+	const updates = a.emitted.filter(([ch]) => ch === "subagents:update");
+	assert.equal(updates.length, 1);
+	assert.deepEqual(updates[0][1].children.map((k) => k.id), [c.id]);
+	let calls = 0;
+	const stale = { on() {}, emit() { calls++; throw new Error("This extension ctx is stale"); } };
+	bindChildren(stale);
+	c.finish("done");
+	c.finish("done");
+	trackChild({ kind: "pi", agent: "b", task: "t", sessionId: "s" });
+	assert.equal(calls, 1, "a stale bus is unsubscribed after its first throw");
+});
+
+test("sessionOf reads the tool context's session id", () => {
+	assert.equal(sessionOf({ sessionManager: { getSessionId: () => "s-9" } }), "s-9");
+	assert.equal(sessionOf({ sessionManager: { getSessionId: () => { throw new Error("gone"); } } }), null);
+	assert.equal(sessionOf(undefined), null);
+});

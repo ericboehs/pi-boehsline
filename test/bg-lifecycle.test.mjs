@@ -243,6 +243,40 @@ test("bg:start runs another extension's job with its own label, header, and tail
   assert.match(wake, /last 40 lines:\nline 0\n/);
 });
 
+test("bg:kill stops one job by id; wake: true still tells the model it was killed", async (t) => {
+  const h = await mount(t);
+  const killed = [];
+  t.mock.method(process, "kill", (pid, signal) => (killed.push([pid, signal]), true));
+  const start = async () => {
+    const req = { command: "pi child | node -e filter", name: "sa:scout", summary: "subagent scout: x" };
+    const reply = new Promise((resolve) => (req.reply = resolve));
+    h.emit("bg:start", req);
+    return { ...(await reply), task: h.children.at(-1) };
+  };
+  const quiet = await start();
+  const req = { id: quiet.id, reply: (r) => (req.got = r) };
+  h.emit("bg:kill", req);
+  assert.equal(req.accepted, true);
+  assert.deepEqual(req.got, { killed: true });
+  assert.deepEqual(killed, [[-quiet.task.child.pid, "SIGTERM"]], "its own process group only");
+  quiet.task.exit(null, "SIGTERM");
+  assert.equal(h.sent.length, 0, "a kill without wake stays quiet, as /bg's x does");
+
+  const woken = await start();
+  const wake = { id: woken.id, wake: true, reply: () => {} };
+  h.emit("bg:kill", wake);
+  woken.task.exit(null, "SIGTERM");
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0].message.content, /`subagent scout: x` killed \(SIGTERM\)/);
+
+  const unknown = { id: "nope00", reply: () => assert.fail("not this instance's job") };
+  h.emit("bg:kill", unknown);
+  assert.equal(unknown.accepted, undefined);
+  const ended = { id: woken.id, reply: (r) => (ended.got = r) };
+  h.emit("bg:kill", ended);
+  assert.deepEqual(ended.got, { killed: false }, "an ended job isn't killed again");
+});
+
 test("bg:start ignores requests another listener already accepted", async (t) => {
   const h = await mount(t);
   h.emit("bg:start", { command: "true", accepted: true, reply: () => assert.fail("must not start") });

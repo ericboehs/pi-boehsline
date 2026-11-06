@@ -113,6 +113,23 @@ test("background hands a quoted child command and its labels to bg.ts", async ()
   assert.match(req.command, /You are a subagent\. Your final message goes to another AI agent/);
 });
 
+test("a background child goes on its session's subagents list, followed by its bg job", async () => {
+  const { listChildren, resetChildren } = await import("../lib/children.ts");
+  resetChildren();
+  const h = mount();
+  h.ctx.sessionManager = { getSessionId: () => "s-sub" };
+  h.ctx.model = { provider: "anthropic", id: "claude-x" };
+  h.onBgStart((r) => {
+    r.accepted = true;
+    r.reply({ id: "bb22cc", logPath: "/tmp/pi-bg-test/bb22cc.log" });
+  });
+  await h.run({ tasks: [{ agent: "scout", task: "map the repo" }, { agent: "nope", task: "x" }], background: true });
+  const kids = listChildren("s-sub");
+  assert.deepEqual(kids.map((k) => [k.kind, k.agent, k.task, k.model, k.state]), [["pi", "scout", "map the repo", "anthropic/claude-x", "running"]]);
+  assert.deepEqual(listChildren("s-other"), []);
+  resetChildren();
+});
+
 test("the progress filter prints a line per turn, a usage banner, then the answer", async () => {
   const h = mount();
   let command;
