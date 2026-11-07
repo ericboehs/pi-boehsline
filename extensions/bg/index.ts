@@ -109,6 +109,7 @@ import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/
 import { Type } from "typebox";
 import { commandRunsCursorRunner, maskDiffSecrets, readJobDetails, trustJobDetails } from "../../lib/cursor-diff.ts";
 import { cursorDetailsRequested } from "../opt-in/cursor-agent/runner.ts";
+import { registerBgCodemode } from "./codemode.ts";
 
 // Deliberately NOT os.tmpdir(): on macOS that is /var/folders/<hash>/T, which is
 // unguessable for a path we hand to the model, and macOS purges it periodically —
@@ -1136,6 +1137,7 @@ class BgPanel {
 }
 
 export default function (pi: ExtensionAPI) {
+	registerBgCodemode(pi);
 	const jobs = new Map<string, Job>();
 	let ctxRef: ExtensionContext | undefined;
 	let ticker: NodeJS.Timeout | undefined;
