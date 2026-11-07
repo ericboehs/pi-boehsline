@@ -169,6 +169,10 @@ within ~30s, like Claude Code. Each check is also emitted on `pi.events` as
 opt-in [auto-bundle](../opt-in/auto-bundle/README.md) uses it to re-run
 `~/bin/pi-bundle` after an update.
 
+**Name badge.** Another extension can put a short badge (up to 4 cells, one line) just left
+of the session name, in the border or the footer: `pi.events.emit("footer:name-badge", { text })`.
+An empty `text` clears it. An avatar drawn with Kitty graphics placeholders fits here.
+
 ## Boot timing
 
 Every cold start is appended to `boot-times.jsonl` with the gap back to the

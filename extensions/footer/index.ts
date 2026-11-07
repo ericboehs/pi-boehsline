@@ -2402,6 +2402,8 @@ export default function footerExtension(pi: ExtensionAPI): void {
    * extension replacing the wrapper), so a bypass marker is never lost.
    */
   let borderNamePainted = false;
+  /** A badge another extension draws just left of the session name (footer:name-badge), e.g. an avatar. */
+  let nameBadge = "";
   /** collect() threw inside an editor border once already: warned, don't repeat. */
   let borderChipsFailed = false;
   const partKey = (part: { id: string; text: string }) => `${part.id}\u0000${part.text}`;
@@ -2517,10 +2519,11 @@ export default function footerExtension(pi: ExtensionAPI): void {
     const sessionName = displaySessionName(pi.getSessionName());
     const peerName = sessionName ? "" : peer.read(requestRender);
     // Bypassed: red with ⚠, whatever the tint, so it can't be missed.
-    if (bypassMarks("name") && (sessionName || peerName)) return color(BRIGHT_RED, `⚠ ${sessionName || peerName}`);
+    const badge = nameBadge && (sessionName || peerName) ? `${nameBadge} ` : "";
+    if (bypassMarks("name") && (sessionName || peerName)) return badge + color(BRIGHT_RED, `⚠ ${sessionName || peerName}`);
     const tint = sessionColorAnsi();
-    return sessionName ? (tint ? paint(tint, sessionName) : untinted(sessionName))
-      : peerName ? theme.fg("dim", peerName)
+    return sessionName ? badge + (tint ? paint(tint, sessionName) : untinted(sessionName))
+      : peerName ? badge + theme.fg("dim", peerName)
       : "";
   }
 
@@ -3312,6 +3315,16 @@ export default function footerExtension(pi: ExtensionAPI): void {
 
   // openrouter-route.ts sniffs the served provider out of the response stream.
   pi.events.on("openrouter-route:updated", () => {
+    repaint?.();
+  });
+
+  // footer:name-badge { text?: string }: a short badge (one or two cells) drawn left of the
+  // session name, in the border or the footer. Empty or missing text clears it.
+  pi.events.on("footer:name-badge", (data: unknown) => {
+    const text = (data as { text?: unknown } | undefined)?.text;
+    const next = typeof text === "string" && !/[\r\n]/.test(text) && visibleWidth(text) <= 4 ? text : "";
+    if (next === nameBadge) return;
+    nameBadge = next;
     repaint?.();
   });
 
