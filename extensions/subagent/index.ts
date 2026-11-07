@@ -546,6 +546,15 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					lastText: outcome.state.answer || outcome.refused || outcome.stderr || "",
 					...(outcome.worktree ? { worktree: outcome.worktree.path } : {}),
 					...(charge ? { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: (charge.chargedCents ?? 0) / 100 } } : {}),
+					...(outcome.diff
+						? {
+								diff: {
+									diff: outcome.diff.transcriptDiff,
+									diffStats: outcome.diff.transcriptStats,
+									...(outcome.diff.diffPath ? { diffPath: outcome.diff.diffPath } : {}),
+								},
+						  }
+						: {}),
 				});
 				const cursor: CursorFacts = {
 					model: spec.model,

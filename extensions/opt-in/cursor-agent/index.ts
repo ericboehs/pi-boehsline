@@ -37,6 +37,7 @@ import {
 } from "./usage-cache.ts";
 import { cycleUsage, dollars, eventTokens, kfmt, type UsageEvent } from "./api.ts";
 import { type CliUsage, short, type ToolStep } from "./events.ts";
+import { type RunDiff } from "./diff.ts";
 import { lookupCharge, prepareRun, refusalNote, type RunSpec, runCursor, type WorktreeInfo } from "./run.ts";
 import { startJob } from "./runner.ts";
 import { type CursorSettings, loadSettings } from "./settings.ts";
@@ -62,6 +63,11 @@ interface CursorDetails {
 	stderr?: string;
 	/** The run was stopped because Cursor kept refusing its own tools: why, and the fix. */
 	refused?: string;
+	/** Unified diff of what the run changed, masked and capped. */
+	diff?: string;
+	diffStats?: RunDiff["diffStats"];
+	/** Full masked diff, 0600 under the cursor state dir. */
+	diffPath?: string;
 	done: boolean;
 }
 
@@ -214,7 +220,7 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			"Delegate a self-contained coding task to Cursor's agent; returns its answer and the run's cost (background: true for long runs, result arrives as a message)",
 		promptGuidelines: [
 			"Use the cursor tool only when the user asks for Cursor or a Cursor model; every run is billed to their Cursor account.",
-			"After the cursor tool edits files, review its changes (git diff) before reporting them as done.",
+			"After the cursor tool edits files, review its changes (details.diff, or git diff) before reporting them as done.",
 			"Never put secrets in the cursor tool's prompt.",
 			...s.rules,
 		],
@@ -262,12 +268,20 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			if (outcome.stderr) d.stderr = outcome.stderr;
 			if (outcome.worktree) d.worktree = outcome.worktree;
 			if (outcome.refused) d.refused = outcome.refused;
+			if (outcome.diff) {
+				d.diff = outcome.diff.diff;
+				d.diffStats = outcome.diff.diffStats;
+				if (outcome.diff.diffPath) d.diffPath = outcome.diff.diffPath;
+			}
 			const exitCode = outcome.exitCode;
 			const ended = (state: "done" | "failed" | "stopped") =>
 				child.finish(state, {
 					lastText: d.answer || d.refused || d.stderr || "",
 					...(d.worktree ? { worktree: d.worktree.path } : {}),
 					...(d.charge ? { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: (d.charge.chargedCents ?? 0) / 100 } } : {}),
+					...(outcome.diff
+						? { diff: { diff: outcome.diff.transcriptDiff, diffStats: outcome.diff.transcriptStats, ...(outcome.diff.diffPath ? { diffPath: outcome.diff.diffPath } : {}) } }
+						: {}),
 				});
 
 			if (own.signal.aborted && !signal?.aborted) {
@@ -371,6 +385,14 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			if (d.worktree) {
 				lines.push(
 					theme.fg("muted", `  worktree ${d.worktree.branch || "?"} · ${d.worktree.changed.length} changed · ${d.worktree.path}`),
+				);
+			}
+			if (d.diffStats && d.diffStats.files > 0) {
+				lines.push(
+					theme.fg(
+						"muted",
+						`  diff ${d.diffStats.files} file(s) +${d.diffStats.insertions} −${d.diffStats.deletions}${d.diffStats.truncated ? " (truncated)" : ""}`,
+					),
 				);
 			}
 			lines.push(

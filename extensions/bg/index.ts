@@ -47,7 +47,13 @@
  *   synchronously, so the sender can detect that bg.ts is not loaded, then calls
  *   `req.reply({ id, logPath } | { error })`. Optional per-job overrides: `name`
  *   (widget label), `summary` (wake header instead of the command), and
- *   `tailLines`/`tailMaxChars` (how much of the log the wake carries).
+ *   `tailLines`/`tailMaxChars` (how much of the log the wake carries), and
+ *   `details` is ignored unless this process's cursor runner marked the request
+ *   (an unexported WeakSet in runner.ts; a forged stack cannot). Even then,
+ *   PI_BG_LOG is set only when the command's argv[1] realpaths to runner.ts.
+ *   That flag is not saved. At completion the sidecar is read only when the
+ *   job command still realpaths there. The diff in `<log>.details.json` joins
+ *   the completion message's details.
  *   bg.ts emits "bg:jobs" with a snapshot of its jobs (id, name, command, cwd,
  *   logPath, startedAt, endedAt, exitCode, signal, killedByUser; foreground
  *   jobs still racing their budget left out) on every start, adoption and
@@ -101,6 +107,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { commandRunsCursorRunner, maskDiffSecrets, readJobDetails, trustJobDetails } from "../../lib/cursor-diff.ts";
+import { cursorDetailsRequested } from "../opt-in/cursor-agent/runner.ts";
 
 // Deliberately NOT os.tmpdir(): on macOS that is /var/folders/<hash>/T, which is
 // unguessable for a path we hand to the model, and macOS purges it periodically —
@@ -749,6 +757,8 @@ interface BgStartRequest {
 	summary?: string;
 	tailLines?: number;
 	tailMaxChars?: number;
+	/** Ignored unless the cursor runner authorized this request. Not settable by other callers. */
+	details?: boolean;
 	accepted?: boolean;
 	reply?: (result: { id: string; logPath: string } | { error: string }) => void;
 }
@@ -766,8 +776,8 @@ function tailFile(
 	while (selected.length > 1 && selected.join("\n").length > maxChars) {
 		selected = selected.slice(1);
 	}
-	let text = selected.join("\n");
-	if (text.length > maxChars) text = `…${text.slice(-maxChars)}`;
+	let text = maskDiffSecrets(selected.join("\n"));
+	if (text.length > maxChars) text = `…${maskDiffSecrets(text.slice(-maxChars))}`;
 	return { text, lines: all.length, shown: selected.length };
 }
 
@@ -1248,6 +1258,7 @@ export default function (pi: ExtensionAPI) {
 			summary?: string;
 			tailLines?: number;
 			tailMaxChars?: number;
+			details?: boolean;
 		} = {},
 	): Promise<{ job: Job; exited: Promise<void> }> {
 		if (!bgDirReady()) throw new Error(`${BG_DIR} is not a directory only you can write to; not running jobs in it`);
@@ -1270,7 +1281,7 @@ export default function (pi: ExtensionAPI) {
 				cwd,
 				detached: true, // own process group, so we can kill the whole tree
 				stdio: [stdinTransport ? "pipe" : "ignore", fd, fd],
-				env: { ...shellEnv(), ...sessionEnv(opts.ctx), PI_BG_JOB_ID: id },
+				env: { ...shellEnv(), ...sessionEnv(opts.ctx), PI_BG_JOB_ID: id, ...(opts.details && commandRunsCursorRunner(command) ? { PI_BG_LOG: logPath } : {}) },
 				windowsHide: true,
 			},
 		);
@@ -1601,6 +1612,19 @@ export default function (pi: ExtensionAPI) {
 		persist(job);
 	}
 
+	/** A cursor run's diff sidecar, merged into the completion message. Other jobs stay `{ id }`. Re-derived from the command, never a persisted flag. */
+	function completionDetails(job: Job): Record<string, unknown> {
+		const details: Record<string, unknown> = { id: job.id };
+		const extra = commandRunsCursorRunner(job.command) ? readJobDetails(job.logPath) : undefined;
+		if (!extra) return details;
+		// Read again through the trust helper: sensitive bodies reduced, secrets masked, diffPath checked.
+		const trusted = trustJobDetails(extra);
+		details.diff = trusted.diff;
+		details.diffStats = trusted.diffStats;
+		if (trusted.diffPath) details.diffPath = trusted.diffPath;
+		return details;
+	}
+
 	function deliverHere(job: Job): void {
 		const code = job.exitCode ?? null;
 		const signal = job.signal ?? null;
@@ -1639,7 +1663,7 @@ export default function (pi: ExtensionAPI) {
 		// The model saw the command when it launched the job, so replaying it in
 		// full on every completion is pure token cost. Collapse whitespace too:
 		// a multi-line command would otherwise mangle the header.
-		const oneLine = (job.summary ?? job.command).replace(/\s+/g, " ").trim();
+		const oneLine = maskDiffSecrets((job.summary ?? job.command).replace(/\s+/g, " ").trim());
 		const command = oneLine.length > 80 ? `${oneLine.slice(0, 79)}…` : oneLine;
 		const header =
 			`[bg ${job.id}] \`${command}\` ${outcome}${when}\n` +
@@ -1651,7 +1675,7 @@ export default function (pi: ExtensionAPI) {
 			: "\n(no output)";
 
 		pi.sendMessage(
-			{ customType: "bg", content: header + body, display: true, details: { id: job.id } },
+			{ customType: "bg", content: header + body, display: true, details: completionDetails(job) },
 			// followUp waits for any in-flight turn to finish its tool calls;
 			// triggerTurn wakes the model when idle. nextTurn parks it silently.
 			WAKE === "nextTurn"
@@ -1992,6 +2016,7 @@ export default function (pi: ExtensionAPI) {
 				summary: req.summary,
 				tailLines: req.tailLines,
 				tailMaxChars: req.tailMaxChars,
+				details: cursorDetailsRequested(req),
 			});
 			if (job.endedAt !== undefined && job.exitCode === 127) {
 				req.reply?.({ error: `failed to start; see ${job.logPath}` });

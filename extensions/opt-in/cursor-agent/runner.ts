@@ -1,7 +1,9 @@
 /**
  * A background cursor run, started by the cursor tool (`background: true`) as a
  * bg job: `node runner.ts <spec.json>`. Its stdout is the job's log, so it
- * prints one line per Cursor step while it works (what /bg shows live), then a
+ * prints one line per Cursor step while it works (what /bg shows live:
+ * `→ #3 edit fizz.rb`, then `✓ #3 …` or `✗ #3 …`; the number is the step's, so
+ * the child transcript can attach the step's sidecar edit to it), then a
  * result block: the answer (the full text when it's long, then a shortened copy)
  * and the model, duration, cost, worktree, exit code and error. The bg
  * extension's completion message carries that block back to the session.
@@ -20,10 +22,19 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { type JobDetails, writeJobDetails } from "../../../lib/cursor-diff.ts";
 import { dollars, eventTokens, kfmt, type UsageEvent } from "./api.ts";
 import { type RunReducer, short } from "./events.ts";
-import { type ChargeLookup, humanDuration, lookupCharge, refusalNote, type RunOutcome, type RunSpec, runCursor } from "./run.ts";
+import { type ChargeLookup, humanDuration, lookupCharge, refusalNote, type RunDiff, type RunOutcome, type RunSpec, runCursor } from "./run.ts";
 import { refreshUsageCache } from "./usage-cache.ts";
+
+/** Unexported. Only startJob adds a request; bg checks the predicate, never a stack. */
+const cursorDetailReqs = new WeakSet<object>();
+
+/** True when this runner's startJob built `req`. A plain `details: true` is not in the set. */
+export function cursorDetailsRequested(req: object): boolean {
+	return cursorDetailReqs.has(req);
+}
 
 /** The answer in the result block; longer answers are printed in full above it. */
 export const ANSWER_CHARS = 6_000;
@@ -39,6 +50,8 @@ export interface BgStartRequest {
 	summary: string;
 	tailLines: number;
 	tailMaxChars: number;
+	/** The job writes `<log>.details.json` (PI_BG_LOG) for its completion message. */
+	details: boolean;
 	accepted: boolean;
 	reply: (result: BgReply) => void;
 }
@@ -72,9 +85,11 @@ export async function startJob(
 			summary: job.summary,
 			tailLines: 1000,
 			tailMaxChars: WAKE_CHARS,
+			details: true,
 			accepted: false,
 			reply: done,
 		};
+		cursorDetailReqs.add(req);
 		events.emit("bg:start", req);
 		if (!req.accepted) done(null); // no listener: the bg extension isn't loaded
 	});
@@ -192,7 +207,7 @@ export async function runBackground(spec: RunSpec, deps: BackgroundDeps = {}): P
 					if (shown.has(i) && was === step.ok) return;
 					shown.set(i, step.ok);
 					const mark = step.ok === undefined ? "→" : step.ok ? "✓" : "✗";
-					write(`${mark} ${step.summary}`);
+					write(`${mark} #${i + 1} ${step.summary}`);
 				});
 			},
 		});
@@ -207,9 +222,36 @@ export async function runBackground(spec: RunSpec, deps: BackgroundDeps = {}): P
 		write("", `── full answer (${answer.length} chars) ──`, answer);
 	}
 	write("", ...resultBlock(spec, result));
+	publishDetails(result.outcome);
 	await result.usage; // before the process exits, so the cache write lands
 	return result.outcome.exitCode ?? 1;
 }
+
+/** Beside the bg log, so the completion message and the child transcript can carry the diff. Not in the log itself. */
+function publishDetails(outcome: RunOutcome): void {
+	const log = process.env.PI_BG_LOG;
+	const diff = outcome.diff;
+	if (!log || !diff) return;
+	const edits = outcome.state.tools.flatMap((t, i) => {
+		if (!t.edit) return [];
+		return [{ i, ...(t.edit.diff ? { diff: t.edit.diff } : {}), ...(t.edit.old ? { old: t.edit.old } : {}), ...(t.edit.new ? { new: t.edit.new } : {}) }];
+	});
+	const body: JobDetails = {
+		diff: diff.diff,
+		diffStats: diff.diffStats,
+		...(diff.diffPath ? { diffPath: diff.diffPath } : {}),
+		transcriptDiff: diff.transcriptDiff,
+		transcriptStats: diff.transcriptStats,
+		...(edits.length ? { edits } : {}),
+	};
+	try {
+		writeJobDetails(log, body);
+	} catch {
+		/* the completion still has the result block */
+	}
+}
+
+export type { RunDiff };
 
 async function main(specPath: string): Promise<void> {
 	const spec = JSON.parse(readFileSync(specPath, "utf8")) as RunSpec;

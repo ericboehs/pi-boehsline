@@ -170,8 +170,8 @@ test("the result block: answer, cost in dollars, model, duration, worktree, exit
 	const log = lines.join("\n");
 	assert.equal(code, 0);
 	assert.deepEqual(lookups, ["sess-42"]);
-	assert.match(log, /^→ shell npm test$/m, "progress: the step as it starts");
-	assert.match(log, /^✓ shell npm test$/m, "progress: the step when it finishes");
+	assert.match(log, /^→ #1 shell npm test$/m, "progress: the step as it starts, numbered");
+	assert.match(log, /^✓ #1 shell npm test$/m, "progress: the step when it finishes, the same number");
 	assert.match(log, /── cursor result · done · composer-2 · 3m05s · \$0\.4250 \(incl\. \$0\.0250 Cursor fee\) · 1K tokens ──/);
 	assert.match(log, /Fixed fizz\.rb; tests pass\./);
 	assert.match(log, /Model: composer-2 \(Composer Two\)/);
@@ -253,7 +253,7 @@ test("end to end through the real bg extension: the completion message carries t
 	assert.match(msg, /All done in the worktree\./);
 	assert.ok(msg.includes(`Worktree: ${wt} (branch pi-test-branch), 1 changed file(s)`));
 	assert.match(msg, /Exit code: 0/);
-	assert.match(readFileSync(`${process.env.PI_BG_DIR}/${id}.log`, "utf8"), /✓ shell npm test/);
+	assert.match(readFileSync(`${process.env.PI_BG_DIR}/${id}.log`, "utf8"), /✓ #1 shell npm test/);
 });
 
 test("stopping the job kills cursor-agent with it", async () => {

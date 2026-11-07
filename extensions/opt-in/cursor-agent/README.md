@@ -27,6 +27,48 @@ Tool arguments: `prompt` (must be self-contained, since Cursor doesn't see the c
   return [fix, tests].map((r) => `${r.worktree?.branch}: ${r.chargedCents}¢`);
   ```
 
+## Show work (diffs)
+
+When a run in a git repo finishes — success, failure or stop, worktree or in place — what it changed is saved for the phone.
+
+The tool result's `details`, and a background run's completion message (`customType: "bg"`, same `details`), carry:
+
+- `diff` — unified diff, secrets masked, capped at 256 KB. The cut is on a file boundary and ends with `… N more files, M more bytes`. A first file bigger than the cap is kept cut. Gitignored paths are left out. Some files are one line naming them, never their content:
+  - `Binary file <path> changed` — a binary file.
+  - `Sensitive file <path> changed` — `.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_*` keys (`id_rsa`, `id_ed25519` …), `.npmrc`, `.netrc`, `.pgpass`, `credentials*.json`. A trailing slash or backslash still counts (`foo\.env\`). A token in the path is masked.
+  - `Large file <path> changed` — a changed file over 1 MB, or an untracked file over 5 MB (which is never staged, so it isn't written into `.git/objects`). An untracked large file that was already there, unchanged, is not listed.
+- `diffStats` — `{ files, insertions, deletions, truncated }`.
+- `diffPath` — the full masked diff (not the cap), mode `0600`, in a `0700` directory: `~/.local/state/pi-cursor/<run id>-<random>.diff` (`$XDG_STATE_HOME/pi-cursor`, or `$PI_CURSOR_STATE_DIR`). The run id is Cursor's session id, else the bg job id; the random suffix keeps two runs with the same id apart. Each write prunes the directory: diffs older than 14 days go, and only the newest 200 are kept.
+
+Masking covers `name=value` secrets and Bearer/Basic headers, bare tokens with a well-known prefix (`ghp_`/`gho_`/`ghs_`…, `github_pat_`, `AKIA`/`ASIA`, `sk-`, `xox*-`, `glpat-`, `AIza`, `ya29.`, `npm_`, JWTs), letter-only `sk-`/`pk-` keys of 20 or more characters (`sk-learn` stays), credentials in URLs, and private key blocks (the BEGIN/END lines stay; each body line becomes `•••`, so hunk line counts still add up). Tokens in an omitted file's path are masked too.
+
+Tracked changes are against the run's base: the commit a worktree started from, or a tree of an in-place checkout taken before the run (dirt that was already there is not the run's). Untracked files git does not ignore are included. The whole repo counts, even when the run's cwd is a subdirectory. Rename detection is forced (`diff.renames=true` and `-M1%`), so a repo configured with `diff.renames=false`, or a small `.env` that was renamed and edited, cannot show that file as an add of its body. The snapshots use a scratch index copied from the real one, so unchanged files aren't hashed again. If a snapshot fails or times out (30 s per git call), there is no diff at all, rather than a partial one that could credit the run with the wrong files.
+
+After a stop, the capture is cut short so Stop stays fast: each git call gets 5 s, and files are re-read only if the base already had them. Edits to existing files show up; files the run created don't.
+
+A Cursor subagent's conversation (`childTranscript`) ends with one more entry, after the reply. It is not a message, so a reader that only handles `type: "message"` skips it and still works:
+
+```json
+{
+  "seq": 4,
+  "type": "custom",
+  "customType": "cursor_diff",
+  "id": "4",
+  "timestamp": "2026-11-07T15:00:00.000Z",
+  "data": {
+    "diff": "diff --git a/fizz.rb b/fizz.rb\n…",
+    "diffStats": { "files": 1, "insertions": 1, "deletions": 1, "truncated": false },
+    "diffPath": "/home/eric/.local/state/pi-cursor/sess-1f2e3d4c.diff"
+  }
+}
+```
+
+`data.diff` may be shorter than `details.diff` (one transcript entry is at most 32 KB). `data.diffPath` is the full masked diff. `diffPath` is omitted when nothing was written.
+
+When a completed edit event included a patch or old/new text, that step's tool call arguments also carry `diff` and/or `old_string` / `new_string`. These are masked the same way as the run diff, capped at 8,000 characters, with newlines kept. They come from EditSuccess's `diffString` and the call's `old_string` / `new_string` (camelCase or the snake_case proto names). Whole-file content is never kept: not `beforeFullFileContent` / `afterFullFileContent`, a write's `fileText`, or a delete's `prevContent`. A step keeps nothing beyond its path when any path is sensitive: every path key on the call and on its success (`path`, `filePath`, `file_path`, `targetFile`, `target_file`, `old_path`, `new_path`, `uri`, `fileUri`, …; a `file://` value is decoded), and every path in a diff or patch header (`rename`/`copy` from/to, `---` / `+++` with or without an `a/` or `b/` prefix, `/dev/null` ignored, `*** Update File:`, `*** Add File:`, `*** Delete File:`, `*** Move to:`). A started event usually only names a path, so a step with no patch still shows up; the run-level diff above is the one Show work can always render.
+
+A background run's log numbers its steps (`→ #3 edit fizz.rb`, then `✓ #3 …`). Those lines are secret-masked, and so is the tail a completion message carries. The child transcript gives each step's call the id `bg-step-<n-1>`, and attaches the sidecar's edits by that id, but only when the job command's argv[1] realpaths to this package's runner. An edit whose step isn't in the transcript (trimmed, or never logged) attaches nothing, rather than landing on another call. Only that runner marks a job for a sidecar (an unexported set in `runner.ts`; `details: true` on a plain `bg:start` does not, and a forged stack cannot). The flag is not saved across reload; completion re-derives it from the command. cursor-agent itself is spawned without any `PI_BG_*` variable, so it cannot see the job id or overwrite the sidecar. The sidecar is opened without following a symlink, and reduced again on read (sensitive files become one line, secrets masked, per-edit old/new bodies dropped). `diffPath` is kept only when the state dir is not a symlink, the file's real directory is that dir, and the file is a regular `0600` file with one link, owned by us (the dir `0700`). The path returned is the real path, and its bytes are reduced before the phone is told.
+
 ## Requirements
 
 - `cursor-agent` on your PATH, logged in (`cursor-agent login`).

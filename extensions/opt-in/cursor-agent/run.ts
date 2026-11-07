@@ -11,6 +11,7 @@ import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { findUsageEvent, type UsageEvent } from "./api.ts";
+import { captureBase, captureChanges, type LargeFile, type RunDiff } from "./diff.ts";
 import { RunReducer, type RunState } from "./events.ts";
 import { blockedBy, type CursorSettings } from "./settings.ts";
 import { git } from "./worktrees.ts";
@@ -42,6 +43,11 @@ export interface RunSpec {
 	/** Whether the sandbox is off and --force is on, for messages (the flags themselves are in cliArgs). */
 	network?: boolean;
 	force?: boolean;
+	/** Commit (worktree) or tree (in place) the run's diff is measured from. Recorded before spawn. */
+	base?: string;
+	baseKind?: "commit" | "tree";
+	/** Untracked files too big for the base tree, as they were (unchanged ones are not the run's). */
+	baseLarge?: LargeFile[];
 }
 
 export interface WorktreeInfo {
@@ -51,6 +57,8 @@ export interface WorktreeInfo {
 	changed: string[];
 }
 
+export type { RunDiff };
+
 export interface RunOutcome {
 	state: RunState;
 	exitCode: number | null;
@@ -58,6 +66,8 @@ export interface RunOutcome {
 	started: number;
 	stderr?: string;
 	worktree?: WorktreeInfo;
+	/** The run's changes, when it ran in a git repo. Set on success, failure and stop. */
+	diff?: RunDiff;
 	/** Set when the run was stopped early because Cursor kept refusing its own tools: why, for the caller to show. */
 	refused?: string;
 }
@@ -107,6 +117,8 @@ export async function prepareRun(args: CursorArgs, sessionCwd: string, settings:
 		if (args.worktreeBase) cliArgs.push("--worktree-base", args.worktreeBase);
 	}
 	cliArgs.push(args.prompt);
+	// Recorded before spawn, so an in-place run's pre-existing dirt is not its diff.
+	const base = await captureBase(cwd, !!args.worktree, args.worktreeBase).catch(() => undefined);
 	return {
 		model,
 		cwd,
@@ -115,7 +127,16 @@ export async function prepareRun(args: CursorArgs, sessionCwd: string, settings:
 		bin: process.env.PI_CURSOR_AGENT_BIN?.trim() || "cursor-agent",
 		...(args.network ? { network: true } : {}),
 		...(args.force ? { force: true } : {}),
+		...(base ? { base: base.base, baseKind: base.kind, ...(base.large ? { baseLarge: base.large } : {}) } : {}),
 	};
+}
+
+/** The process env without any PI_BG_* variable, so cursor-agent cannot see the job id or the sidecar path. */
+function agentEnv(): NodeJS.ProcessEnv {
+	if (!Object.keys(process.env).some((k) => k.startsWith("PI_BG_"))) return process.env;
+	const env = { ...process.env };
+	for (const k of Object.keys(env)) if (k.startsWith("PI_BG_")) delete env[k];
+	return env;
 }
 
 /** Whether `bin` (a RunSpec's) is an executable file: the path as given, else a file on PATH. */
@@ -155,7 +176,8 @@ export async function runCursor(
 	const started = Date.now();
 	const stderr: string[] = [];
 	const exitCode = await new Promise<number | null>((done, fail) => {
-		const proc = spawn(spec.bin, spec.cliArgs, { cwd: spec.cwd, stdio: ["ignore", "pipe", "pipe"] });
+		// cursor-agent must not see PI_BG_LOG: it could overwrite the sidecar during the cost lookup.
+		const proc = spawn(spec.bin, spec.cliArgs, { cwd: spec.cwd, stdio: ["ignore", "pipe", "pipe"], env: agentEnv() });
 		proc.stdout.on("data", (chunk: Buffer) => {
 			// Feed first: `onEvent?.(run, run.feed(…))` would skip the feed when there is no onEvent.
 			const changed = run.feed(chunk.toString());
@@ -200,6 +222,17 @@ export async function runCursor(
 			git(ws, ["status", "--short"]).catch(() => ""),
 		]);
 		out.worktree = { path: ws, branch: branch.trim(), changed: status.split("\n").filter(Boolean) };
+	}
+	// What the run changed, for the phone: success, failure and stop alike (a stop only re-reads what the base had).
+	const diffDir = spec.worktree ? (ws && ws !== spec.cwd ? ws : undefined) : spec.cwd;
+	if (diffDir && spec.base) {
+		const runId = out.state.sessionId || process.env.PI_BG_JOB_ID;
+		const diff = await captureChanges(diffDir, spec.base, {
+			...(runId ? { runId } : {}),
+			...(spec.baseLarge ? { baseLarge: spec.baseLarge } : {}),
+			...(signal?.aborted ? { stopped: true } : {}),
+		}).catch(() => undefined);
+		if (diff && (diff.full.trim() !== "" || diff.diffStats.files > 0)) out.diff = diff;
 	}
 	return out;
 }

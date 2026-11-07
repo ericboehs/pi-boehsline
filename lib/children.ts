@@ -18,14 +18,17 @@
  * Each child also keeps its conversation (childTranscript), so the phone can draw it as a chat:
  * entries in a pi session file's shape (the task as the user's message, the assistant's text,
  * thinking and tool calls, the tool results, short), numbered so Botsun asks only for what is
- * new. At most LOG_ENTRIES or LOG_BYTES: past either, the oldest work goes first; the task and
- * the newest entry (the final reply, once it ended) always stay. A background or Cursor child's
- * is what its log or run state says, its steps as tool calls.
+ * new. A finished Cursor run adds one last entry, type "custom" / customType "cursor_diff"
+ * ({diff, diffStats, diffPath?}); a reader that only handles type "message" skips it. At most
+ * LOG_ENTRIES or LOG_BYTES: past either, the oldest work goes first; the task and the newest
+ * entry always stay. A background or Cursor child's is what its log or run state says, its steps
+ * as tool calls. An edit whose event carried a patch is on that call's arguments.
  */
 
 import { randomBytes } from "node:crypto";
 import { closeSync, openSync, readSync } from "node:fs";
 import { maskSecrets } from "../extensions/opt-in/op-broker/broker.ts";
+import { commandRunsCursorRunner, type CursorDiffInfo, type CursorEditArg, maskDiffSecrets, readJobDetails, trustCursorDiff, trustEdit } from "./cursor-diff.ts";
 
 export type ChildKind = "pi" | "cursor";
 export type ChildState = "running" | "done" | "failed" | "stopped";
@@ -78,14 +81,28 @@ export type ChildMessage =
 /**
  * One entry of a child's conversation in a pi session file's shape (what Botsun reads from a
  * session's own transcript), with its number: Botsun asks for what is past the last one it has.
+ *
+ * A Cursor run's diff is one more entry, of `type: "custom"` (pi's own shape for an entry that
+ * is not a message): a reader that only knows `type: "message"` skips it and still works.
  */
-export interface ChildEntry {
-	seq: number;
-	type: "message";
-	id: string;
-	timestamp: string;
-	message: ChildMessage;
-}
+export type ChildEntry =
+	| {
+			seq: number;
+			type: "message";
+			id: string;
+			timestamp: string;
+			message: ChildMessage;
+	  }
+	| {
+			seq: number;
+			type: "custom";
+			customType: "cursor_diff";
+			id: string;
+			timestamp: string;
+			data: CursorDiffInfo;
+	  };
+
+export type { CursorDiffInfo };
 
 /** A page of a child's conversation (childTranscript). */
 export interface ChildTranscript {
@@ -139,13 +156,18 @@ interface BgSource {
 	keep: boolean;
 }
 
+interface LogSlot {
+	entry: ChildEntry;
+	bytes: number;
+}
+
 interface Rec extends ChildInfo {
 	stop?: () => void;
 	bg?: BgSource;
 	/** A stop was asked (from the phone): its end is "stopped" whatever its exit. */
 	stopping?: boolean;
 	/** Its conversation, oldest first, each entry's JSON size beside it. */
-	log: { entry: ChildEntry; bytes: number }[];
+	log: LogSlot[];
 	logBytes: number;
 	/** The next entry's number. */
 	seq: number;
@@ -376,6 +398,7 @@ const jsonBytes = (v: unknown) => Buffer.byteLength(JSON.stringify(v));
 
 /** An assistant entry of tool calls only (or thinking): work, which goes first past the caps. */
 function isWork(entry: ChildEntry): boolean {
+	if (entry.type !== "message") return false;
 	const m = entry.message;
 	return m.role === "assistant" && !m.content.some((b) => b.type === "text");
 }
@@ -393,10 +416,11 @@ function trimLog(rec: Rec): void {
 		const [gone] = log.splice(at, 1);
 		if (!gone) break;
 		rec.logBytes -= gone.bytes;
-		if (work <= 0 || gone.entry.message.role !== "assistant") continue;
+		if (work <= 0 || gone.entry.type !== "message" || gone.entry.message.role !== "assistant") continue;
 		const ids = new Set(gone.entry.message.content.flatMap((b) => (b.type === "toolCall" ? [b.id] : [])));
 		for (let i = log.length - 2; i > 0; i--) {
-			const m = log[i]?.entry.message;
+			const e = log[i]?.entry;
+			const m = e?.type === "message" ? e.message : undefined;
 			if (m?.role === "toolResult" && ids.has(m.toolCallId)) rec.logBytes -= log.splice(i, 1)[0]?.bytes ?? 0;
 		}
 	}
@@ -452,12 +476,86 @@ function addText(rec: Rec, text: unknown): void {
 /** The newest assistant entry's text blocks. */
 function lastTexts(rec: Rec): string[] {
 	for (let i = rec.log.length - 1; i >= 0; i--) {
-		const m = rec.log[i]?.entry.message;
-		if (m?.role !== "assistant") continue;
-		const texts = m.content.flatMap((b) => (b.type === "text" ? [b.text] : []));
+		const e = rec.log[i]?.entry;
+		if (!e || e.type !== "message" || e.message.role !== "assistant") continue;
+		const texts = e.message.content.flatMap((b) => (b.type === "text" ? [b.text] : []));
 		if (texts.length > 0) return texts;
 	}
 	return [];
+}
+
+const EDIT_ARG = 8_000;
+
+/** An edit's patch: masked and capped, newlines kept (cleanText would trim the patch). */
+function editText(s: string): string {
+	return cap(maskDiffSecrets(s.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "")), EDIT_ARG);
+}
+
+/** A Cursor run's diff, after the reply. Skipped when nothing changed. Sensitive bodies are reduced again; a diffPath outside the state dir is dropped. */
+function addCursorDiff(rec: Rec, info: CursorDiffInfo): void {
+	const trusted = trustCursorDiff(info);
+	if (!trusted.diff.trim() && trusted.diffStats.files === 0) return;
+	let entry: ChildEntry = {
+		seq: rec.seq,
+		type: "custom",
+		customType: "cursor_diff",
+		id: String(rec.seq),
+		timestamp: new Date().toISOString(),
+		data: { ...trusted, diff: maskDiffSecrets(trusted.diff) },
+	};
+	let bytes = jsonBytes(entry);
+	for (let i = 0; bytes > ENTRY_BYTES && i < 8; i++) {
+		entry = { ...entry, data: shrink(entry.data, (ENTRY_BYTES / bytes) * 0.9) as CursorDiffInfo };
+		bytes = jsonBytes(entry);
+	}
+	if (bytes > ENTRY_BYTES) {
+		// A page holds one entry at least; point at the file rather than break that.
+		const where = trusted.diffPath ? `the full diff is at ${trusted.diffPath}` : "the run's log has the full diff";
+		entry = { ...entry, data: { ...trusted, diff: `… diff too long to show here; ${where}\n`, diffStats: { ...trusted.diffStats, truncated: true } } };
+		bytes = jsonBytes(entry);
+	}
+	rec.seq++;
+	rec.log.push({ entry, bytes });
+	rec.logBytes += bytes;
+	trimLog(rec);
+}
+
+/** The newest tool call with this id, and its log slot. */
+function callOf(rec: Rec, id: string): { slot: LogSlot; block: { arguments: Record<string, unknown> } } | undefined {
+	const cleanId = clean(id, 80);
+	for (let i = rec.log.length - 1; i >= 0; i--) {
+		const slot = rec.log[i];
+		const e = slot?.entry;
+		if (!slot || !e || e.type !== "message" || e.message.role !== "assistant") continue;
+		for (const b of e.message.content) if (b.type === "toolCall" && b.id === cleanId) return { slot, block: b };
+	}
+	return undefined;
+}
+
+/** An edit's patch onto call `id`'s arguments; nothing when no call has that id. The entry stays within ENTRY_BYTES. */
+function attachEdit(rec: Rec, id: string, edit: { diff?: string; old?: string; new?: string }): void {
+	const found = callOf(rec, id);
+	if (!found) return;
+	const args = found.block.arguments;
+	if (edit.diff) args.diff = editText(edit.diff);
+	if (edit.old) args.old_string = editText(edit.old);
+	if (edit.new) args.new_string = editText(edit.new);
+	for (const k of ["old_string", "new_string", "diff"]) {
+		if (jsonBytes(found.slot.entry) <= ENTRY_BYTES) break;
+		delete args[k];
+	}
+	const bytes = jsonBytes(found.slot.entry);
+	rec.logBytes += bytes - found.slot.bytes;
+	found.slot.bytes = bytes;
+}
+
+/** A background run's sidecar edits, each onto its step's call (bg-step-<i>, from the log's "#n"). Reduced again so a tampered sidecar cannot attach a secret body. Read only when the job command's argv[1] realpaths to this package's runner. */
+function applyEdits(rec: Rec, edits: CursorEditArg[]): void {
+	for (const edit of edits) {
+		const trusted = trustEdit(edit);
+		if (trusted) attachEdit(rec, `bg-step-${trusted.i}`, trusted);
+	}
+	trimLog(rec);
 }
 
 /**
@@ -531,18 +629,23 @@ export interface ChildHandle {
 	/** A note of its own (e.g. "Looking up the run's cost…"). */
 	set(patch: Partial<Pick<ChildInfo, "activity" | "lastText" | "worktree" | "usage" | "model">>): void;
 	/** It ended: done, failed, or stopped (a stop asked through stopChild always says stopped). */
-	finish(state: Exclude<ChildState, "running">, patch?: Partial<Pick<ChildInfo, "lastText" | "worktree" | "usage">>): void;
+	finish(state: Exclude<ChildState, "running">, patch?: ChildFinishPatch): void;
 	/** A stop was asked of it (its own abort, from the phone). */
 	readonly stopping: boolean;
 }
 
 /** The fields of cursor-agent's RunState the list reads. */
 export interface CursorStateLike {
-	tools: { summary: string; ok?: boolean }[];
+	tools: { summary: string; ok?: boolean; edit?: { diff?: string; old?: string; new?: string } }[];
 	live?: string;
 	answer?: string;
 	thinking?: boolean;
 	workspace?: string;
+}
+
+export interface ChildFinishPatch extends Partial<Pick<ChildInfo, "lastText" | "worktree" | "usage">> {
+	/** A Cursor run's diff, added as the last transcript entry (after the reply). */
+	diff?: CursorDiffInfo;
 }
 
 function makeId(kind: ChildKind): string {
@@ -656,7 +759,7 @@ function applyPatch(rec: Rec, patch: Partial<Pick<ChildInfo, "activity" | "lastT
  * (when it is new there): a run that finished, or a background one's result block. A failure's
  * reason ("killed by SIGTERM") is not a reply.
  */
-function end(rec: Rec, state: Exclude<ChildState, "running">, patch: Partial<Pick<ChildInfo, "lastText" | "worktree" | "usage">>): void {
+function end(rec: Rec, state: Exclude<ChildState, "running">, patch: ChildFinishPatch): void {
 	const full = patch.lastText ?? (rec.bg?.result ? rec.bg.resultLines.join("\n") : undefined);
 	applyPatch(rec, patch);
 	rec.state = rec.stopping ? "stopped" : state;
@@ -667,6 +770,7 @@ function end(rec: Rec, state: Exclude<ChildState, "running">, patch: Partial<Pic
 	closeOpen(rec);
 	const reply = cleanText(full, REPLY_TEXT);
 	if (reply && (state === "done" || rec.bg?.result) && !lastTexts(rec).includes(reply)) addText(rec, reply);
+	if (patch.diff) addCursorDiff(rec, patch.diff);
 	notify(true);
 	scheduleSweep();
 }
@@ -813,6 +917,8 @@ function applyCursorState(rec: Rec, state: CursorStateLike, worktree?: string): 
 			addEntry(rec, { role: "assistant", content: [callBlock(rec, id, name, args, cursorLabel(String(t.summary ?? "")))] });
 			rec.cursorSeen = i + 1;
 		}
+		// Completed events carry the patch; the call was opened on started, so fill it in now.
+		if (t.edit) attachEdit(rec, id, t.edit);
 		if (t.ok !== undefined && !rec.cursorDone.has(i)) {
 			rec.cursorDone.add(i);
 			addResult(rec, id, "", t.ok === false);
@@ -923,12 +1029,15 @@ function cursorLogLine(rec: Rec, line: string): void {
 		rec.activity = THINKING;
 		return;
 	}
-	const step = /^([→✓✗]) (.+)$/.exec(line);
-	if (!step?.[2]) return;
-	const label = cursorLabel(step[2]);
+	// "→ #3 edit fizz.rb": the number is the runner's step (older logs have none).
+	const step = /^([→✓✗]) (?:#(\d{1,6}) )?(.+)$/.exec(line);
+	if (!step?.[3]) return;
+	const summary = step[3];
+	const label = cursorLabel(summary);
+	const stepId = step[2] ? `bg-step-${Number(step[2]) - 1}` : undefined;
 	const call = () => {
-		const id = `bg-${rec.seq}`;
-		const { name, args } = cursorCall(step[2] ?? "");
+		const id = stepId ?? `bg-${rec.seq}`;
+		const { name, args } = cursorCall(summary);
 		addEntry(rec, { role: "assistant", content: [callBlock(rec, id, name, args, label)] });
 		return id;
 	};
@@ -936,7 +1045,7 @@ function cursorLogLine(rec: Rec, line: string): void {
 		rec.turns++;
 		pushTail(rec, label);
 		rec.activity = label;
-		call();
+		if (!stepId || !callOf(rec, stepId)) call();
 	} else {
 		const recent = rec.tail.slice(-8).includes(clean(label, LINE_MAX));
 		if (!recent) {
@@ -945,6 +1054,12 @@ function cursorLogLine(rec: Rec, line: string): void {
 		}
 		if (step[1] === "✗") failTail(rec, label);
 		rec.activity = THINKING;
+		if (stepId) {
+			// Its call, by number: open, already answered (a repeated line), or not seen (trimmed, or no → line).
+			if (rec.open.has(stepId)) addResult(rec, stepId, "", step[1] === "✗");
+			else if (!callOf(rec, stepId)) addResult(rec, call(), "", step[1] === "✗");
+			return;
+		}
 		const open = [...rec.open].find(([, c]) => c.label === label)?.[0];
 		addResult(rec, open ?? call(), "", step[1] === "✗");
 	}
@@ -972,7 +1087,7 @@ function readLog(rec: Rec): void {
 	}
 }
 
-type BgJob = { id?: string; endedAt?: number; exitCode?: number | null; signal?: string | null; killedByUser?: boolean };
+type BgJob = { id?: string; endedAt?: number; exitCode?: number | null; signal?: string | null; killedByUser?: boolean; command?: string };
 
 /** A background child's bg job ended (as bg:jobs or bg:list says). */
 function bgEnded(rec: Rec, job: BgJob): void {
@@ -983,7 +1098,17 @@ function bgEnded(rec: Rec, job: BgJob): void {
 		rec.bg.carry = "";
 	}
 	const state = job.killedByUser || job.signal ? "stopped" : job.exitCode === 0 ? "done" : "failed";
-	end(rec, state, {});
+	const side = rec.kind === "cursor" && rec.bg && commandRunsCursorRunner(job.command) ? readJobDetails(rec.bg.logPath) : undefined;
+	if (side?.edits) applyEdits(rec, side.edits);
+	const diff = side ? transcriptOf(side) : undefined;
+	end(rec, state, diff ? { diff } : {});
+}
+
+function transcriptOf(side: NonNullable<ReturnType<typeof readJobDetails>>): CursorDiffInfo | undefined {
+	const diff = side.transcriptDiff ?? side.diff;
+	const diffStats = side.transcriptStats ?? side.diffStats;
+	if (!diff.trim() && diffStats.files === 0) return undefined;
+	return { diff, diffStats, ...(side.diffPath ? { diffPath: side.diffPath } : {}) };
 }
 
 function onBgJobs(jobs: unknown): void {
