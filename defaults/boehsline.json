@@ -1,5 +1,5 @@
 {
   "//": "A starting ~/.pi/agent/boehsline.json. Every opt-in is off until it's listed in enable; `/boehsline` toggles them and shows the merged config. Other keys are per-extension settings (see each extension's README); a package such as a private work companion can supply them, and this file overrides it. Comments (// and /* */) and trailing commas are allowed.",
   "enable": [],
-  "//enable": "Opt-ins: approval-guardian, image-prune, meeting, omlx (needs a local oMLX server), sc, skill-modes, tmux-attention, update, watch, wiki-session-log."
+  "//enable": "Opt-ins: approval-guardian, image-prune, meeting, memory, omlx (needs a local oMLX server), sc, skill-modes, tmux-attention, update, watch, wiki-session-log."
 }

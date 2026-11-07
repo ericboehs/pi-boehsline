@@ -1,0 +1,10 @@
+#!/usr/bin/env node
+// pi-memory: the memory pool from the shell (lib/memory/cli.ts). Node >= 22.18 runs the .ts directly.
+import { main } from "../lib/memory/cli.ts";
+
+process.exitCode = await main(process.argv.slice(2), {
+	out: (s) => process.stdout.write(`${s}\n`),
+	err: (s) => process.stderr.write(`${s}\n`),
+	env: process.env,
+	cwd: process.cwd(),
+});

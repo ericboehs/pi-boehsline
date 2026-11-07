@@ -57,6 +57,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [cursor-agent](extensions/opt-in/cursor-agent/README.md) | Delegates tasks to Cursor's agent CLI, with live steps and each run's real cost | `cursor` tool, `/cursor-usage`, `/cursor-worktrees` |
 | [image-prune](extensions/opt-in/image-prune/README.md) | Shrinks big tool result images on arrival, and swaps old images for a note with their path past a size threshold | `/image-prune` |
 | [watch](extensions/opt-in/watch/README.md) | Slack, bot feed and notification watcher with digests and drafts | `/watch`, `watch_items` tool |
+| [memory](extensions/opt-in/memory/README.md) | Durable facts about you and your work, shared by every session on the host: markdown files, local git, a secret scanner, optional qmd search | `remember`, `memory_search`, `forget`, `memory_update` tools, `/memory` |
 | [meeting](extensions/opt-in/meeting/README.md) | Live meeting copilot: rolling notes, name and action alerts, slide summaries, and chat answers, from the transcript | `/meeting` |
 | [op-broker](extensions/opt-in/op-broker/README.md) | 1Password for agents: an approval card per item, one shared Touch ID for every session | `/op-broker` |
 | [omlx](extensions/opt-in/omlx/README.md) | Adds models loaded in a local oMLX server to `/model` |  |
@@ -115,6 +116,7 @@ Everything below goes in `~/.pi/agent/boehsline.json`, or comes from a package t
   },
 
   "meeting": { "model": "github-copilot/claude-haiku-5.5", "qmdCollections": ["notes"], "dailyDir": "~/Notes/daily", "owner": "earl", "slideSummaries": true },
+  "memory": { "root": "~/.local/share/pi-memory", "inject": { "startChars": 2500, "startMax": 25 }, "qmd": "auto", "search": { "collections": [] } },  // see extensions/opt-in/memory
   "image-prune": { "thresholdMB": 5, "keepTurns": 2, "shrinkMaxPx": 1568, "shrinkMinKB": 512 },  // "enabled": false pauses it; /image-prune now still works
   "scheduler-tool": { "exposure": "deferred" },  // "direct" puts the schedule tool in every prompt
   "update": { "dir": "~/Code/github.com/ericboehs/pi", "args": ["--quick-tests", "--push"] },  // no dir: the checkout pi runs from

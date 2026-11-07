@@ -1,0 +1,106 @@
+{
+  "//": "Near-duplicate cases shared by pi-memory (lib/memory/dedupe.ts) and Botsun (Memory.duplicate, Memory.cleanup) until Botsun's copy goes. Lists are newest first. scope stands in for Botsun's bot (null bot = global).",
+  "words": [
+    { "text": "Eric's Mac runs pi 1.5 on macOS 26", "words": ["eric", "mac", "runs", "macos"] },
+    { "text": "Deploy, deploy; DEPLOY to prod-east", "words": ["deploy", "prod", "east"] },
+    { "text": "a an to of", "words": [] },
+    { "text": "café über naïve résumé", "words": ["caf", "ber", "sum"] }
+  ],
+  "duplicate": [
+    {
+      "name": "the same fact again",
+      "text": "Eric prefers tabs over spaces in Go code",
+      "existing": [{ "id": "m-20261101-aaaa", "text": "Eric prefers tabs over spaces in Go code" }],
+      "duplicate_of": "m-20261101-aaaa"
+    },
+    {
+      "name": "half of a saved fact is held by it",
+      "text": "Eric prefers tabs over spaces",
+      "existing": [{ "id": "m-20261101-aaaa", "text": "Eric prefers tabs over spaces in Go code, width four" }],
+      "duplicate_of": "m-20261101-aaaa"
+    },
+    {
+      "name": "a longer fact holding a saved one is not a duplicate of it",
+      "text": "Eric prefers tabs over spaces in Go code, width four, and gofmt on save",
+      "existing": [{ "id": "m-20261101-aaaa", "text": "Eric prefers tabs over spaces" }],
+      "duplicate_of": null
+    },
+    {
+      "name": "exactly 80% of the words is a duplicate",
+      "text": "alpha bravo charlie delta echo",
+      "existing": [{ "id": "m-20261101-aaaa", "text": "alpha bravo charlie delta foxtrot" }],
+      "duplicate_of": "m-20261101-aaaa"
+    },
+    {
+      "name": "below 80% is not",
+      "text": "alpha bravo charlie delta echo",
+      "existing": [{ "id": "m-20261101-aaaa", "text": "alpha bravo charlie golf foxtrot" }],
+      "duplicate_of": null
+    },
+    {
+      "name": "fewer than three words is never a duplicate",
+      "text": "tabs please",
+      "existing": [{ "id": "m-20261101-aaaa", "text": "tabs please" }],
+      "duplicate_of": null
+    },
+    {
+      "name": "another scope never counts",
+      "text": "Eric prefers tabs over spaces in Go code",
+      "scope": "projects/github.com/acme/widgets",
+      "existing": [{ "id": "m-20261101-aaaa", "text": "Eric prefers tabs over spaces in Go code" }],
+      "duplicate_of": null
+    },
+    {
+      "name": "the newest match wins",
+      "text": "the deploy needs two approvals",
+      "existing": [
+        { "id": "m-20261105-bbbb", "text": "the deploy needs two approvals in the channel" },
+        { "id": "m-20261101-aaaa", "text": "the deploy needs two approvals" }
+      ],
+      "duplicate_of": "m-20261105-bbbb"
+    }
+  ],
+  "cleanup": [
+    {
+      "name": "of two near-duplicates the older goes",
+      "memories": [
+        { "id": "m-20261105-bbbb", "text": "Eric prefers tabs over spaces in Go code" },
+        { "id": "m-20261101-aaaa", "text": "Eric prefers tabs over spaces in Go" }
+      ],
+      "archived": ["m-20261101-aaaa"]
+    },
+    {
+      "name": "an older fact holding a newer one goes too (either direction)",
+      "memories": [
+        { "id": "m-20261105-bbbb", "text": "Eric prefers tabs over spaces" },
+        { "id": "m-20261101-aaaa", "text": "Eric prefers tabs over spaces in Go code, width four" }
+      ],
+      "archived": ["m-20261101-aaaa"]
+    },
+    {
+      "name": "different scopes are both kept",
+      "memories": [
+        { "id": "m-20261105-bbbb", "text": "Eric prefers tabs over spaces in Go code" },
+        { "id": "m-20261101-aaaa", "text": "Eric prefers tabs over spaces in Go code", "scope": "projects/github.com/acme/widgets" }
+      ],
+      "archived": []
+    },
+    {
+      "name": "short facts are never cleaned up",
+      "memories": [
+        { "id": "m-20261105-bbbb", "text": "use tabs" },
+        { "id": "m-20261101-aaaa", "text": "use tabs" }
+      ],
+      "archived": []
+    },
+    {
+      "name": "unrelated facts are kept",
+      "memories": [
+        { "id": "m-20261105-cccc", "text": "the deploy needs two approvals" },
+        { "id": "m-20261103-bbbb", "text": "Sam owns the billing service" },
+        { "id": "m-20261101-aaaa", "text": "the deploy needs two approvals in the channel" }
+      ],
+      "archived": ["m-20261101-aaaa"]
+    }
+  ]
+}
