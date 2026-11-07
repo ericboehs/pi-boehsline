@@ -36,6 +36,9 @@ test("wiki-session-log: runs the command with the session file after a settled t
 	const ctx = { sessionManager: { getSessionFile: () => "/tmp/session.jsonl" } };
 	handlers.get("session_start")({}, ctx);
 	handlers.get("agent_settled")({}, ctx);
-	for (let i = 0; i < 50 && !existsSync(out); i++) await new Promise((r) => setTimeout(r, 20));
-	assert.equal(readFileSync(out, "utf8").trim(), "--flag /tmp/session.jsonl");
+	// The shell's `>` creates the file before echo writes it, so wait for the line, not the file;
+	// and give a loaded machine up to 10 s to spawn the command at all.
+	const line = () => (existsSync(out) ? readFileSync(out, "utf8") : "");
+	for (let i = 0; i < 500 && !line().endsWith("\n"); i++) await new Promise((r) => setTimeout(r, 20));
+	assert.equal(line().trim(), "--flag /tmp/session.jsonl");
 });

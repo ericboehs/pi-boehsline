@@ -23,6 +23,11 @@ process.env.PI_OP_BROKER_TTL_MS = "30000";
 after(() => rmSync(root, { recursive: true, force: true }));
 
 const EXT = join(import.meta.dirname, "..", "extensions", "opt-in", "op-broker");
+// Run from inside a pi whose op-broker is on (this checkout's), the environment already has its
+// shim on PATH and its socket: start from what a shell without the broker would have, or the
+// tests below see the live session's broker and the last test finds the shim still on PATH.
+process.env.PATH = (process.env.PATH ?? "").split(":").filter((d) => d !== EXT).join(":");
+for (const k of ["PI_OP_BROKER_SOCK", "PI_OP_BROKER_DIR", "PI_OP_BROKER_NODE", "PI_OP_BROKER_PASSTHRU"]) delete process.env[k];
 const { parse } = await import(join(EXT, "shim.mjs"));
 const { Broker, cardTitle, grantKey, maskSecrets, parseRef } = await import(join(EXT, "broker.ts"));
 const { NAME, REF } = await import(join(EXT, "validate.mjs"));
