@@ -7,6 +7,8 @@
 #   1. SIGUSR2: pi shuts down once it is idle (a running turn finishes first).
 #   2. In the same pane: `pi --session <file>` (typed into the pane's shell, or the pane is
 #      respawned with "$SHELL -ic 'pi --session <file>; exec $SHELL -i'" when it died with pi).
+#      --session FILE and --cd DIR (with --only) resume FILE instead and type
+#      `cd -- DIR && pi --session FILE`; a respawned pane's shell starts in DIR too.
 #   3. If the guardian was bypassed when pi left: types `/approval-guardian bypass` into the new
 #      pi once it is up and idle in that pane.
 # A record counts only when it is a regular file of ours named <pid>.json and that pid is a "pi"
@@ -14,7 +16,8 @@
 # --reload-old types /reload into those that agent-link shows idle (~/.claude/sessions/<pid>.json);
 # text left unsent in such a pane's editor would be sent along with it.
 #
-# Usage: pi-restart-all [--dry-run] [--foreground] [--wait SECONDS] [--only PANE] [--reload-old]
+# Usage: pi-restart-all [--dry-run] [--foreground] [--wait SECONDS] [--only PANE]
+#                      [--session FILE] [--cd DIR] [--reload-old]
 #   Runs detached by default (it may restart the pi that started it); the log is
 #   ~/.local/state/pi-restart/last.log.
 set -u
@@ -22,7 +25,7 @@ set -u
 state="${XDG_STATE_HOME:-$HOME/.local/state}/pi-restart"
 live="$state/live"
 log="$state/last.log"
-dry=0 fg=0 wait_s=900 only="" reload_old=0
+dry=0 fg=0 wait_s=900 only="" reload_old=0 session_opt="" cd_opt=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) dry=1 ;;
@@ -30,13 +33,32 @@ while [ $# -gt 0 ]; do
     --reload-old) reload_old=1 ;;
     --wait) wait_s="${2:?--wait needs seconds}"; shift ;;
     --only) only="${2:?--only needs a pane id like %12}"; shift ;;
-    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --session) session_opt="${2:?--session needs a session file}"; shift ;;
+    --cd) cd_opt="${2:?--cd needs a directory}"; shift ;;
+    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "pi-restart-all: unknown option $1" >&2; exit 2 ;;
   esac
   shift
 done
 case "$wait_s" in ''|*[!0-9]*) echo "pi-restart-all: --wait takes whole seconds" >&2; exit 2 ;; esac
 case "$only" in '') ;; %*) case "${only#%}" in ''|*[!0-9]*) echo "pi-restart-all: --only takes a pane id like %12" >&2; exit 2 ;; esac ;; *) echo "pi-restart-all: --only takes a pane id like %12" >&2; exit 2 ;; esac
+if [ -n "$session_opt" ] || [ -n "$cd_opt" ]; then
+  [ -n "$only" ] || { echo "pi-restart-all: --session and --cd need --only" >&2; exit 2; }
+fi
+if [ -n "$cd_opt" ] && [ -z "$session_opt" ]; then
+  # pi takes its cwd from the session file's header, so --cd alone would resume in the old directory.
+  echo "pi-restart-all: --cd needs --session (a session whose header names that directory)" >&2; exit 2
+fi
+for v in "$session_opt" "$cd_opt"; do
+  case "$v" in *[[:cntrl:]]*) echo "pi-restart-all: --session and --cd can't contain control characters" >&2; exit 2 ;; esac
+done
+if [ -n "$session_opt" ] && { [ ! -e "$session_opt" ] || [ ! -f "$session_opt" ]; }; then
+  echo "pi-restart-all: --session is not a regular file: $session_opt" >&2; exit 2
+fi
+if [ -n "$cd_opt" ]; then
+  [ -d "$cd_opt" ] || { echo "pi-restart-all: --cd is not a directory: $cd_opt" >&2; exit 2; }
+  cd_opt=$(cd -- "$cd_opt" && pwd -P) || { echo "pi-restart-all: --cd is not a directory: $cd_opt" >&2; exit 2; }
+fi
 
 mkdir -p "$state" && chmod 700 "$state"
 self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -44,6 +66,8 @@ self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 if [ "$dry" = 0 ] && [ "$fg" = 0 ]; then
   args=(--foreground --wait "$wait_s")
   [ -n "$only" ] && args+=(--only "$only")
+  [ -n "$session_opt" ] && args+=(--session "$session_opt")
+  [ -n "$cd_opt" ] && args+=(--cd "$cd_opt")
   [ "$reload_old" = 1 ] && args+=(--reload-old)
   # Under the tmux server when there is one: outlives the pi (and its tool) that started it.
   # The tmux server's environment isn't ours: pass the bits the run depends on.
@@ -102,6 +126,15 @@ new_record() {
 }
 
 record_bypassed() { [ "$(field "$1" bypass)" = true ]; }
+
+# The command typed into the pane (or run by the respawned shell): a session to resume, and a
+# directory to cd to first when --cd was given.
+resume_command() {
+  local session="$1" resume="$2" dir="$3" cmd
+  if [ "$resume" = 1 ]; then cmd="pi --session $(printf '%q' "$session")"; else cmd="pi"; fi
+  [ -n "$dir" ] && cmd="cd -- $(printf '%q' "$dir") && $cmd"
+  printf '%s' "$cmd"
+}
 editor_cleared() { ! tmux -S "$1" capture-pane -p -t "$2" | grep -v "^[[:space:]]*$" | tail -n 3 | grep -qF -- "$3"; }
 
 # Types a slash command into the pane and presses Enter until the check (a function and its
@@ -122,13 +155,15 @@ restart_one() {
   local rec="$1" pid pane socket session cwd name
   pid=$(field "$rec" pid); pane=$(field "$rec" pane); socket=$(field "$rec" socket)
   session=$(field "$rec" sessionFile); cwd=$(field "$rec" cwd)
+  [ -n "$session_opt" ] && session="$session_opt"
+  [ -n "$cd_opt" ] && cwd="$cd_opt"
   name="$pane ($(basename "$cwd"))"
   # pi writes the session file with the first reply: before that there's nothing to resume, so a
   # fresh pi starts in the pane instead.
   local resume=1
   [ -f "$session" ] || resume=0
   if [ "$dry" = 1 ]; then
-    say "$name: would restart pid $pid, $([ $resume = 1 ] && echo "resume $(basename "$session")" || echo "fresh pi (nothing to resume)")$([ "$(field "$rec" bypass)" = true ] && echo ', bypass')"
+    say "$name: would restart pid $pid, $([ $resume = 1 ] && echo "resume $(basename "$session")" || echo "fresh pi (nothing to resume)")$([ "$(field "$rec" bypass)" = true ] && echo ', bypass'); would type: $(resume_command "$session" "$resume" "$cd_opt")"
     return
   fi
 
@@ -143,15 +178,16 @@ restart_one() {
   local bypass=false
   if sane_record "$rec" && [ "$(field "$rec" exiting)" = true ]; then
     bypass=$(field "$rec" bypass)
-    # A /new or /resume between the signal and the exit: resume the session it left from.
-    session=$(field "$rec" sessionFile); cwd=$(field "$rec" cwd)
+    # A /new or /resume between the signal and the exit: resume the session it left from, unless
+    # --session/--cd named where to continue.
+    [ -n "$session_opt" ] || session=$(field "$rec" sessionFile)
+    [ -n "$cd_opt" ] || cwd=$(field "$rec" cwd)
     resume=1; [ -f "$session" ] || resume=0
   fi
   rm -f "$rec"
 
   local sh="${SHELL:-/bin/zsh}" pi_cmd
-  pi_cmd="pi --session $(printf '%q' "$session")"
-  [ $resume = 1 ] || pi_cmd="pi"
+  pi_cmd=$(resume_command "$session" "$resume" "$cd_opt")
   if ! tmux -S "$socket" display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
     say "$name: the pane closed with pi, not resumed ($pi_cmd)"
     return
@@ -163,8 +199,9 @@ restart_one() {
       zsh|bash|sh|-zsh|-bash|login) ;;
       *) say "$name: the pane runs something else now, not resumed ($pi_cmd)"; return ;;
     esac
-    tmux -S "$socket" send-keys -t "$pane" -l "$pi_cmd"
-    tmux -S "$socket" send-keys -t "$pane" Enter
+    if ! tmux -S "$socket" send-keys -t "$pane" -l "$pi_cmd" || ! tmux -S "$socket" send-keys -t "$pane" Enter; then
+      say "$name: couldn't type the command, not resumed ($pi_cmd)"; return
+    fi
   fi
 
   local fresh

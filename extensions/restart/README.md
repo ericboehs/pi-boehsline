@@ -23,5 +23,9 @@ restarts one pane. Sessions started before this extension are listed; `/reload` 
 pass `--reload-old` to type `/reload` into the ones agent-link shows idle (text left unsent in
 that pane's editor would be sent with it).
 
+With `--only`, `--session FILE` resumes that file instead of the record's, and `--cd DIR` types
+`cd -- DIR && pi --session FILE` (a respawned pane's shell starts in `DIR` too), quoting both with
+`printf %q`. `--cd` needs `--session` (pi takes its directory from the session header), and neither may contain control characters. [cd](../cd/README.md)'s `/cd <dir>` uses both to continue a conversation elsewhere.
+
 [botsun-owner](../opt-in/botsun-owner/README.md)'s Restart (the phone's info sheet) runs
 `pi-restart-all --only <its pane>` for its own session, and offers it only while this record is there.
