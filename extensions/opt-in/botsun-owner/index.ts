@@ -4,7 +4,8 @@
 // the full current state, then busy/idle/prompt/prompt_end/session/bye (and
 // footer/usage on change: the usage windows are provider-usage's numbers), and
 // what /color is (color.ts) on hello, session and each change. Botsun writes
-// back down it only a sandbox session's token and the session's saved color.
+// back down it a sandbox session's token, the session's saved color, the icon
+// catalog and an icon line's answer (icon.ts).
 //
 // T2, reply as Eric: each session also listens on its own owner socket
 // (~/.local/state/botsun/owner/<pid>.sock, 0600). Botsun asks it for a nonce,
@@ -38,6 +39,7 @@ import { optIn } from "../../../lib/opt-in.ts";
 import { canonicalAnswer, canonicalAnswerV2, invalidAnswer, onPromptsChange, openPrompts, type RemotePrompt } from "../../../lib/remote-prompts.ts";
 import { messageV2, messageV3, validHost, validScope } from "../../../lib/signing-v2.ts";
 import { checkPin, isPinsError, pin, ratchet, shortFingerprint, signVersionOf, type KeyKind } from "./pins.ts";
+import { ICON_DISCONNECTED, iconCompletions, iconLineFields, lookOf, looksOf, parseIconArgs, takeCatalog, type IconCatalog, type IconReply } from "./icon.ts";
 import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
 import { latestUsage, onUsageChange, type ProviderUsageSnapshot } from "../../../lib/usage-snapshot.ts";
@@ -163,6 +165,10 @@ interface Conn {
 	/** /color through the color extension's events (extensions/color): what it is now, null when that extension
 	 * isn't loaded; and set it, false when it couldn't. */
 	color?: { claim: () => ColorClaim | null; set: (spec: string, at: number) => boolean };
+	/** The icon catalog Botsun sent, and the look it last said this session has. #22 reads icon. */
+	icons?: IconCatalog;
+	icon?: { look: string | null; color: string | null };
+	iconWait?: { id: string; timer: ReturnType<typeof setTimeout>; resolve: (reply: IconReply) => void };
 	/** The last claim Botsun was told or sent (JSON): a change to it is reported, one Botsun sent is not. */
 	colorSaid?: string;
 	/** Botsun's color as /color last took it, and for which session: the same color at the same time in
@@ -619,14 +625,19 @@ const SANDBOX_TOKEN_MAX_S = 12 * 3600; // SandboxTokens::MAX_AGE
 /** Where the VM extensions find sessionToken (their turnHeader). */
 export const SESSION_TOKEN = Symbol.for("botsun.sessionToken");
 
-/** The longest line Botsun's end of the connection writes (a sandbox_token line is ~120 bytes). */
+/** The longest line Botsun's end of the connection writes. The icon catalog is the long one
+ * (shapes, sets, palette) and stays under this; a sandbox_token line is ~120 bytes. */
 const SERVER_LINE_MAX = 4096;
+const ICON_WAIT_MS = 5_000;
 
 /**
  * A line Botsun wrote down this process's own connection to it: never taken from <pid>.sock,
- * where any process of this user could connect. Two kinds, anything else is ignored:
+ * where any process of this user could connect. Anything else is ignored:
  * - "color": the session's saved color on Botsun (its phone's pick, or a reset's), for /color
  *   (applyColor). Botsun on the Mac and a sandbox VM's bridge both send it.
+ * - "name": a rename from the phone's info sheet.
+ * - "icons": the icon catalog and the current look, answered to hello and session.
+ * - "icon": the answer to an icon line this session sent (/icon).
  * - "sandbox_token": a sandbox session's VM-tool token, from its VM's bridge only
  *   (vm/owner-bridge.mjs, after Botsun bound this session's hello to its template and Eric started
  *   it); a newer one (a renewal) replaces it. Kept in this process only: never a file, env, the
@@ -644,6 +655,8 @@ export function serverLine(c: Conn, line: string): boolean {
 	const { v, type, token, expires_in: ttl } = msg as Record<string, unknown>;
 	if (v === 1 && type === "color") return applyColor(c, msg as Record<string, unknown>);
 	if (v === 1 && type === "name") return applyName(c, msg as Record<string, unknown>);
+	if (v === 1 && type === "icons") return applyIcons(c, msg as Record<string, unknown>);
+	if (v === 1 && type === "icon") return applyIconReply(c, msg as Record<string, unknown>);
 	if (v !== 1 || type !== "sandbox_token") return false;
 	if (typeof token !== "string" || !SANDBOX_TOKEN.test(token)) return false;
 	if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < 1 || ttl > SANDBOX_TOKEN_MAX_S) return false;
@@ -671,9 +684,97 @@ function applyColor(c: Conn, msg: Record<string, unknown>): boolean {
 	return ok;
 }
 
+/** Botsun's icon catalog, and the look it says this session has. A bad catalog is ignored. */
+function applyIcons(c: Conn, msg: Record<string, unknown>): boolean {
+	const catalog = takeCatalog(msg);
+	if (!catalog) return false;
+	c.icons = catalog;
+	const look = lookOf(msg, catalog);
+	if (look) c.icon = look;
+	return true;
+}
+
+/**
+ * The answer to the icon line this session sent. Only the id it is waiting on is taken: another
+ * connection's answer, or a replay, is not this command's. What it says the look is now is checked
+ * against the catalog, and an error is stripped before it reaches the TUI.
+ */
+function applyIconReply(c: Conn, msg: Record<string, unknown>): boolean {
+	const wait = c.iconWait;
+	if (!wait || msg.id !== wait.id) return false;
+	c.iconWait = undefined;
+	clearTimeout(wait.timer);
+	if (msg.ok === true) {
+		const look = lookOf(msg, c.icons) ?? { look: null, color: null };
+		c.icon = look;
+		wait.resolve({ ok: true, ...look, unset: msg.unset === true, cleared: msg.cleared === true });
+	} else {
+		wait.resolve({ ok: false, error: cleanError(msg.error) });
+	}
+	return true;
+}
+
+function failIconWait(c: Conn, error: string): void {
+	const wait = c.iconWait;
+	if (!wait) return;
+	c.iconWait = undefined;
+	clearTimeout(wait.timer);
+	wait.resolve({ ok: false, error });
+}
+
+/** The current look, for a footer avatar (#22). Null until Botsun has said, or after a session switch. */
+export function sessionIcon(): { look: string | null; color: string | null } | null {
+	const c = store[STORE];
+	if (!c || c.closed) return null;
+	return c.icon ?? null;
+}
+
+async function pickIcon(ctx: ExtensionContext, catalog: IconCatalog | undefined): Promise<{ kind: "clear" } | { kind: "set"; look: string; color?: string } | undefined> {
+	if (!catalog) {
+		ctx.ui.notify("Botsun hasn't sent its icons yet", "info");
+		return;
+	}
+	if (typeof ctx.ui.select !== "function") {
+		ctx.ui.notify("usage: /icon <look> [color]", "info");
+		return;
+	}
+	const look = await ctx.ui.select("Session icon", [...looksOf(catalog), "automatic"]);
+	if (look === undefined) return;
+	if (look === "automatic") return { kind: "clear" };
+	const color = await ctx.ui.select("Icon color", [...catalog.colors, "keep color"]);
+	if (color === undefined) return;
+	if (color === "keep color") return { kind: "set", look };
+	return { kind: "set", look, color };
+}
+
+function sendIcon(c: Conn, req: { kind: "clear" } | { kind: "set"; look: string; color?: string }): Promise<IconReply> {
+	if (!c.connected || !c.sock) return Promise.resolve({ ok: false, error: ICON_DISCONNECTED });
+	const id = randomBytes(8).toString("hex");
+	return new Promise((resolve) => {
+		const timer = setTimeout(() => {
+			if (c.iconWait?.id === id) c.iconWait = undefined;
+			resolve({ ok: false, error: "Botsun didn't answer" });
+		}, ICON_WAIT_MS);
+		timer.unref();
+		c.iconWait = { id, timer, resolve };
+		write(c, "icon", { id, ...iconLineFields(req) });
+	});
+}
+
 // What a name never carries: control characters, the line and paragraph separators, and the
 // direction marks and overrides that would make it read other than it is.
 const NAME_BAD = /[\p{Cc}\u2028\u2029\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+const ERROR_BAD = /[\p{Cc}\u2028\u2029\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu;
+const ERROR_MAX = 80;
+
+/** An icon answer's error, as pi may show it: no control characters, line separators or direction
+ * marks (Botsun's own are plain English, but the wire is any same-user process on the owner
+ * socket), and short enough for one TUI line. Never empty. */
+export function cleanError(raw: unknown): string {
+	const plain = typeof raw === "string" ? raw.replace(ERROR_BAD, "") : "";
+	const short = plain.slice(0, ERROR_MAX).trim();
+	return short || "Botsun refused the icon";
+}
 
 /** A name from Botsun (or the phone's /name) as pi may take it: undefined when nothing is left. */
 export function cleanName(raw: unknown): string | undefined {
@@ -1654,6 +1755,7 @@ function connect(c: Conn): void {
 		c.sock = undefined;
 		c.connected = false;
 		c.sandboxToken = undefined; // Botsun revoked it with the connection: the next hello gets a new one
+		failIconWait(c, ICON_DISCONNECTED);
 		scheduleRetry(c);
 	});
 }
@@ -1662,6 +1764,7 @@ function connect(c: Conn): void {
 function close(c: Conn): void {
 	if (c.closed) return;
 	write(c, "bye");
+	failIconWait(c, ICON_DISCONNECTED);
 	c.closed = true;
 	clearTimeout(c.retryTimer);
 	clearTimeout(c.handoffTimer);
@@ -1729,7 +1832,7 @@ const PHONE_BUILTINS: PhoneCommand[] = [
 export function phoneCommands(pi: Pick<ExtensionAPI, "getCommands">): PhoneCommand[] {
 	const seen = new Set(PHONE_BUILTINS.map((c) => c.name));
 	const rest = pi.getCommands()
-		.filter((c) => !seen.has(c.name) && !BUILTINS.has(c.name) && c.name !== RELOAD_COMMAND && /^[A-Za-z][\w:.-]*$/.test(c.name))
+		.filter((c) => !seen.has(c.name) && !BUILTINS.has(c.name) && c.name !== RELOAD_COMMAND && c.name !== "icon" && /^[A-Za-z][\w:.-]*$/.test(c.name))
 		.map((c) => ({ name: c.name.slice(0, 64), ...(c.description ? { description: c.description.slice(0, 160) } : {}) }));
 	return [...PHONE_BUILTINS, ...rest].slice(0, 300);
 }
@@ -1860,6 +1963,36 @@ function main(pi: ExtensionAPI): void {
 				return;
 			}
 			await ctx.reload();
+		},
+	});
+
+	// The phone has the icon sheet. This is the keyboard's: looks and colors come from Botsun's
+	// catalog, never a list kept here. Hidden from the phone's command list (phoneCommands).
+	pi.registerCommand("icon", {
+		description: "Set this session's icon on Botsun's Home",
+		getArgumentCompletions: (prefix) => iconCompletions(prefix, conn?.icons ?? null),
+		handler: async (args, ctx) => {
+			if (!conn?.connected) {
+				ctx.ui.notify(ICON_DISCONNECTED, "error");
+				return;
+			}
+			if (conn.iconWait) {
+				ctx.ui.notify("an icon change is already on its way", "info");
+				return;
+			}
+			const parsed = parseIconArgs(args);
+			if (parsed.kind === "bad") {
+				ctx.ui.notify(parsed.error, "error");
+				return;
+			}
+			const request = parsed.kind === "pick" ? await pickIcon(ctx, conn.icons) : parsed;
+			if (!request) return;
+			const reply = await sendIcon(conn, request);
+			if (!reply.ok) {
+				ctx.ui.notify(reply.error ?? "Botsun refused the icon", "error");
+				return;
+			}
+			ctx.ui.notify(reply.look ? (reply.color ? `icon: ${reply.look}, ${reply.color}` : `icon: ${reply.look}`) : "icon: automatic", "info");
 		},
 	});
 
@@ -1996,7 +2129,10 @@ function main(pi: ExtensionAPI): void {
 			conn.nonces.clear(); // a nonce was for the session it was issued in
 			listenOwner(conn);
 			const changed = info.sessionFile !== conn.sessionFile || info.sessionId !== conn.sessionId || info.cwd !== conn.cwd;
-			if (info.sessionId !== conn.sessionId) conn.sandboxToken = undefined; // it was for the session Botsun bound
+			if (info.sessionId !== conn.sessionId) {
+				conn.sandboxToken = undefined; // it was for the session Botsun bound
+				conn.icon = undefined; // the look was the session pi left; the next icons line says this one's
+			}
 			if (!("boundId" in conn)) conn.boundId = conn.sessionId; // a connection from before boundId: its hello's
 			const rehello = helloOnSwitch(conn, info, conn.launch);
 			Object.assign(conn, info);
