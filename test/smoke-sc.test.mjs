@@ -52,7 +52,12 @@ test("/sc attaches the newest image, steering, with its path and the instruction
 });
 
 test("/sc sends a non-image by path, nothing attached", async () => {
-	writeFileSync(join(downloads, "notes.txt"), "hi");
+	const notes = join(downloads, "notes.txt");
+	writeFileSync(notes, "hi");
+	// tmpfs (and other coarse clocks) can stamp back-to-back writes with the
+	// same mtime, so readdir order would keep new.PNG. Force this file newest.
+	const newer = new Date(Date.now() + 5_000);
+	utimesSync(notes, newer, newer);
 	const s = load();
 	await s.commands.get("sc").handler("", stubCtx().ctx);
 	assert.equal(typeof s.sent[0].content, "string");

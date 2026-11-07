@@ -11,7 +11,8 @@ import { test } from "node:test";
 import { applyToRepo, describe, listWorktrees, removeWorktree } from "../extensions/opt-in/cursor-agent/worktrees.ts";
 
 const sh = (cwd, ...args) =>
-	execFileSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...args], { encoding: "utf8" });
+	// gpgsign=false: a global commit.gpgsign must not require the user's signing key.
+	execFileSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...args], { encoding: "utf8" });
 
 function setup() {
 	const dir = mkdtempSync(join(tmpdir(), "cursor-wt-"));

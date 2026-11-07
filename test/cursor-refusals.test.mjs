@@ -97,7 +97,7 @@ const alive = (pid) => {
 	}
 };
 
-const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", ...args], { encoding: "utf8" });
+const git = (cwd, ...args) => execFileSync("git", ["-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...args], { encoding: "utf8" });
 const repo = path.join(scratch, "repo");
 mkdirSync(repo);
 git(repo, "init", "-q", "-b", "main");
