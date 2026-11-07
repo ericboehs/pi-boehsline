@@ -20,6 +20,7 @@ import { optIn } from "../../../lib/opt-in.ts";
 import { remotes } from "../../../lib/memory/git.ts";
 import * as ops from "../../../lib/memory/ops.ts";
 import { slugFor } from "../../../lib/memory/project.ts";
+import { oneLine } from "../../../lib/memory/render.ts";
 import { memorySettings, tildePath } from "../../../lib/memory/settings.ts";
 import * as store from "../../../lib/memory/store.ts";
 
@@ -275,7 +276,7 @@ export function memory(pi: ExtensionAPI): void {
 						}
 						if (!tail.trim()) {
 							const pins = store.readPins(m.root);
-							return say(pins.length ? pins.map((p, i) => `${i + 1}. ${p}`).join("\n") : "No pins. /memory pin <text> adds one.");
+							return say(pins.length ? pins.map((p, i) => `${i + 1}. ${oneLine(p)}`).join("\n") : "No pins. /memory pin <text> adds one.");
 						}
 						const r = ops.pin(m, tail);
 						return say(`Pinned (${r.pins.length}). New sessions get it; this one keeps its block.`);

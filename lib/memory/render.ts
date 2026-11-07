@@ -6,10 +6,12 @@
  * reviewed above inferred (proposed and archived are never shown), then a mix
  * of recency and use (each doubling of `used` is worth a week).
  *
- * Every line is one memory, flattened to a single line with tag-shaped `<`
- * turned into `‹`, so no memory can add headings, close the block or open
- * markup of its own. Memories and pins that fail the scanner (a hand-edited
- * file) are left out. Pins get a budget of their own, the same startChars.
+ * Every line is one memory, flattened to a single line with markup defused
+ * (`<` turned into `‹`) while path-like placeholders such as
+ * `~/Code/<host>/<org>/<repo>` and `<pid>.json`, and date shapes such as
+ * `<YYYY-MM-DD>`, stay readable, so no memory can add headings, close the block
+ * or open markup of its own. Memories and pins that fail the scanner (a
+ * hand-edited file) are left out. Pins get a budget of their own, the same startChars.
  *
  * Pure node: no pi imports.
  */
@@ -42,13 +44,58 @@ export interface Block {
 	refused: number;
 }
 
-/** One line of untrusted text: control and format characters dropped, whitespace collapsed, tags defused. */
+/**
+ * Placeholder names that may stay readable, in a path-like context. Closed:
+ * a name not here is defused. `user` and `name` are deliberately absent: they
+ * are role and skill fields, not placeholders; nor is any tag this repo emits
+ * to a model (`session`, `id`, `key`, ...: a test greps for them). Compared lowercased with `-`,
+ * `_` and digits removed, so `<host>`, `<HOST>` and `<host1>` are the same.
+ */
+const ALLOW = new Set([
+	"host", "org", "repo", "project", "slug", "branch", "dir", "path", "file",
+	"pid", "port", "model", "pane", "version", "env", "region",
+	"ticket", "pr", "commit", "sha", "date", "ts", "namespace",
+	"cluster", "pod",
+]);
+
+const tagKey = (name: string) => name.toLowerCase().replace(/[-_\d]/g, "");
+/** Strict date/time placeholders: YYYY or YY, MM, DD, HH, SS joined by - _ or :. */
+const DATE_PLACEHOLDER = /^(?:Y{4}|Y{2}|M{2}|D{2}|H{2}|S{2})(?:[-_:](?:Y{4}|Y{2}|M{2}|D{2}|H{2}|S{2}))*$/;
+const CANDIDATE = /^<([A-Za-z][A-Za-z0-9_:-]{0,23})>/;
+/** A `<` that starts something tag-shaped: a closing tag, declaration, chat token or name. */
+const TAG_START = /^[<＜](?=[\s\p{M}]*[/!?|\p{L}])/u;
+const BEFORE = new Set(["/", "~", ".", ":", "=", "(", ",", "-"]);
+
+/** Path-like context: before `<` is a path/punctuation character, or after `>` is `/` or `.`. A letter before `<` is not enough (`ok<tag>`). */
+function context(s: string, at: number, end: number): boolean {
+	const before = at > 0 ? s[at - 1]! : "";
+	return (before !== "" && BEFORE.has(before)) || s[end] === "/" || s[end] === ".";
+}
+
+/** A placeholder token at `at` (`<host>`, `<pid>.json`, `<YYYY-MM-DD>`), not markup. Dates are context-free. */
+function placeholder(s: string, at: number): boolean {
+	const m = CANDIDATE.exec(s.slice(at));
+	if (!m) return false;
+	const name = m[1]!;
+	if (DATE_PLACEHOLDER.test(name)) return true;
+	if (!ALLOW.has(tagKey(name))) return false;
+	return context(s, at, at + m[0].length);
+}
+
+/** One line of untrusted text: control and format characters dropped, whitespace collapsed, markup defused; placeholders kept. */
 export function oneLine(s: string): string {
-	return s
+	const flat = s
 		.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
 		.replace(/\s+/g, " ")
-		.trim()
-		.replace(/<(?=[\s\p{M}]*[/!?|\p{L}])/gu, "‹");
+		.trim();
+	let out = "";
+	for (let i = 0; i < flat.length; i++) {
+		const c = flat[i]!;
+		if (c === "<" && placeholder(flat, i)) out += c;
+		else if ((c === "<" || c === "＜") && TAG_START.test(flat.slice(i))) out += "‹";
+		else out += c;
+	}
+	return out;
 }
 
 /** The lines that fit in `chars` (one newline each), in order, skipping any that don't. */

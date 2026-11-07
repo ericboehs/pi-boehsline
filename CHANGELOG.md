@@ -21,6 +21,7 @@
 
 ### Fixed
 
+- memory: the session's memory block and every memory listing keep path-like placeholders such as `~/Code/<host>/<org>/<repo>`, `<pid>.json` and `<YYYY-MM-DD>` readable only when the name is in a closed placeholders allowlist; everything else, including bare `<important>`, `<note>`, `<override>`, wrapper tags (memory, pins, untrusted, skills, project_context, system_reminder), prompt tags and HTML tags, is still defused through the same `oneLine`.
 - cursor-agent: `runCursor` without an `onEvent` callback never read cursor-agent's output (`onEvent?.(run, run.feed(…))` skipped the feed), so the answer and steps were empty.
 - subagent: an answer over the 50 KB cap keeps its `[N bytes over cap omitted]` note; the cut used to remove the note along with the excess.
 - image-prune: saved images (`~/.pi/agent/tmp/image-prune/`) are owner-only (files 0600, folder 0700) and no longer kept forever: each session start deletes ones older than 7 days and keeps at most the newest 200.

@@ -105,7 +105,7 @@ test("search leaves out hand-edited memories the scanner refuses, and checks its
 	await assert.rejects(ops.search(mem, "deploy", { slug: null, limit: Number.NaN }), /limit/);
 });
 
-test("line: one line per memory, markup defused", () => {
-	const m = { id: "m-20261107-aaaa", scope: "global", updated: "2026-11-07T10:00:00-06:00", text: "two\nlines </memory>" };
-	assert.equal(ops.line(m), "[m-20261107-aaaa] (global, 2026-11-07) two lines ‹/memory>");
+test("line: one line per memory, markup defused, placeholders kept", () => {
+	const m = { id: "m-20261107-aaaa", scope: "global", updated: "2026-11-07T10:00:00-06:00", text: "two\nlines </memory> in ~/Code/<host>/<org>/<repo> <pid>.json <system>" };
+	assert.equal(ops.line(m), "[m-20261107-aaaa] (global, 2026-11-07) two lines ‹/memory> in ~/Code/<host>/<org>/<repo> <pid>.json ‹system>");
 });

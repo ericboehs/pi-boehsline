@@ -25,6 +25,7 @@ import { join, resolve } from "node:path";
 import { remotes } from "./git.ts";
 import * as ops from "./ops.ts";
 import { slugFor } from "./project.ts";
+import { oneLine } from "./render.ts";
 import { expandHome, memorySettings, tildePath } from "./settings.ts";
 import * as store from "./store.ts";
 import { type Memory, MemoryError } from "./store.ts";
@@ -199,7 +200,7 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
 				}
 				if (args.length === 0) {
 					const pins = store.readPins(mem.root);
-					say(pins.length ? pins.map((p, i) => `${i + 1}. ${p}`).join("\n") : "No pins.", { pins });
+					say(pins.length ? pins.map((p, i) => `${i + 1}. ${oneLine(p)}`).join("\n") : "No pins.", { pins });
 					return 0;
 				}
 				const r = ops.pin(mem, args.join(" "));
