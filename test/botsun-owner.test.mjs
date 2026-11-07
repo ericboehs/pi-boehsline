@@ -18,6 +18,10 @@ process.env.HOME = home;
 process.env.BOEHSLINE_CONFIG = join(home, "boehsline.json");
 process.env.BOTSUN_OWNER_RETRY_MS = "50";
 delete process.env.BOTSUN_OWNER_DEBUG;
+// Never the real tmux or restart records (restartEnv below fakes both).
+delete process.env.TMUX;
+delete process.env.TMUX_PANE;
+process.env.XDG_STATE_HOME = join(home, "state");
 after(() => rmSync(home, { recursive: true, force: true }));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -75,7 +79,7 @@ async function mount({ ctx: over = {}, sessionName } = {}) {
 	const fire = (event, payload = {}, c = ctx) => s.fire(event, payload, c);
 	// A failed assertion must not leave a connection retrying past the test.
 	cleanups.push(() => fire("session_shutdown", { reason: "quit" }));
-	return { ...s, ctx, fire };
+	return { ...s, ctx, fire, mod };
 }
 
 // Device key pins (pins.ts): each test pairs fresh keys, so each starts with none.
@@ -1447,6 +1451,240 @@ test("close: Eric's phone aborts a running turn, gets {ok} at once, then pi shut
 	await until(() => log.includes("shutdown"));
 	assert.deepEqual(log, ["shutdown"], "nothing running: no abort");
 	assert.equal(m.sent.length, 0);
+});
+
+// ---- The phone's Reload and Restart ----------------------------------------
+
+/** A v1 signature over a session decision whose digest is sha256(decision). */
+function signV1(key, nonce, decision) {
+	const digest = createHash("sha256").update(decision, "utf8").digest("hex");
+	const msg = ["botsun-decide-v1", "7", nonce, "session", "sid-a", decision, digest].join("\n");
+	return cryptoSign("sha256", Buffer.from(msg), { key: key.privateKey, dsaEncoding: "der" }).toString("base64");
+}
+
+/** pi-restart-all's view of this pi: titled "pi", in tmux pane %12 (a tmux server socket that is
+ * there), with the restart extension's record (or not). */
+async function restartEnv() {
+	const saved = { TMUX: process.env.TMUX, TMUX_PANE: process.env.TMUX_PANE, XDG_STATE_HOME: process.env.XDG_STATE_HOME };
+	const title = process.title;
+	const state = mkdtempSync(join(home, "state-"));
+	const live = join(state, "pi-restart", "live");
+	const socket = join(state, "tmux.sock");
+	const tmux = createServer(() => {});
+	await new Promise((r) => tmux.listen(socket, r));
+	process.env.XDG_STATE_HOME = state;
+	process.title = "pi";
+	cleanups.push(() => {
+		for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : (process.env[k] = v);
+		process.title = title;
+		return new Promise((r) => tmux.close(() => r()));
+	});
+	return {
+		inTmux: () => { process.env.TMUX = `${socket},1234,0`; process.env.TMUX_PANE = "%12"; },
+		record: (over = {}) => {
+			mkdirSync(live, { recursive: true });
+			writeFileSync(join(live, `${process.pid}.json`),
+				JSON.stringify({ pid: process.pid, sessionFile: "/tmp/sessions/a.jsonl", cwd: "/tmp/work/proj", pane: "%12", socket, bypass: false, idle: true, at: "", ...over }));
+		},
+		noRecord: () => rmSync(join(live, `${process.pid}.json`), { force: true }),
+	};
+}
+
+test("reload: v2 only, its own decision; refused while a turn runs (nonce spent); then pi's reload through its command", async () => {
+	const decide = phoneKey();
+	writeKeys({ 7: decide.raw.toString("base64") });
+	const m = await owner();
+	const { RELOAD_BUSY, RELOAD_COMMAND } = m.mod;
+	let idle = true;
+	m.ctx.isIdle = () => idle;
+	m.ctx.abort = () => assert.fail("a reload never aborts");
+	m.ctx.shutdown = () => assert.fail("a reload never shuts pi down");
+	const reload = async ({ key = decide, decision = "reload", payload = decision, type = "reload", nonce } = {}) => {
+		if (!nonce) {
+			let features;
+			({ nonce, features } = await ask({ type: "nonce" }));
+			assert.ok(features.includes("reload"));
+		}
+		return ask({ type, nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", decision, payload) });
+	};
+	assert.equal((await reload({ key: phoneKey() })).error, "signature does not verify");
+	assert.equal((await reload({ decision: "close", payload: "close" })).error, "signature does not verify", "a close signature isn't a reload one");
+	assert.equal((await reload({ decision: "restart", payload: "restart" })).error, "signature does not verify", "nor a restart one");
+	assert.equal((await reload({ payload: "close" })).error, "signature does not verify", "over its own payload");
+	assert.equal((await reload({ type: "close" })).error, "signature does not verify", "and a reload one isn't a close");
+	// v1 (a signature that verifies, from a device that hasn't ratcheted): refused, nonce spent.
+	const { nonce: n1 } = await ask({ type: "nonce" });
+	const v1 = { type: "reload", nonce: n1, device_id: 7, signature: signV1(decide, n1, "reload") };
+	assert.equal((await ask(v1)).error, "reload needs a v2 signature: v1 is refused (update Botsun and the app)");
+	assert.equal((await ask({ ...v1, sig_v: 1 })).error, "nonce is expired or used", "spent");
+	assert.equal((await ask({ type: "reload" })).error, "bad request", "unsigned");
+	assert.equal(m.sent.length, 0);
+	// A running turn: refused after the check, so the nonce is spent and it can't land once the turn ends.
+	idle = false;
+	const { nonce: busy } = await ask({ type: "nonce" });
+	assert.equal((await reload({ nonce: busy })).error, RELOAD_BUSY);
+	idle = true;
+	assert.equal((await reload({ nonce: busy })).error, "nonce is expired or used", "no replay");
+	await m.fire("agent_start");
+	assert.equal((await reload()).error, RELOAD_BUSY, "busy as Botsun sees it");
+	await m.fire("agent_settled");
+	// A dialog open at the keyboard (a reload would dismiss it).
+	await m.fire("ui_prompt_start", { kind: "select", title: "Pick one" });
+	assert.equal((await reload()).error, m.mod.dialogOpen("reload"));
+	await m.fire("ui_prompt_end", {});
+	assert.equal(m.sent.length, 0);
+
+	const reloads = [];
+	const notes = [];
+	const cmdCtx = { reload: async () => reloads.push(1), ui: { notify: (text) => notes.push(text) } };
+	const { handler } = m.commands.get(RELOAD_COMMAND);
+	await handler("", cmdCtx);
+	assert.equal(reloads.length, 0, "typed by hand it doesn't reload");
+	assert.match(notes[0], /type \/reload instead/);
+	assert.deepEqual(await reload(), { ok: true });
+	await until(() => m.sent.length === 1);
+	const sent = m.sent[0];
+	assert.deepEqual(sent.options, { expandPromptTemplates: true });
+	const [, token] = sent.content.match(new RegExp(`^/${RELOAD_COMMAND} ([\\w-]{24})$`)) ?? [];
+	assert.ok(token, sent.content);
+	// pi runs that command with a command context (its reload() is /reload's): once, with that request's token.
+	await handler("not-the-token", cmdCtx);
+	assert.equal(reloads.length, 0, "another token doesn't");
+	assert.deepEqual(await reload(), { ok: true });
+	await until(() => m.sent.length === 2);
+	const token2 = m.sent[1].content.split(" ")[1];
+	assert.notEqual(token2, token, "a fresh token each time");
+	await handler(token, cmdCtx);
+	assert.equal(reloads.length, 0, "nor a spent one");
+	assert.deepEqual(await reload(), { ok: true });
+	await until(() => m.sent.length === 3);
+	const token3 = m.sent[2].content.split(" ")[1];
+	await handler(token3, cmdCtx);
+	assert.equal(reloads.length, 1);
+	await handler(token3, cmdCtx);
+	assert.equal(reloads.length, 1, "once");
+	assert.ok(!m.mod.phoneCommands({ getCommands: () => [{ name: RELOAD_COMMAND }, { name: "goal" }] }).some((c) => c.name === RELOAD_COMMAND),
+		"not on the phone's / list");
+});
+
+test("reload and restart reply first and act after; a turn started in between stops them", async () => {
+	const decide = phoneKey();
+	writeKeys({ 7: decide.raw.toString("base64") });
+	const env = await restartEnv();
+	env.inTmux();
+	env.record();
+	const m = await owner();
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	const spawned = [];
+	conn.spawnRestart = (pane) => spawned.push(pane);
+	let idle = true;
+	m.ctx.isIdle = () => idle;
+	const request = (type) => {
+		const { nonce } = m.mod.handleOwnerRequest(conn, { type: "nonce" });
+		return m.mod.handleOwnerRequest(conn, { type, nonce, device_id: 7, sig_v: 2, signature: signV2(decide, nonce, "session", type, type) });
+	};
+	for (const [type, done] of [["reload", () => m.sent.length], ["restart", () => spawned.length]]) {
+		let reply = request(type);
+		assert.equal(reply.ok, true, type);
+		assert.equal(done(), 0, `${type}: nothing before the reply is written`);
+		reply[m.mod.AFTER_REPLY]();
+		assert.equal(done(), 1, `${type}: done after it`);
+		reply = request(type);
+		idle = false; // a typed prompt started meanwhile
+		reply[m.mod.AFTER_REPLY]();
+		assert.equal(done(), 1, `${type}: skipped`);
+		idle = true;
+	}
+	assert.deepEqual(spawned, ["%12"]);
+});
+
+test("restart: only in tmux with the restart extension's record; pi-restart-all --only this pane, after the reply", async () => {
+	const decide = phoneKey();
+	writeKeys({ 7: decide.raw.toString("base64") });
+	const env = await restartEnv();
+	const m = await owner();
+	const { RESTART_BUSY, RESTART_NO_TMUX } = m.mod;
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	const spawned = [];
+	conn.spawnRestart = (pane) => spawned.push(pane);
+	let idle = true;
+	m.ctx.isIdle = () => idle;
+	m.ctx.shutdown = () => assert.fail("pi-restart-all ends pi, not this");
+	const features = async () => (await ask({ type: "nonce" })).features;
+	const restart = async ({ key = decide, decision = "restart", nonce } = {}) => {
+		nonce ??= (await ask({ type: "nonce" })).nonce;
+		return ask({ type: "restart", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", decision, decision) });
+	};
+	// v1 (verifies, the device not ratcheted yet): refused, nonce spent.
+	const { nonce: n1 } = await ask({ type: "nonce" });
+	assert.equal((await ask({ type: "restart", nonce: n1, device_id: 7, signature: signV1(decide, n1, "restart") })).error,
+		"restart needs a v2 signature: v1 is refused (update Botsun and the app)");
+	assert.equal((await restart({ nonce: n1 })).error, "nonce is expired or used");
+	// Not in tmux: not offered, refused after the check (nonce spent).
+	assert.ok((await features()).includes("reload"));
+	assert.ok(!(await features()).includes("restart"));
+	const { nonce: outside } = await ask({ type: "nonce" });
+	assert.equal((await restart({ nonce: outside })).error, RESTART_NO_TMUX);
+	assert.equal((await restart({ nonce: outside })).error, "nonce is expired or used");
+	assert.equal((await restart({ key: phoneKey() })).error, "signature does not verify", "verified first");
+	// In tmux, but no record, another pane's, another server's, or one on its way out.
+	env.inTmux();
+	assert.ok(!(await features()).includes("restart"), "no record");
+	assert.equal((await restart()).error, RESTART_NO_TMUX);
+	for (const over of [{ pane: "%13" }, { socket: join(home, "other.sock") }, { pid: process.pid + 1 }, { exiting: true }]) {
+		env.record(over);
+		assert.ok(!(await features()).includes("restart"), JSON.stringify(over));
+	}
+	assert.equal((await restart()).error, RESTART_NO_TMUX);
+	env.record();
+	assert.ok((await features()).includes("restart"));
+	assert.ok(m.mod.restartTarget(process.env, process.pid));
+	// pi-restart-all also skips a pane whose tmux server socket isn't there, or a process not titled "pi".
+	const gone = join(home, "gone.sock");
+	env.record({ socket: gone });
+	assert.equal(m.mod.restartTarget({ ...process.env, TMUX: `${gone},1,0` }, process.pid), null, "no tmux server");
+	env.record();
+	process.title = "node";
+	assert.ok(!(await features()).includes("restart"), "not titled pi");
+	process.title = "pi";
+	assert.equal(m.mod.restartTarget(process.env, process.pid, join(home, "no-such-pi-restart-all")), null, "nor without the script");
+	// Signing: its own decision.
+	assert.equal((await restart({ decision: "reload" })).error, "signature does not verify", "a reload signature isn't a restart one");
+	assert.equal((await restart({ decision: "close" })).error, "signature does not verify");
+	// A running turn.
+	idle = false;
+	assert.equal((await restart()).error, RESTART_BUSY);
+	idle = true;
+	assert.deepEqual(spawned, []);
+	assert.deepEqual(await restart(), { ok: true });
+	await until(() => spawned.length === 1);
+	assert.deepEqual(spawned, ["%12"]);
+	assert.equal(m.sent.length, 0);
+});
+
+test("features: restart is said when it becomes possible, after every session_start handler ran", async () => {
+	const env = await restartEnv();
+	env.inTmux();
+	const { m, srv } = await ownerWith({});
+	const hello = srv.lines.find((l) => l.type === "hello");
+	assert.ok(hello.features.includes("reload"));
+	assert.ok(!hello.features.includes("restart"));
+	// /reload: this extension's session_start runs, then the restart extension's writes its record.
+	await m.fire("session_shutdown", { reason: "reload" });
+	const started = m.fire("session_start", { reason: "reload" });
+	env.record();
+	await started;
+	await until(() => srv.lines.filter((l) => l.type === "features").length === 2);
+	const [forced, changed] = srv.lines.filter((l) => l.type === "features");
+	assert.ok(!forced.features.includes("restart"));
+	assert.ok(changed.features.includes("restart"));
+	// Unchanged: no line.
+	await m.fire("session_shutdown", { reason: "reload" });
+	await m.fire("session_start", { reason: "reload" });
+	await sleep(30);
+	assert.equal(srv.lines.filter((l) => l.type === "features").length, 3, "the forced one only");
+	env.noRecord();
+	assert.ok(!(await ask({ type: "nonce" })).features.includes("restart"), "gone with the record");
 });
 
 test("a locked phone's close: call key, v2, decision close_call, this session only; never ends a running turn", async () => {

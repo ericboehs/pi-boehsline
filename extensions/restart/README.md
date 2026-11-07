@@ -22,3 +22,6 @@ logs to `~/.local/state/pi-restart/last.log`. `--dry-run` lists what it would do
 restarts one pane. Sessions started before this extension are listed; `/reload` them once, or
 pass `--reload-old` to type `/reload` into the ones agent-link shows idle (text left unsent in
 that pane's editor would be sent with it).
+
+[botsun-owner](../opt-in/botsun-owner/README.md)'s Restart (the phone's info sheet) runs
+`pi-restart-all --only <its pane>` for its own session, and offers it only while this record is there.

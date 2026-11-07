@@ -27,11 +27,12 @@
 // so nothing here keeps pi alive.
 
 import { createHash, createPublicKey, randomBytes, verify as verifySignature } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { accessSync, appendFileSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { optIn } from "../../../lib/opt-in.ts";
 import { canonicalAnswer, canonicalAnswerV2, invalidAnswer, onPromptsChange, openPrompts, type RemotePrompt } from "../../../lib/remote-prompts.ts";
@@ -130,6 +131,14 @@ interface Conn {
 	 * framing runs, a sent prompt hasn't started yet or pi has queued messages, and nothing is aborted; its
 	 * shutdown is skipped if one has started since. */
 	close?: (opts?: { idleOnly?: boolean }) => { stopped: boolean; shutdown: () => void } | null;
+	/** The phone's Reload and Restart: null while anything runs (as close_call's idleOnly); `run` acts once the reply
+	 * is sent, and is skipped if something has started since. */
+	reload?: () => { run: () => void } | null;
+	restart?: (pane: string) => { run: () => void } | null;
+	/** Starts `pi-restart-all --only <pane>` (spawnRestartAll); tests put a fake here. */
+	spawnRestart?: (pane: string) => void;
+	/** The features Botsun was last told (JSON): a change to them is reported. */
+	featuresSent?: string;
 	/** A call's verified words, held until the voice helper releases them (session-voice plan). */
 	held?: Map<string, { text: string; at: number; proposal?: string; sigV?: 1 | 2 | 3; deviceId?: string }>;
 	/** A reply whose video frames are still being extracted: later replies wait for it, to keep their order. */
@@ -578,6 +587,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (r.type === "stop") return stopRequest(c, r);
 	if (r.type === "stop_child") return stopChildRequest(c, r);
 	if (r.type === "close") return r.key !== undefined ? closeCall(c, r) : closeRequest(c, r);
+	if (r.type === "reload" || r.type === "restart") return reloadOrRestart(c, r, r.type);
 	// Display only (a chip's mode, as a click on the footer flips it): not signed, nothing acts.
 	if (r.type === "footer_tap") return footerTap(String(r.chip ?? ""));
 	// A read, as Botsun reads a session's own transcript: not signed, and only this session's child.
@@ -688,7 +698,7 @@ function applyName(c: Conn, msg: Record<string, unknown>): boolean {
 	// would reach the socket's data handler and end pi.
 	try { c.setSessionName(name); } catch { return false; }
 	c.namedAt = Date.now();
-	try { write(c, "features", { features: featureList(c) }); } catch {}
+	try { reportFeatures(c); } catch {}
 	return true;
 }
 
@@ -1244,6 +1254,74 @@ function closeCall(c: Conn, r: Record<string, unknown>): Record<string, unknown>
 	return { ok: true, [AFTER_REPLY]: closing.shutdown };
 }
 
+export const RELOAD_BUSY = "this session is running a turn: reload once it ends";
+export const RESTART_BUSY = "this session is running a turn: restart once it ends";
+export const RESTART_NO_TMUX = "this session can't restart from the phone: it isn't running in tmux";
+export const dialogOpen = (what: "reload" | "restart"): string => `this session has a dialog open: ${what} once it's answered`;
+export const v2OnlyRefused = (what: "reload" | "restart"): string =>
+	`${what} needs a v2 signature: v1 is refused (update Botsun and the app)`;
+
+/** The restart extension's records (extensions/restart, liveDir), by path: no import. */
+const restartLiveDir = (env: NodeJS.ProcessEnv): string =>
+	join(env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "pi-restart", "live");
+const RESTART_ALL = fileURLToPath(new URL("../../../bin/pi-restart-all", import.meta.url));
+
+/**
+ * The tmux pane pi-restart-all can restart this pi in, or null. What the script itself checks
+ * before it signals (else it skips the pane quietly): pi's process title is "pi", in a tmux pane
+ * whose server socket is there, and the restart extension's record for this pid names that pane
+ * and server and isn't on its way out; and the script is there to run.
+ */
+export function restartTarget(env: NodeJS.ProcessEnv = process.env, pid: number = process.pid, bin: string = RESTART_ALL): { pane: string } | null {
+	const pane = env.TMUX_PANE ?? "";
+	const socket = (env.TMUX ?? "").split(",")[0] ?? "";
+	if (process.title !== "pi" || !/^%\d+$/.test(pane) || !socket) return null;
+	try {
+		if (!statSync(socket).isSocket()) return null;
+		const path = join(restartLiveDir(env), `${pid}.json`);
+		if (!lstatSync(path).isFile()) return null;
+		const rec = JSON.parse(readFileSync(path, "utf8"));
+		if (rec?.pid !== pid || rec.pane !== pane || rec.socket !== socket || rec.exiting === true) return null;
+		accessSync(bin, fsConstants.X_OK);
+	} catch {
+		return null;
+	}
+	return { pane };
+}
+
+/** `pi-restart-all --only <pane>`: it hands itself to the tmux server (run-shell -b), so it outlives this pi. */
+function spawnRestartAll(pane: string): void {
+	const child = spawn(RESTART_ALL, ["--only", pane], { detached: true, stdio: "ignore" });
+	child.on("error", (e) => debug(`restart: ${e.message}`));
+	child.unref();
+}
+
+/**
+ * The phone's Reload (/reload: extensions, prompts, skills) and Restart (pi-restart-all restarts
+ * this pi in its tmux pane and resumes the session). Signed like close, v2 only, each over its own
+ * decision ("reload" / "restart", payload the same word), so neither signature passes as the other
+ * or as a close. Refused while anything runs or a dialog is open (a reload would dismiss it), after
+ * verifyDevice so the nonce is spent; restart also when this pi can't be restarted. Else {ok} first
+ * and the act after the reply.
+ */
+function reloadOrRestart(c: Conn, r: Record<string, unknown>, what: "reload" | "restart"): Record<string, unknown> {
+	if (r.key !== undefined) return { error: "bad request" };
+	const denied = verifyDevice(c, r, { decision: what, digest: () => sha256hex(Buffer.from(what, "utf8")),
+		v2: { kind: "session", decision: what, payload: () => what } });
+	if (denied) return { error: denied };
+	if (!atLeastV2(r)) return { error: v2OnlyRefused(what) };
+	if (!c.reload || !c.restart) return { error: `this session can't ${what} from the phone yet; run /reload` };
+	const target = what === "restart" ? restartTarget() : null;
+	if (what === "restart" && !target) return { error: RESTART_NO_TMUX };
+	const busy = what === "reload" ? RELOAD_BUSY : RESTART_BUSY;
+	if (c.busy || c.framing) return { error: busy };
+	if (c.prompt) return { error: dialogOpen(what) };
+	const acting = target ? c.restart(target.pane) : c.reload();
+	if (!acting) return { error: busy };
+	debug(`owner ${what} from the phone`);
+	return { ok: true, [AFTER_REPLY]: acting.run };
+}
+
 function listenOwner(c: Conn): void {
 	if (c.server || c.closed) return;
 	const path = ownerSock();
@@ -1450,7 +1528,17 @@ function featureList(c: Conn): string[] {
 		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 	})();
 	return ["say", "say_call", "answer_call", "close_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close", "name",
-		"subagents", "subagent_chats", ...(hasStash ? ["stash"] : [])];
+		"subagents", "subagent_chats", ...(hasStash ? ["stash"] : []), ...(c.reload ? ["reload"] : []),
+		...(c.restart && restartTarget() ? ["restart"] : [])];
+}
+
+/** A features line; unless forced, only when they changed since Botsun was last told (restart comes and goes). */
+function reportFeatures(c: Conn, force = true): void {
+	const features = featureList(c);
+	const key = JSON.stringify(features);
+	if (!force && key === c.featuresSent) return;
+	c.featuresSent = key;
+	write(c, "features", { features });
 }
 
 /** The conversation a sandbox template's pi was started in, from its first session: Botsun starts it
@@ -1476,8 +1564,10 @@ const LAUNCH = Symbol.for("botsun-owner.launch");
 
 function sendHello(c: Conn): void {
 	c.boundId = c.sessionId;
+	const features = featureList(c);
+	c.featuresSent = JSON.stringify(features);
 	write(c, "hello", {
-		features: featureList(c),
+		features,
 		cwd: c.cwd,
 		session_file: c.sessionFile,
 		session_id: c.sessionId,
@@ -1594,6 +1684,8 @@ const BUILTINS = new Set(["settings", "model", "tree", "thinking", "scoped-model
 	"name", "session", "changelog", "hotkeys", "fork", "clone", "trust", "login", "logout", "new", "cd", "compact", "resume",
 	"reload", "quit"]);
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh"];
+/** The command the phone's reload runs through (main); not on the phone's "/" list. */
+export const RELOAD_COMMAND = "botsun-reload";
 
 /** "/name args" as a command; a path like /Users/x is not one. Pure for tests. */
 export function slashCommand(text: string): { name: string; args: string } | null {
@@ -1637,7 +1729,7 @@ const PHONE_BUILTINS: PhoneCommand[] = [
 export function phoneCommands(pi: Pick<ExtensionAPI, "getCommands">): PhoneCommand[] {
 	const seen = new Set(PHONE_BUILTINS.map((c) => c.name));
 	const rest = pi.getCommands()
-		.filter((c) => !seen.has(c.name) && !BUILTINS.has(c.name) && /^[A-Za-z][\w:.-]*$/.test(c.name))
+		.filter((c) => !seen.has(c.name) && !BUILTINS.has(c.name) && c.name !== RELOAD_COMMAND && /^[A-Za-z][\w:.-]*$/.test(c.name))
 		.map((c) => ({ name: c.name.slice(0, 64), ...(c.description ? { description: c.description.slice(0, 160) } : {}) }));
 	return [...PHONE_BUILTINS, ...rest].slice(0, 300);
 }
@@ -1754,6 +1846,23 @@ function main(pi: ExtensionAPI): void {
 	let afterStop: string[] = [];
 	let steerHook = false;
 
+	// pi's reload is only on a command's context, and a command sent with expandPromptTemplates runs
+	// with one, as typed: it reloads only with the one-time token the phone's verified reload sent it
+	// with; typed by hand (or sent by anything else) it does nothing.
+	let reloadToken: string | undefined;
+	pi.registerCommand(RELOAD_COMMAND, {
+		description: "Botsun's Reload from the phone (at the keyboard, use /reload)",
+		handler: async (args, ctx) => {
+			const token = reloadToken;
+			reloadToken = undefined;
+			if (!token || args.trim() !== token) {
+				ctx.ui.notify("This is Botsun's Reload from the phone: type /reload instead", "info");
+				return;
+			}
+			await ctx.reload();
+		},
+	});
+
 	// The guardian's bypass, as it announces it (on start and on each change): the phone shows it.
 	pi.events?.on(GUARDIAN_BYPASS_STATE_EVENT, (state: unknown) => {
 		bypassed = (state as { active?: unknown } | undefined)?.active === true;
@@ -1837,6 +1946,23 @@ function main(pi: ExtensionAPI): void {
 			};
 			return { stopped: stop() === "stopped", shutdown };
 		};
+		// The phone's Reload and Restart: never while anything runs or a dialog is open, checked again
+		// once the reply is sent.
+		const settled = () => !running() && !conn?.prompt;
+		const whenIdle = (what: string, act: () => void) => !settled() ? null : {
+			run: () => {
+				if (!settled()) {
+					debug(`${what}: a turn or a dialog started before it; not done`);
+					return;
+				}
+				act();
+			},
+		};
+		const reload = () => whenIdle("reload", () => {
+			reloadToken = randomBytes(18).toString("base64url");
+			pi.sendUserMessage(`/${RELOAD_COMMAND} ${reloadToken}`, { expandPromptTemplates: true });
+		});
+		const restart = (pane: string) => whenIdle("restart", () => (conn?.spawnRestart ?? spawnRestartAll)(pane));
 		const command = (text: string, busy: boolean) =>
 			compacting && /^\//.test(text.trim()) && !/^\/(model|thinking|name|bypass)\b/.test(text.trim()) ? "wait for the compaction to finish" : runCommand(pi, ctx, text, busy);
 		const commands = () => phoneCommands(pi);
@@ -1856,6 +1982,8 @@ function main(pi: ExtensionAPI): void {
 			conn.deliver = deliver;
 			conn.stop = stop;
 			conn.close = close;
+			conn.reload = reload;
+			conn.restart = restart;
 			conn.command = command;
 			conn.commands = commands;
 			conn.models = models;
@@ -1896,7 +2024,7 @@ function main(pi: ExtensionAPI): void {
 			reportSubagents(conn);
 			// A reload may have added or dropped commands: the phone's "/" list follows.
 			try { write(conn, "commands", { commands: commands() }); } catch {}
-			try { write(conn, "features", { features: featureList(conn) }); } catch {}
+			try { reportFeatures(conn); } catch {}
 			try { write(conn, "models", { models: models() }); } catch {}
 			// And what the phone shows from hello: context use and the stash, fresh, not after the next run.
 			write(conn, "context", { context: (() => { try { return context(); } catch { return null; } })() });
@@ -1909,11 +2037,19 @@ function main(pi: ExtensionAPI): void {
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
 			busy: false, prompt: null, promptDepth: 0, sessionName, setSessionName, ...info, launch: g[LAUNCH],
-			nonces: new Map(), inject, deliver, stop, close, command, commands, models, context, confirm, color, model: modelOf(ctx),
+			nonces: new Map(), inject, deliver, stop, close, reload, restart, command, commands, models, context, confirm, color,
+			model: modelOf(ctx),
 		};
 		store[STORE] = conn;
 		connect(conn);
 		listenOwner(conn);
+	});
+	// The restart extension writes its record in its own session_start, before or after this one:
+	// once every handler ran, say whether restart is possible now, if that changed.
+	pi.on("session_start", () => {
+		setTimeout(() => {
+			if (conn && !conn.closed) try { reportFeatures(conn, false); } catch {}
+		}, 0);
 	});
 
 	// Streaming (so the phone shows the reply as it's written): the assistant message's text so
