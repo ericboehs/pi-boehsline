@@ -14,6 +14,13 @@
  * What a child is doing comes from its output: a foreground pi child's JSON events, a Cursor
  * run's reducer state, a background job's log (the subagent progress filter's lines, or the
  * cursor runner's). The log parse is best effort: a line it doesn't know is skipped.
+ *
+ * Each child also keeps its conversation (childTranscript), so the phone can draw it as a chat:
+ * entries in a pi session file's shape (the task as the user's message, the assistant's text,
+ * thinking and tool calls, the tool results, short), numbered so Botsun asks only for what is
+ * new. At most LOG_ENTRIES or LOG_BYTES: past either, the oldest work goes first; the task and
+ * the newest entry (the final reply, once it ended) always stay. A background or Cursor child's
+ * is what its log or run state says, its steps as tool calls.
  */
 
 import { randomBytes } from "node:crypto";
@@ -57,13 +64,61 @@ export interface ChildInfo {
 	sessionId: string | null;
 }
 
+/** A block of a child's message, as pi writes it in a session file. */
+export type ChildBlock =
+	| { type: "text"; text: string }
+	| { type: "thinking"; thinking: string }
+	| { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> };
+
+export type ChildMessage =
+	| { role: "user"; content: { type: "text"; text: string }[] }
+	| { role: "assistant"; content: ChildBlock[] }
+	| { role: "toolResult"; toolCallId: string; toolName: string; content: { type: "text"; text: string }[]; isError: boolean };
+
+/**
+ * One entry of a child's conversation in a pi session file's shape (what Botsun reads from a
+ * session's own transcript), with its number: Botsun asks for what is past the last one it has.
+ */
+export interface ChildEntry {
+	seq: number;
+	type: "message";
+	id: string;
+	timestamp: string;
+	message: ChildMessage;
+}
+
+/** A page of a child's conversation (childTranscript). */
+export interface ChildTranscript {
+	entries: ChildEntry[];
+	/** The newest entry's number. */
+	last: number;
+	/** More past these: ask again from the last one returned. */
+	more: boolean;
+	/** The reply it is writing now, masked; "" once it ended. */
+	live: string;
+	state: ChildState;
+}
+
 export const KEEP_MS = 10 * 60_000;
 export const MAX_CHILDREN = 16;
 export const TAIL_LINES = 30;
+export const LOG_ENTRIES = 400;
+export const LOG_BYTES = 512 * 1024;
+/** One entry at most, as JSON: always a page of its own. */
+export const ENTRY_BYTES = 32 * 1024;
+/** A page's entries at most, as JSON: under OwnerSessions::MAX_LINE (64 KB) with the live text and envelope. */
+export const PAGE_BYTES = 40 * 1024;
 const TASK_MAX = 200;
 const LINE_MAX = 160;
 const ACTIVITY_MAX = 120;
 const TEXT_MAX = 600;
+const TASK_TEXT = 8_000;
+const REPLY_TEXT = 16_000;
+const RESULT_TEXT = 1_000;
+const THINK_TEXT = 4_000;
+const ARG_TEXT = 2_000;
+const LIVE_TEXT = 4_000;
+const BLOCKS_MAX = 64;
 const POLL_MS = 2_000;
 const READ_MAX = 256 * 1024;
 
@@ -89,6 +144,18 @@ interface Rec extends ChildInfo {
 	bg?: BgSource;
 	/** A stop was asked (from the phone): its end is "stopped" whatever its exit. */
 	stopping?: boolean;
+	/** Its conversation, oldest first, each entry's JSON size beside it. */
+	log: { entry: ChildEntry; bytes: number }[];
+	logBytes: number;
+	/** The next entry's number. */
+	seq: number;
+	/** The reply streaming now, raw (masked when served). */
+	live: string;
+	/** Tool calls in the conversation with no result yet (id → name, label): closed when it ends. */
+	open: Map<string, { name: string; label: string }>;
+	/** A Cursor run's steps already in the conversation, and those with their result. */
+	cursorSeen: number;
+	cursorDone: Set<number>;
 }
 
 type Listener = (immediate: boolean) => void;
@@ -129,9 +196,45 @@ export function clean(s: unknown, n: number): string {
 }
 
 /** Text kept as written (its newlines), masked and capped. */
-function cleanText(s: unknown): string {
-	const text = maskSecrets(String(s ?? "").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").trim());
-	return cap(text, TEXT_MAX);
+/** Masking a huge tool result costs far more than the little kept of it. A head this far past the
+ * cap still holds any whole secret that starts inside it (a PEM key is a few KB), and the whole is
+ * masked when masking shrank the head so much that its cut could show. */
+const MASK_MARGIN = 32 * 1024;
+
+function cleanText(s: unknown, n = TEXT_MAX): string {
+	const raw = String(s ?? "");
+	const head = raw.length > n + MASK_MARGIN ? maskedText(raw.slice(0, n + MASK_MARGIN)) : null;
+	return cap(head !== null && head.length > n ? head : maskedText(raw), n);
+}
+
+function maskedText(s: string): string {
+	return maskSecrets(s.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").trim());
+}
+
+/** An argument named like a credential: its value never goes in the conversation. */
+const SECRET_KEY = /pass|secret|token|auth|cred|api.?key|private/i;
+
+/** A tool call's arguments for the conversation: strings masked and capped, at most 3 deep. */
+function logArgs(v: unknown, depth = 0): unknown {
+	if (typeof v === "string") return cleanText(v, ARG_TEXT);
+	if (typeof v === "number") return Number.isFinite(v) ? v : null;
+	if (typeof v === "boolean" || v === null) return v;
+	if (depth >= 3 || typeof v !== "object") return undefined;
+	if (Array.isArray(v)) return v.slice(0, 20).map((x) => logArgs(x, depth + 1) ?? null);
+	const out: Record<string, unknown> = {};
+	for (const [k, x] of Object.entries(v as Record<string, unknown>).slice(0, 30)) {
+		const value = SECRET_KEY.test(k) && x !== null && x !== undefined && x !== "" ? "•••" : logArgs(x, depth + 1);
+		if (value !== undefined) out[clean(k, 60)] = value;
+	}
+	return out;
+}
+
+/** Every string over 200 characters cut to `ratio` of its length (an entry over ENTRY_BYTES). */
+function shrink(v: unknown, ratio: number): unknown {
+	if (typeof v === "string") return v.length > 200 ? cap(v, Math.max(200, Math.floor(v.length * ratio))) : v;
+	if (Array.isArray(v)) return v.map((x) => shrink(x, ratio));
+	if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, shrink(x, ratio)]));
+	return v;
 }
 
 const base = (p: string) => {
@@ -199,6 +302,27 @@ export function cursorLabel(summary: string): string {
 	return clean(label, ACTIVITY_MAX);
 }
 
+/** A Cursor step summary as the pi tool call it is like ("shell bin/test" → bash, its command). */
+export function cursorCall(summary: string): { name: string; args: Record<string, unknown> } {
+	const s = oneLine(summary);
+	const space = s.indexOf(" ");
+	const kind = space < 0 ? s : s.slice(0, space);
+	const rest = space < 0 ? "" : s.slice(space + 1);
+	const tools: Record<string, [string, string]> = {
+		read: ["read", "path"],
+		shell: ["bash", "command"],
+		edit: ["edit", "path"],
+		write: ["write", "path"],
+		delete: ["delete", "path"],
+		glob: ["find", "pattern"],
+		grep: ["grep", "pattern"],
+		ls: ["ls", "path"],
+	};
+	const tool = tools[kind];
+	if (tool && rest) return { name: tool[0], args: { [tool[1]]: rest } };
+	return { name: clean(kind, 40) || "step", args: rest ? { summary: rest } : {} };
+}
+
 // ---- the store
 
 function notify(immediate: boolean): void {
@@ -239,8 +363,134 @@ function scheduleSweep(): void {
 }
 
 function info(c: Rec): ChildInfo {
-	const { stop: _stop, bg: _bg, stopping: _stopping, ...rest } = c;
+	const {
+		stop: _stop, bg: _bg, stopping: _stopping, log: _log, logBytes: _logBytes, seq: _seq, live: _live, open: _open,
+		cursorSeen: _cursorSeen, cursorDone: _cursorDone, ...rest
+	} = c;
 	return { ...rest, tail: [...c.tail], ...(c.usage ? { usage: { ...c.usage } } : {}) };
+}
+
+// ---- a child's conversation
+
+const jsonBytes = (v: unknown) => Buffer.byteLength(JSON.stringify(v));
+
+/** An assistant entry of tool calls only (or thinking): work, which goes first past the caps. */
+function isWork(entry: ChildEntry): boolean {
+	const m = entry.message;
+	return m.role === "assistant" && !m.content.some((b) => b.type === "text");
+}
+
+/**
+ * The cap: past LOG_ENTRIES or LOG_BYTES, the oldest work entry goes (with its calls' results),
+ * else the oldest entry after the task. The task and the newest entry always stay. Botsun keeps
+ * its copy by the same rule (OwnerSessions#child_log_trim).
+ */
+function trimLog(rec: Rec): void {
+	const log = rec.log;
+	while ((log.length > LOG_ENTRIES || rec.logBytes > LOG_BYTES) && log.length > 2) {
+		const work = log.findIndex((e, i) => i > 0 && i < log.length - 1 && isWork(e.entry));
+		const at = work > 0 ? work : 1;
+		const [gone] = log.splice(at, 1);
+		if (!gone) break;
+		rec.logBytes -= gone.bytes;
+		if (work <= 0 || gone.entry.message.role !== "assistant") continue;
+		const ids = new Set(gone.entry.message.content.flatMap((b) => (b.type === "toolCall" ? [b.id] : [])));
+		for (let i = log.length - 2; i > 0; i--) {
+			const m = log[i]?.entry.message;
+			if (m?.role === "toolResult" && ids.has(m.toolCallId)) rec.logBytes -= log.splice(i, 1)[0]?.bytes ?? 0;
+		}
+	}
+}
+
+/** Adds one entry, fitted to ENTRY_BYTES (its long strings cut), then the cap. */
+function addEntry(rec: Rec, message: ChildMessage): void {
+	let entry: ChildEntry = { seq: rec.seq, type: "message", id: String(rec.seq), timestamp: new Date().toISOString(), message };
+	let bytes = jsonBytes(entry);
+	for (let i = 0; bytes > ENTRY_BYTES && i < 8; i++) {
+		entry = { ...entry, message: shrink(entry.message, (ENTRY_BYTES / bytes) * 0.9) as ChildMessage };
+		bytes = jsonBytes(entry);
+	}
+	if (bytes > ENTRY_BYTES) {
+		const text = [{ type: "text" as const, text: "[too long to show]" }];
+		entry = { ...entry, message: message.role === "toolResult" ? { ...message, content: text } : { role: message.role, content: text } as ChildMessage };
+		bytes = jsonBytes(entry);
+	}
+	rec.seq++;
+	rec.log.push({ entry, bytes });
+	rec.logBytes += bytes;
+	trimLog(rec);
+}
+
+/** A tool call block, its arguments masked; the call stays open until its result. */
+function callBlock(rec: Rec, id: string, name: string, args: Record<string, unknown>, label: string): ChildBlock {
+	rec.open.set(id, { name, label });
+	return { type: "toolCall", id: clean(id, 80), name: clean(name, 60) || "tool", arguments: (logArgs(args) as Record<string, unknown>) ?? {} };
+}
+
+function addResult(rec: Rec, id: string, text: unknown, isError: boolean): void {
+	const call = rec.open.get(id);
+	rec.open.delete(id);
+	addEntry(rec, {
+		role: "toolResult",
+		toolCallId: clean(id, 80),
+		toolName: clean(call?.name ?? "tool", 60),
+		content: [{ type: "text", text: cleanText(text, RESULT_TEXT) }],
+		isError,
+	});
+}
+
+/** Every call still open gets an empty result: it ended, or the log moved past it. */
+function closeOpen(rec: Rec): void {
+	for (const id of [...rec.open.keys()]) addResult(rec, id, "", false);
+}
+
+function addText(rec: Rec, text: unknown): void {
+	const t = cleanText(text, REPLY_TEXT);
+	if (t) addEntry(rec, { role: "assistant", content: [{ type: "text", text: t }] });
+}
+
+/** The newest assistant entry's text blocks. */
+function lastTexts(rec: Rec): string[] {
+	for (let i = rec.log.length - 1; i >= 0; i--) {
+		const m = rec.log[i]?.entry.message;
+		if (m?.role !== "assistant") continue;
+		const texts = m.content.flatMap((b) => (b.type === "text" ? [b.text] : []));
+		if (texts.length > 0) return texts;
+	}
+	return [];
+}
+
+/**
+ * One page of a child's conversation past entry `since` (-1: from the start), at most `maxBytes`
+ * of entries (one at least). Only a child on `sessionId`'s list: null for any other.
+ */
+export function childTranscript(sessionId: string | null, id: string, since = -1, maxBytes = PAGE_BYTES): ChildTranscript | null {
+	if (prune()) scheduleSweep();
+	const rec = store().children.get(id);
+	if (!rec || sessionId === null || rec.sessionId !== sessionId) return null;
+	const entries: ChildEntry[] = [];
+	let bytes = 0;
+	let more = false;
+	for (const { entry, bytes: n } of rec.log) {
+		if (entry.seq <= since) continue;
+		if (entries.length > 0 && bytes + n > maxBytes) {
+			more = true;
+			break;
+		}
+		entries.push(entry);
+		bytes += n;
+	}
+	let live = "";
+	if (rec.state === "running" && rec.live) {
+		const masked = maskSecrets(rec.live.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "")).trim();
+		live = masked.length > LIVE_TEXT ? `…${masked.slice(-(LIVE_TEXT - 1))}` : masked;
+	}
+	return { entries, last: rec.seq - 1, more, live, state: rec.state };
+}
+
+/** The streaming reply, its newest REPLY_TEXT characters kept. */
+function setLive(rec: Rec, text: string): void {
+	rec.live = text.length > REPLY_TEXT ? text.slice(-REPLY_TEXT) : text;
 }
 
 /** Every child this process tracks (or only one session's), oldest first. */
@@ -324,7 +574,15 @@ export function trackChild(start: ChildStart): ChildHandle {
 		...(start.worktree ? { worktree: clean(start.worktree, 300) } : {}),
 		sessionId: start.sessionId,
 		...(start.stop ? { stop: start.stop } : {}),
+		log: [],
+		logBytes: 0,
+		seq: 0,
+		live: "",
+		open: new Map(),
+		cursorSeen: 0,
+		cursorDone: new Set(),
 	};
+	addEntry(rec, { role: "user", content: [{ type: "text", text: cleanText(start.task, TASK_TEXT) }] });
 	if (start.bg) {
 		rec.bg = { id: start.bg.id, logPath: start.bg.logPath, offset: 0, carry: "", result: false, resultLines: [], full: false, keep: false };
 	}
@@ -393,12 +651,22 @@ function applyPatch(rec: Rec, patch: Partial<Pick<ChildInfo, "activity" | "lastT
 	if (patch.usage) rec.usage = { ...patch.usage };
 }
 
+/**
+ * It ended. In its conversation, calls left open close first, then its final reply goes last
+ * (when it is new there): a run that finished, or a background one's result block. A failure's
+ * reason ("killed by SIGTERM") is not a reply.
+ */
 function end(rec: Rec, state: Exclude<ChildState, "running">, patch: Partial<Pick<ChildInfo, "lastText" | "worktree" | "usage">>): void {
+	const full = patch.lastText ?? (rec.bg?.result ? rec.bg.resultLines.join("\n") : undefined);
 	applyPatch(rec, patch);
 	rec.state = rec.stopping ? "stopped" : state;
 	rec.endedAt = Date.now();
 	rec.activity = "";
+	rec.live = "";
 	delete rec.stop;
+	closeOpen(rec);
+	const reply = cleanText(full, REPLY_TEXT);
+	if (reply && (state === "done" || rec.bg?.result) && !lastTexts(rec).includes(reply)) addText(rec, reply);
 	notify(true);
 	scheduleSweep();
 }
@@ -424,7 +692,7 @@ function failTail(rec: Rec, label: string): void {
 
 // ---- a pi child's JSON events (pi --mode json)
 
-type Part = { type?: string; text?: string; name?: string; arguments?: Record<string, unknown> };
+type Part = { type?: string; text?: string; thinking?: string; redacted?: boolean; id?: string; name?: string; arguments?: Record<string, unknown> };
 type PiMessage = { role?: string; content?: Part[] | string; usage?: Record<string, unknown> };
 type PiEvent = {
 	type?: string;
@@ -432,9 +700,30 @@ type PiEvent = {
 	toolName?: string;
 	args?: Record<string, unknown>;
 	isError?: boolean;
+	result?: { content?: Part[] | string };
 	message?: PiMessage;
 	assistantMessageEvent?: { type?: string };
 };
+
+const partsText = (content: Part[] | string | undefined) =>
+	typeof content === "string" ? content : Array.isArray(content) ? content.flatMap((p) => (p?.type === "text" && typeof p.text === "string" ? [p.text] : [])).join("\n") : "";
+
+/** An assistant message's blocks for the conversation, in order: text, thinking, tool calls. */
+function assistantBlocks(rec: Rec, m: PiMessage): ChildBlock[] {
+	if (typeof m.content === "string") return m.content.trim() ? [{ type: "text", text: cleanText(m.content, REPLY_TEXT) }] : [];
+	const blocks: ChildBlock[] = [];
+	for (const p of (Array.isArray(m.content) ? m.content : []).slice(0, BLOCKS_MAX)) {
+		if (p?.type === "text" && typeof p.text === "string" && p.text.trim()) blocks.push({ type: "text", text: cleanText(p.text, REPLY_TEXT) });
+		else if (p?.type === "thinking" && typeof p.thinking === "string" && !p.redacted && p.thinking.trim()) {
+			blocks.push({ type: "thinking", thinking: cleanText(p.thinking, THINK_TEXT) });
+		} else if (p?.type === "toolCall" && typeof p.id === "string" && p.id) {
+			const name = String(p.name ?? "tool");
+			const args = p.arguments && typeof p.arguments === "object" ? p.arguments : {};
+			blocks.push(callBlock(rec, p.id, name, args, toolLabel(name, args)));
+		}
+	}
+	return blocks;
+}
 
 /** Reads a pi child's AgentEvents into its record: turns, the tool it runs, its text and usage. */
 class PiParser {
@@ -464,9 +753,11 @@ class PiParser {
 				if (ev.toolCallId) this.labels.delete(ev.toolCallId);
 				if (ev.isError) failTail(rec, label);
 				if (this.labels.size === 0) rec.activity = THINKING;
+				if (ev.toolCallId) addResult(rec, ev.toolCallId, partsText(ev.result?.content), ev.isError === true);
 				break;
 			}
 			case "message_update": {
+				if (ev.message?.role === "assistant") setLive(rec, partsText(ev.message.content));
 				if (ev.message?.role !== "assistant" || this.labels.size > 0) break;
 				const kind = ev.assistantMessageEvent?.type ?? "";
 				if (kind.startsWith("thinking")) rec.activity = THINKING;
@@ -487,6 +778,9 @@ class PiParser {
 				usage.cacheWrite += n(u.cacheWrite);
 				usage.cost += n(cost);
 				rec.usage = usage;
+				rec.live = "";
+				const blocks = assistantBlocks(rec, m);
+				if (blocks.length > 0) addEntry(rec, { role: "assistant", content: blocks });
 				const parts = Array.isArray(m.content) ? m.content : [];
 				let text = typeof m.content === "string" ? m.content : "";
 				for (const p of parts) if (p?.type === "text" && p.text) text = p.text;
@@ -511,6 +805,20 @@ function applyCursorState(rec: Rec, state: CursorStateLike, worktree?: string): 
 	const text = state.live || state.answer;
 	if (text) rec.lastText = cleanText(text);
 	if (worktree) rec.worktree = clean(worktree, 300);
+	// Its steps as tool calls, each once, and a result once the step says how it went.
+	tools.forEach((t, i) => {
+		const id = `cursor-${i}`;
+		if (i >= rec.cursorSeen) {
+			const { name, args } = cursorCall(String(t.summary ?? ""));
+			addEntry(rec, { role: "assistant", content: [callBlock(rec, id, name, args, cursorLabel(String(t.summary ?? "")))] });
+			rec.cursorSeen = i + 1;
+		}
+		if (t.ok !== undefined && !rec.cursorDone.has(i)) {
+			rec.cursorDone.add(i);
+			addResult(rec, id, "", t.ok === false);
+		}
+	});
+	setLive(rec, typeof state.live === "string" ? state.live : "");
 }
 
 // ---- background children: their bg job's log
@@ -537,6 +845,7 @@ function piLogLine(rec: Rec, line: string): void {
 	const banner = PI_RESULT.exec(line);
 	if (banner) {
 		bg.result = true;
+		closeOpen(rec);
 		rec.turns = Number(banner[1]);
 		rec.usage = { input: kNum(banner[2]), cacheRead: kNum(banner[3]), output: kNum(banner[4]), cacheWrite: 0, cost: Number(banner[5] ?? 0) || 0 };
 		rec.activity = WRITING;
@@ -548,20 +857,26 @@ function piLogLine(rec: Rec, line: string): void {
 	const body = turn[2] ?? "";
 	const calls = body.split(" | ");
 	const first = body.split(" ")[0] ?? "";
+	// A new turn: the last one's calls are done (the filter writes no results).
+	closeOpen(rec);
 	if (PI_TOOLS.has(first)) {
 		let last = THINKING;
-		for (const call of calls) {
+		const blocks: ChildBlock[] = [];
+		calls.forEach((call, k) => {
 			const sp = call.indexOf(" ");
 			const name = sp < 0 ? call : call.slice(0, sp);
 			const arg = sp < 0 ? "" : call.slice(sp + 1);
-			const key = name === "bash" ? "command" : name === "grep" || name === "find" ? "pattern" : name === "web_fetch" ? "url" : "path";
+			const key = name === "bash" ? "command" : name === "grep" || name === "find" ? "pattern" : name === "web_fetch" ? "url" : name === "web_search" ? "query" : "path";
 			last = toolLabel(name, { [key]: arg });
 			pushTail(rec, last);
-		}
+			if (blocks.length < BLOCKS_MAX) blocks.push(callBlock(rec, `bg-${rec.seq}-${k}`, name, { [key]: arg }, last));
+		});
+		if (blocks.length > 0) addEntry(rec, { role: "assistant", content: blocks });
 		rec.activity = last;
 	} else if (body && body !== "(no text)") {
 		rec.lastText = cleanText(body);
 		pushTail(rec, `> ${body}`);
+		addText(rec, body);
 		rec.activity = THINKING;
 	}
 }
@@ -575,6 +890,7 @@ function cursorLogLine(rec: Rec, line: string): void {
 	const banner = CURSOR_RESULT.exec(line) ?? (/^── cursor result · failed to start ──$/.test(line) ? [line, "failed"] : null);
 	if (banner) {
 		bg.result = true;
+		closeOpen(rec);
 		bg.keep = bg.full && bg.resultLines.length > 0;
 		bg.full = false;
 		if (!bg.keep) bg.resultLines = [];
@@ -610,10 +926,17 @@ function cursorLogLine(rec: Rec, line: string): void {
 	const step = /^([→✓✗]) (.+)$/.exec(line);
 	if (!step?.[2]) return;
 	const label = cursorLabel(step[2]);
+	const call = () => {
+		const id = `bg-${rec.seq}`;
+		const { name, args } = cursorCall(step[2] ?? "");
+		addEntry(rec, { role: "assistant", content: [callBlock(rec, id, name, args, label)] });
+		return id;
+	};
 	if (step[1] === "→") {
 		rec.turns++;
 		pushTail(rec, label);
 		rec.activity = label;
+		call();
 	} else {
 		const recent = rec.tail.slice(-8).includes(clean(label, LINE_MAX));
 		if (!recent) {
@@ -622,6 +945,8 @@ function cursorLogLine(rec: Rec, line: string): void {
 		}
 		if (step[1] === "✗") failTail(rec, label);
 		rec.activity = THINKING;
+		const open = [...rec.open].find(([, c]) => c.label === label)?.[0];
+		addResult(rec, open ?? call(), "", step[1] === "✗");
 	}
 }
 

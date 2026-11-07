@@ -2763,3 +2763,34 @@ test("stop_child: Eric's phone, signed v2, stops only this session's child", asy
 	assert.deepEqual(await stop(mine.id), { ok: true, stopped: false }, "already ended");
 	kids.resetChildren();
 });
+
+test("child_transcript: a page of this session's subagent's conversation, unsigned, never another session's", async () => {
+	kids.resetChildren();
+	await owner();
+	const mine = kids.trackChild({ kind: "pi", agent: "scout", task: "look around", sessionId: "sid-a" });
+	const theirs = kids.trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "sid-b" });
+	mine.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "read", arguments: { path: "/x/a.rb" } }] } });
+	mine.piEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "read", result: { content: [{ type: "text", text: "ok" }] } });
+	mine.piEvent({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "Half a" }] } });
+	assert.ok((await ask({ type: "nonce" })).features.includes("subagent_chats"));
+	const page = await ask({ type: "child_transcript", child_id: mine.id, since: -1 });
+	assert.deepEqual(Object.keys(page).sort(), ["entries", "last", "live", "more", "ok", "state"]);
+	assert.deepEqual([page.ok, page.last, page.more, page.live, page.state], [true, 2, false, "Half a", "running"]);
+	assert.deepEqual(page.entries.map((e) => [e.seq, e.message.role]), [[0, "user"], [1, "assistant"], [2, "toolResult"]]);
+	assert.deepEqual((await ask({ type: "child_transcript", child_id: mine.id, since: 1 })).entries.map((e) => e.seq), [2], "past since only");
+	assert.deepEqual((await ask({ type: "child_transcript", child_id: mine.id, since: "x" })).entries.length, 3, "a bad since is from the start");
+	assert.equal((await ask({ type: "child_transcript", child_id: theirs.id })).error, "no such subagent in this session");
+	assert.equal((await ask({ type: "child_transcript", child_id: "../x" })).error, "bad request");
+	assert.equal((await ask({ type: "child_transcript" })).error, "bad request");
+
+	// The worst a page carries: its entries' bytes and the live reply, all three bytes a character.
+	for (let i = 0; i < 40; i++) {
+		mine.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: `w${i}`, name: "read", arguments: { path: "界".repeat(1_500) } }] } });
+		mine.piEvent({ type: "tool_execution_end", toolCallId: `w${i}`, toolName: "read", result: { content: [{ type: "text", text: "界".repeat(5_000) }] } });
+	}
+	mine.piEvent({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "界".repeat(20_000) }] } });
+	const full = await ask({ type: "child_transcript", child_id: mine.id, since: 2 });
+	assert.ok(full.more && full.live.length > 3_000);
+	assert.ok(Buffer.byteLength(JSON.stringify(full)) < 64 * 1024, "one line under the socket's limit");
+	kids.resetChildren();
+});

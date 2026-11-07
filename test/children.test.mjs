@@ -10,10 +10,16 @@ import { join } from "node:path";
 import { after, beforeEach, test } from "node:test";
 import {
 	bindChildren,
+	childTranscript,
+	cursorCall,
 	cursorLabel,
+	ENTRY_BYTES,
 	KEEP_MS,
 	listChildren,
+	LOG_BYTES,
+	LOG_ENTRIES,
 	MAX_CHILDREN,
+	PAGE_BYTES,
 	onChildrenChange,
 	pollOnce,
 	resetChildren,
@@ -313,4 +319,194 @@ test("sessionOf reads the tool context's session id", () => {
 	assert.equal(sessionOf({ sessionManager: { getSessionId: () => "s-9" } }), "s-9");
 	assert.equal(sessionOf({ sessionManager: { getSessionId: () => { throw new Error("gone"); } } }), null);
 	assert.equal(sessionOf(undefined), null);
+});
+
+// ---- a child's conversation (childTranscript)
+
+/** Its whole conversation, every page. */
+function conversation(sessionId, id) {
+	const all = [];
+	let since = -1;
+	for (;;) {
+		const page = childTranscript(sessionId, id, since);
+		assert.ok(page, "listed");
+		all.push(...page.entries);
+		if (!page.more) return { entries: all, page };
+		since = page.entries.at(-1).seq;
+	}
+}
+/** An entry as role and what it says, for comparing in order. */
+const said = (e) => {
+	const m = e.message;
+	if (m.role === "toolResult") return ["result", m.toolCallId, m.content[0].text, m.isError];
+	return [m.role, ...m.content.map((b) => (b.type === "text" ? b.text : b.type === "thinking" ? `(thinking) ${b.thinking}` : `${b.name} ${JSON.stringify(b.arguments)}`))];
+};
+
+test("a foreground pi child's conversation from its JSON events: in order, masked, the partial reply live", () => {
+	const c = trackChild({ kind: "pi", agent: "scout", task: "look at the widget\nwith password=hunter2", sessionId: "s-1" });
+	const lives = [];
+	for (const line of fixture) {
+		c.piLine(line);
+		lives.push(childTranscript("s-1", c.id).live);
+	}
+	assert.ok(lives.includes("The"), "the reply being written shows as it streams");
+	assert.equal(lives.at(-1), "", "and goes once its message ends");
+	const { entries } = conversation("s-1", c.id);
+	assert.deepEqual(entries.map((e) => e.seq), entries.map((_, i) => i), "numbered from 0, in order");
+	assert.deepEqual(entries.map(said), [
+		["user", "look at the widget\nwith password=•••"],
+		["assistant", 'read {"path":"/work/demo/lib/widget.rb"}'],
+		["result", "call-1", "class Widget; end", false],
+		["assistant", "Running the tests now.", 'bash {"command":"API_TOKEN=••• bin/test\\nmore"}'],
+		["result", "call-2", "1 failure", true],
+		["assistant", "The widget test fails on line 12.\nFix: return nil."],
+	]);
+	assert.ok(entries.every((e) => e.type === "message" && e.id === String(e.seq) && !Number.isNaN(Date.parse(e.timestamp))), "a session file's entries");
+	c.finish("done", { lastText: "The widget test fails on line 12.\nFix: return nil." });
+	assert.equal(conversation("s-1", c.id).entries.length, 6, "its last message is the final reply: not twice");
+	assert.equal(childTranscript("s-other", c.id), null, "only its own session's");
+	assert.equal(childTranscript(null, c.id), null);
+});
+
+test("a huge tool result is masked from its head, or whole when masking shrank the head away", () => {
+	const c = trackChild({ kind: "pi", agent: "worker", task: "t", sessionId: "s" });
+	const result = (id, text) => {
+		c.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id, name: "bash", arguments: { command: "cat" } }] } });
+		c.piEvent({ type: "tool_execution_end", toolCallId: id, toolName: "bash", result: { content: [{ type: "text", text }] } });
+		return conversation("s", c.id).entries.at(-1).message.content[0].text;
+	};
+	const head = result("t1", `password=hunter2 ${"z".repeat(500_000)}`);
+	assert.ok(head.startsWith("password=••• zzz") && head.endsWith("…") && head.length <= 1_000);
+	assert.equal(result("t2", `password=${"a".repeat(40_000)} tail`), "password=••• tail", "the whole, when the head's cut would show");
+});
+
+test("the conversation's cap: the task and the final reply stay, the oldest work goes first", () => {
+	const c = trackChild({ kind: "pi", agent: "worker", task: "the task", sessionId: "s" });
+	c.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "An early note." }] } });
+	for (let i = 0; i < LOG_ENTRIES; i++) {
+		c.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: `t${i}`, name: "bash", arguments: { command: `step ${i}` } }] } });
+		c.piEvent({ type: "tool_execution_end", toolCallId: `t${i}`, toolName: "bash", result: { content: [{ type: "text", text: "z".repeat(5000) }] } });
+	}
+	let { entries } = conversation("s", c.id);
+	assert.ok(entries.length <= LOG_ENTRIES);
+	assert.deepEqual(said(entries[0]), ["user", "the task"]);
+	assert.deepEqual(said(entries[1]), ["assistant", "An early note."], "work went before the note");
+	const results = new Set(entries.filter((e) => e.message.role === "toolResult").map((e) => e.message.toolCallId));
+	const calls = new Set(entries.flatMap((e) => (e.message.role === "assistant" ? e.message.content.filter((b) => b.type === "toolCall").map((b) => b.id) : [])));
+	assert.deepEqual([...results].filter((id) => !calls.has(id)), [], "a call's result goes with it");
+	assert.ok(!calls.has("t0") && calls.has(`t${LOG_ENTRIES - 1}`), "the oldest went, the newest stayed");
+	c.finish("done", { lastText: "The final answer." });
+	({ entries } = conversation("s", c.id));
+	assert.deepEqual(said(entries.at(-1)), ["assistant", "The final answer."]);
+	assert.deepEqual(said(entries[0]), ["user", "the task"]);
+
+	const big = trackChild({ kind: "pi", agent: "worker", task: "t", sessionId: "s" });
+	for (let i = 0; i < 300; i++) {
+		big.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `note ${i} ${"w".repeat(4000)}` }] } });
+	}
+	big.finish("done", { lastText: "done it" });
+	({ entries } = conversation("s", big.id));
+	const bytes = entries.reduce((n, e) => n + Buffer.byteLength(JSON.stringify(e)), 0);
+	assert.ok(bytes <= LOG_BYTES, `${bytes} bytes kept`);
+	assert.deepEqual([said(entries[0]), said(entries.at(-1))], [["user", "t"], ["assistant", "done it"]], "no work to drop: the oldest notes go");
+	assert.ok(entries.length < 300 && entries.length > 2);
+});
+
+test("an entry is at most ENTRY_BYTES; a page at most its bytes, one entry at least, and says there is more", () => {
+	const c = trackChild({ kind: "pi", agent: "worker", task: "t", sessionId: "s" });
+	c.piEvent({ type: "message_end", message: { role: "assistant", content: Array.from({ length: 10 }, () => ({ type: "text", text: "é".repeat(15000) })) } });
+	const one = childTranscript("s", c.id, 0);
+	assert.equal(one.entries.length, 1);
+	assert.ok(Buffer.byteLength(JSON.stringify(one.entries[0])) <= ENTRY_BYTES);
+	const shrunk = one.entries[0].message.content;
+	assert.ok(shrunk.length === 10 && shrunk.every((b) => b.text.startsWith("éé") && b.text.endsWith("…")), "each text cut to fit, not the entry replaced");
+	for (let i = 0; i < 20; i++) c.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `${i} ${"x".repeat(3000)}` }] } });
+	const first = childTranscript("s", c.id, -1, 10_000);
+	assert.ok(first.more && first.entries.length >= 1);
+	assert.ok(first.entries.slice(1).reduce((n, e) => n + Buffer.byteLength(JSON.stringify(e)), 0) <= 10_000);
+	assert.equal(childTranscript("s", c.id, -1, 1).entries.length, 1, "one entry even past the bytes");
+	assert.equal(first.last, 21);
+	const rest = childTranscript("s", c.id, 21);
+	assert.deepEqual([rest.entries.length, rest.more], [0, false], "nothing past the newest");
+	assert.ok(PAGE_BYTES < 64 * 1024);
+});
+
+test("a finished child's conversation stays its 10 minutes, then goes with it", (t) => {
+	t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: 2_000_000 });
+	const c = trackChild({ kind: "pi", agent: "a", task: "t", sessionId: "s" });
+	c.finish("done", { lastText: "ok" });
+	t.mock.timers.tick(KEEP_MS - 1_000);
+	assert.deepEqual(childTranscript("s", c.id).entries.map(said), [["user", "t"], ["assistant", "ok"]]);
+	t.mock.timers.tick(1_010); // past its 10 minutes, before the sweep's timer: the read itself drops it
+	assert.equal(childTranscript("s", c.id), null);
+});
+
+test("a failure's reason is no reply; calls left open close when it ends", () => {
+	const c = trackChild({ kind: "pi", agent: "a", task: "t", sessionId: "s" });
+	c.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "thinking", thinking: "not for the phone", redacted: true }] } });
+	c.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "x1", name: "bash", arguments: { command: "sleep 99", token: "abc123", env: { API_KEY: "k-1" } } }] } });
+	c.piEvent({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: `${"y".repeat(5000)} the end` }] } });
+	const { live } = childTranscript("s", c.id);
+	assert.ok(live.length === 4000 && live.startsWith("…") && live.endsWith(" the end"), "the reply on its way: its last 4,000 characters");
+	c.finish("failed", { lastText: "killed by SIGTERM" });
+	const { entries } = conversation("s", c.id);
+	assert.deepEqual(entries.map(said), [
+		["user", "t"],
+		["assistant", 'bash {"command":"sleep 99","token":"•••","env":{"API_KEY":"•••"}}'],
+		["result", "x1", "", false],
+	]);
+});
+
+test("a background pi child's conversation from its log: each turn's calls, its notes, the result as its reply", () => {
+	const events = bus();
+	bindChildren(events);
+	const log = join(dir, "pi-chat.log");
+	writeFileSync(log, "· turn 1 · read /work/demo/lib/widget.rb\n· turn 2 · bash bin/test | grep TODO\n· turn 3 · 4 files look fine\n");
+	const c = trackChild({ kind: "pi", agent: "scout", task: "check it", sessionId: "s", bg: { id: "bb11cc", logPath: log } });
+	pollOnce();
+	writeFileSync(log, `${readFileSync(log, "utf8")}── result · 3 turns · 4.4k in (3.0k cached) / 130 out · $0.0038 ──\nThe widget is fine.\nSecond line.\n`);
+	pollOnce();
+	events.handlers.get("bg:jobs")([{ id: "bb11cc", endedAt: Date.now(), exitCode: 0, signal: null, killedByUser: false }]);
+	const { entries } = conversation("s", c.id);
+	const ids = entries.filter((e) => e.message.role === "assistant").flatMap((e) => e.message.content.filter((b) => b.type === "toolCall").map((b) => b.id));
+	assert.deepEqual(entries.map(said), [
+		["user", "check it"],
+		["assistant", 'read {"path":"/work/demo/lib/widget.rb"}'],
+		["result", ids[0], "", false],
+		["assistant", 'bash {"command":"bin/test"}', 'grep {"pattern":"TODO"}'],
+		["result", ids[1], "", false],
+		["result", ids[2], "", false],
+		["assistant", "4 files look fine"],
+		["assistant", "The widget is fine.\nSecond line."],
+	]);
+});
+
+test("a Cursor child's conversation: its steps as calls, a failed one an error, its answer last", () => {
+	const events = bus();
+	bindChildren(events);
+	const log = join(dir, "cursor-chat.log");
+	writeFileSync(log, ["session abc · GPT-5", "→ read lib/widget.rb", "✓ read lib/widget.rb", "✗ shell bin/test", "→ ls src", "", "── cursor result · done · gpt-5 · 1m · $0.42 · 12k tokens ──", "Fixed it.", "", "Model: gpt-5", ""].join("\n"));
+	const bg = trackChild({ kind: "cursor", agent: "cursor", task: "fix", sessionId: "s", bg: { id: "cc11dd", logPath: log } });
+	pollOnce();
+	assert.equal(conversation("s", bg.id).entries.at(-1).message.role, "toolResult", "its result banner closes a step left open, before its job ends");
+	events.handlers.get("bg:jobs")([{ id: "cc11dd", endedAt: Date.now(), exitCode: 0 }]);
+	const steps = conversation("s", bg.id).entries.map(said);
+	assert.deepEqual(steps.map((s) => s[0]), ["user", "assistant", "result", "assistant", "result", "assistant", "result", "assistant"]);
+	assert.deepEqual([steps[1][1], steps[2][3], steps[3][1], steps[4][3], steps[5][1], steps[7][1]], ['read {"path":"lib/widget.rb"}', false, 'bash {"command":"bin/test"}', true, 'ls {"path":"src"}', "Fixed it."]);
+
+	const fg = trackChild({ kind: "cursor", agent: "cursor", task: "t", sessionId: "s" });
+	fg.cursorState({ tools: [{ summary: "read a.rb", ok: true }, { summary: "shell bin/test" }], live: "Look", thinking: false });
+	assert.equal(childTranscript("s", fg.id).live, "Look");
+	fg.cursorState({ tools: [{ summary: "read a.rb", ok: true }, { summary: "shell bin/test", ok: false }], live: "", thinking: false });
+	fg.finish("done", { lastText: "All set." });
+	const run = conversation("s", fg.id).entries.map(said);
+	assert.deepEqual(run, [
+		["user", "t"],
+		["assistant", 'read {"path":"a.rb"}'],
+		["result", "cursor-0", "", false],
+		["assistant", 'bash {"command":"bin/test"}'],
+		["result", "cursor-1", "", true],
+		["assistant", "All set."],
+	]);
+	assert.deepEqual(cursorCall("mcp thing"), { name: "mcp", args: { summary: "thing" } });
 });

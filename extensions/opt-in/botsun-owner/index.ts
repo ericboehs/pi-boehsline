@@ -40,7 +40,7 @@ import { checkPin, isPinsError, pin, ratchet, shortFingerprint, signVersionOf, t
 import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
 import { latestUsage, onUsageChange, type ProviderUsageSnapshot } from "../../../lib/usage-snapshot.ts";
-import { bindChildren, type ChildInfo, listChildren, onChildrenChange, stopChild } from "../../../lib/children.ts";
+import { bindChildren, type ChildInfo, childTranscript, listChildren, onChildrenChange, stopChild } from "../../../lib/children.ts";
 import { claimOf, colorPush, type ColorClaim } from "./color.ts";
 
 type PromptKind = "select" | "confirm" | "input" | "editor" | "custom";
@@ -580,6 +580,8 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (r.type === "close") return r.key !== undefined ? closeCall(c, r) : closeRequest(c, r);
 	// Display only (a chip's mode, as a click on the footer flips it): not signed, nothing acts.
 	if (r.type === "footer_tap") return footerTap(String(r.chip ?? ""));
+	// A read, as Botsun reads a session's own transcript: not signed, and only this session's child.
+	if (r.type === "child_transcript") return childTranscriptRequest(c, r);
 	if (r.type !== "say") return { error: "unknown request" };
 	if (r.key !== undefined) return sayCall(c, r);
 	const { text } = r;
@@ -1120,6 +1122,20 @@ function stopChildRequest(c: Conn, r: Record<string, unknown>): Record<string, u
 	return { ok: true, stopped: result === "stopped" };
 }
 
+/**
+ * One page of a subagent's conversation for its chat on the phone (lib/children.ts's
+ * childTranscript): the entries past `since`, at most PAGE_BYTES of them, so the reply stays one
+ * line under OwnerSessions::MAX_LINE. Botsun asks again while `more` says so.
+ */
+function childTranscriptRequest(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const id = typeof r.child_id === "string" && CHILD_ID.test(r.child_id) ? r.child_id : null;
+	if (!id) return { error: "bad request" };
+	const since = typeof r.since === "number" && Number.isSafeInteger(r.since) && r.since >= -1 ? r.since : -1;
+	const page = childTranscript(c.sessionId, id, since);
+	if (!page) return { error: "no such subagent in this session" };
+	return { ok: true, entries: page.entries, last: page.last, more: page.more, live: page.live, state: page.state };
+}
+
 /** Under OwnerSessions::MAX_LINE (64 KB) with the line's envelope. */
 export const SUBAGENTS_BYTES = 56 * 1024;
 /** Progress (a new tool, a turn) goes at most this often; a start or an end at once. */
@@ -1434,7 +1450,7 @@ function featureList(c: Conn): string[] {
 		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 	})();
 	return ["say", "say_call", "answer_call", "close_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close", "name",
-		"subagents", ...(hasStash ? ["stash"] : [])];
+		"subagents", "subagent_chats", ...(hasStash ? ["stash"] : [])];
 }
 
 /** The conversation a sandbox template's pi was started in, from its first session: Botsun starts it
