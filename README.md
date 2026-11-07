@@ -39,6 +39,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [pr-tracker](extensions/pr-tracker/README.md) | A canvas card for the current branch's GitHub PR, kept up to date | `/pr-tracker` |
 | [prompt-history](extensions/prompt-history/README.md) | Shell-style prompt history shared by every pi, with Ctrl+R search | Ctrl+R |
 | [provider-usage](extensions/provider-usage/README.md) | Usage and quota chips for codex, copilot, grok and more | `provider_usage` tool |
+| [providers](extensions/providers/README.md) | `disabledProviders` hides built-in providers from /model and cycling; Copilot's Anthropic requests go zstd-compressed |  |
 | [restart](extensions/restart/README.md) | `bin/pi-restart-all` restarts every pi in tmux and resumes it, guardian bypass included |  |
 | [stash](extensions/stash/README.md) | Park a draft with Ctrl+S and get it back later | Ctrl+S, `/stash` |
 | [subagent](extensions/subagent/README.md) | Run a separate pi, or Cursor's agent (with cursor-agent on), for a focused task | `subagent` tool |
