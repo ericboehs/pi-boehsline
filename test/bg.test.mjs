@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -120,6 +120,22 @@ test("a foreground command returns the built-in structured result for scripts", 
   assert.equal(result.structuredContent.exit_code, 0);
   assert.equal(typeof result.structuredContent.wall_time_seconds, "number");
   assert.equal("full_output_path" in result.structuredContent, false);
+});
+
+test("with a log dir others can write to, foreground runs as the built-in does and background is refused", async (t) => {
+  const { bash, ctx } = mount();
+  const logs = () => readdirSync(process.env.PI_BG_DIR).sort();
+  const before = logs();
+  chmodSync(process.env.PI_BG_DIR, 0o777);
+  t.after(() => chmodSync(process.env.PI_BG_DIR, 0o700));
+
+  const result = await bash.execute("loose-dir", { command: "echo hi" }, undefined, undefined, ctx);
+  assert.equal(result.structuredContent.output, "hi\n");
+  await assert.rejects(
+    bash.execute("loose-dir-bg", { command: "echo hi", background: true }, undefined, undefined, ctx),
+    /is not a directory only you can write to/,
+  );
+  assert.deepEqual(logs(), before, "nothing written into it");
 });
 
 test("a nonzero exit is an error for the model but still carries the exit code", async () => {

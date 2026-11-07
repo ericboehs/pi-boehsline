@@ -57,10 +57,26 @@
  *   wakes the model with "killed", for a stop the model didn't ask for (a
  *   subagent stopped from Eric's phone), so it doesn't wait on that result.
  *
+ * Surviving /reload and restarts:
+ *   Every job runs under a tiny /bin/sh wrapper that writes its exit status to
+ *   `<log>.exit` (temp file + mv) when it ends, so a job that is no longer our
+ *   child still reports its exit code.
+ *   /reload: session_shutdown leaves a hand-off in a globalThis slot; the next
+ *   instance takes the whole job table if it opens the same session id. The
+ *   old instance keeps the ChildProcess handles and forwards their exits.
+ *   Restart / resume: each persisted session's jobs (metadata, never output)
+ *   are kept in STATE_DIR/<session id>.json. session_start for that session
+ *   re-adopts jobs whose leader is provably still the job (pid + start time +
+ *   the wrapper's args), polls them, and reports once the ones that ended
+ *   while the session was closed. /new and /fork open a new session id, so
+ *   they start empty.
+ *
  * Env knobs:
  *   PI_BG_DIR         log/spool directory (default /tmp/pi-bg-<uid>, mode
  *                     0700; not $TMPDIR — macOS makes that per-user and
  *                     unguessable, and purges it out from under running jobs)
+ *   PI_BG_STATE_DIR   job registry directory (default
+ *                     $XDG_STATE_HOME/pi-bg or ~/.local/state/pi-bg, 0700)
  *   PI_BG_TAIL_LINES  lines injected on completion (default 15, 0 disables)
  *   PI_BG_WAKE        followUp | nextTurn | off  (default followUp)
  *   PI_BG_FG_TIMEOUT  foreground seconds before auto-background (default
@@ -71,7 +87,7 @@
  *                     to seconds first — models confuse the units constantly
  */
 
-import { spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -104,8 +120,180 @@ function defaultBgDir(): string {
 
 const BG_DIR = process.env.PI_BG_DIR ?? defaultBgDir();
 const LOG_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-/** Only ever delete files this extension created: exactly <6 hex>.log */
-const LOG_NAME_RE = /^[0-9a-f]{6}\.log$/;
+/** Only ever delete files this extension created: <6 hex>.log and its wrapper's exit file. */
+const LOG_NAME_RE = /^[0-9a-f]{6}\.log(\.exit(\.tmp)?)?$/;
+const JOB_ID_RE = /^[0-9a-f]{6}$/;
+
+/**
+ * The registry outlives /tmp cleaners and reboots-in-between; it only holds
+ * metadata (commands, paths, pids), never output.
+ */
+const STATE_DIR =
+	process.env.PI_BG_STATE_DIR ??
+	path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "pi-bg");
+/** Not-running entries older than this are dropped unreported. */
+const REGISTRY_TTL_MS = 24 * 60 * 60 * 1000;
+const REGISTRY_MAX_BYTES = 16 * 1024 * 1024;
+/** Session ids name registry files: no separators, no leading dot. */
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+/** Exit polling for jobs that aren't a child of this process. */
+const ADOPTED_POLL_MS = 2000;
+/** Re-check an adopted job's identity every this many polls, in case its pid was reused between two. */
+const VERIFY_EVERY_POLLS = 15;
+/** The wrapper, the registry and adoption need /bin/sh and ps. */
+const DURABLE = process.platform !== "win32";
+
+/**
+ * Runs the job's shell ("$@") and records its exit status in $0 (`<log>.exit`)
+ * through a temp file + mv, so a reader never sees a partial file. The no-op
+ * trap keeps the wrapper alive through a stop's group-wide SIGTERM until the job
+ * is gone; trapped (unlike ignored) signals reset on exec, so the job itself
+ * keeps default dispositions. A killed job reads as 128+N, like any shell.
+ * set -C after the rm: the write never follows a link planted at the temp name.
+ */
+const EXIT_WRAPPER =
+	'trap : TERM INT HUP; "$@"; s=$?; (umask 077; rm -f "$0.tmp"; set -C; printf \'%s\\n\' "$s" > "$0.tmp") && mv -f "$0.tmp" "$0"; exit "$s"';
+const exitPathOf = (logPath: string) => `${logPath}.exit`;
+
+/**
+ * BG_DIR is a directory of ours that no one else can write to. Otherwise
+ * another user could swap a log for a symlink to a secret, which a wake would
+ * read into the conversation, or plant files the wrapper writes through.
+ */
+function bgDirReady(): boolean {
+	try {
+		fs.mkdirSync(BG_DIR, { recursive: true, mode: 0o700 });
+		if (process.platform === "win32") return true;
+		const st = fs.lstatSync(BG_DIR);
+		const uid = process.getuid?.();
+		return st.isDirectory() && (uid === undefined || st.uid === uid) && (st.mode & 0o022) === 0;
+	} catch {
+		return false;
+	}
+}
+
+/** Spawned bare, a missing shell fails the start (ENOENT) instead of exiting 127 inside the wrapper later. */
+function shellRunnable(shell: string): boolean {
+	if (!path.isAbsolute(shell)) return true;
+	try {
+		fs.accessSync(shell, fs.constants.X_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Owned by us and not writable by anyone else: safe to trust what it says. */
+function ownedPrivately(st: fs.Stats): boolean {
+	const uid = process.getuid?.();
+	return (uid === undefined || st.uid === uid) && (st.mode & 0o022) === 0;
+}
+
+/** Read a small private regular file without following a symlink. */
+function readPrivateFile(file: string, maxBytes: number): { text: string; mtimeMs: number } | undefined {
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+		const st = fs.fstatSync(fd);
+		if (!st.isFile() || !ownedPrivately(st) || st.size > maxBytes) return undefined;
+		return { text: fs.readFileSync(fd, "utf8"), mtimeMs: st.mtimeMs };
+	} catch {
+		return undefined;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+}
+
+/** The status the wrapper recorded, or undefined while the job runs (or if it was SIGKILLed). */
+function readExitFile(logPath: string): { code: number; at: number } | undefined {
+	const file = readPrivateFile(exitPathOf(logPath), 16);
+	const match = file && /^(\d{1,3})\n?$/.exec(file.text);
+	const code = match ? Number(match[1]) : Number.NaN;
+	return file && code <= 255 ? { code, at: file.mtimeMs } : undefined;
+}
+
+function removeExitFile(logPath: string): void {
+	try {
+		fs.rmSync(exitPathOf(logPath), { force: true });
+	} catch {
+		// best-effort; pruned with the logs
+	}
+}
+
+function signalName(number: number): NodeJS.Signals | undefined {
+	for (const [name, value] of Object.entries(os.constants.signals)) {
+		if (value === number) return name as NodeJS.Signals;
+	}
+	return undefined;
+}
+
+interface ProcessIdentity {
+	/** ps lstart, pinned to C locale and UTC: the same process always reads the same. */
+	start: string;
+	args: string;
+}
+const psArgs = (pid: number) => ["-ww", "-o", "lstart=", "-o", "args=", "-p", String(pid)];
+const PS_OPTIONS = { env: { ...process.env, LC_ALL: "C", TZ: "UTC" }, timeout: 3000, encoding: "utf8" as const };
+/** The synchronous lookup (before a stop) blocks the UI: give up sooner. */
+const PS_SYNC_TIMEOUT_MS = 1000;
+const LSTART_RE = /^\s*([A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4})\s+(.*)$/;
+
+function parsePs(out: string): ProcessIdentity | undefined {
+	const match = LSTART_RE.exec(out.split("\n")[0] ?? "");
+	return match?.[1] && match[2] !== undefined ? { start: match[1], args: match[2] } : undefined;
+}
+
+function processIdentity(pid: number): Promise<ProcessIdentity | undefined> {
+	return new Promise((resolve) => {
+		try {
+			execFile("ps", psArgs(pid), PS_OPTIONS, (error, stdout) =>
+				resolve(error ? undefined : parsePs(String(stdout))),
+			);
+		} catch {
+			resolve(undefined);
+		}
+	});
+}
+
+function processIdentitySync(pid: number): ProcessIdentity | undefined {
+	try {
+		return parsePs(
+			String(
+				execFileSync("ps", psArgs(pid), {
+					...PS_OPTIONS,
+					timeout: PS_SYNC_TIMEOUT_MS,
+					stdio: ["ignore", "pipe", "ignore"],
+				}),
+			),
+		);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * The pid is still the job's wrapper: started when the job was, and running
+ * with this job's exit file in its argv. A process that merely inherited the
+ * pid fails both.
+ */
+function isJobProcess(job: { logPath: string; pidStart?: string }, identity: ProcessIdentity | undefined): boolean {
+	return (
+		identity !== undefined &&
+		job.pidStart !== undefined &&
+		identity.start === job.pidStart &&
+		identity.args.includes(` ${exitPathOf(job.logPath)} `)
+	);
+}
+
+/** kill(pid, 0): ours and alive. EPERM means another user's process now holds the pid. */
+function pidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
 const TAIL_LINES = Number.parseInt(process.env.PI_BG_TAIL_LINES ?? "15", 10);
 const TAIL_MAX_CHARS = 2000;
 const VIEWER_WINDOW_BYTES = 1024 * 1024;
@@ -150,29 +338,211 @@ const ADOPT_TAIL_CHARS = 400;
 /** Limit of `structuredContent.output` for scripts, same as built-in bash. */
 const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
 
-interface Job {
+/**
+ * A job as plain data: what the registry stores, the /reload hand-off passes
+ * and BgLive.deliver forwards. Never output.
+ */
+interface JobRecord {
 	id: string;
 	name: string;
 	command: string;
 	cwd: string;
 	logPath: string;
 	pid: number | undefined;
+	/** ps lstart of the wrapper, recorded at spawn: adoption requires the same. */
+	pidStart?: string;
+	/** The persisted session the job was started in (its registry file). */
+	sessionId?: string;
 	startedAt: number;
 	endedAt?: number;
 	exitCode?: number | null;
 	signal?: NodeJS.Signals | null;
+	/** Ended without a recorded status (not our child, and no exit file). */
+	exitUnknown?: boolean;
 	killedByUser: boolean;
 	/** Killed through bg:kill with wake: the completion wake still applies. */
 	wakeOnKill?: boolean;
 	/** Foreground-race job: its tool result carries the outcome; suppress the wake. */
-	quiet: boolean;
+	quiet?: boolean;
 	/** Wake header text instead of the command (event-bus jobs). */
 	summary?: string;
 	/** Per-job overrides of TAIL_LINES / TAIL_MAX_CHARS for the wake. */
 	tailLines?: number;
 	tailMaxChars?: number;
+	/** Its completion reached a session (or the UI). */
+	reported?: boolean;
+	/** Not a child of this process: poll it, and verify it before any signal. */
+	adopted?: boolean;
+	/** Last time a pi saw it in the registry; ages out not-running entries. */
+	seenAt?: number;
+}
+
+interface Job extends JobRecord {
+	quiet: boolean;
+	/** This instance holds the ChildProcess, whose exit event reports the job. */
+	own: boolean;
+	/** Ended while no pi had it; said in the wake. */
+	whileDown?: boolean;
+	/** The last signal a stop sent, for a stopped job whose status went unrecorded. */
+	lastSignal?: NodeJS.Signals;
+	polls?: number;
 	/** Drop the child's event-loop ref so an adopted job outlives the turn. */
 	unrefChild?: () => void;
+}
+
+function toRecord(job: Job): JobRecord {
+	const { id, name, command, cwd, logPath, pid, pidStart, sessionId, startedAt, endedAt, exitCode, signal } = job;
+	const { exitUnknown, killedByUser, wakeOnKill, quiet, summary, tailLines, tailMaxChars, reported, adopted } = job;
+	return {
+		id, name, command, cwd, logPath, pid, pidStart, sessionId, startedAt, endedAt, exitCode, signal,
+		exitUnknown, killedByUser, wakeOnKill, quiet, summary, tailLines, tailMaxChars, reported, adopted,
+		seenAt: Date.now(),
+	};
+}
+
+/**
+ * Validate a record from the registry or another bg instance. Its log must be
+ * BG_DIR/<id>.log, so a record can't point a wake's tail at any other file, and
+ * its pid is only ever signalled after isJobProcess() (adopted) or while it is
+ * an unreaped child of this process (handed over).
+ */
+function parseRecord(raw: unknown): JobRecord | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const r = raw as Record<string, unknown>;
+	const text = (value: unknown, max: number): value is string => typeof value === "string" && value.length <= max;
+	const time = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
+	const optional = <T>(value: unknown, ok: (v: unknown) => v is T): T | undefined => (ok(value) ? value : undefined);
+	const count = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v) && v >= 0;
+	if (typeof r.id !== "string" || !JOB_ID_RE.test(r.id)) return undefined;
+	if (r.logPath !== path.join(BG_DIR, `${r.id}.log`)) return undefined;
+	if (!text(r.name, 100) || !text(r.command, 2 * 1024 * 1024) || !text(r.cwd, 4096) || !time(r.startedAt)) return undefined;
+	if (r.pid !== undefined && !(typeof r.pid === "number" && Number.isInteger(r.pid) && r.pid > 1)) return undefined;
+	if (r.endedAt !== undefined && !time(r.endedAt)) return undefined;
+	if (r.exitCode !== undefined && r.exitCode !== null && !count(r.exitCode)) return undefined;
+	if (r.signal !== undefined && r.signal !== null && !(typeof r.signal === "string" && /^SIG[A-Z0-9]+$/.test(r.signal))) {
+		return undefined;
+	}
+	return {
+		id: r.id,
+		name: r.name,
+		command: r.command,
+		cwd: r.cwd,
+		logPath: r.logPath,
+		pid: r.pid as number | undefined,
+		pidStart: optional(r.pidStart, (v): v is string => text(v, 64)),
+		sessionId: optional(r.sessionId, (v): v is string => typeof v === "string" && SESSION_ID_RE.test(v)),
+		startedAt: r.startedAt,
+		endedAt: r.endedAt as number | undefined,
+		exitCode: r.exitCode as number | null | undefined,
+		signal: r.signal as NodeJS.Signals | null | undefined,
+		exitUnknown: r.exitUnknown === true,
+		killedByUser: r.killedByUser === true,
+		wakeOnKill: r.wakeOnKill === true,
+		quiet: r.quiet === true,
+		summary: optional(r.summary, (v): v is string => text(v, 10_000)),
+		tailLines: optional(r.tailLines, count),
+		tailMaxChars: optional(r.tailMaxChars, count),
+		reported: r.reported === true,
+		adopted: r.adopted === true,
+		seenAt: optional(r.seenAt, time),
+	};
+}
+
+const registryFile = (sessionId: string) => path.join(STATE_DIR, `${sessionId}.json`);
+
+/**
+ * STATE_DIR is a 0700 directory of ours (created when `create`). Anything else
+ * (another user's, a symlink) and the registry is neither read nor written.
+ */
+function stateDirReady(create: boolean): boolean {
+	try {
+		if (create) fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+		const st = fs.lstatSync(STATE_DIR);
+		const uid = process.getuid?.();
+		if (!st.isDirectory() || (uid !== undefined && st.uid !== uid)) return false;
+		if ((st.mode & 0o077) !== 0) fs.chmodSync(STATE_DIR, 0o700);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** The session's registered jobs; [] for a missing, foreign, loose-permission or malformed file. */
+function readRegistry(sessionId: string): JobRecord[] {
+	if (!DURABLE || !SESSION_ID_RE.test(sessionId) || !stateDirReady(false)) return [];
+	const file = readPrivateFile(registryFile(sessionId), REGISTRY_MAX_BYTES);
+	if (!file) return [];
+	try {
+		const data = JSON.parse(file.text) as { v?: unknown; sessionId?: unknown; jobs?: unknown };
+		if (data?.v !== 1 || data.sessionId !== sessionId || !Array.isArray(data.jobs)) return [];
+		const byId = new Map<string, JobRecord>();
+		for (const raw of data.jobs) {
+			const record = parseRecord(raw);
+			if (record) byId.set(record.id, { ...record, sessionId });
+		}
+		return [...byId.values()];
+	} catch {
+		return [];
+	}
+}
+
+/** Replace the session's registry atomically (0600 temp file + rename); none left removes it. */
+function writeRegistry(sessionId: string, records: JobRecord[]): void {
+	if (!DURABLE || !SESSION_ID_RE.test(sessionId)) return;
+	const file = registryFile(sessionId);
+	if (records.length === 0) {
+		try {
+			fs.rmSync(file, { force: true });
+		} catch {
+			// best-effort
+		}
+		return;
+	}
+	if (!stateDirReady(true)) return;
+	const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+	try {
+		const jobs = records.map((record) => ({ ...record, quiet: undefined, adopted: undefined }));
+		fs.writeFileSync(tmp, `${JSON.stringify({ v: 1, sessionId, savedAt: Date.now(), jobs })}\n`, {
+			mode: 0o600,
+			flag: "wx",
+		});
+		fs.renameSync(tmp, file);
+	} catch {
+		try {
+			fs.rmSync(tmp, { force: true });
+		} catch {
+			// best-effort
+		}
+	}
+}
+
+/**
+ * Record jobs' current state in their sessions' registries, merged by id with
+ * what is there (another instance may hold other jobs of the same session).
+ * Reported endings drop out. Never throws.
+ */
+function persist(...list: Job[]): void {
+	const bySession = new Map<string, Job[]>();
+	for (const job of list) {
+		if (!job.sessionId || job.quiet) continue;
+		bySession.set(job.sessionId, [...(bySession.get(job.sessionId) ?? []), job]);
+	}
+	for (const [sessionId, jobs] of bySession) {
+		try {
+			const ids = new Set(jobs.map((job) => job.id));
+			const existing = readRegistry(sessionId);
+			const records = existing.filter((record) => !ids.has(record.id));
+			for (const job of jobs) {
+				if (job.endedAt !== undefined && job.reported) continue;
+				// A copy handed over before ps answered lacks what the spawning instance wrote since.
+				job.pidStart ??= existing.find((record) => record.id === job.id)?.pidStart;
+				records.push(toRecord(job));
+			}
+			writeRegistry(sessionId, records);
+		} catch {
+			// the registry is best-effort
+		}
+	}
 }
 
 /**
@@ -184,10 +554,72 @@ interface Job {
  * globalThis + Symbol.for: survives the module being re-imported on reload.
  */
 interface BgLive {
-	deliver(job: Job): void;
+	/** A finished job (a JobRecord, or an older version's Job). Throws if it can't be taken. */
+	deliver(job: unknown): void;
+}
+/**
+ * Left by session_shutdown for the next instance in this process. take()
+ * returns the job table as records, current at the moment it is called (so it
+ * includes jobs that ended in between), and only once.
+ */
+interface BgHandoff {
+	sessionId: string | undefined;
+	take(): JobRecord[];
 }
 const LIVE_KEY = Symbol.for("pi-boehsline.bg.live");
-const liveSlot = globalThis as unknown as { [LIVE_KEY]?: BgLive };
+const HANDOFF_KEY = Symbol.for("pi-boehsline.bg.handoff");
+const CHILDREN_KEY = Symbol.for("pi-boehsline.bg.children");
+const liveSlot = globalThis as unknown as {
+	[LIVE_KEY]?: BgLive;
+	[HANDOFF_KEY]?: BgHandoff;
+	[CHILDREN_KEY]?: Map<number, string>;
+};
+
+/**
+ * pid -> job id of this process's unreaped bg children, kept by whichever
+ * instance spawned them and shared by all. While a pid maps to a job's id it
+ * can't belong to anything else, so that job's group may be signalled without
+ * ps; a stale instance's copy of a job learns nothing else once it is gone.
+ */
+function childPids(): Map<number, string> {
+	liveSlot[CHILDREN_KEY] ??= new Map();
+	return liveSlot[CHILDREN_KEY];
+}
+
+type Verdict = "job" | "other" | "unknown";
+
+/** Is the pid still the job? "unknown" when ps can't tell: then neither adopt, report, nor signal. */
+function verdictOf(job: JobRecord, identity: ProcessIdentity | undefined, pid: number): Verdict {
+	if (identity) {
+		if (isJobProcess(job, identity)) return "job";
+		// Without a recorded start time, only another program at the pid is proof.
+		if (job.pidStart === undefined && identity.args.includes(` ${exitPathOf(job.logPath)} `)) return "unknown";
+		return "other";
+	}
+	return pidAlive(pid) ? "unknown" : "other";
+}
+
+/** The session's id, persisted or not (the hand-off matches on it). */
+function sessionIdOf(ctx: unknown): string | undefined {
+	try {
+		const id = (ctx as { sessionManager?: { getSessionId?(): string } } | undefined)?.sessionManager?.getSessionId?.();
+		return typeof id === "string" && id ? id : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** The id jobs are registered under: only a session with a file can be resumed. */
+function registryIdOf(ctx: unknown): string | undefined {
+	if (!DURABLE) return undefined;
+	try {
+		const manager = (ctx as { sessionManager?: { getSessionFile?(): string | undefined } } | undefined)?.sessionManager;
+		const id = sessionIdOf(ctx);
+		return manager?.getSessionFile?.() && id && SESSION_ID_RE.test(id) ? id : undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 /**
  * "bundle exec rspec spec/foo" -> "rspec". Best-effort label for the widget.
@@ -425,6 +857,7 @@ function statusOf(job: Job): string {
 	const elapsed = humanDuration((job.endedAt ?? Date.now()) - job.startedAt);
 	if (job.endedAt === undefined) return `running ${elapsed}`;
 	if (job.signal) return `stopped ${elapsed}`;
+	if (job.exitUnknown) return "ended (exit unknown)";
 	if (job.exitCode === 0) return `done ${elapsed}`;
 	return `exit ${job.exitCode} · ${elapsed}`;
 }
@@ -698,17 +1131,48 @@ export default function (pi: ExtensionAPI) {
 	let ticker: NodeJS.Timeout | undefined;
 	/** Set once this instance's pi is shut down or found stale; completions then go to the live instance. */
 	let disposed = false;
+	/** The live session's id, and the id its jobs are registered under (persisted sessions only). */
+	let sessionId: string | undefined;
+	let registryId: string | undefined;
+	let poller: NodeJS.Timeout | undefined;
+	/** What this instance left for the next one at shutdown, until it is taken or discarded. */
+	let handoff: BgHandoff | undefined;
+	/** Inside session_start: wakes wait until it returns. */
+	let starting = false;
+	const report = (job: Job) => {
+		if (starting) setTimeout(() => deliver(job), 0);
+		else deliver(job);
+	};
 	const self: BgLive = {
-		deliver(job) {
-			// A job adopted from a reloaded instance: list it here and wake this session.
+		deliver(raw) {
+			// The exit of a job another (stale) instance holds the child of.
+			const record = parseRecord(raw);
+			if (!record) throw new Error("not a bg job");
+			const existing = jobs.get(record.id);
+			if (existing) {
+				// Handed over or adopted here: this copy may know more (a stop sent from here).
+				if (existing.endedAt !== undefined) return;
+				existing.killedByUser ||= record.killedByUser;
+				existing.wakeOnKill ||= record.wakeOnKill;
+				existing.exitUnknown = record.exitUnknown;
+				applyEnd(existing, record.exitCode ?? null, record.signal ?? null, record.endedAt);
+				report(existing);
+				return;
+			}
+			// Unknown here (it belongs to the session before /new, /resume or /fork): list it and wake this session.
+			const job = jobFrom(record);
 			jobs.set(job.id, job);
-			deliver(job);
+			report(job);
 		},
 	};
 
+	function jobFrom(record: JobRecord): Job {
+		return { ...record, quiet: record.quiet === true, own: false };
+	}
+
 	const running = () => [...jobs.values()].filter((job) => job.endedAt === undefined);
 	/** Jobs the widget surfaces (quiet foreground-race jobs are invisible until adopted). */
-	const adopted = () => running().filter((job) => !job.quiet);
+	const visible = () => running().filter((job) => !job.quiet);
 	/** What other extensions see (`bg:jobs`, `bg:list`): every job past the foreground race, running or finished. */
 	const snapshot = () =>
 		[...jobs.values()]
@@ -718,7 +1182,7 @@ export default function (pi: ExtensionAPI) {
 	function renderWidget(): void {
 		const ctx = ctxRef;
 		if (ctx?.mode !== "tui") return;
-		const active = adopted();
+		const active = visible();
 		if (active.length === 0) {
 			ctx.ui.setWidget(WIDGET_KEY, undefined);
 			return;
@@ -753,7 +1217,7 @@ export default function (pi: ExtensionAPI) {
 
 	function syncTicker(): void {
 		// This timer only refreshes the TUI, never wakes the model.
-		const active = ctxRef?.mode === "tui" && adopted().length > 0;
+		const active = ctxRef?.mode === "tui" && visible().length > 0;
 		if (active && !ticker) {
 			ticker = setInterval(() => {
 				try {
@@ -786,17 +1250,22 @@ export default function (pi: ExtensionAPI) {
 			tailMaxChars?: number;
 		} = {},
 	): Promise<{ job: Job; exited: Promise<void> }> {
-		fs.mkdirSync(BG_DIR, { recursive: true, mode: 0o700 });
+		if (!bgDirReady()) throw new Error(`${BG_DIR} is not a directory only you can write to; not running jobs in it`);
 		const id = crypto.randomBytes(3).toString("hex");
 		const logPath = path.join(BG_DIR, `${id}.log`);
 		const fd = fs.openSync(logPath, "a");
+		// A reused id must not inherit an earlier job's status.
+		removeExitFile(logPath);
 
 		// Same shell the built-in bash tool uses (bash -c), not /bin/sh.
 		const shellConfig = getShellConfig();
 		const stdinTransport = shellConfig.commandTransport === "stdin";
+		const shellArgs = stdinTransport ? shellConfig.args : [...shellConfig.args, command];
+		// /bin/sh only wraps it: the job runs in shellConfig.shell as before.
+		const wrap = DURABLE && shellRunnable(shellConfig.shell);
 		const child = spawn(
-			shellConfig.shell,
-			stdinTransport ? shellConfig.args : [...shellConfig.args, command],
+			wrap ? "/bin/sh" : shellConfig.shell,
+			wrap ? ["-c", EXIT_WRAPPER, exitPathOf(logPath), shellConfig.shell, ...shellArgs] : shellArgs,
 			{
 				cwd,
 				detached: true, // own process group, so we can kill the whole tree
@@ -812,14 +1281,18 @@ export default function (pi: ExtensionAPI) {
 			cwd,
 			logPath,
 			pid: child.pid,
+			sessionId: registryId,
 			startedAt: Date.now(),
 			killedByUser: false,
 			quiet: opts.quiet === true,
+			own: true,
 			summary: opts.summary,
 			tailLines: opts.tailLines,
 			tailMaxChars: opts.tailMaxChars,
 		};
 		jobs.set(id, job);
+		const pid = child.pid;
+		if (pid !== undefined) childPids().set(pid, id);
 
 		let resolveExited!: () => void;
 		const exited = new Promise<void>((resolve) => {
@@ -832,6 +1305,8 @@ export default function (pi: ExtensionAPI) {
 			// Never let a throw escape a ChildProcess listener: it becomes an
 			// uncaughtException and takes pi down with it.
 			child.once("exit", (code, signal) => {
+				// Reaped: from here on the pid may be anyone's.
+				if (pid !== undefined && childPids().get(pid) === id) childPids().delete(pid);
 				safeFinish(job, code, signal);
 				resolveExited();
 				resolve();
@@ -865,7 +1340,24 @@ export default function (pi: ExtensionAPI) {
 		// Confirm the fork actually happened before telling the model "started",
 		// so spawn failures surface in the tool result instead of arriving later.
 		await ready;
+		register(job);
 		return { job, exited };
+	}
+
+	/**
+	 * Put a job past the foreground race in its session's registry, then record
+	 * its wrapper's start time (what re-adoption checks) once ps answers. Not if
+	 * the job ended meanwhile: once reaped, its pid may belong to something else.
+	 */
+	function register(job: Job): void {
+		if (!job.sessionId || job.quiet || job.endedAt !== undefined || job.pid === undefined) return;
+		persist(job);
+		const pid = job.pid;
+		void processIdentity(pid).then((identity) => {
+			if (!identity || job.endedAt !== undefined || job.pidStart !== undefined) return;
+			job.pidStart = identity.start;
+			persist(job);
+		});
 	}
 
 	/**
@@ -896,12 +1388,172 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function finish(job: Job, code: number | null, signal: NodeJS.Signals | null): void {
-		if (job.endedAt !== undefined) return;
-		job.endedAt = Date.now();
+	/**
+	 * Record how a job ended. The wrapper exits 128+N when the job died of
+	 * signal N; for a stop we sent, report it as that signal.
+	 */
+	function applyEnd(job: Job, code: number | null, signal: NodeJS.Signals | null, endedAt = Date.now()): void {
+		if (signal === null && code !== null && code > 128 && job.killedByUser) {
+			const name = signalName(code - 128);
+			if (name) {
+				signal = name;
+				code = null;
+			}
+		}
+		if (signal === null && code === null && job.exitUnknown && job.killedByUser && job.lastSignal) {
+			signal = job.lastSignal;
+			job.exitUnknown = false;
+		}
+		job.endedAt = endedAt;
 		job.exitCode = code;
 		job.signal = signal;
+	}
+
+	function finish(job: Job, code: number | null, signal: NodeJS.Signals | null, endedAt?: number): void {
+		if (job.endedAt !== undefined) return;
+		applyEnd(job, code, signal, endedAt);
+		removeExitFile(job.logPath);
 		deliver(job);
+	}
+
+	/** A job that isn't our child has ended: its wrapper's exit file says how, if it got to write one. */
+	function endForeign(job: Job): void {
+		if (job.endedAt !== undefined) return;
+		const exit = readExitFile(job.logPath);
+		job.exitUnknown = !exit;
+		finish(job, exit?.code ?? null, null, exit?.at);
+	}
+
+	function stopTimers(): void {
+		if (ticker) clearInterval(ticker);
+		if (poller) clearInterval(poller);
+		ticker = undefined;
+		poller = undefined;
+	}
+
+	/** Adopted jobs aren't our children, so no exit event: poll for their exit file or a gone pid. */
+	function syncPoller(): void {
+		const needed = !disposed && running().some((job) => job.adopted);
+		if (needed && !poller) {
+			poller = setInterval(() => {
+				try {
+					pollAdopted();
+				} catch {
+					// never throw out of a timer
+				}
+			}, ADOPTED_POLL_MS);
+			poller.unref?.();
+		} else if (!needed && poller) {
+			clearInterval(poller);
+			poller = undefined;
+		}
+	}
+
+	function pollAdopted(): void {
+		for (const job of running()) {
+			if (!job.adopted || job.pid === undefined) continue;
+			if (readExitFile(job.logPath) || !pidAlive(job.pid)) {
+				endForeign(job);
+				continue;
+			}
+			job.polls = (job.polls ?? 0) + 1;
+			if (job.polls % VERIFY_EVERY_POLLS === 0) {
+				const pid = job.pid;
+				void processIdentity(pid)
+					.then((identity) => {
+						// ps failing says nothing; a different process at the pid ends ours.
+						if (job.endedAt === undefined && verdictOf(job, identity, pid) === "other") endForeign(job);
+					})
+					.catch(() => {});
+			}
+		}
+		syncPoller();
+	}
+
+	/**
+	 * Pick up this session's registered jobs after a restart or resume: running
+	 * ones whose leader is provably still the job are adopted; ones that ended
+	 * in between come back finished, to be reported once. Returns those.
+	 */
+	async function readopt(id: string): Promise<Job[]> {
+		const records = readRegistry(id).filter((record) => !jobs.has(record.id));
+		if (records.length === 0) return [];
+		const checked = await Promise.all(
+			records.map(async (record): Promise<{ record: JobRecord; state: Verdict }> => {
+				const pid = record.pid;
+				if (record.endedAt !== undefined || pid === undefined || readExitFile(record.logPath)) {
+					return { record, state: "other" };
+				}
+				return { record, state: verdictOf(record, await processIdentity(pid), pid) };
+			}),
+		);
+		const now = Date.now();
+		const report: Job[] = [];
+		const undecided: JobRecord[] = [];
+		for (const { record, state } of checked) {
+			// Handed over, or its completion was forwarded here while ps ran.
+			if (jobs.has(record.id)) continue;
+			if (record.endedAt !== undefined && record.reported) continue;
+			// ps couldn't tell (failed, or no start time was recorded): neither adopt nor report it.
+			if (state === "unknown") {
+				if (now - (record.seenAt ?? record.startedAt) <= REGISTRY_TTL_MS) undecided.push(record);
+				continue;
+			}
+			const job: Job = { ...jobFrom(record), sessionId: id, quiet: false, adopted: true };
+			if (state === "other") {
+				if (job.endedAt === undefined) {
+					const exit = readExitFile(job.logPath);
+					if (now - (exit?.at ?? job.seenAt ?? job.startedAt) > REGISTRY_TTL_MS) continue;
+					job.exitUnknown = !exit;
+					applyEnd(job, exit?.code ?? null, null, exit?.at ?? now);
+					removeExitFile(job.logPath);
+				} else if (now - job.endedAt > REGISTRY_TTL_MS) {
+					continue;
+				}
+				job.whileDown = true;
+				report.push(job);
+			}
+			jobs.set(job.id, job);
+		}
+		// What this instance tracks for the session, plus what a later resume should try again.
+		writeRegistry(id, [
+			...[...jobs.values()]
+				.filter((job) => job.sessionId === id && !job.quiet && !(job.endedAt !== undefined && job.reported))
+				.map(toRecord),
+			...undecided,
+		]);
+		return report;
+	}
+
+	/**
+	 * Other sessions' registries untouched for REGISTRY_TTL_MS keep only jobs
+	 * still provably running; the rest (and the file, once empty) go. Stray temp
+	 * files from an interrupted write go too.
+	 */
+	async function pruneRegistry(): Promise<void> {
+		try {
+			if (!stateDirReady(false)) return;
+			const cutoff = Date.now() - REGISTRY_TTL_MS;
+			for (const entry of await fs.promises.readdir(STATE_DIR, { withFileTypes: true })) {
+				if (!entry.isFile()) continue;
+				const file = path.join(STATE_DIR, entry.name);
+				const stale = (await fs.promises.lstat(file)).mtimeMs < cutoff;
+				if (/\.json\.\d+\.[0-9a-f]{8}\.tmp$/.test(entry.name)) {
+					if (stale) await fs.promises.rm(file, { force: true });
+					continue;
+				}
+				const id = /^(.+)\.json$/.exec(entry.name)?.[1];
+				if (!stale || !id || id === registryId || !SESSION_ID_RE.test(id)) continue;
+				const alive: JobRecord[] = [];
+				for (const record of readRegistry(id)) {
+					if (record.endedAt !== undefined || record.pid === undefined || readExitFile(record.logPath)) continue;
+					if (isJobProcess(record, await processIdentity(record.pid))) alive.push(record);
+				}
+				writeRegistry(id, alive);
+			}
+		} catch {
+			// directory may not exist yet
+		}
 	}
 
 	function safeFinish(job: Job, code: number | null, signal: NodeJS.Signals | null): void {
@@ -921,27 +1573,32 @@ export default function (pi: ExtensionAPI) {
 		if (!disposed) {
 			try {
 				deliverHere(job);
+				job.reported = true;
+				persist(job);
 				return;
 			} catch {
 				// "ctx is stale after session replacement or reload": hand off below
 				disposed = true;
-				if (ticker) {
-					clearInterval(ticker);
-					ticker = undefined;
-				}
+				stopTimers();
 			}
 		}
 		const live = liveSlot[LIVE_KEY];
 		if (live && live !== self) {
 			try {
-				live.deliver(job);
-				return;
+				live.deliver(toRecord(job));
+				job.reported = true;
 			} catch (error) {
 				appendLog(job, `pi-bg: completion not delivered: ${error instanceof Error ? error.message : String(error)}`);
-				return;
 			}
+			persist(job);
+			return;
 		}
-		appendLog(job, "pi-bg: completion not delivered: no live pi session");
+		// Mid-/reload: the next instance takes this job, ended and unreported, with the table.
+		if (!handoff || liveSlot[HANDOFF_KEY] !== handoff) {
+			appendLog(job, "pi-bg: completion not delivered: no live pi session");
+		}
+		// Unreported, it is reported when this session is resumed.
+		persist(job);
 	}
 
 	function deliverHere(job: Job): void {
@@ -954,12 +1611,21 @@ export default function (pi: ExtensionAPI) {
 		// (timed-out) jobs get the completion wake.
 		if (job.quiet) return;
 
-		const elapsed = humanDuration(endedAt - job.startedAt);
 		const outcome =
-			signal !== null ? `killed (${signal})` : code === 0 ? "succeeded" : `exited ${code}`;
+			signal !== null
+				? `killed (${signal})`
+				: job.exitUnknown
+					? "ended (exit unknown)"
+					: code === 0
+						? "succeeded"
+						: `exited ${code}`;
+		// An unknown end was only noticed, so its time is not the job's runtime.
+		const when =
+			`${job.exitUnknown && signal === null ? "" : ` after ${humanDuration(endedAt - job.startedAt)}`}` +
+			`${job.whileDown ? " while the session was closed" : ""}`;
 
 		if ((job.killedByUser && !job.wakeOnKill) || WAKE === "off") {
-			ctxRef?.ui?.notify(`bg ${job.id} ${outcome} after ${elapsed}`, "info");
+			ctxRef?.ui?.notify(`bg ${job.id} ${outcome}${when}`, "info");
 			return;
 		}
 
@@ -976,7 +1642,7 @@ export default function (pi: ExtensionAPI) {
 		const oneLine = (job.summary ?? job.command).replace(/\s+/g, " ").trim();
 		const command = oneLine.length > 80 ? `${oneLine.slice(0, 79)}…` : oneLine;
 		const header =
-			`[bg ${job.id}] \`${command}\` ${outcome} after ${elapsed}\n` +
+			`[bg ${job.id}] \`${command}\` ${outcome}${when}\n` +
 			`log: ${job.logPath} (${lines} line${lines === 1 ? "" : "s"})`;
 		// Report what was actually included, not the configured cap: a capped tail
 		// otherwise reads as if the job started partway through.
@@ -994,23 +1660,47 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
+	/**
+	 * Whether the job's pid is still the job, right now. A child of this process
+	 * (own, or handed over by a reloaded instance that still holds it) is, while
+	 * the shared child map says so; this also holds for a stale instance's copy,
+	 * which hears nothing once the job is reaped. Anything else needs ps.
+	 */
+	function pidState(job: Job, pid: number): Verdict {
+		if (childPids().get(pid) === job.id) return "job";
+		// Not in the map: reaped, unless handed over by an instance from before the map.
+		if (!job.adopted && job.pidStart === undefined) return job.own ? "other" : "unknown";
+		return verdictOf(job, processIdentitySync(pid), pid);
+	}
+
+	/** Stop a job's whole process group, only ever while its pid is provably still the job. */
 	function kill(job: Job): boolean {
 		if (job.endedAt !== undefined || job.pid === undefined) return false;
+		const pid = job.pid;
+		const state = pidState(job, pid);
+		if (state !== "job") {
+			// Gone, or someone else's now: never signal it. Unknown (ps failed): leave it running.
+			if (state === "other") endForeign(job);
+			return false;
+		}
 		job.killedByUser = true;
+		persist(job);
 		try {
-			process.kill(-job.pid, "SIGTERM"); // negative pid = whole process group
+			process.kill(-pid, "SIGTERM"); // negative pid = whole process group
+			job.lastSignal = "SIGTERM";
 			setTimeout(() => {
-				if (job.endedAt === undefined && job.pid !== undefined) {
-					try {
-						process.kill(-job.pid, "SIGKILL");
-					} catch {
-						// already gone
-					}
+				if (job.endedAt !== undefined || pidState(job, pid) !== "job") return;
+				try {
+					process.kill(-pid, "SIGKILL");
+					job.lastSignal = "SIGKILL";
+				} catch {
+					// already gone
 				}
 			}, 5000).unref?.();
 			return true;
 		} catch {
-			safeFinish(job, null, "SIGTERM");
+			if (job.own) safeFinish(job, null, "SIGTERM");
+			else endForeign(job);
 			return false;
 		}
 	}
@@ -1095,7 +1785,8 @@ export default function (pi: ExtensionAPI) {
 			// An explicit timeout keeps pi's built-in hard-deadline semantics and
 			// kills the process tree if it expires. Passing only built-in fields also
 			// keeps the override's `background` option out of the base implementation.
-			if (FG_TIMEOUT_SECS === 0 || input.timeout !== undefined) {
+			// Also when the log dir isn't private: then no log is written at all.
+			if (FG_TIMEOUT_SECS === 0 || input.timeout !== undefined || !bgDirReady()) {
 				const timeout =
 					input.timeout === undefined
 						? undefined
@@ -1175,6 +1866,7 @@ export default function (pi: ExtensionAPI) {
 				job.quiet = false; // adopt: the completion wake now applies
 				job.unrefChild?.(); // outlive the turn, like an explicit bg job
 				syncTicker(); // widget ignored it while quiet; start the UI ticker now
+				register(job);
 				let peek = "";
 				try {
 					const all = tailLines(job.logPath, 8 * 1024);
@@ -1318,28 +2010,79 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		ctxRef = ctx;
 		disposed = false;
+		handoff = undefined;
+		starting = true;
+		sessionId = sessionIdOf(ctx);
+		registryId = registryIdOf(ctx);
+		// Taken or not, a hand-off is only ever for the instance right after it.
+		const pending = liveSlot[HANDOFF_KEY];
+		delete liveSlot[HANDOFF_KEY];
 		liveSlot[LIVE_KEY] = self;
-		setTimeout(() => void pruneLogs(), 5_000).unref();
+
+		const toReport: Job[] = [];
+		// /reload: continue the previous instance's table, if it had this session.
+		if (pending && sessionId !== undefined && pending.sessionId === sessionId) {
+			let records: JobRecord[] = [];
+			try {
+				records = pending.take();
+			} catch {
+				// an older or broken instance: start empty, as before hand-offs
+			}
+			for (const raw of records) {
+				const record = parseRecord(raw);
+				if (!record || jobs.has(record.id)) continue;
+				const job = jobFrom(record);
+				jobs.set(job.id, job);
+				if (job.endedAt !== undefined && !job.reported) toReport.push(job);
+			}
+		}
+		// Restart or resume: what is still registered under this session.
+		try {
+			if (registryId) toReport.push(...(await readopt(registryId)));
+		} finally {
+			starting = false;
+		}
+		syncPoller();
 		syncTicker();
+		// After session_start returns: a wake that starts a turn mid-startup would race pi's own setup.
+		if (toReport.length > 0) {
+			setTimeout(() => {
+				for (const job of toReport) if (!job.reported) deliver(job);
+			}, 0);
+		}
+		setTimeout(() => void pruneLogs(), 5_000).unref();
+		if (DURABLE) setTimeout(() => void pruneRegistry(), 5_000).unref();
 	});
 
-	pi.on("session_shutdown", async (_event, ctx) => {
-		if (ticker) {
-			clearInterval(ticker);
-			ticker = undefined;
-		}
+	pi.on("session_shutdown", async (event, ctx) => {
+		stopTimers();
 		if (ctx.mode === "tui") ctx.ui.setWidget(WIDGET_KEY, undefined);
 		const orphans = running();
-		if (orphans.length > 0 && ctx.hasUI) {
+		const reloading = (event as { reason?: string } | undefined)?.reason === "reload";
+		if (orphans.length > 0 && ctx.hasUI && !reloading) {
 			// Detached jobs outlive pi on purpose; surface where to find them.
 			ctx.ui.notify(
-				`${orphans.length} bg job(s) still running: ${orphans.map((j) => j.id).join(", ")} in ${BG_DIR}`,
+				`${orphans.length} bg job(s) still running: ${orphans.map((j) => j.id).join(", ")} in ${BG_DIR}` +
+					(registryId ? "; resuming this session picks them up again" : ""),
 				"warning",
 			);
 		}
+		// Seen running just now: their registry entries age from here.
+		persist(...orphans);
 		ctxRef = undefined;
 		// Jobs still running report to whichever instance takes the next session.
 		disposed = true;
 		if (liveSlot[LIVE_KEY] === self) delete liveSlot[LIVE_KEY];
+		let taken = false;
+		const mine: BgHandoff = {
+			sessionId,
+			take: () => {
+				if (taken) return [];
+				taken = true;
+				return [...jobs.values()].filter((job) => !job.quiet).map(toRecord);
+			},
+		};
+		handoff = mine;
+		liveSlot[HANDOFF_KEY] = mine;
 	});
 }
