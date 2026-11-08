@@ -42,6 +42,15 @@ interface BackgroundTask {
   triggerOnCompletion?: unknown;
 }
 
+/** The quiet extension's shared state (no import between extensions). */
+const QUIET_STATE = Symbol.for("pi-boehsline.quiet");
+
+/** False when the quiet extension is not loaded: every run is Eric's. */
+function runIsQuiet(): boolean {
+  const state = (globalThis as Record<symbol, unknown>)[QUIET_STATE] as { quiet?: unknown } | undefined;
+  return state?.quiet === true;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -248,9 +257,20 @@ function main(pi: ExtensionAPI): void {
     }
   };
 
+  // A quiet run's settle must not brighten the window. It has no attention of
+  // its own; notify_user and the classifier arrive through quiet:attention.
+  pi.events.on("quiet:attention", (attention: unknown) => {
+    void setAttention(attention != null);
+  });
+
   // A working agent dims its background window's index until it settles.
   pi.on("agent_start", () => {
-    void setRunning(true);
+    // A run starting clears the window's attention; one the quiet extension still holds
+    // (notify_user, the classifier) is put back, since nothing he did cleared it.
+    void setRunning(true).then(() => {
+      const state = (globalThis as Record<symbol, unknown>)[QUIET_STATE] as { attention?: unknown } | undefined;
+      if (state?.attention) void setAttention(true);
+    });
   });
 
   pi.on("agent_settled", async () => {
@@ -262,6 +282,10 @@ function main(pi: ExtensionAPI): void {
     // A sibling pane is still working: the window stays dim until the last
     // one settles rather than flashing bright while work continues.
     if (remaining > 0) return;
+
+    // Background work stays quiet: its settle raises no window attention. A
+    // notify_user or classifier result already set it through quiet:attention.
+    if (runIsQuiet()) return;
 
     // A turn that launched background work does not need attention yet. Its
     // completion notification will either wake another turn or be handled by

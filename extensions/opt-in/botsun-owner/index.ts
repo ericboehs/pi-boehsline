@@ -97,6 +97,8 @@ interface Conn {
 	handoffTimer?: ReturnType<typeof setTimeout>;
 	delay: number;
 	busy: boolean;
+	/** The `quiet` value of the last busy line written this run. */
+	quietSent?: boolean;
 	prompt: Prompt | null;
 	promptDepth: number;
 	cwd: string;
@@ -1582,8 +1584,22 @@ let compacting: string | null = null;
 let inputAt = 0;
 const PROMPT_STARTING_MS = 10_000;
 // Every prompt this extension sends: marked before pi's input event fires for it.
+// The quiet extension consumes this mark, so a phone message starts a run of
+// Eric's, not a quiet background run.
+const QUIET_MINE_EVENT = "quiet:mine";
+const QUIET_RUN_EVENT = "quiet:run";
+const QUIET_ATTENTION_EVENT = "quiet:attention";
+const QUIET_STATE = Symbol.for("pi-boehsline.quiet");
+
+/** False when the quiet extension is not loaded: every run is Eric's. */
+function runIsQuiet(): boolean {
+	const state = (globalThis as Record<symbol, unknown>)[QUIET_STATE] as { quiet?: unknown } | undefined;
+	return state?.quiet === true;
+}
+
 function sendUser(pi: ExtensionAPI, content: string | UserContent[], options?: Parameters<ExtensionAPI["sendUserMessage"]>[1]): void {
 	inputAt = Date.now();
+	try { pi.events?.emit?.(QUIET_MINE_EVENT, {}); } catch {}
 	pi.sendUserMessage(content, options);
 }
 // Whether the approval guardian is bypassed (its state event), for the phone's red title.
@@ -2001,6 +2017,21 @@ function main(pi: ExtensionAPI): void {
 		bypassed = (state as { active?: unknown } | undefined)?.active === true;
 		if (conn && !conn.closed) try { write(conn, "bypass", { active: bypassed }); } catch {}
 	});
+	// Quiet mode: read the run's origin from the shared state (the quiet extension
+	// publishes it in before_agent_start, before any agent_start handler can race),
+	// and follow a mid-run flip from quiet to Eric's.
+	pi.events?.on?.(QUIET_RUN_EVENT, (state: unknown) => {
+		if (!conn || conn.closed || !conn.busy) return;
+		const quiet = (state as { quiet?: unknown } | undefined)?.quiet === true;
+		if (conn.quietSent === quiet) return;
+		conn.quietSent = quiet;
+		try { write(conn, "busy", { quiet }); } catch {}
+	});
+	// A quiet run's attention (notify_user or the classifier): the phone shows it.
+	pi.events?.on?.(QUIET_ATTENTION_EVENT, (attention: unknown) => {
+		if (!conn || conn.closed) return;
+		try { write(conn, "attention", { attention: attention ?? null }); } catch {}
+	});
 	// /color, as the color extension announces it: Botsun keeps the session's color the same.
 	pi.events?.on?.(COLOR_STATE_EVENT, (state: unknown) => reportColor(conn, state));
 	const color = colorHooks(pi);
@@ -2313,7 +2344,8 @@ function main(pi: ExtensionAPI): void {
 		inputAt = 0; // pi's turn counts as running from here
 		if (!conn || conn.closed || conn.busy) return;
 		conn.busy = true;
-		write(conn, "busy");
+		conn.quietSent = runIsQuiet();
+		write(conn, "busy", { quiet: conn.quietSent });
 	});
 
 	pi.on("agent_settled", () => {
@@ -2329,6 +2361,7 @@ function main(pi: ExtensionAPI): void {
 		}
 		if (!conn || conn.closed || !conn.busy) return;
 		conn.busy = false;
+		conn.quietSent = undefined;
 		write(conn, "idle");
 		reportContext();
 	});

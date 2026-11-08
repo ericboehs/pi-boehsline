@@ -89,6 +89,7 @@ process.env.BOTSUN_OWNER_PIN_DIR = pinDir;
 beforeEach(() => {
 	delete process.env.PI_SUBAGENT_CHILD;
 	delete globalThis[Symbol.for("botsun-owner.launch")]; // pi's startup session, once per process
+	delete globalThis[Symbol.for("pi-boehsline.quiet")];
 	rmSync(join(home, ".claude"), { recursive: true, force: true });
 	rmSync(pinDir, { recursive: true, force: true });
 });
@@ -3031,4 +3032,54 @@ test("child_transcript: a page of this session's subagent's conversation, unsign
 	assert.ok(full.more && full.live.length > 3_000);
 	assert.ok(Buffer.byteLength(JSON.stringify(full)) < 64 * 1024, "one line under the socket's limit");
 	kids.resetChildren();
+});
+
+const QUIET_STATE = Symbol.for("pi-boehsline.quiet");
+
+test("busy carries quiet, repeats when a run flips, and an attention line follows quiet:attention", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+
+	globalThis[QUIET_STATE] = { quiet: true, attention: null };
+	await m.fire("agent_start");
+	await until(() => srv.lines.some((line) => line.type === "busy"));
+	assert.equal(srv.lines.find((line) => line.type === "busy").quiet, true, "a background run is announced as quiet");
+
+	m.pi.events.emit("quiet:run", { quiet: false });
+	await until(() => srv.lines.filter((line) => line.type === "busy").length >= 2);
+	assert.equal(srv.lines.filter((line) => line.type === "busy").at(-1).quiet, false, "Eric's steer repeats busy");
+
+	const attention = { kind: "ready", text: "Try the build", at: 1, source: "classifier" };
+	m.pi.events.emit("quiet:attention", attention);
+	await until(() => srv.lines.some((line) => line.type === "attention"));
+	assert.deepEqual(srv.lines.find((line) => line.type === "attention").attention, attention);
+
+	m.pi.events.emit("quiet:attention", null);
+	await until(() => srv.lines.filter((line) => line.type === "attention").length >= 2);
+	assert.equal(srv.lines.filter((line) => line.type === "attention").at(-1).attention, null, "cleared when Eric's input comes");
+	delete globalThis[QUIET_STATE];
+});
+
+test("every sendUser marks its next input as Eric's before sending it", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	const order = [];
+	m.pi.events.on("quiet:mine", () => order.push("mark"));
+	const send = m.pi.sendUserMessage;
+	m.pi.sendUserMessage = (...args) => {
+		order.push("send");
+		return send(...args);
+	};
+
+	const { nonce } = await ask({ type: "nonce" });
+	const text = "Eric's own words";
+	assert.deepEqual(
+		await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) }),
+		{ ok: true, delivered: "prompt" },
+	);
+	assert.deepEqual(order, ["mark", "send"], "the mark is emitted synchronously before pi gets the message");
 });

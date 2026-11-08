@@ -111,7 +111,9 @@ function main(pi: ExtensionAPI) {
 
       if (!mimeType) {
         // Not an image — nothing is attached, so the path is the whole payload.
-        await pi.sendUserMessage(
+        // His own /sc: the quiet extension counts the run as his.
+      try { pi.events?.emit?.("quiet:mine", {}); } catch {}
+      await pi.sendUserMessage(
           `Latest in iCloud Downloads: "${found.path}" (${when}). It's not an image; read the file. ${instruction}`,
           delivery,
         );
@@ -119,6 +121,8 @@ function main(pi: ExtensionAPI) {
       }
 
       const data = (await readFile(found.path)).toString("base64");
+      // His own /sc: the quiet extension counts the run as his.
+      try { pi.events?.emit?.("quiet:mine", {}); } catch {}
       await pi.sendUserMessage([
         { type: "text", text: `${label}. ${instruction}` },
         { type: "image", data, mimeType },

@@ -13,7 +13,8 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 | type | when | extra fields |
 |---|---|---|
 | `hello` | on every (re)connect, and instead of `session` when a sandbox template's pi switches back to its own conversation (its startup session) | `cwd`, `session_file`, `session_id`, `busy`, `prompt`, `model`, `ask`, `commands`, `models`, `stash`, `footer`, `usage`, `context`, `compacting`, `bypass`, `features` (the nonce reply's list), and `color`, `color_at`, `color_carried` (below) |
-| `busy` / `idle` | a run starts / pi has settled | |
+| `busy` / `idle` | a run starts / pi has settled | `quiet` on `busy` (`true` for a background run); a mid-run steer repeats `busy` with `quiet: false` |
+| `attention` | the quiet extension raises or clears attention | `attention` (`{kind, text, at, source}` or null); `kind` is `ready`, `decision`, `blocked`, `failed`, `deadline` or `asked`, `source: "classifier"` when the safety net raised it |
 | `prompt` / `prompt_end` | a dialog (`ask`, select, confirm, input, editor, custom) opens / closes | `kind`, `title` (≤ 500 chars) |
 | `stream` / `stream_end` | the reply as it's written / done | `text` |
 | `model` | `/model`, Ctrl+P, a thinking-level change | `model` (`{name, provider, id, thinking}`) |

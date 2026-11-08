@@ -75,6 +75,7 @@ async function mount({ responder, windowActive = "0", runningPanes = "" } = {}) 
   return {
     execCalls,
     requests,
+    emit: (channel, data) => pi.events.emit(channel, data),
     start: () => handlers.get("agent_start")(),
     settle: () => handlers.get("agent_settled")(),
     prompt: (event = {}) => handlers.get("ui_prompt_start")(event),
@@ -241,4 +242,67 @@ test("settling with a sibling still running stays dim", async () => {
     0,
     "the last pane to settle announces, not an earlier one",
   );
+});
+
+const QUIET_STATE = Symbol.for("pi-boehsline.quiet");
+
+test("a quiet run's settle does not mark the window", async () => {
+  const pi = await mount();
+  globalThis[QUIET_STATE] = { quiet: true, attention: null };
+  try {
+    await pi.settle();
+    assert.equal(
+      pi.execCalls.filter((call) => call.includes("@special_activity") && !call.includes("-u")).length,
+      0,
+      "background work raises no window attention",
+    );
+    assert.equal(pi.requests.length, 0, "and does not need the background-task probe");
+  } finally {
+    delete globalThis[QUIET_STATE];
+  }
+});
+
+test("Eric's run still marks the window", async () => {
+  const pi = await mount();
+  globalThis[QUIET_STATE] = { quiet: false, attention: null };
+  try {
+    await pi.settle();
+    assert.ok(
+      pi.execCalls.some((call) => call.includes("@special_activity") && !call.includes("-u")),
+      "his own run announces as before",
+    );
+  } finally {
+    delete globalThis[QUIET_STATE];
+  }
+});
+
+test("quiet:attention marks the window, and null clears it", async () => {
+  const pi = await mount();
+  pi.emit("quiet:attention", { kind: "ready", text: "Try the build", at: 1, source: "tool" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(
+    pi.execCalls.some((call) => call.includes("@special_activity") && !call.includes("-u")),
+    "notify_user/classifier attention brightens the window",
+  );
+
+  pi.emit("quiet:attention", null);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(
+    pi.execCalls.some((call) => call.includes("-u") && call.includes("@special_activity")),
+    "Eric's next input clears it",
+  );
+});
+
+test("a run starting keeps an attention the quiet extension still holds", async () => {
+  const pi = await mount({ runningPanes: "on" });
+  globalThis[QUIET_STATE] = { quiet: true, attention: { kind: "ready", text: "Try it", at: 1 } };
+  try {
+    await pi.start();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const special = pi.execCalls.filter((call) => call.includes("@special_activity"));
+    assert.ok(special.length >= 2, "cleared by the start, then set again");
+    assert.ok(!special.at(-1).includes("-u"), "the last word is set, not unset");
+  } finally {
+    delete globalThis[QUIET_STATE];
+  }
 });
