@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { deflateSync } from "node:zlib";
-import { kittyDelete, kittyTransmit, placeholderRow, shrink, stripFrame } from "../extensions/opt-in/botsun-owner/icon-picker.ts";
+import { kittyBlinking, kittyDelete, kittyTransmit, placeholderRow, shrink, stripFrame, stripFrames } from "../extensions/opt-in/botsun-owner/icon-picker.ts";
 
 function crc32(buf) {
 	let c = ~0;
@@ -67,6 +67,9 @@ test("stripFrame cuts one frame out, through every filter type", async () => {
 		assert.ok(got.rgba.equals(want), `frame ${f}`);
 	}
 	assert.equal(await stripFrame(file, frames, size), null, "past the strip's end");
+	const many = await stripFrames(file, [2, 0], size);
+	assert.ok(many[0].rgba.equals((await stripFrame(file, 2, size)).rgba) && many[1].rgba.equals((await stripFrame(file, 0, size)).rgba), "several from one decode, in the order asked");
+	assert.equal(await stripFrames(file, [0, frames], size), null);
 	assert.equal(await stripFrame(Buffer.from("not a png at all, really not one"), 0, size), null);
 });
 
@@ -90,6 +93,24 @@ test("kitty sequences: chunked, tmux-wrapped, and placeholders carry the id", ()
 		assert.ok(Buffer.from(b64, "base64").equals(z));
 		process.env.TMUX = "/tmp/x,1,0";
 		assert.equal(kittyDelete(5), "\x1bPtmux;\x1b\x1b_Ga=d,d=I,i=5,q=2\x1b\x1b\\\x1b\\");
+	} finally {
+		if (saved === undefined) delete process.env.TMUX;
+		else process.env.TMUX = saved;
+	}
+	delete process.env.TMUX;
+	try {
+		const z = Buffer.from([1]);
+		const cmds = kittyBlinking(9, 2, 2, z, [z, z], 4, 2, 3000).split("\x1b\\").filter(Boolean).map((c) => c.split(";")[0]);
+		assert.deepEqual(cmds, [
+			"\x1b_Ga=t,f=32,o=z,s=2,v=2,i=9,q=2,m=0",
+			"\x1b_Ga=p,U=1,i=9,c=4,r=2,q=2",
+			"\x1b_Ga=f,f=32,o=z,s=2,v=2,i=9,z=50,q=2,m=0",
+			"\x1b_Ga=f,f=32,o=z,s=2,v=2,i=9,z=90,q=2,m=0",
+			"\x1b_Ga=f,f=32,o=z,s=2,v=2,i=9,z=50,q=2,m=0",
+			"\x1b_Ga=a,i=9,r=1,z=3000,q=2",
+			"\x1b_Ga=a,i=9,s=3,v=1,q=2",
+		], "shut, shut more, open, rest on the open eyes, loop");
+		assert.equal(kittyBlinking(9, 2, 2, z, [], 4, 2, 3000), kittyTransmit(9, 2, 2, z, 4, 2), "no blink frames: still");
 	} finally {
 		if (saved === undefined) delete process.env.TMUX;
 		else process.env.TMUX = saved;

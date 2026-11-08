@@ -1,4 +1,4 @@
-// /icon's picker, drawn: each look's idle frame beside its name, in the color it would get, and
+// /icon's picker, drawn: each look's idle frame (blinking, as the avatar does) beside its name, in the color it would get, and
 // then the chosen look in every color. The frames are Botsun's exported strips
 // (~/.local/share/botsun/icons/<look>/<color>.png, `bin/botsun icons export`), shown with Kitty
 // graphics through Unicode placeholders (U=1), wrapped for tmux passthrough, so a picture sits in
@@ -23,6 +23,7 @@ interface Manifest {
 	revision?: string;
 	frame?: { width?: number; height?: number };
 	idle_index?: number;
+	blink_indexes?: number[];
 }
 
 function manifest(dir: string): Manifest | null {
@@ -41,6 +42,11 @@ function manifest(dir: string): Manifest | null {
  * 8-bit RGBA, non-interlaced only (what Botsun exports); anything else is null.
  */
 export async function stripFrame(png: Buffer, frame: number, size: number): Promise<{ w: number; h: number; rgba: Buffer } | null> {
+	return (await stripFrames(png, [frame], size))?.[0] ?? null;
+}
+
+/** Several frames of a strip, in the order asked, from one decode (null if any is out of range). */
+export async function stripFrames(png: Buffer, frames: number[], size: number): Promise<{ w: number; h: number; rgba: Buffer }[] | null> {
 	if (png.length < 33 || png.readUInt32BE(0) !== 0x89504e47) return null;
 	let off = 8;
 	let width = 0;
@@ -61,12 +67,11 @@ export async function stripFrame(png: Buffer, frame: number, size: number): Prom
 	if (!width || !height || !idat.length) return null;
 	const raw = await inflateAsync(Buffer.concat(idat));
 	const stride = width * 4;
-	const x0 = frame * size;
-	if (x0 + size > width || size > height) return null;
-	const need = (x0 + size) * 4; // bytes of each row to restore: up to the frame's right edge
+	if (!frames.length || frames.some((f) => !Number.isInteger(f) || f < 0 || (f + 1) * size > width) || size > height) return null;
+	const need = (Math.max(...frames) + 1) * size * 4; // bytes of each row to restore: up to the last frame's right edge
 	const prev = Buffer.alloc(need);
 	const cur = Buffer.alloc(need);
-	const out = Buffer.alloc(size * size * 4);
+	const outs = frames.map(() => Buffer.alloc(size * size * 4));
 	for (let y = 0; y < size; y++) {
 		const base = y * (stride + 1);
 		if (base + 1 + need > raw.length) return null;
@@ -94,10 +99,10 @@ export async function stripFrame(png: Buffer, frame: number, size: number): Prom
 			}
 			cur[i] = v & 255;
 		}
-		cur.copy(out, y * size * 4, x0 * 4, need);
+		frames.forEach((f, n) => cur.copy(outs[n]!, y * size * 4, f * size * 4, (f + 1) * size * 4));
 		cur.copy(prev);
 	}
-	return { w: size, h: size, rgba: out };
+	return outs.map((rgba) => ({ w: size, h: size, rgba }));
 }
 
 /** Halve an RGBA square until it is at most max px: a box average, alpha-weighted. */
@@ -132,13 +137,31 @@ const apc = (keys: string, payload = "") => wrap(`\x1b_G${keys}${payload ? `;${p
 
 /** Transmit raw RGBA (zlib, o=z) in <=4096-byte base64 chunks, then a virtual placement of cols x rows cells. */
 export function kittyTransmit(id: number, w: number, h: number, zrgba: Buffer, cols: number, rows: number): string {
-	const b64 = zrgba.toString("base64");
+	return kittyData(`a=t,f=32,o=z,s=${w},v=${h},i=${id},q=2`, zrgba) + apc(`a=p,U=1,i=${id},c=${cols},r=${rows},q=2`);
+}
+
+/** zlib RGBA in <=4096-byte base64 chunks; keys go on the first chunk only. */
+function kittyData(keys: string, z: Buffer): string {
+	const b64 = z.toString("base64");
 	let seq = "";
 	for (let i = 0; i < b64.length; i += 4096) {
 		const more = i + 4096 < b64.length ? 1 : 0;
-		seq += apc(i === 0 ? `a=t,f=32,o=z,s=${w},v=${h},i=${id},q=2,m=${more}` : `m=${more}`, b64.slice(i, i + 4096));
+		seq += apc(i === 0 ? `${keys},m=${more}` : `m=${more}`, b64.slice(i, i + 4096));
 	}
-	return seq + apc(`a=p,U=1,i=${id},c=${cols},r=${rows},q=2`);
+	return seq;
+}
+
+/**
+ * An idle frame that blinks, as the avatar does: the blink frames shut and open again (50, 90,
+ * 50 ms), then the open eyes for restMs, looping. No blink frames: a still picture.
+ */
+export function kittyBlinking(id: number, w: number, h: number, idle: Buffer, blinks: Buffer[], cols: number, rows: number, restMs: number): string {
+	let seq = kittyTransmit(id, w, h, idle, cols, rows);
+	if (!blinks.length) return seq;
+	const shut = [...blinks, ...blinks.slice(0, -1).reverse()];
+	shut.forEach((f, n) => (seq += kittyData(`a=f,f=32,o=z,s=${w},v=${h},i=${id},z=${n === blinks.length - 1 ? 90 : 50},q=2`, f)));
+	seq += apc(`a=a,i=${id},r=1,z=${Math.round(restMs)},q=2`); // the open eyes' own gap
+	return seq + apc(`a=a,i=${id},s=3,v=1,q=2`); // loop forever
 }
 
 export const kittyDelete = (id: number): string => apc(`a=d,d=I,i=${id},q=2`);
@@ -184,9 +207,10 @@ const ICON_PX = 64;
 const LABEL_MAX = 22;
 
 // Frames already cut, by path and revision: the next /icon draws at once.
-const frameCache = new Map<string, Promise<{ w: number; h: number; z: Buffer } | null>>();
+type Frames = { w: number; h: number; z: Buffer; blinks: Buffer[] };
+const frameCache = new Map<string, Promise<Frames | null>>();
 
-function frameFor(dir: string, look: string, color: string): Promise<{ w: number; h: number; z: Buffer } | null> {
+function frameFor(dir: string, look: string, color: string): Promise<Frames | null> {
 	const m = manifest(dir);
 	const key = `${look}/${color}@${m?.revision ?? ""}`;
 	let p = frameCache.get(key);
@@ -194,10 +218,13 @@ function frameFor(dir: string, look: string, color: string): Promise<{ w: number
 		p = (async () => {
 			if (!/^[a-z0-9.]{1,40}$/.test(look) || !/^[a-z]{1,20}$/.test(color)) return null;
 			const png = await readFile(join(dir, look, `${color}.png`));
-			const img = await stripFrame(png, m?.idle_index ?? 0, m?.frame?.width ?? 128);
-			if (!img) return null;
-			const small = shrink(img, ICON_PX);
-			return { w: small.w, h: small.h, z: await deflateAsync(small.rgba) };
+			const blinkAt = (m?.blink_indexes ?? []).filter((i) => Number.isInteger(i) && i >= 0).slice(0, 4);
+			const imgs = (await stripFrames(png, [m?.idle_index ?? 0, ...blinkAt], m?.frame?.width ?? 128))
+				?? (await stripFrames(png, [m?.idle_index ?? 0], m?.frame?.width ?? 128));
+			if (!imgs) return null;
+			const smalls = imgs.map((img) => shrink(img, ICON_PX));
+			const z = await Promise.all(smalls.map((img) => deflateAsync(img.rgba)));
+			return { w: smalls[0]!.w, h: smalls[0]!.h, z: z[0]!, blinks: z.slice(1) };
 		})().catch(() => null);
 		frameCache.set(key, p);
 	}
@@ -238,7 +265,8 @@ export async function pickDrawn(ctx: ExtensionContext, title: string, items: Pic
 				sent.add(id);
 				void frameFor(dir, look, color).then((f) => {
 					if (!f || closed) return;
-					write(kittyTransmit(id, f.w, f.h, f.z, ICON_COLS, ICON_ROWS));
+					// Each blinks on its own clock, so the grid doesn't blink in step.
+					write(kittyBlinking(id, f.w, f.h, f.z, f.blinks, ICON_COLS, ICON_ROWS, 2500 + Math.random() * 3500));
 					tui.requestRender();
 				});
 			};

@@ -29,7 +29,7 @@
 
 import { createHash, createPublicKey, randomBytes, verify as verifySignature } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { accessSync, appendFileSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, existsSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, join } from "node:path";
@@ -177,6 +177,10 @@ interface Conn {
 	iconNotes?: Record<string, string>;
 	iconNotesHeld?: Record<string, string>;
 	iconWait?: { id: string; timer: ReturnType<typeof setTimeout>; resolve: (reply: IconReply) => void };
+	/** A /icon pick made before pi wrote the session file (a new session, before its first
+	 * message): Botsun only takes an icon from a pi whose file names the session, so it goes once
+	 * the file is there. Drawn already; `before` is what a refusal puts back. */
+	iconPending?: { request: { kind: "clear" } | { kind: "set"; look: string; color?: string }; before?: { look: string | null; color: string | null } };
 	/** The last claim Botsun was told or sent (JSON): a change to it is reported, one Botsun sent is not. */
 	colorSaid?: string;
 	/** Botsun's color as /color last took it, and for which session: the same color at the same time in
@@ -807,12 +811,17 @@ function suggestIconLine(c: Conn | undefined, suggestion: IconSuggestion): void 
 	if (!c.sessionId || c.boundId !== c.sessionId) return;
 	if (!c.icons || !looksOf(c.icons).includes(suggestion.look)) return;
 	if (c.icon?.look) return;
-	if (c.iconWait) return;
+	if (c.iconWait || c.iconPending) return;
 	const id = randomBytes(8).toString("hex");
 	const line: Record<string, unknown> = { id, look: suggestion.look, if_unset: true };
 	if (suggestion.color) line.color = suggestion.color;
 	debug(`icon suggestion: ${suggestion.look}${suggestion.color ? `, ${suggestion.color}` : ""}`);
 	write(c, "icon", line);
+}
+
+/** What /icon says it set. */
+function iconSaid(look: string | null | undefined, color: string | null | undefined): string {
+	return look ? (color ? `icon: ${look}, ${color}` : `icon: ${look}`) : "icon: automatic";
 }
 
 /** The current look, for a footer avatar (#22). Null until Botsun has said, or after a session switch. */
@@ -2193,7 +2202,17 @@ function main(pi: ExtensionAPI): void {
 			}
 			// Drawn now, not when Botsun answers: the footer avatar takes the pick at once, and
 			// Botsun's answer (or a refusal) puts it right.
-			const before = conn.icon;
+			const before = conn.iconPending ? conn.iconPending.before : conn.icon;
+			const file = sessionInfo(ctx).sessionFile;
+			if (file && !existsSync(file)) {
+				// A new session: pi writes its file with the first message, and Botsun wants the file.
+				conn.iconPending = { request, before };
+				if (request.kind === "set") setIcon(conn, { look: request.look, color: request.color ?? before?.color ?? null });
+				else setIcon(conn, { look: null, color: null });
+				ctx.ui.notify(`${iconSaid(request.kind === "set" ? request.look : null, request.kind === "set" ? request.color : null)} (Botsun saves it after your first message)`, "info");
+				return;
+			}
+			conn.iconPending = undefined;
 			const sentAt = Date.now();
 			if (request.kind === "set") setIcon(conn, { look: request.look, color: request.color ?? before?.color ?? null });
 			else setIcon(conn, { look: null, color: null });
@@ -2204,9 +2223,26 @@ function main(pi: ExtensionAPI): void {
 				ctx.ui.notify(reply.error ?? "Botsun refused the icon", "error");
 				return;
 			}
-			ctx.ui.notify(reply.look ? (reply.color ? `icon: ${reply.look}, ${reply.color}` : `icon: ${reply.look}`) : "icon: automatic", "info");
+			ctx.ui.notify(iconSaid(reply.look, reply.color), "info");
 		},
 	});
+
+	// A pick held for the session file (above): sent once pi has written it, i.e. once the first
+	// message is in. Only a refusal is said; the pick is on screen already.
+	const flushPendingIcon = async (ctx: ExtensionContext) => {
+		const c = conn;
+		const pending = c?.iconPending;
+		if (!c || !pending || !c.connected || c.iconWait) return;
+		const file = sessionInfo(ctx).sessionFile;
+		if (!file || !existsSync(file)) return;
+		c.iconPending = undefined;
+		const reply = await sendIcon(c, pending.request);
+		if (reply.ok) return;
+		setIcon(c, pending.before ?? { look: null, color: null });
+		try { ctx.ui.notify(reply.error ?? "Botsun refused the icon", "error"); } catch {}
+	};
+	pi.on("message_end", (_event, ctx) => void flushPendingIcon(ctx));
+	pi.on("agent_end", (_event, ctx) => void flushPendingIcon(ctx));
 
 	// The guardian's bypass, as it announces it (on start and on each change): the phone shows it.
 	pi.events?.on(GUARDIAN_BYPASS_STATE_EVENT, (state: unknown) => {
@@ -2359,6 +2395,7 @@ function main(pi: ExtensionAPI): void {
 			if (info.sessionId !== conn.sessionId) {
 				conn.sandboxToken = undefined; // it was for the session Botsun bound
 				conn.icon = undefined; // the look was the session pi left; the next icons line says this one's
+				conn.iconPending = undefined;
 			}
 			if (!("boundId" in conn)) conn.boundId = conn.sessionId; // a connection from before boundId: its hello's
 			const rehello = helloOnSwitch(conn, info, conn.launch);

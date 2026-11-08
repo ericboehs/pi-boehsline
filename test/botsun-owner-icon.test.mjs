@@ -4,7 +4,7 @@
  * the real owner socket or the real pi sessions.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -122,11 +122,13 @@ test("/icon needs Botsun when nothing is connected, and sends the line when it i
 	s.pi.getSessionName = () => undefined;
 	await mod.default(s.pi);
 	const notes = [];
+	// Not written yet: pi writes a new session's file with its first message.
+	const sessionFile = join(home, "sessions", "a.jsonl");
 	const ctx = {
 		cwd: "/tmp/work/proj",
 		hasUI: true,
 		mode: "tui",
-		sessionManager: { getSessionFile: () => "/tmp/sessions/a.jsonl", getSessionId: () => "sid-a" },
+		sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "sid-a" },
 		ui: {
 			notify: (text, level) => notes.push([level, text]),
 			select: async (title, options) => {
@@ -159,14 +161,36 @@ test("/icon needs Botsun when nothing is connected, and sends the line when it i
 		colors: ["pink", "mint"],
 	});
 
+	// A new session's pick waits for its file (Botsun wants the file to name the session), drawn
+	// meanwhile, and goes once the first message has put the file there.
+	assert.deepEqual(announced, [{ look: null, color: null, answered: 0 }], "the catalog's word, once");
+	announced.length = 0;
+	notes.length = 0;
+	await icon.handler("heart pink", ctx);
+	assert.equal(lines.filter((l) => l.type === "icon").length, 0, "nothing goes before the file is written");
+	assert.deepEqual(notes.at(-1), ["info", "icon: heart, pink (Botsun saves it after your first message)"]);
+	assert.deepEqual(announced, [{ look: "heart", color: "pink", answered: 0 }]);
+	assert.equal(suggestIcon({ look: "ghost" }), true);
+	await s.fire("message_end", { message: { role: "user" } }, ctx);
+	await sleep(60);
+	assert.equal(lines.filter((l) => l.type === "icon").length, 0, "still no file: still held, and a suggestion doesn't cover the pick");
+	mkdirSync(join(home, "sessions"), { recursive: true });
+	writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: "sid-a" })}\n`);
+	await s.fire("message_end", { message: { role: "user" } }, ctx);
+	await until(() => lines.some((l) => l.type === "icon" && l.look === "heart"));
+	const held1 = lines.find((l) => l.type === "icon" && l.look === "heart");
+	assert.equal(held1.color, "pink");
+	await until(() => mod.sessionIcon()?.color === "pink");
+
 	notes.length = 0;
 	announced.length = 0;
+	const sentBefore = lines.filter((l) => l.type === "icon").length;
 	await icon.handler("nope pink", ctx);
 	assert.equal(notes.at(-1)[1], "unknown look");
 	// Announced before the line went out, then put back when Botsun refused it.
 	assert.deepEqual(announced, [
-		{ look: "nope", color: "pink", answered: 0 },
-		{ look: null, color: null, answered: 1 },
+		{ look: "nope", color: "pink", answered: sentBefore },
+		{ look: "heart", color: "pink", answered: sentBefore + 1 },
 	]);
 	const sent = lines.find((l) => l.type === "icon" && l.look === "nope");
 	assert.equal(sent.color, "pink");
@@ -176,7 +200,7 @@ test("/icon needs Botsun when nothing is connected, and sends the line when it i
 	notes.length = 0;
 	await icon.handler("", ctx);
 	assert.equal(notes.at(-1)[1], "icon: heart");
-	const picked = lines.find((l) => l.type === "icon" && l.look === "heart");
+	const picked = lines.findLast((l) => l.type === "icon" && l.look === "heart");
 	assert.equal(picked.color, undefined, "keep color omits it");
 	assert.deepEqual(mod.sessionIcon(), { look: "heart", color: null });
 
