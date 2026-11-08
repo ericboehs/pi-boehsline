@@ -635,7 +635,20 @@ async function fetchCodex(ctx: ExtensionContext): Promise<UsageDisplay> {
     ...(accountId ? { "chatgpt-account-id": accountId } : {}),
     "user-agent": "pi-codex-window/1.0",
   })) as CodexUsageResponse;
+  return codexDisplay(usage);
+}
 
+/** The soonest window reset: what a chip paces against, and what the shared
+ *  cache publishes as `resetMs` (failover waits for it). */
+function soonestReset(resets: readonly (number | undefined)[]): number | undefined {
+  const known = resets.filter((at): at is number => at !== undefined && Number.isFinite(at));
+  return known.length > 0 ? Math.min(...known) : undefined;
+}
+
+/** One `/usage` response as the chip value, the /command detail and the same
+ *  windows as data (the shared cache's `windows`/`resetMs`). Exported for the
+ *  parse tests: the failover extension reads the cache, not pi. */
+export function codexDisplay(usage: CodexUsageResponse, nowMs = Date.now()): UsageDisplay {
   const windows = [
     usage.rate_limit?.primary_window,
     usage.rate_limit?.secondary_window,
@@ -652,7 +665,6 @@ async function fetchCodex(ctx: ExtensionContext): Promise<UsageDisplay> {
       (left, right) => (windowSeconds(left) ?? 0) - (windowSeconds(right) ?? 0),
     );
 
-  const nowMs = Date.now();
   const value = windows
     .map((window) => formatCodexWindow(window, nowMs))
     .filter((formatted): formatted is string => formatted !== undefined)
@@ -666,7 +678,13 @@ async function fetchCodex(ctx: ExtensionContext): Promise<UsageDisplay> {
   const snapshots = windows
     .map((window) => usageWindowSnapshot(usageSpanLabel(windowSeconds(window)), window, nowMs))
     .filter((entry): entry is UsageWindowSnapshot => entry !== undefined);
-  return { value, commandText: `${value}\nResets: ${resetSummary}`, windows: snapshots };
+  const resetMs = soonestReset(windows.map((window) => resetAtMs(window, nowMs)));
+  return {
+    value,
+    commandText: `${value}\nResets: ${resetSummary}`,
+    ...(resetMs !== undefined ? { resetMs } : {}),
+    windows: snapshots,
+  };
 }
 
 // ---------- claude ----------
@@ -2071,7 +2089,20 @@ function opencodeGoAuthFailed(err: unknown): err is Error {
   return err instanceof Error && err.message.includes("invalid or expired");
 }
 
-function opencodeGoDisplay(meters: OpencodeGoMeter[]): UsageDisplay {
+/** The meters as cache data (the shared cache's `windows`): short label,
+ *  rounded percent, ISO reset. Failover decides whether this provider is used
+ *  up from these, so they must be written. */
+function opencodeGoSnapshots(meters: readonly OpencodeGoMeter[]): UsageWindowSnapshot[] {
+  return meters.map((meter) => ({
+    label: usageSpanLabel(meter.seconds),
+    percent: Math.round(Math.max(0, Math.min(100, meter.percent))),
+    ...(meter.resetMs !== undefined ? { resets_at: new Date(meter.resetMs).toISOString() } : {}),
+  }));
+}
+
+/** The chip value, the /command detail, and the same meters as data. Exported
+ *  for the tests: the shared cache entry is this display plus `fetchedAt`. */
+export function opencodeGoDisplay(meters: OpencodeGoMeter[]): UsageDisplay {
   const nowMs = Date.now();
   const groups = meters.map((meter) => ({
     meter,
@@ -2102,7 +2133,13 @@ function opencodeGoDisplay(meters: OpencodeGoMeter[]): UsageDisplay {
         : percent;
     return `${group.meter.label}: ${money}${reset}`;
   });
-  return { value, commandText: detail.join("\n") };
+  const resetMs = soonestReset(meters.map((meter) => meter.resetMs));
+  return {
+    value,
+    commandText: detail.join("\n"),
+    ...(resetMs !== undefined ? { resetMs } : {}),
+    windows: opencodeGoSnapshots(meters),
+  };
 }
 
 /** pi auth first, then the env names other OpenCode clients use. */

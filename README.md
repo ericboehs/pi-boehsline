@@ -33,6 +33,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [compact-progress](extensions/compact-progress/README.md) | Progress bar and learned ETA while compaction runs |  |
 | [compaction](extensions/compaction/README.md) | Cache-replay compaction, and idle compaction before the cache expires | `/idle` |
 | [cursor-focus](extensions/cursor-focus/README.md) | Your terminal's real cursor instead of pi's drawn one |  |
+| [failover](extensions/failover/README.md) | A usage limit switches to the next model in your chain, then back when the window resets |  |
 | [footer](extensions/footer/README.md) | A lean status line you can reorder and trim | `/footer`, `/boot`, `/bypass` |
 | [image-preview](extensions/image-preview/README.md) | Real images inside tmux, and a full-size popup | `/preview` |
 | [next-steps](extensions/next-steps/README.md) | Type `/2` to pick option 2 of a "Next steps:" list |  |
@@ -120,6 +121,7 @@ Everything below goes in `~/.pi/agent/boehsline.json`, or comes from a package t
 
   "meeting": { "model": "github-copilot/claude-haiku-5.5", "qmdCollections": ["notes"], "dailyDir": "~/Notes/daily", "owner": "earl", "slideSummaries": true },
   "memory": { "root": "~/.local/share/pi-memory", "inject": { "startChars": 2500, "startMax": 25 }, "qmd": "auto", "search": { "collections": [] } },  // see extensions/opt-in/memory
+  "failover": { "chain": ["anthropic/claude-opus-5.5", "opencode-go/glm-5.3"], "maxSwitches": 3 },  // see extensions/failover
   "image-prune": { "thresholdMB": 5, "keepTurns": 2, "shrinkMaxPx": 1568, "shrinkMinKB": 512 },  // "enabled": false pauses it; /image-prune now still works
   "scheduler-tool": { "exposure": "deferred" },  // "direct" puts the schedule tool in every prompt
   "update": { "dir": "~/Code/github.com/ericboehs/pi", "args": ["--quick-tests", "--push"] },  // no dir: the checkout pi runs from

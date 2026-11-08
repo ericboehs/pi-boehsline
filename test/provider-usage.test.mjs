@@ -24,6 +24,8 @@ import {
   formatUsageCacheReport,
   grokUsageDisplay,
   opencodeGoCookieHeader,
+  opencodeGoDisplay,
+  codexDisplay,
   parseOpencodeGoStatus,
   parseOpencodeGoUsage,
   resolveUsageDriver,
@@ -154,6 +156,59 @@ test("parseOpencodeGoUsage reports nothing for payloads without usage windows", 
   assert.deepEqual(parseOpencodeGoUsage({}), []);
   assert.deepEqual(parseOpencodeGoUsage({ usage: {} }), []);
   assert.deepEqual(parseOpencodeGoUsage({ rollingUsage: { usagePercent: 1 } }), []);
+});
+
+test("the opencode-go cache entry carries its meters as windows and the soonest reset", () => {
+  // The keys the key usage API returns, one of them used up: this is the entry
+  // provider-usage writes to usage-cache.json, and what failover reads to skip a
+  // model and to know when to come back.
+  const display = opencodeGoDisplay(
+    parseOpencodeGoUsage({
+      usage: {
+        rolling: { status: "ok", percent: 100, resetsAt: "2026-09-19T15:00:00.000Z" },
+        weekly: { status: "ok", percent: 42, resetsAt: "2026-09-21T00:00:00.000Z" },
+        monthly: { status: "ok", percent: 66, resetsAt: "2026-10-01T00:00:00.000Z" },
+      },
+    }),
+  );
+  assert.deepEqual(display.windows, [
+    { label: "5h", percent: 100, resets_at: "2026-09-19T15:00:00.000Z" },
+    { label: "week", percent: 42, resets_at: "2026-09-21T00:00:00.000Z" },
+    { label: "30d", percent: 66, resets_at: "2026-10-01T00:00:00.000Z" },
+  ]);
+  assert.equal(
+    display.resetMs,
+    Date.parse("2026-09-19T15:00:00.000Z"),
+    "the soonest meter reset, which is what the chip paces against",
+  );
+  // The console (cookie) path renders through the same display.
+  const consoleDisplay = opencodeGoDisplay(parseOpencodeGoStatus(FIXTURE));
+  assert.equal(consoleDisplay.resetMs, Date.parse("2026-09-19T15:00:00.000Z"));
+  assert.deepEqual(
+    consoleDisplay.windows.map((window) => window.label),
+    ["5h", "week", "30d"],
+    "the paid period end dates the month meter",
+  );
+});
+
+test("the codex cache entry carries its windows and the soonest reset", () => {
+  const now = Date.parse("2026-09-19T10:00:00.000Z");
+  const at = (ms) => Math.floor((now + ms) / 1000);
+  const display = codexDisplay(
+    {
+      rate_limit: {
+        // Not in shortest-first order: the display sorts, the reset is the min.
+        secondary_window: { used_percent: 100, reset_at: at(7 * 86_400_000), limit_window_seconds: 7 * 86_400 },
+        primary_window: { used_percent: 100, reset_at: at(3 * 3_600_000), limit_window_seconds: 5 * 3_600 },
+      },
+    },
+    now,
+  );
+  assert.deepEqual(display.windows, [
+    { label: "5h", percent: 100, resets_at: "2026-09-19T13:00:00.000Z" },
+    { label: "week", percent: 100, resets_at: "2026-09-26T10:00:00.000Z" },
+  ]);
+  assert.equal(display.resetMs, now + 3 * 3_600_000, "the soonest window: the first one to come back");
 });
 
 test("opencodeGoCookieHeader pairs known names and prefixes bare values", () => {
