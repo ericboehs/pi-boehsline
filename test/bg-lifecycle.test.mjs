@@ -290,6 +290,49 @@ test("above-prompt elapsed times refresh without model wakes; completion still w
   assert.equal(h.sent.length, 1);
 });
 
+test("a background job's name: given by the tool's name, else guessed past setup and wrappers", async (t) => {
+  const h = await mount(t);
+  assert.match(h.bash.parameters.properties.name.description, /Short label/);
+  await h.run({ command: "cd ios && xcrun simctl create Foo iPhone", background: true, name: "make the \u001b[31msimulator\u001b[0m\nnow, a very long label indeed" });
+  const task = h.children[0];
+  const { cleanJobName } = await import("../extensions/bg/index.ts");
+  const named = cleanJobName("make the \u001b[31msimulator\u001b[0m\nnow, a very long label indeed");
+  assert.ok(named.length <= 40 && named.endsWith("…") && !/[\u0000-\u001f]/.test(named), `at most 40 characters, one line, no control characters: ${named}`);
+  assert.deepEqual(h.render(), [`● 1 background job · ${named} 0s · /bg`]);
+  assert.equal(h.list().find((j) => j.id === task.id).name, named, "bg:list (canvas, Botsun) carries the name");
+  task.exit();
+  assert.match(h.sent[0].message.content, new RegExp(`^\\[bg ${task.id}\\] ${named.replace(/[[\]]/g, "\\$&")} · \`cd ios && xcrun simctl create Foo iPhone\` succeeded`));
+
+  await h.run({ command: "cd ~/Code/github.com/ericboehs/botsun && bin/check --ios", background: true });
+  assert.deepEqual(h.render(), ["● 1 background job · bin/check --ios 0s · /bg"]);
+  h.children[1].exit();
+  assert.match(h.sent[1].message.content, /^\[bg \w+\] `cd ~/, "a guessed name doesn't lead the wake");
+});
+
+test("labelFor: the first step that does the work, as program and first argument", async () => {
+  const { labelFor } = await import("../extensions/bg/index.ts");
+  const cases = {
+    "cd ~/x && bin/check --ios": "bin/check --ios",
+    "cd ios; xcrun simctl create Foo iPhone": "simctl create",
+    "set -e; FOO=1 BAR=2 timeout 600 bundle exec rspec spec/models": "rspec spec/models",
+    "npm run build": "npm run build",
+    "sleep 30 && tail -f log/dev.log": "tail -f",
+    "sudo -E env A=1 nice -n 5 make test": "make test",
+    "/usr/local/bin/node scripts/test.mjs": "node scripts/test.mjs",
+    "op run --env-file .env -- rails s": "rails s",
+    "op read op://v/i/f": "op read",
+    "uv run pytest -q": "pytest -q",
+    "export PATH=x:$PATH\nnode server.js": "node server.js",
+    "./run.sh --fast": "run.sh --fast",
+    "for i in $(seq 1 400); do echo $i; sleep 1; done": "echo",
+    "cd /tmp": "cd /tmp",
+    "( cd x && make )": "make",
+    "FOO=1": "job",
+  };
+  for (const [command, want] of Object.entries(cases)) assert.equal(labelFor(command), want, command);
+  assert.ok(labelFor(`run ${"x".repeat(80)}`).length <= 40);
+});
+
 test("widget bounds width and uses live theme colors", async (t) => {
   const h = await mount(t);
   await h.run({ command: "npm run build", background: true });
@@ -306,7 +349,7 @@ test("widget bounds width and uses live theme colors", async (t) => {
 
 test("widget distinguishes duplicate labels and summarizes overflow", async (t) => {
   const h = await mount(t);
-  for (let i = 0; i < 4; i++) await h.run({ command: `node task-${i}.js`, background: true });
+  for (let i = 0; i < 4; i++) await h.run({ command: `node task.js --shard ${i}`, background: true });
   const ids = h.children.map((task) => task.id);
   assert.deepEqual(h.render(), [
     `● 4 background jobs · ${ids[0]} 0s · ${ids[1]} 0s · ${ids[2]} 0s · +1 · /bg`,
@@ -327,7 +370,7 @@ test("foreground jobs stay hidden until adopted, then notify on completion", asy
   t.mock.timers.tick(1000);
   const result = await pending;
   assert.match(result.content[0].text, /moved to background/);
-  assert.deepEqual(h.render(), ["● 1 background job · test 1s · /bg"]);
+  assert.deepEqual(h.render(), ["● 1 background job · npm test 1s · /bg"]);
   assert.deepEqual(h.sent, []);
   h.children[0].exit();
   assert.deepEqual(h.render(), []);
@@ -555,7 +598,7 @@ test("/reload hands the whole job table to the next instance: ids, widget, /bg, 
   await h.shutdown("reload");
   h.goStale();
   const next = await boot(t, h.backgroundTasks, { session, reason: "reload" });
-  assert.deepEqual(next.render(), ["● 1 background job · build 30s · /bg"]);
+  assert.deepEqual(next.render(), ["● 1 background job · npm run build 30s · /bg"]);
   const listed = next.list();
   assert.deepEqual(listed.map((job) => job.id).sort(), [build.id, lint.id].sort());
   assert.equal(listed.find((job) => job.id === lint.id).exitCode, 0);
@@ -688,7 +731,7 @@ test("restart: the resumed session re-adopts its running job, polls it, and repo
   const killed = mockKill(t);
 
   const next = await boot(t, h.backgroundTasks, { session, reason: "startup" });
-  assert.deepEqual(next.render(), ["● 1 background job · build 0s · /bg"]);
+  assert.deepEqual(next.render(), ["● 1 background job · npm run build 0s · /bg"]);
   assert.deepEqual(next.list().map((job) => [job.id, job.endedAt]), [[task.id, undefined]]);
   t.mock.timers.tick(2000);
   assert.deepEqual(next.sent, [], "still running");

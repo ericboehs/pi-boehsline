@@ -375,6 +375,8 @@ interface JobRecord {
 	quiet?: boolean;
 	/** Wake header text instead of the command (event-bus jobs). */
 	summary?: string;
+	/** Its name was given (the bash tool's `name`, a bg:start request), not guessed from the command: the wake leads with it. */
+	named?: boolean;
 	/** Per-job overrides of TAIL_LINES / TAIL_MAX_CHARS for the wake. */
 	tailLines?: number;
 	tailMaxChars?: number;
@@ -401,10 +403,10 @@ interface Job extends JobRecord {
 
 function toRecord(job: Job): JobRecord {
 	const { id, name, command, cwd, logPath, pid, pidStart, sessionId, startedAt, endedAt, exitCode, signal } = job;
-	const { exitUnknown, killedByUser, wakeOnKill, quiet, summary, tailLines, tailMaxChars, reported, adopted } = job;
+	const { exitUnknown, killedByUser, wakeOnKill, quiet, summary, named, tailLines, tailMaxChars, reported, adopted } = job;
 	return {
 		id, name, command, cwd, logPath, pid, pidStart, sessionId, startedAt, endedAt, exitCode, signal,
-		exitUnknown, killedByUser, wakeOnKill, quiet, summary, tailLines, tailMaxChars, reported, adopted,
+		exitUnknown, killedByUser, wakeOnKill, quiet, summary, named, tailLines, tailMaxChars, reported, adopted,
 		seenAt: Date.now(),
 	};
 }
@@ -449,6 +451,7 @@ function parseRecord(raw: unknown): JobRecord | undefined {
 		wakeOnKill: r.wakeOnKill === true,
 		quiet: r.quiet === true,
 		summary: optional(r.summary, (v): v is string => text(v, 10_000)),
+		named: r.named === true ? true : undefined,
 		tailLines: optional(r.tailLines, count),
 		tailMaxChars: optional(r.tailMaxChars, count),
 		reported: r.reported === true,
@@ -630,32 +633,177 @@ function registryIdOf(ctx: unknown): string | undefined {
 	}
 }
 
-/**
- * "bundle exec rspec spec/foo" -> "rspec". Best-effort label for the widget.
- * Skips shell keywords, wrappers, env assignments, and loop variables so that
- * e.g. `for i in $(seq 1 400); do echo ...` labels as "echo", not "for".
- */
-const LABEL_SKIP = new Set([
-	// shell control keywords
-	"for", "while", "until", "if", "then", "else", "elif", "fi", "do", "done", "in", "case", "esac",
-	// wrappers and runners that say nothing about the job
-	"sudo", "env", "time", "nohup", "exec", "command", "bundle", "npm", "npx", "pnpm", "yarn",
-	"run", "bin/rails", "rails", "mise", "asdf", "uv", "poetry", "bunx", "deno", "task", "just",
-]);
+/** A job's name: at most this many characters (the bash tool's `name`, or the guess below). */
+export const JOB_NAME_MAX = 40;
 
-function labelFor(command: string): string {
-	const words = command.trim().split(/\s+/);
-	for (const word of words) {
-		if (word.length < 2) continue; // loop vars like `i`
-		if (word.includes("=")) continue; // FOO=bar prefixes
-		if (!/^[A-Za-z0-9_.:/-]+$/.test(word)) continue; // $(seq, quotes, redirects
-		if (/^\d+$/.test(word)) continue; // bare numbers
-		if (LABEL_SKIP.has(word)) continue;
-		return path.basename(word).slice(0, 14);
+/** A given name as a job keeps it: one line, no control characters, at most JOB_NAME_MAX. */
+export function cleanJobName(raw: unknown): string | undefined {
+	if (typeof raw !== "string") return undefined;
+	const name = raw.replace(/[\p{Cc}\u2028\u2029\u200E\u200F\u202A-\u202E\u2066-\u2069]+/gu, " ").replace(/\s+/g, " ").trim();
+	if (!name) return undefined;
+	return name.length > JOB_NAME_MAX ? `${name.slice(0, JOB_NAME_MAX - 1)}…` : name;
+}
+
+// Steps that set up rather than do the work: a whole step starting with one is passed over.
+const LABEL_SETUP = new Set([
+	"cd", "pushd", "popd", "set", "export", "unset", "source", ".", "ulimit", "trap", "umask", "true", ":",
+	"sleep", "mkdir", "rm", "echo", "printf", "local", "declare", "typeset", "shopt", "alias",
+]);
+// Shell keywords: dropped from the front of a step (`do make`, `then rspec`); a loop or `if`
+// header step (`for i in …`, `while read l`) is passed over whole.
+const LABEL_KEYWORDS = new Set(["do", "then", "else", "elif", "{", "!", "time"]);
+const LABEL_HEADERS = new Set(["for", "while", "until", "if", "case", "select", "function", "done", "fi", "esac", "}"]);
+// Wrappers that say nothing about the job: skipped, with their own flags (and `timeout`'s duration).
+const LABEL_WRAPPERS = new Set([
+	"sudo", "env", "nohup", "exec", "command", "builtin", "nice", "caffeinate", "stdbuf", "timeout", "gtimeout",
+	"xcrun", "npx", "bunx", "pnpx", "dotenv", "op", "fnox",
+]);
+// Runners whose first word is the runner itself: `bundle exec rspec` -> rspec, `uv run pytest` -> pytest.
+const LABEL_RUNNERS: Record<string, Set<string>> = {
+	bundle: new Set(["exec"]),
+	mise: new Set(["exec", "x", "run"]),
+	uv: new Set(["run"]),
+	poetry: new Set(["run"]),
+	pipenv: new Set(["run"]),
+	pnpm: new Set(["exec", "dlx"]),
+	yarn: new Set(["exec", "dlx"]),
+	asdf: new Set(["exec"]),
+	rbenv: new Set(["exec"]),
+};
+// Scripts runners whose script name says what runs: `npm run build` keeps all three words.
+const LABEL_SCRIPT_RUNNERS = new Set(["npm", "pnpm", "yarn", "bun"]);
+
+const LABEL_WORD = /^[A-Za-z0-9_.:/@%+,=~-]+$/;
+
+/** The steps of a command, split at unquoted `&&`, `||`, `;`, `|`, `&` and newlines; each step's words. */
+function labelSteps(command: string): string[][] {
+	const steps: string[][] = [];
+	let words: string[] = [];
+	let word = "";
+	let quote: string | undefined;
+	let depth = 0;
+	const flushWord = () => {
+		if (word) words.push(word);
+		word = "";
+	};
+	const flushStep = () => {
+		flushWord();
+		if (words.length) steps.push(words);
+		words = [];
+	};
+	for (let i = 0; i < command.length; i++) {
+		const c = command[i]!;
+		if (quote) {
+			if (c === quote) quote = undefined;
+			word += c;
+			continue;
+		}
+		if (c === "'" || c === '"' || c === "`") {
+			quote = c;
+			word += c;
+			continue;
+		}
+		if (c === "\\" && i + 1 < command.length) {
+			if (command[i + 1] !== "\n") word += command[i]! + command[i + 1]!;
+			i++;
+			continue;
+		}
+		if (c === "$" && command[i + 1] === "(") depth++;
+		if (depth > 0) {
+			if (c === ")") depth--;
+			word += c;
+			continue;
+		}
+		if (c === " " || c === "\t") {
+			flushWord();
+			continue;
+		}
+		if (c === ";" || c === "|" || c === "&" || c === "\n" || c === "(" || c === ")") {
+			flushStep();
+			continue;
+		}
+		word += c;
 	}
-	// Nothing looked like a program name; fall back to the first token that is
-	// at least not an environment assignment.
-	return words.find((word) => !word.includes("="))?.slice(0, 14) ?? "job";
+	flushStep();
+	return steps;
+}
+
+/**
+ * A job's name when none is given: the first step that does the work, as its program and first
+ * argument ("bin/check --ios", "simctl create", "npm run build", "rspec spec/models"). Leading
+ * `cd dir &&`, `set -e;`, env assignments, `timeout 60`, `sudo`, `bundle exec`, `xcrun` and shell
+ * keywords are passed over. At most JOB_NAME_MAX characters.
+ */
+export function labelFor(command: string): string {
+	const label = (words: string[], allowSetup = false): string | undefined => {
+		let i = 0;
+		const skipFlags = (withValue = false) => {
+			while (i < words.length && (words[i]!.startsWith("-") || (withValue && /^\d+(?:\.\d+)?[smhd]?$/.test(words[i]!)))) i++;
+		};
+		while (i < words.length) {
+			const w = words[i]!;
+			if (LABEL_KEYWORDS.has(w)) {
+				i++;
+				continue;
+			}
+			if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) {
+				i++;
+				continue;
+			}
+			if (LABEL_WRAPPERS.has(path.basename(w))) {
+				const name = path.basename(w);
+				if (name === "op" || name === "fnox") {
+					// `op run --env-file x -- cmd`, `fnox exec -- cmd`: the command after `--`; `op read` is op's own work.
+					const dd = words.indexOf("--", i + 1);
+					if (dd < 0) break;
+					i = dd + 1;
+					continue;
+				}
+				i++;
+				skipFlags(name === "timeout" || name === "gtimeout" || name === "nice");
+				if (name === "env") while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!)) i++;
+				continue;
+			}
+			const runner = LABEL_RUNNERS[path.basename(w)];
+			if (runner && words[i + 1] && runner.has(words[i + 1]!)) {
+				i += 2;
+				skipFlags();
+				if (words[i] === "--") i++;
+				continue;
+			}
+			break;
+		}
+		const program = words[i];
+		if (!program || LABEL_HEADERS.has(program) || (!allowSetup && LABEL_SETUP.has(program))) return undefined;
+		if (!LABEL_WORD.test(program)) return undefined;
+		// An absolute program is its basename; a relative one (bin/check, ./run) keeps its path.
+		const shown = program.startsWith("/") ? path.basename(program) : program.replace(/^\.\//, "");
+		const parts = [shown];
+		let j = i + 1;
+		if (LABEL_SCRIPT_RUNNERS.has(path.basename(program)) && ["run", "run-script", "exec", "x"].includes(words[j] ?? "")) {
+			parts.push(words[j]!);
+			j++;
+		}
+		const arg = words[j];
+		if (arg && LABEL_WORD.test(arg) && !/^[<>]/.test(arg)) parts.push(arg.length > 24 ? path.basename(arg) : arg);
+		return parts.join(" ");
+	};
+	const steps = labelSteps(command.trim());
+	for (const words of steps) {
+		const found = label(words);
+		if (found) return found.length > JOB_NAME_MAX ? `${found.slice(0, JOB_NAME_MAX - 1)}…` : found;
+	}
+	// Only setup steps (`sleep 30`, `cd /tmp`, a loop of echoes): the first of those.
+	for (const words of steps) {
+		const found = label(words, true);
+		if (found) return found.length > JOB_NAME_MAX ? `${found.slice(0, JOB_NAME_MAX - 1)}…` : found;
+	}
+	// Nothing looked like a program: the first plain word that isn't an assignment.
+	for (const words of steps) {
+		const word = words.find((w) => !w.includes("=") && LABEL_WORD.test(w));
+		if (word) return path.basename(word).slice(0, JOB_NAME_MAX);
+	}
+	return "job";
 }
 
 function humanDuration(ms: number): string {
@@ -1257,6 +1405,8 @@ export default function (pi: ExtensionAPI) {
 			quiet?: boolean;
 			ctx?: unknown;
 			name?: string;
+			/** The command to guess a name from, when it isn't `command` (the foreground race's has pi's prefix in front). */
+			label?: string;
 			summary?: string;
 			tailLines?: number;
 			tailMaxChars?: number;
@@ -1289,7 +1439,8 @@ export default function (pi: ExtensionAPI) {
 		);
 		const job: Job = {
 			id,
-			name: opts.name?.slice(0, 20) || labelFor(command),
+			name: cleanJobName(opts.name) ?? labelFor(opts.label ?? command),
+			named: cleanJobName(opts.name) ? true : undefined,
 			command,
 			cwd,
 			logPath,
@@ -1668,7 +1819,7 @@ export default function (pi: ExtensionAPI) {
 		const oneLine = maskDiffSecrets((job.summary ?? job.command).replace(/\s+/g, " ").trim());
 		const command = oneLine.length > 80 ? `${oneLine.slice(0, 79)}…` : oneLine;
 		const header =
-			`[bg ${job.id}] \`${command}\` ${outcome}${when}\n` +
+			`[bg ${job.id}] ${job.named && !job.summary ? `${job.name} · ` : ""}\`${command}\` ${outcome}${when}\n` +
 			`log: ${job.logPath} (${lines} line${lines === 1 ? "" : "s"})`;
 		// Report what was actually included, not the configured cap: a capped tail
 		// otherwise reads as if the job started partway through.
@@ -1781,14 +1932,19 @@ export default function (pi: ExtensionAPI) {
 						"Run detached; returns a job id immediately and notifies on completion",
 				}),
 			),
+			name: Type.Optional(
+				Type.String({
+					description: `Short label for a background job (≤${JOB_NAME_MAX} chars), shown in /bg, its completion and Botsun`,
+				}),
+			),
 		}),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const input = params as { command: string; timeout?: number; background?: boolean };
+			const input = params as { command: string; timeout?: number; background?: boolean; name?: string };
 			// Follow the session, not the launch directory.
 			const cwd = (ctx as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 
 			if (input.background) {
-				const { job } = await start(input.command, cwd, { ctx });
+				const { job } = await start(input.command, cwd, { ctx, name: input.name });
 				if (job.endedAt !== undefined && job.exitCode === 127) {
 					return {
 						content: [{ type: "text", text: `bg job failed to start; see ${job.logPath}` }],
@@ -1835,7 +1991,7 @@ export default function (pi: ExtensionAPI) {
 			const budgetSecs = FG_TIMEOUT_SECS;
 			const prefix = shellCommandPrefix(cwd);
 			const command = prefix ? `${prefix}\n${input.command}` : input.command;
-			const { job, exited } = await start(command, cwd, { quiet: true, ctx });
+			const { job, exited } = await start(command, cwd, { quiet: true, ctx, name: input.name, label: input.command });
 
 			// Stream the job log into partial tool updates so live output in the
 			// TUI matches the built-in tool.

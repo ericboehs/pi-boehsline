@@ -6,11 +6,19 @@ Adds `background: true` to the Bash tool and automatically
 backgrounds commands that exceed the foreground budget without an explicit
 timeout. Explicit foreground timeouts remain hard deadlines.
 
+A job's name is the bash tool's `name` (a short label, at most 40 characters, control characters
+dropped) when given; it leads the completion message too. Without one, it is guessed from the
+command: the first step that does the work, as its program and first argument (`cd ios && xcrun
+simctl create Foo` is `simctl create`, `set -e; timeout 600 bundle exec rspec spec/models` is
+`rspec spec/models`), past `cd`, `set`, env assignments, `timeout N`, `sudo`, `bundle exec`, `uv
+run`, `op run --` and shell keywords. The widget, `/bg`, `bg:jobs`/`bg:list` (the canvas card,
+and Botsun through it) all show the same `name`.
+
 Running background jobs appear in a compact widget **above the prompt**, not
 in the footer:
 
 ```text
-● 2 background jobs · rspec 1m12s · vite 12s · /bg
+● 2 background jobs · rspec spec/models 1m12s · vite 12s · /bg
 ```
 
 The widget updates elapsed times without waking the model, shows up to three
