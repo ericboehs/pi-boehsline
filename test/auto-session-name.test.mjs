@@ -412,3 +412,67 @@ test("parseNamingReply lands no name from a broken JSON reply when it asked for 
   assert.equal(parseNamingReply("Cactus Winter Keeper").name, "Cactus Winter Keeper");
   assert.equal(parseNamingReply("Cactus Winter Keeper", CATALOG).name, "Cactus Winter Keeper");
 });
+
+test("a quiet miss (no naming model) tries again on a later turn, up to the cap, without a warning", async () => {
+  const s = stubPi();
+  let name;
+  s.pi.getSessionName = () => name;
+  s.pi.setSessionName = (next) => {
+    name = next;
+  };
+  const notes = [];
+  const branch = [{ type: "message", message: { role: "user", content: "my cactus keeps dying" } }];
+  const ctx = (models) => ({
+    hasUI: true,
+    ui: { notify: (...a) => notes.push(a), setStatus: () => {}, setWidget: () => {} },
+    sessionManager: { getBranch: () => branch },
+    modelRegistry: fakeRegistry(models, { "opencode-go/deepseek-v4.1-flash": { stopReason: "stop", content: [{ type: "text", text: "Cactus Winter Keeper" }] } }),
+  });
+  autoSessionName(s.pi);
+  await s.fire("agent_settled", {}, ctx([]));
+  assert.equal(name, undefined, "no model with credentials: no name yet");
+  await s.fire("agent_settled", {}, ctx([{ provider: "opencode-go", id: "deepseek-v4.1-flash" }]));
+  assert.equal(name, "Cactus Winter Keeper", "the next settle, with credentials, names it");
+  assert.deepEqual(notes, [], "quiet misses never warn");
+
+  // Three quiet misses and it stops trying.
+  const t = stubPi();
+  let other;
+  t.pi.getSessionName = () => other;
+  t.pi.setSessionName = (next) => {
+    other = next;
+  };
+  autoSessionName(t.pi);
+  for (let i = 0; i < 3; i++) await t.fire("agent_settled", {}, ctx([]));
+  await t.fire("agent_settled", {}, ctx([{ provider: "opencode-go", id: "deepseek-v4.1-flash" }]));
+  assert.equal(other, undefined, "gave up after MAX_AUTO_FAILURES quiet misses");
+});
+
+test("the name is asked for at the first assistant reply with text, not only at settle", async () => {
+  const s = stubPi();
+  let name;
+  s.pi.getSessionName = () => name;
+  s.pi.setSessionName = (next) => {
+    name = next;
+  };
+  let asked = 0;
+  const reg = {
+    ...fakeRegistry([{ provider: "opencode-go", id: "deepseek-v4.1-flash" }], {}),
+    complete: async () => (asked++, { stopReason: "stop", content: [{ type: "text", text: "Cactus Winter Keeper" }] }),
+  };
+  const ctx = {
+    hasUI: true,
+    ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+    sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", content: "my cactus keeps dying" } }] },
+    modelRegistry: reg,
+  };
+  autoSessionName(s.pi);
+  await s.fire("message_end", { message: { role: "user", content: "hi" } }, ctx);
+  await s.fire("message_end", { message: { role: "assistant", content: [{ type: "toolCall", name: "read" }] } }, ctx);
+  assert.equal(asked, 0, "a user message or a tool-call-only reply doesn't trigger it");
+  await s.fire("message_end", { message: { role: "assistant", content: [{ type: "text", text: "Let me look." }] } }, ctx);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(name, "Cactus Winter Keeper");
+  await s.fire("agent_settled", {}, ctx);
+  assert.equal(asked, 1, "asked once: settle doesn't ask again");
+});

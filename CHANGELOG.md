@@ -37,6 +37,7 @@
 
 ### Fixed
 
+- auto-session-name: a quiet miss (no naming model with credentials, as in a window started without them, or the session's own model failing) no longer ends automatic naming for the session: it counts as a failure, so a later turn tries again, up to the same 3 tries and still without a warning. The name is also asked for as soon as the first assistant reply with text is in (not awaited, the turn goes on), rather than only when the turn settles; settle still tries when that didn't happen.
 - memory: the session's memory block and every memory listing keep path-like placeholders such as `~/Code/<host>/<org>/<repo>`, `<pid>.json` and `<YYYY-MM-DD>` readable only when the name is in a closed placeholders allowlist; everything else, including bare `<important>`, `<note>`, `<override>`, wrapper tags (memory, pins, untrusted, skills, project_context, system_reminder), prompt tags and HTML tags, is still defused through the same `oneLine`.
 - cursor-agent: `runCursor` without an `onEvent` callback never read cursor-agent's output (`onEvent?.(run, run.feed(…))` skipped the feed), so the answer and steps were empty.
 - subagent: an answer over the 50 KB cap keeps its `[N bytes over cap omitted]` note; the cut used to remove the note along with the excess.

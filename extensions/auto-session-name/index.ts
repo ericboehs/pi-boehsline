@@ -421,7 +421,9 @@ export default function (pi: ExtensionAPI) {
     if (isUserGivenName(name)) attempted = true;
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
+  // One automatic try per fresh session (a few on real failures): as soon as the first assistant
+  // reply with text is in, so the name doesn't wait for the whole turn, else when the turn settles.
+  async function autoName(ctx: ExtensionContext): Promise<void> {
     if (process.env.PI_AUTO_NAME === "0") return;
     if (attempted || isUserGivenName(pi.getSessionName())) {
       attempted = true;
@@ -433,17 +435,31 @@ export default function (pi: ExtensionAPI) {
       if (title) failures = 0;
       else attempted = false;
     } catch (e) {
-      // Nothing to ask (no naming model, no session model with credentials),
-      // or only the session's own model and it couldn't: not worth a
-      // warning, and retrying won't change it. /auto-name still reports it.
-      if ((e as Error).message === NO_NAMING_MODEL || (e as { quiet?: boolean }).quiet) return;
-      // Retry on later turns, but stop hammering providers that keep refusing.
+      // A quiet miss (no naming model with credentials here, say a window started without them,
+      // or only the session's own model and it couldn't) is still a miss: a later turn tries
+      // again, up to MAX_AUTO_FAILURES, without a warning. /auto-name still reports it.
       failures += 1;
       attempted = failures >= MAX_AUTO_FAILURES;
+      if ((e as Error).message === NO_NAMING_MODEL || (e as { quiet?: boolean }).quiet) return;
+      // Stop hammering providers that keep refusing, and say so once.
       if (attempted && ctx.hasUI) {
         ctx.ui.notify(`auto-name gave up: ${(e as Error).message}`, "warning");
       }
     }
+  }
+
+  pi.on("message_end", (event, ctx) => {
+    const m = (event as { message?: { role?: string; content?: unknown } }).message;
+    if (m?.role !== "assistant" || attempted) return;
+    const content = m.content;
+    const text = typeof content === "string" ? content : Array.isArray(content) ? content.filter((b) => b?.type === "text").map((b) => b.text ?? "").join("") : "";
+    if (!text.trim()) return;
+    // Not awaited: the turn goes on while the name is asked for.
+    void autoName(ctx).catch(() => {});
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    await autoName(ctx);
   });
 
   pi.registerCommand("auto-name", {
