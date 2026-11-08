@@ -10,6 +10,7 @@
 
 import { commit, type GitResult } from "./git.ts";
 import { duplicate } from "./dedupe.ts";
+import { VERIFIED_STATUSES, type Verified, type VerifiedStatus } from "./frontmatter.ts";
 import { type Qmd, qmdClient } from "./qmd.ts";
 import { type Block, oneLine, render } from "./render.ts";
 import { refusal, type Scanner, scanner } from "./scan.ts";
@@ -65,27 +66,68 @@ export function scopeFor(kind: string | undefined, slug: string | null): string 
 	throw new MemoryError(`unknown scope ${kind}: use global or project`);
 }
 
-export function remember(mem: Memories, input: { text: string; tags?: readonly string[]; scope: string; source: Source; confidence?: store.Confidence }): Written {
+export function remember(mem: Memories, input: { text: string; tags?: readonly string[]; scope: string; source: Source; confidence?: store.Confidence; expires?: string }): Written {
 	const text = store.cleanText(input.text);
 	const tags = store.normalizeTags(input.tags ?? []);
+	const expires = input.expires === undefined ? undefined : store.cleanExpires(input.expires);
 	check(mem, text, tags.join(" "));
-	const existing = store.load(mem.root).memories.filter((m) => m.state !== "archived");
+	const existing = store.load(mem.root).memories.filter((m) => m.state !== "archived" && !store.expired(m));
 	const same = duplicate(text, input.scope, existing);
 	if (same) throw new MemoryError(`already saved as ${same.id} (use memory_update to change it, or forget it first)`);
-	const memory = store.write(mem.root, { scope: input.scope, text, tags, source: input.source, confidence: input.confidence });
+	const memory = store.write(mem.root, { scope: input.scope, text, tags, source: input.source, confidence: input.confidence, ...(expires ? { expires } : {}) });
 	return { memory, committed: after(mem, `${input.source.kind} ${memory.id}`) };
 }
 
-export function update(mem: Memories, id: string, text: string, tags?: readonly string[]): Written {
-	const clean = store.cleanText(text);
-	check(mem, clean, ...(tags ? [store.normalizeTags(tags).join(" ")] : []));
+/**
+ * Replace a fact's text and/or tags and/or expiry. `text === undefined` leaves
+ * the text as it is (so a review can add an expiry to a time-bound fact without
+ * retyping it); `expires: null` clears it.
+ */
+export function update(mem: Memories, id: string, text: string | undefined, tags?: readonly string[], change: { expires?: string | null } = {}): Written {
+	if (text === undefined && tags === undefined && change.expires === undefined) throw new MemoryError("nothing to change");
+	const clean = text === undefined ? undefined : store.cleanText(text);
+	const normTags = tags === undefined ? undefined : store.normalizeTags(tags);
+	check(mem, ...(clean !== undefined ? [clean] : []), ...(normTags !== undefined ? [normTags.join(" ")] : []));
 	const current = store.find(mem.root, id);
 	if (!current || current.state === "archived") throw new MemoryError(`no memory ${id}${current ? " (it is archived; restore it first)" : ""}`);
-	const others = store.load(mem.root).memories.filter((m) => m.state !== "archived" && m.id !== id);
-	const same = duplicate(clean, current.scope, others);
-	if (same) throw new MemoryError(`that would duplicate ${same.id}; forget one of them instead`);
-	const memory = store.update(mem.root, id, { text: clean, tags });
+	if (clean !== undefined) {
+		const others = store.load(mem.root).memories.filter((m) => m.state !== "archived" && m.id !== id && !store.expired(m));
+		const same = duplicate(clean, current.scope, others);
+		if (same) throw new MemoryError(`that would duplicate ${same.id}; forget one of them instead`);
+	}
+	const memory = store.update(mem.root, id, {
+		...(clean !== undefined ? { text: clean } : {}),
+		...(normTags !== undefined ? { tags: normTags } : {}),
+		...(change.expires !== undefined ? { expires: change.expires === null ? null : store.cleanExpires(change.expires) } : {}),
+	});
 	return { memory, committed: after(mem, `update ${id}`) };
+}
+
+/**
+ * Record how a fact was checked against the sessions it came from: when, what
+ * came of it, by what (a model id or "user"), and the evidence. The evidence is
+ * scanned like any other write and only then cut at MAX_EVIDENCE, so a secret
+ * straddling the cut is still refused (and never written in part).
+ */
+export function verify(mem: Memories, id: string, input: { status: string; evidence: string; by: string; now?: Date }): Written {
+	if (!(VERIFIED_STATUSES as readonly string[]).includes(input.status)) throw new MemoryError(`status is one of ${VERIFIED_STATUSES.join(", ")}`);
+	const raw = (typeof input.evidence === "string" ? input.evidence : "").trim();
+	check(mem, raw);
+	const evidence = raw.slice(0, store.MAX_EVIDENCE);
+	const verified: Verified = { at: store.isoLocal(input.now), status: input.status as VerifiedStatus, by: input.by, evidence };
+	const memory = store.verify(mem.root, id, verified);
+	return { memory, committed: after(mem, `verify ${id} ${verified.status}`) };
+}
+
+/** Archive every active fact whose `expires` day has passed, one commit each ("expire <id>"). */
+export async function expire(mem: Memories, now = new Date()): Promise<Memory[]> {
+	const stale = store.load(mem.root).memories.filter((m) => m.state === "active" && store.expired(m, now));
+	const out: Memory[] = [];
+	for (const m of stale) {
+		out.push(store.archive(mem.root, m.id, now));
+		await after(mem, `expire ${m.id}`);
+	}
+	return out;
 }
 
 export function forget(mem: Memories, id: string): Written {
@@ -139,7 +181,7 @@ export async function search(mem: Memories, query: string, opts: { scope?: Searc
 	if (opts.limit !== undefined && !Number.isFinite(opts.limit)) throw new MemoryError("limit must be a number");
 	const limit = Math.max(1, Math.min(50, Math.trunc(opts.limit ?? 10)));
 	if (scope === "project" && !opts.slug) throw new MemoryError("no project scope here: this folder has no git origin remote");
-	const pool = store.load(mem.root).memories.filter((m) => m.state === "active" && inScope(m, scope, opts.slug) && mem.scanner.scan(m.text).ok);
+	const pool = store.load(mem.root).memories.filter((m) => m.state === "active" && !store.expired(m) && inScope(m, scope, opts.slug) && mem.scanner.scan(m.text).ok);
 	const byId = new Map(pool.map((m) => [m.id, m]));
 	const builtin = builtinSearch(query, pool, limit).map((h) => h.memory);
 	const q = await mem.qmd.query(query, limit * 2, mem.settings.search.collections);

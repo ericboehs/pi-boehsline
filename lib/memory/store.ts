@@ -16,17 +16,19 @@
  * Pure node: no pi imports.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, sep } from "node:path";
-import { type Fields, parse, serialize } from "./frontmatter.ts";
+import { type Fields, parse, parseDay, parseVerified, serialize, type Verified, verifiedField } from "./frontmatter.ts";
 import { gitInit } from "./git.ts";
 
 export const ID = /^m-\d{8}-[a-z0-9]{4,}$/;
 const SLUG_SEGMENT = /^[a-z0-9_][a-z0-9._-]*$/;
 export const MAX_TEXT = 1000;
 export const MAX_TAGS = 8;
+/** The longest `verified.evidence` a write keeps. */
+export const MAX_EVIDENCE = 300;
 export const MAX_PINS = 50;
 export const ARCHIVE_DAYS = 30;
 const MAX_FILE_BYTES = 64 * 1024;
@@ -57,6 +59,10 @@ export interface Memory {
 	tags: string[];
 	text: string;
 	botsun_id?: number;
+	/** YYYY-MM-DD: the fact is in force through that day, local time. */
+	expires?: string;
+	/** The last review of the fact against the sessions it came from. */
+	verified?: Verified;
 	/** When it was archived (archive/ only). */
 	archived?: string;
 	state: State;
@@ -84,6 +90,35 @@ export function isoLocal(d = new Date()): string {
 	const pad = (n: number) => String(Math.trunc(Math.abs(n))).padStart(2, "0");
 	const off = -d.getTimezoneOffset();
 	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${off >= 0 ? "+" : "-"}${pad(off / 60)}:${pad(off % 60)}`;
+}
+
+/** The local calendar day of `d`, YYYY-MM-DD. */
+export function dayOf(d = new Date()): string {
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/**
+ * A fact's version: a short hash of the content a review checks (text and
+ * expiry), recorded as `verified.of` when it is verified. `updated` can't serve:
+ * it has second precision, so a verification and an edit in the same second
+ * would read as unchanged and the fact would never be reviewed again.
+ */
+export function version(m: { text: string; expires?: string }): string {
+	return createHash("sha256").update(m.text).update("\u0000").update(m.expires ?? "").digest("hex").slice(0, 12);
+}
+
+/** A fact with `expires` is in force through that day, local time; after it, it is expired. */
+export function expired(m: { expires?: string }, now = new Date()): boolean {
+	return !!m.expires && dayOf(now) > m.expires;
+}
+
+/** A `--expires` value: a real day, today or later (a fact can end today). */
+export function cleanExpires(v: unknown, now = new Date()): string {
+	const day = parseDay(v);
+	if (!day) throw new MemoryError("expires is a day, YYYY-MM-DD");
+	if (day < dayOf(now)) throw new MemoryError(`expires ${day} is already past; leave it out for a fact with no end`);
+	return day;
 }
 
 export function newId(now = new Date()): string {
@@ -195,6 +230,8 @@ function fieldsOf(m: Omit<Memory, "path" | "state" | "text">): Fields {
 	for (const k of ["session", "cwd", "model"] as const) if (m.source[k]) source[k] = m.source[k];
 	const fields: Fields = { id: m.id, scope: m.scope, created: m.created, updated: m.updated, source, confidence: m.confidence, tags: m.tags };
 	if (m.botsun_id !== undefined) fields.botsun_id = m.botsun_id;
+	if (m.expires) fields.expires = m.expires;
+	if (m.verified) fields.verified = verifiedField(m.verified);
 	if (m.archived) fields.archived = m.archived;
 	return fields;
 }
@@ -214,6 +251,8 @@ export function fromText(text: string, path: string, state: State): Memory | nul
 	const kind = KINDS.includes(src.kind as SourceKind) ? (src.kind as SourceKind) : "cli";
 	const confidence = CONFIDENCE.includes(f.confidence as Confidence) ? (f.confidence as Confidence) : "stated";
 	const created = str(f.created) ?? "";
+	const expires = parseDay(f.expires);
+	const verified = parseVerified(f.verified);
 	return {
 		id,
 		scope: f.scope,
@@ -224,6 +263,8 @@ export function fromText(text: string, path: string, state: State): Memory | nul
 		tags: normalizeTags(Array.isArray(f.tags) ? f.tags : []),
 		text: parsed.body.trim(),
 		...(typeof f.botsun_id === "number" ? { botsun_id: f.botsun_id } : {}),
+		...(expires ? { expires } : {}),
+		...(verified ? { verified } : {}),
 		...(str(f.archived) ? { archived: str(f.archived) } : {}),
 		state,
 		path,
@@ -333,6 +374,8 @@ export interface NewMemory {
 	source: Source;
 	confidence?: Confidence;
 	botsun_id?: number;
+	/** YYYY-MM-DD; checked here, so a bad or past day never reaches a file. */
+	expires?: string;
 	now?: Date;
 }
 
@@ -346,7 +389,18 @@ export function write(root: string, input: NewMemory): Memory {
 	let id = newId(now);
 	for (let i = 0; i < 5 && existsFile(join(dir, `${id}.md`)); i++) id = newId(now);
 	const iso = isoLocal(now);
-	const base = { id, scope: input.scope, created: iso, updated: iso, source: input.source, confidence, tags: normalizeTags(input.tags ?? []), ...(input.botsun_id !== undefined ? { botsun_id: input.botsun_id } : {}) };
+	const expires = input.expires === undefined ? undefined : cleanExpires(input.expires, now);
+	const base = {
+		id,
+		scope: input.scope,
+		created: iso,
+		updated: iso,
+		source: input.source,
+		confidence,
+		tags: normalizeTags(input.tags ?? []),
+		...(input.botsun_id !== undefined ? { botsun_id: input.botsun_id } : {}),
+		...(expires ? { expires } : {}),
+	};
 	const path = join(dir, `${id}.md`);
 	if (existsFile(path)) throw new MemoryError("id collision; try again");
 	atomicWrite(path, serialize(fieldsOf(base), text));
@@ -372,16 +426,31 @@ function rewrite(root: string, m: Memory, from?: string): Memory {
 	return { ...m, path };
 }
 
-export function update(root: string, id: string, patch: { text?: string; tags?: readonly string[]; now?: Date }): Memory {
+export function update(root: string, id: string, patch: { text?: string; tags?: readonly string[]; expires?: string | null; now?: Date }): Memory {
 	const m = find(root, id);
 	if (!m || m.state === "archived") throw new MemoryError(`no memory ${id}${m ? " (it is archived; restore it first)" : ""}`);
+	const now = patch.now ?? new Date();
 	const next: Memory = {
 		...m,
 		text: patch.text !== undefined ? cleanText(patch.text) : m.text,
 		tags: patch.tags !== undefined ? normalizeTags(patch.tags) : m.tags,
-		updated: isoLocal(patch.now),
+		updated: isoLocal(now),
 	};
+	if (patch.expires === null) delete next.expires;
+	else if (patch.expires !== undefined) next.expires = cleanExpires(patch.expires, now);
 	return rewrite(root, next, m.path);
+}
+
+/**
+ * Record a review of `id`, leaving `updated` alone: a verification is not a
+ * change to the fact, and changing the fact is what makes it due again. The
+ * version checked is recorded here, from the file as it is now, so the caller
+ * can't record one it didn't see.
+ */
+export function verify(root: string, id: string, verified: Verified): Memory {
+	const m = find(root, id);
+	if (!m || m.state === "archived") throw new MemoryError(`no memory ${id}${m ? " (it is archived; restore it first)" : ""}`);
+	return rewrite(root, { ...m, verified: { ...verified, of: version(m) } }, m.path);
 }
 
 export function archive(root: string, id: string, now = new Date()): Memory {
@@ -390,10 +459,16 @@ export function archive(root: string, id: string, now = new Date()): Memory {
 	return rewrite(root, { ...m, state: "archived", archived: isoLocal(now) }, m.path);
 }
 
+/**
+ * Bring an archived fact back. `expires` is dropped: a fact archived because its
+ * day passed would otherwise come back active but expired — invisible, and
+ * archived again by the next `expire`. A restored fact has no end until one is
+ * set again.
+ */
 export function restore(root: string, id: string): Memory {
 	const m = find(root, id);
 	if (!m || m.state !== "archived") throw new MemoryError(m ? `${id} is not archived` : `no archived memory ${id}`);
-	const { archived: _gone, ...rest } = m;
+	const { archived: _gone, expires: _expired, ...rest } = m;
 	return rewrite(root, { ...rest, state: rest.confidence === "inferred" ? "proposed" : "active" }, m.path);
 }
 

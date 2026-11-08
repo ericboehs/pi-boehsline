@@ -4,12 +4,71 @@
  * a flow list (`[a, "b c"]`) or one level of flow map (`{ kind: cli, cwd: "~/x" }`).
  * A ` #` comment after a plain value is dropped, so hand-edited files keep working.
  *
+ * Two of the fields a memory may carry have a shape of their own and are
+ * checked here rather than left as loose text: `expires` (a YYYY-MM-DD day, the
+ * fact is in force through it) and `verified` (a one-level flow map recording
+ * the review that checked the fact against the sessions it came from). Both are
+ * optional; a file without them parses as it always did.
+ *
  * Pure node: no pi imports.
  */
 
 export type Scalar = string | number | boolean | null;
 export type Value = Scalar | Scalar[] | Record<string, Scalar>;
 export type Fields = Record<string, Value>;
+
+export const VERIFIED_STATUSES = ["confirmed", "contradicted", "unverifiable"] as const;
+export type VerifiedStatus = (typeof VERIFIED_STATUSES)[number];
+
+/** How a fact was checked: when, how it came out, by what, and the short evidence. */
+export interface Verified {
+	/** ISO time of the check. */
+	at: string;
+	status: VerifiedStatus;
+	/** The model id that checked it, or `user`. */
+	by: string;
+	/** Session id(s) and one line of why, at most a few hundred characters. */
+	evidence: string;
+	/**
+	 * The fact's version when it was checked (store.version: a short hash of its
+	 * text and expiry), so "changed since verification" doesn't depend on the
+	 * second-precision `updated`. Absent in files written before it existed.
+	 */
+	of?: string;
+}
+
+const DAY = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/** A real calendar day written YYYY-MM-DD, or undefined. */
+export function parseDay(v: unknown): string | undefined {
+	if (typeof v !== "string") return undefined;
+	const m = DAY.exec(v.trim());
+	if (!m) return undefined;
+	const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+	const t = new Date(Date.UTC(y, mo - 1, d));
+	return t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === d ? v.trim() : undefined;
+}
+
+/** The `verified` map, when it holds a known status and a real time; undefined otherwise. */
+export function parseVerified(v: unknown): Verified | undefined {
+	if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+	const m = v as Record<string, unknown>;
+	const status = m.status;
+	if (typeof status !== "string" || !(VERIFIED_STATUSES as readonly string[]).includes(status)) return undefined;
+	if (typeof m.at !== "string" || !Number.isFinite(Date.parse(m.at))) return undefined;
+	return {
+		at: m.at,
+		status: status as VerifiedStatus,
+		by: typeof m.by === "string" ? m.by : "",
+		evidence: typeof m.evidence === "string" ? m.evidence : "",
+		...(typeof m.of === "string" && m.of ? { of: m.of } : {}),
+	};
+}
+
+/** The flow map a `verified` field is written as. */
+export function verifiedField(v: Verified): Record<string, Scalar> {
+	return { at: v.at, status: v.status, by: v.by, evidence: v.evidence, ...(v.of ? { of: v.of } : {}) };
+}
 
 export interface Parsed {
 	fields: Fields;

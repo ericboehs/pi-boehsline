@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parse, serialize } from "../lib/memory/frontmatter.ts";
+import { parse, parseDay, parseVerified, serialize, VERIFIED_STATUSES, verifiedField } from "../lib/memory/frontmatter.ts";
 
 test("front matter round-trips scalars, flow lists and one flow map", () => {
 	const fields = {
@@ -56,4 +56,41 @@ test("not front matter: no opening, no closing, bad lines, bad values", () => {
 test("serialize refuses keys that would break the format", () => {
 	assert.throws(() => serialize({ "bad key": "x" }, "b"));
 	assert.throws(() => serialize({ source: { "a:b": "x" } }, "b"));
+});
+
+test("expires and verified round-trip, and a file without them parses unchanged", () => {
+	const verified = { at: "2026-11-08T03:30:12-06:00", status: "confirmed", by: "opencode-go/deepseek-v4.1-flash", evidence: 'session 0b1c: said "twice", with a comma, a: colon and {braces}' };
+	const fields = {
+		id: "m-20261107-k3f9",
+		scope: "global",
+		expires: "2026-11-09",
+		verified: verifiedField(verified),
+		confidence: "stated",
+		tags: [],
+	};
+	const text = serialize(fields, "The widget freeze runs through Sunday.");
+	const back = parse(text);
+	assert.deepEqual(back?.fields, fields);
+	assert.deepEqual(parseVerified(back?.fields.verified), verified);
+	assert.equal(parseDay(back?.fields.expires), "2026-11-09");
+	assert.equal(text.split("\n").find((l) => l.startsWith("verified:")), `verified: { at: ${verified.at}, status: confirmed, by: opencode-go/deepseek-v4.1-flash, evidence: ${JSON.stringify(verified.evidence)} }`);
+
+	// An old file, written before either field existed.
+	const old = parse("---\nid: m-20261107-old1\nscope: global\nconfidence: stated\n---\nAn older fact.\n");
+	assert.deepEqual(old?.fields, { id: "m-20261107-old1", scope: "global", confidence: "stated" });
+	assert.equal(parseDay(old?.fields.expires), undefined);
+	assert.equal(parseVerified(old?.fields.verified), undefined);
+});
+
+test("days are real calendar days; a verified map needs a known status and a real time", () => {
+	assert.equal(parseDay("2026-11-09"), "2026-11-09");
+	assert.equal(parseDay(" 2026-11-09 "), "2026-11-09");
+	for (const bad of ["2026-02-30", "2026-13-01", "2026-1-9", "9 Nov 2026", "20261109", "", null, 20261109]) assert.equal(parseDay(bad), undefined, JSON.stringify(bad));
+	const at = "2026-11-08T03:30:12-06:00";
+	for (const status of VERIFIED_STATUSES) assert.equal(parseVerified({ at, status })?.status, status);
+	assert.equal(parseVerified({ at, status: "maybe" }), undefined);
+	assert.equal(parseVerified({ at: "yesterday", status: "confirmed" }), undefined);
+	assert.equal(parseVerified({ status: "confirmed" }), undefined);
+	assert.equal(parseVerified("confirmed"), undefined);
+	assert.deepEqual(parseVerified({ at, status: "confirmed" }), { at, status: "confirmed", by: "", evidence: "" });
 });

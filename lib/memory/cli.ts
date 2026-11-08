@@ -4,9 +4,11 @@
  *
  *   pi-memory list [--scope visible|global|project|all] [--state active|proposed|archived|all]
  *   pi-memory search <words…> [--scope …] [--limit N]
- *   pi-memory add [--project] [--tags a,b] <fact…>
- *   pi-memory edit <id> [--text T]            without --text: opens $EDITOR
- *   pi-memory forget <id> | restore <id>
+ *   pi-memory add [--project] [--tags a,b] [--expires YYYY-MM-DD] <fact…>
+ *   pi-memory edit <id> [--text T] [--expires YYYY-MM-DD]   without --text: opens $EDITOR
+ *   pi-memory forget <id> | restore <id> | expire
+ *   pi-memory verify <id> --status confirmed|contradicted|unverifiable --evidence "…"
+ *   pi-memory review-check [--days 14] [--json]   expires stale facts, lists what is due
  *   pi-memory pin [text…] | pin rm <n>        no text: list the pins
  *   pi-memory context                         the block a session here would start with
  *   pi-memory status | qmd setup
@@ -14,6 +16,9 @@
  * Every command takes --json, --cwd DIR (which repo is "the project"; default
  * the current folder) and --root DIR (default memory.root, else
  * ~/.local/share/pi-memory). Exit 0 on success, 1 on an error, 2 on bad usage.
+ * `review-check` is the one exception: 0 when something is due, 3 when nothing
+ * is (1 stays an error), so a scheduled run stops early without confusing the
+ * two.
  *
  * Pure node: no pi imports.
  */
@@ -23,9 +28,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { remotes } from "./git.ts";
+import { VERIFIED_STATUSES } from "./frontmatter.ts";
 import * as ops from "./ops.ts";
 import { slugFor } from "./project.ts";
 import { oneLine } from "./render.ts";
+import * as review from "./review.ts";
 import { expandHome, memorySettings, tildePath } from "./settings.ts";
 import * as store from "./store.ts";
 import { type Memory, MemoryError } from "./store.ts";
@@ -37,7 +44,7 @@ export interface Io {
 	cwd: string;
 }
 
-const VALUE_FLAGS = new Set(["cwd", "tags", "scope", "limit", "root", "text", "state"]);
+const VALUE_FLAGS = new Set(["cwd", "tags", "scope", "limit", "root", "text", "state", "expires", "status", "evidence", "by", "days"]);
 const BOOL_FLAGS = new Set(["json", "project", "help"]);
 
 class Usage extends Error {}
@@ -75,9 +82,11 @@ const HELP = `pi-memory: durable facts for pi sessions on this host
 
   list [--scope visible|global|project|all] [--state active|proposed|archived|all]
   search <words…> [--scope …] [--limit N]
-  add [--project] [--tags a,b] <fact…>
-  edit <id> [--text T]           (no --text: $EDITOR)
-  forget <id>  |  restore <id>
+  add [--project] [--tags a,b] [--expires YYYY-MM-DD] <fact…>
+  edit <id> [--text T] [--expires YYYY-MM-DD]   (no --text: $EDITOR)
+  forget <id>  |  restore <id>  |  expire
+  verify <id> --status confirmed|contradicted|unverifiable --evidence "…" [--by MODEL]
+  review-check [--days 14]              what is due; exit 0 when something is, 3 when nothing is
   pin [text…]  |  pin rm <n>     (no text: list pins)
   context                        the block a session here starts with
   status  |  qmd setup
@@ -99,7 +108,7 @@ function editText(current: string, env: NodeJS.ProcessEnv): string | undefined {
 	}
 }
 
-const asJson = (m: Memory) => ({ id: m.id, scope: m.scope, state: m.state, text: m.text, tags: m.tags, created: m.created, updated: m.updated, confidence: m.confidence, source: m.source, ...(m.archived ? { archived: m.archived } : {}) });
+const asJson = (m: Memory) => ({ id: m.id, scope: m.scope, state: m.state, text: m.text, tags: m.tags, created: m.created, updated: m.updated, confidence: m.confidence, source: m.source, ...(m.expires ? { expires: m.expires } : {}), ...(m.verified ? { verified: m.verified } : {}), ...(m.archived ? { archived: m.archived } : {}) });
 
 export async function main(argv: readonly string[], io: Io): Promise<number> {
 	let json = false;
@@ -118,6 +127,13 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
 			if (v === undefined) return fallback;
 			if (typeof v !== "string" || !allowed.includes(v as T)) throw new Usage(`--${name} is one of ${allowed.join(", ")}`);
 			return v as T;
+		};
+		const whole = (name: string, fallback: number, min: number): number => {
+			const v = flags[name];
+			if (v === undefined) return fallback;
+			const n = typeof v === "string" ? Number(v) : Number.NaN;
+			if (!Number.isInteger(n) || n < min) throw new Usage(`--${name} is a whole number, ${min} or more`);
+			return n;
 		};
 		const base = memorySettings(io.env);
 		const settings = typeof flags.root === "string" ? { ...base, root: resolve(io.cwd, expandHome(flags.root)) } : base;
@@ -162,7 +178,8 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
 				const text = args.join(" ");
 				const scope = ops.scopeFor(flags.project ? "project" : "global", flags.project ? slug() : null);
 				const tags = typeof flags.tags === "string" ? flags.tags.split(",") : [];
-				const w = ops.remember(mem, { text, tags, scope, source: { kind: "cli", cwd: tildePath(cwd) } });
+				const expires = typeof flags.expires === "string" ? flags.expires : undefined;
+				const w = ops.remember(mem, { text, tags, scope, source: { kind: "cli", cwd: tildePath(cwd) }, ...(expires ? { expires } : {}) });
 				await settle(w);
 				say(`Saved as ${w.memory.id} (${w.memory.scope}).`, { memory: asJson(w.memory) });
 				return 0;
@@ -171,16 +188,56 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
 				const target = id();
 				const current = store.find(mem.root, target);
 				if (!current || current.state === "archived") throw new MemoryError(`no memory ${target}`);
-				const text = typeof flags.text === "string" ? flags.text : editText(current.text, io.env);
-				if (text === undefined) throw new MemoryError("the editor exited without saving");
-				if (text === current.text) {
+				const expires = typeof flags.expires === "string" ? store.cleanExpires(flags.expires) : undefined;
+				let text: string | undefined;
+				if (typeof flags.text === "string") text = flags.text;
+				else if (expires === undefined) text = editText(current.text, io.env);
+				if (text === undefined && expires === undefined) throw new MemoryError("the editor exited without saving");
+				const sameText = text === undefined || text === current.text;
+				if (sameText && (expires === undefined || expires === current.expires)) {
 					say("Unchanged.", { memory: asJson(current), unchanged: true });
 					return 0;
 				}
-				const w = ops.update(mem, target, text);
+				const w = ops.update(mem, target, sameText ? undefined : text, undefined, expires !== undefined ? { expires } : {});
 				await settle(w);
 				say(`Updated ${target}.`, { memory: asJson(w.memory) });
 				return 0;
+			}
+			case "expire": {
+				const gone = await ops.expire(mem);
+				await mem.qmd.updateDetached();
+				say(gone.length ? gone.map((m) => `Expired ${m.id}.`).join("\n") : "Nothing expired.", { expired: gone.map((m) => m.id) });
+				return 0;
+			}
+			case "verify": {
+				const target = id();
+				// Both are required: a verification nobody made is worse than none.
+				const { status, evidence } = flags;
+				if (typeof status !== "string" || typeof evidence !== "string" || !evidence.trim()) {
+					throw new Usage(`verify needs --status ${VERIFIED_STATUSES.join("|")} and --evidence`);
+				}
+				if (!(VERIFIED_STATUSES as readonly string[]).includes(status)) throw new Usage(`--status is one of ${VERIFIED_STATUSES.join(", ")}`);
+				const by = typeof flags.by === "string" ? flags.by : "user";
+				const w = ops.verify(mem, target, { status, evidence, by });
+				await settle(w);
+				say(`Verified ${w.memory.id} as ${status}.`, { memory: asJson(w.memory) });
+				return 0;
+			}
+			case "review-check": {
+				const days = whole("days", review.DEFAULT_REVIEW_DAYS, 0);
+				const now = new Date();
+				const expired = await ops.expire(mem, now);
+				await mem.qmd.updateDetached();
+				const list = review.due(store.load(mem.root).memories, { now, days });
+				const lines = [
+					...(expired.length ? [`expired ${expired.length}: ${expired.map((m) => m.id).join(", ")}`] : []),
+					...(list.length ? list.map(review.line) : ["Nothing due."]),
+				];
+				say(lines.join("\n"), {
+					expired: expired.map((m) => m.id),
+					due: list.map((d) => ({ id: d.memory.id, scope: d.memory.scope, text: d.memory.text, updated: d.memory.updated, expires: d.memory.expires ?? null, verified: d.memory.verified ?? null, reasons: d.reasons })),
+				});
+				return list.length ? 0 : 3;
 			}
 			case "forget":
 			case "restore": {
@@ -223,14 +280,18 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
 				}
 				const qmd = settings.qmd === "off" ? "off" : (await mem.qmd.hasMemory()) ? "memory collection" : "no memory collection";
 				const rem = settings.git ? remotes(mem.root) : [];
+				const soon = review.expiringSoon(loaded.memories).length;
+				const never = review.neverVerified(loaded.memories).length;
 				const lines = [
 					`root: ${tildePath(mem.root)}${rem.length ? `  (WARNING: git remote ${rem.join(", ")}; commits are refused)` : ""}`,
 					`project: ${s ?? "(none: no git origin)"}`,
 					...Object.entries(counts).map(([k, n]) => `${k}: ${n}`),
 					`pins: ${store.readPins(mem.root).length}`,
 					`qmd: ${qmd}`,
+					`expiring within ${review.SOON_DAYS} days: ${soon}`,
+					`never verified: ${never}`,
 				];
-				say(lines.join("\n"), { root: mem.root, project: s, counts, pins: store.readPins(mem.root).length, qmd, remotes: rem, skipped: loaded.skipped });
+				say(lines.join("\n"), { root: mem.root, project: s, counts, pins: store.readPins(mem.root).length, qmd, remotes: rem, skipped: loaded.skipped, expiringSoon: soon, neverVerified: never });
 				return 0;
 			}
 			case "qmd": {

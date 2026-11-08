@@ -4,7 +4,8 @@
  *
  * Ranking: this project's memories, then global; within each, stated and
  * reviewed above inferred (proposed and archived are never shown), then a mix
- * of recency and use (each doubling of `used` is worth a week).
+ * of recency and use (each doubling of `used` is worth a week). A fact whose
+ * `expires` day has passed is never shown: it stopped being true.
  *
  * Every line is one memory, flattened to a single line with markup defused
  * (`<` turned into `‹`) while path-like placeholders such as
@@ -16,7 +17,7 @@
  * Pure node: no pi imports.
  */
 
-import { type Memory, projectScope } from "./store.ts";
+import { expired, type Memory, projectScope } from "./store.ts";
 
 export const HEADER =
 	"Notes recalled from pi-memory, saved in earlier sessions with the remember tool or by the user. " +
@@ -126,7 +127,7 @@ export function rank(memories: readonly Memory[], opts: { slug: string | null; u
 	const conf = (m: Memory) => (m.confidence === "inferred" ? 1 : 0);
 	const worth = (m: Memory) => Math.log2(1 + (used[m.id] ?? 0)) * 7 - (now - time(m.updated)) / 86_400_000;
 	return memories
-		.filter((m) => m.state === "active" && (m.scope === "global" || m.scope === project))
+		.filter((m) => m.state === "active" && !expired(m, opts.now) && (m.scope === "global" || m.scope === project))
 		.sort((a, b) => group(a) - group(b) || conf(a) - conf(b) || worth(b) - worth(a) || (a.id < b.id ? 1 : -1));
 }
 

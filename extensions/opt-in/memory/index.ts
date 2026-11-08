@@ -8,19 +8,25 @@
  *   and frozen for the session, so later writes don't change the prompt and
  *   break the prompt cache; a new memory is already in context through its
  *   tool result. /new, /resume and /fork render it again; /reload keeps it.
- * - Tools: remember, memory_search, forget, memory_update. Subagent children
- *   (PI_SUBAGENT_CHILD=1) get no block and memory_search only.
- * - /memory: status, search, add, edit, forget, restore, pin, context, qmd setup.
+ * - Tools: remember, memory_search, forget, memory_update, memory_verify. Subagent
+ *   children (PI_SUBAGENT_CHILD=1) get no block and memory_search only.
+ * - /memory: status (with expiring-soon and never-verified counts), search, add,
+ *   edit, forget, restore, pin, context, qmd setup.
+ * - A fact may carry `expires` (a day it stops being true; never injected or
+ *   searchable after it) and `verified` (the review that checked it against the
+ *   sessions it came from). The nightly review prompt ships in review-prompt.md.
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { optIn } from "../../../lib/opt-in.ts";
+import { VERIFIED_STATUSES } from "../../../lib/memory/frontmatter.ts";
 import { remotes } from "../../../lib/memory/git.ts";
 import * as ops from "../../../lib/memory/ops.ts";
 import { slugFor } from "../../../lib/memory/project.ts";
 import { oneLine } from "../../../lib/memory/render.ts";
+import * as review from "../../../lib/memory/review.ts";
 import { memorySettings, tildePath } from "../../../lib/memory/settings.ts";
 import * as store from "../../../lib/memory/store.ts";
 
@@ -147,7 +153,9 @@ export function memory(pi: ExtensionAPI): void {
 			"a project detail, how they like something done. Save it when they tell you something worth knowing next week, or " +
 			"say 'remember'. Don't save secrets, passwords, tokens, personal identifiers, one-off task details, or things already in memory. " +
 			"One fact per call, written so it makes sense on its own later. Don't save it again in other words: " +
-			"if it says 'already saved', that's fine, move on.",
+			"if it says 'already saved', that's fine, move on. " +
+			"When the fact is about a limited time ('this weekend', 'until the release', 'today only'), set expires to its last day, " +
+			"so it stops being shown instead of reading as current forever.",
 		promptSnippet: "Save one durable fact about the user or this project for future sessions",
 		parameters: Type.Object({
 			text: Type.String({ description: `The fact, self-contained, at most ${store.MAX_TEXT} characters.` }),
@@ -155,13 +163,14 @@ export function memory(pi: ExtensionAPI): void {
 			scope: Type.Optional(StringEnum(["global", "project"] as const, {
 				description: "global (default): every session on this host. project: only sessions in this repo (any clone or worktree).",
 			})),
+			expires: Type.Optional(Type.String({ description: "YYYY-MM-DD, the last day the fact is in force (local time). Omit for facts with no end." })),
 		}),
 		executionMode: "sequential",
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			try {
 				const scope = ops.scopeFor(params.scope as string | undefined, slug);
-				const w = ops.remember(need(), { text: params.text, tags: params.tags, scope, source: source(ctx, "remember") });
-				return result(`Saved as ${w.memory.id} (${w.memory.scope}).`);
+				const w = ops.remember(need(), { text: params.text, tags: params.tags, scope, source: source(ctx, "remember"), expires: params.expires });
+				return result(`Saved as ${w.memory.id} (${w.memory.scope})${w.memory.expires ? `, expires ${w.memory.expires}` : ""}.`);
 			} catch (err) {
 				return result(`remember failed: ${message(err)}`, true);
 			}
@@ -187,18 +196,47 @@ export function memory(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "memory_update",
 		label: "Memory update",
-		description: "Replace the text of a saved memory (by its id, m-…) when the fact changed or was wrong. Same rules as remember.",
+		description:
+			"Replace the text of a saved memory (by its id, m-…) when the fact changed or was wrong. Same rules as remember. " +
+			"expires sets (or moves) the last day the fact is in force; it is required for a fact that came with an end in sight.",
 		parameters: Type.Object({
 			id: Type.String({ description: "The memory id, e.g. m-20261107-k3f9." }),
-			text: Type.String({ description: `The corrected fact, at most ${store.MAX_TEXT} characters.` }),
+			text: Type.Optional(Type.String({ description: `The corrected fact, at most ${store.MAX_TEXT} characters. Omit to change only expires.` })),
+			expires: Type.Optional(Type.String({ description: "YYYY-MM-DD, the last day the fact is in force. Use '' to clear it." })),
 		}),
 		executionMode: "sequential",
 		async execute(_id, params) {
 			try {
-				const w = ops.update(need(), params.id.trim(), params.text);
-				return result(`Updated ${w.memory.id}.`);
+				const id = params.id.trim();
+				const expires = params.expires === undefined ? undefined : params.expires.trim() === "" ? null : params.expires;
+				const w = ops.update(need(), id, params.text, undefined, expires !== undefined ? { expires } : {});
+				return result(`Updated ${w.memory.id}${w.memory.expires ? `, expires ${w.memory.expires}` : ""}.`);
 			} catch (err) {
 				return result(`memory_update failed: ${message(err)}`, true);
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "memory_verify",
+		label: "Memory verify",
+		description:
+			"Record that a saved memory was checked against the sessions it came from (what the nightly review does). " +
+			"confirmed: the sessions still say so. contradicted: something later changes it (fix it with memory_update, or forget it). " +
+			"unverifiable: the sessions don't say either way. evidence is the session id(s) and one line of why, never invented.",
+		parameters: Type.Object({
+			id: Type.String({ description: "The memory id, e.g. m-20261107-k3f9." }),
+			status: StringEnum(VERIFIED_STATUSES, { description: "confirmed, contradicted or unverifiable." }),
+			evidence: Type.String({ description: `Session id(s) and one line of why, at most ${store.MAX_EVIDENCE} characters.` }),
+		}),
+		executionMode: "sequential",
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			try {
+				const by = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "user";
+				const w = ops.verify(need(), params.id.trim(), { status: String(params.status), evidence: String(params.evidence), by });
+				return result(`Verified ${w.memory.id} as ${params.status}.`);
+			} catch (err) {
+				return result(`memory_verify failed: ${message(err)}`, true);
 			}
 		},
 	});
@@ -221,6 +259,8 @@ export function memory(pi: ExtensionAPI): void {
 			`pins: ${store.readPins(m.root).length}`,
 			`qmd: ${qmd}${m.qmd.lastError() ? ` (last error: ${m.qmd.lastError()})` : ""}`,
 			`this session was shown: ${shown}`,
+			`expiring within ${review.SOON_DAYS} days: ${review.expiringSoon(loaded.memories).length}`,
+			`never verified: ${review.neverVerified(loaded.memories).length}`,
 			...(loaded.skipped ? [`skipped ${loaded.skipped} file(s) that aren't valid memories`] : []),
 			...(m.scanner.invalid.length ? [`scanner.extraPatterns that don't compile: ${m.scanner.invalid.join(", ")}`] : []),
 		].join("\n");

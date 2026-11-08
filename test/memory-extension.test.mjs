@@ -58,9 +58,9 @@ test("off unless enabled: registers nothing", async () => {
 	assert.deepEqual(stub.names(), []);
 });
 
-test("enabled: four tools, /memory, and the session hooks", async () => {
+test("enabled: five tools, /memory, and the session hooks", async () => {
 	const { stub } = await boot();
-	assert.deepEqual(stub.names(), ["command:memory", "on:before_agent_start", "on:session_shutdown", "on:session_start", "tool:forget", "tool:memory_search", "tool:memory_update", "tool:remember"]);
+	assert.deepEqual(stub.names(), ["command:memory", "on:before_agent_start", "on:session_shutdown", "on:session_start", "tool:forget", "tool:memory_search", "tool:memory_update", "tool:memory_verify", "tool:remember"]);
 });
 
 test("the memory section is set on the first run and frozen for the session", async () => {
@@ -196,4 +196,48 @@ test("/memory commands", async () => {
 	assert.match(await s.command(""), new RegExp(`this session was shown: ${id}`));
 	assert.match(await s.command("qmd setup"), /off/);
 	assert.match(await s.command("bogus"), /Unknown/);
+});
+
+test("remember takes expires; memory_verify records the check; /memory counts both", async () => {
+	const s = await boot();
+	await s.start();
+	const pad = (n) => String(n).padStart(2, "0");
+	const day = (offset = 0) => {
+		const d = new Date();
+		d.setDate(d.getDate() + offset);
+		return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+	};
+
+	const saved = await s.call("remember", { text: "The widget freeze runs this weekend", expires: day(3) });
+	assert.match(saved.text, new RegExp(`^Saved as (m-\\S+) \\(global\\), expires ${day(3)}\\.$`));
+	const id = /Saved as (\S+) /.exec(saved.text)[1];
+	assert.equal(store.find(s.root, id).expires, day(3));
+	assert.match((await s.call("remember", { text: "Another fact about widgets", expires: day(-1) })).text, /already past/);
+	assert.match((await s.call("remember", { text: "Another fact about widgets", expires: "tomorrow" })).text, /YYYY-MM-DD/);
+	const other = /Saved as (\S+) /.exec((await s.call("remember", { text: "Sam owns the billing service" })).text)[1];
+	const updated = store.find(s.root, id).updated;
+
+	const ok = await s.call("memory_verify", { id, status: "confirmed", evidence: `${s.session.id}: he said so` });
+	assert.equal(ok.text, `Verified ${id} as confirmed.`);
+	const m = store.find(s.root, id);
+	assert.deepEqual([m.verified.status, m.verified.by, m.verified.evidence], ["confirmed", "test/model-1", `${s.session.id}: he said so`]);
+	assert.equal(m.updated, updated, "a verification does not count as a change to the fact");
+
+	assert.match((await s.call("memory_verify", { id, status: "confirmed", evidence: fake.jwt() })).text, /secret/);
+	assert.equal(store.find(s.root, id).verified.status, "confirmed", "a refused verification changes nothing");
+	assert.match((await s.call("memory_verify", { id, status: "sideways", evidence: "x" })).text, /status is one of/);
+	const long = `${s.session.id}: ${"he said the policy changed on Tuesday. ".repeat(10)}`;
+	assert.equal((await s.call("memory_verify", { id, status: "unverifiable", evidence: long })).isError, false);
+	assert.equal(store.find(s.root, id).verified.evidence.length, store.MAX_EVIDENCE);
+
+	// expires alone, through memory_update.
+	const moved = await s.call("memory_update", { id, expires: day(9) });
+	assert.match(moved.text, new RegExp(`^Updated ${id}, expires ${day(9)}\\.$`));
+	assert.equal(store.find(s.root, id).text, "The widget freeze runs this weekend");
+	assert.equal((await s.call("memory_update", { id, expires: "" })).isError, false);
+	assert.equal(store.find(s.root, id).expires, undefined);
+
+	assert.match(await s.command(""), /expiring within 7 days: 0\nnever verified: 1/);
+	await s.call("memory_verify", { id: other, status: "unverifiable", evidence: "no session matches" });
+	assert.match(await s.command(""), /never verified: 0/);
 });
