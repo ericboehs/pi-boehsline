@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
 	mkdirSync,
 	mkdtempSync,
+	rmSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -10,6 +11,9 @@ import { join } from "node:path";
 import test from "node:test";
 import type { ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import approvalGuardian, {
+	BYPASS_AGAIN_COMMAND,
+	BYPASS_STATE_ENTRY_TYPE,
+	bypassedWhenLeft,
 	actionFromToolCall,
 	APPROVAL_GUARDIAN_BYPASS_CONTROL_EVENT,
 	APPROVAL_GUARDIAN_BYPASS_STATE_EVENT,
@@ -2078,5 +2082,95 @@ test("fails closed on contradictory high and critical allow decisions", () => {
 			enforceActionRequirements(action, { kind: "allowed", assessment }).kind,
 			"denied",
 		);
+	}
+});
+
+test("a resumed session that ended bypassed gets the bypass command in its editor, not the bypass", async () => {
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const root = mkdtempSync(join(tmpdir(), "guardian-bypass-again-"));
+	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+	const entry = (active: boolean) => ({ type: "custom", customType: BYPASS_STATE_ENTRY_TYPE, data: { active } });
+	try {
+		assert.equal(bypassedWhenLeft([]), false);
+		assert.equal(bypassedWhenLeft([entry(true)]), true);
+		assert.equal(bypassedWhenLeft([entry(true), { type: "message" }]), true);
+		assert.equal(bypassedWhenLeft([entry(true), entry(false)]), false);
+		assert.equal(bypassedWhenLeft([{ type: "custom", customType: "other", data: { active: true } }]), false);
+
+		const handlers = new Map<string, (event: { reason?: string }, ctx: never) => unknown>();
+		const commands = new Map<string, { handler: (args: string, ctx: never) => unknown }>();
+		const appended: Array<[string, unknown]> = [];
+		approvalGuardian({
+			events: { on: () => undefined, emit: () => undefined },
+			on: (name: string, handler: (event: { reason?: string }, ctx: never) => unknown) => {
+				handlers.set(name, handler);
+			},
+			registerCommand: (name: string, options: { handler: (args: string, ctx: never) => unknown }) =>
+				commands.set(name, options),
+			appendEntry: (type: string, data: unknown) => appended.push([type, data]),
+		} as never);
+
+		let branch: unknown[] = [entry(true)];
+		let editor = "";
+		const notices: string[] = [];
+		const widgets: Array<[string, string[] | undefined]> = [];
+		const ctx = (mode = "tui") =>
+			({
+				mode,
+				cwd: "/repo/project",
+				isProjectTrusted: () => false,
+				modelRegistry: { find: () => undefined, hasConfiguredAuth: () => false },
+				sessionManager: { getBranch: () => branch, getSessionFile: () => "/tmp/guardian-again.jsonl" },
+				ui: {
+					theme: { fg: (_color: string, text: string) => text },
+					setStatus: () => undefined,
+					setWidget: (key: string, lines: string[] | undefined) => widgets.push([key, lines]),
+					notify: (text: string) => notices.push(text),
+					getEditorText: () => editor,
+					setEditorText: (text: string) => {
+						editor = text;
+					},
+				},
+			}) as never;
+		const start = async (reason: string, mode = "tui") => {
+			editor = "";
+			notices.length = 0;
+			widgets.length = 0;
+			await handlers.get("session_start")?.({ reason }, ctx(mode));
+		};
+		const bypassedNow = () => widgets.some(([, lines]) => lines?.some((line) => /BYPASSED/.test(line)));
+
+		for (const reason of ["resume", "startup"]) {
+			await start(reason);
+			assert.equal(editor, BYPASS_AGAIN_COMMAND, `${reason}: the command is offered`);
+			assert.match(notices.join("\n"), /press Enter/);
+			assert.equal(bypassedNow(), false, `${reason}: the bypass itself stays off`);
+		}
+		for (const reason of ["new", "fork", "reload"]) {
+			await start(reason);
+			assert.equal(editor, "", `${reason}: nothing offered`);
+		}
+		await start("resume", "rpc");
+		assert.equal(editor, "", "not outside the TUI");
+
+		editor = "half a prompt";
+		await handlers.get("session_start")?.({ reason: "resume" }, ctx());
+		assert.equal(editor, "half a prompt", "an editor with text is left alone");
+
+		branch = [entry(true), entry(false)];
+		await start("resume");
+		assert.equal(editor, "", "the bypass was turned off before the session ended");
+
+		branch = [];
+		await commands.get("approval-guardian")?.handler("bypass", ctx());
+		await commands.get("approval-guardian")?.handler("enable", ctx());
+		assert.deepEqual(appended.filter(([type]) => type === BYPASS_STATE_ENTRY_TYPE), [
+			[BYPASS_STATE_ENTRY_TYPE, { active: true }],
+			[BYPASS_STATE_ENTRY_TYPE, { active: false }],
+		]);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(root, { recursive: true, force: true });
 	}
 });

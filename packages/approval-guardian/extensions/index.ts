@@ -92,6 +92,23 @@ const TEMPORARY_BYPASS_PROCESS_SLOT = Symbol.for(
 	"pi-approval-guardian.temporary-bypass",
 );
 
+/** A session entry recording each bypass change, so a resumed session knows it ended bypassed. */
+export const BYPASS_STATE_ENTRY_TYPE = "approval-guardian-bypass-state";
+export const BYPASS_AGAIN_COMMAND = "/approval-guardian bypass";
+
+/** Whether the branch's last bypass change turned it on: the session ended bypassed. */
+export function bypassedWhenLeft(entries: readonly unknown[]): boolean {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i] as
+			| { type?: string; customType?: string; data?: { active?: unknown } }
+			| undefined;
+		if (entry?.type === "custom" && entry.customType === BYPASS_STATE_ENTRY_TYPE) {
+			return entry.data?.active === true;
+		}
+	}
+	return false;
+}
+
 function sessionFileOf(ctx: ExtensionContext): string | undefined {
 	return ctx.sessionManager.getSessionFile?.();
 }
@@ -245,6 +262,20 @@ export default function approvalGuardian(
 		});
 	};
 
+	// A resumed session that ended bypassed gets the bypass command typed into its editor, never
+	// run: turning the bypass back on still takes the user's Enter. An editor already holding text
+	// is left alone.
+	const offerBypassAgain = (ctx: ExtensionContext): void => {
+		if (ctx.mode !== "tui") return;
+		if (!bypassedWhenLeft(ctx.sessionManager.getBranch?.() ?? [])) return;
+		if ((ctx.ui.getEditorText?.() ?? "").trim() !== "") return;
+		ctx.ui.setEditorText?.(BYPASS_AGAIN_COMMAND);
+		ctx.ui.notify(
+			"This session had Approval Guardian bypassed when it ended. The bypass is off now; press Enter to turn it back on.",
+			"warning",
+		);
+	};
+
 	pi.on("session_start", (event: SessionStartEvent, ctx) => {
 		runtimeContext = ctx;
 		const wasBypassed = temporaryBypassActive;
@@ -254,6 +285,7 @@ export default function approvalGuardian(
 		// /resume, /fork, and startup must not inherit a bypass from the slot.
 		if (event.reason === "reload") restoreTemporaryBypassAfterReload(ctx);
 		else if (wasBypassed) persistTemporaryBypass(false);
+		if (event.reason === "resume" || event.reason === "startup") offerBypassAgain(ctx);
 		syncGuardianRuntimeHealth(ctx, statusCallbacks);
 	});
 	pi.on("session_shutdown", (event: SessionShutdownEvent, ctx) => {
@@ -317,6 +349,7 @@ export default function approvalGuardian(
 
 		temporaryBypassActive = nextActive;
 		persistTemporaryBypass(nextActive, sessionFileOf(ctx));
+		pi.appendEntry?.(BYPASS_STATE_ENTRY_TYPE, { active: nextActive });
 		disposeReviewerControllers();
 		reviewerSwitchNoticeKeys.clear();
 		circuitBreaker.reset();

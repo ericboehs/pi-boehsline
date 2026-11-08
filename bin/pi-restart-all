@@ -138,9 +138,12 @@ resume_command() {
 editor_cleared() { ! tmux -S "$1" capture-pane -p -t "$2" | grep -v "^[[:space:]]*$" | tail -n 3 | grep -qF -- "$3"; }
 
 # Types a slash command into the pane and presses Enter until the check (a function and its
-# arguments) passes: the first Enter can go to the command's autocomplete.
+# arguments) passes: the first Enter can go to the command's autocomplete. Ctrl+E Ctrl+U first
+# empties the editor line: the guardian has already put `/approval-guardian bypass` there in a
+# resumed session that ended bypassed.
 type_command() {
   local socket="$1" pane="$2" text="$3"; shift 3
+  tmux -S "$socket" send-keys -t "$pane" C-e C-u
   tmux -S "$socket" send-keys -t "$pane" -l "$text"
   for _ in 1 2 3; do
     sleep 1
