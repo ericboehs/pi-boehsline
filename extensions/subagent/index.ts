@@ -89,12 +89,20 @@ const cursorFields = {
 	),
 };
 
+const sandboxField = Type.Optional(
+	Type.Boolean({
+		description:
+			"Run the task in Botsun's workers VM instead of on this Mac: the repo is copied in, pi runs as the unprivileged worker user with read-only tools (-ne -na), and its output streams back here. Scout only until the patch gate; the agent file can also set sandbox: true.",
+	}),
+);
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Agent name (scout, worker, cursor, or an agents/*.md file)" }),
 	task: Type.String({ description: "Bounded task with concrete deliverable" }),
 	cwd: Type.Optional(Type.String({ description: "Override working directory" })),
 	model: Type.Optional(Type.String({ description: "Model override for this task" })),
 	...cursorFields,
+	sandbox: sandboxField,
 });
 
 const Params = Type.Object({
@@ -104,6 +112,7 @@ const Params = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working dir override (single mode)" })),
 	model: Type.Optional(Type.String({ description: "Child model override, e.g. haiku (for cursor: a Cursor model id)" })),
 	...cursorFields,
+	sandbox: sandboxField,
 	background: Type.Optional(
 		Type.Boolean({ description: "Run detached via the bg extension; returns at once, result arrives as a message when done" }),
 	),
@@ -174,9 +183,11 @@ type Agent = {
 	network?: boolean;
 	/** cursor-agent --force, user-scope agent files only (like network). */
 	force?: boolean;
+	/** Run in Botsun's workers VM (frontmatter `sandbox: true`). */
+	sandbox?: boolean;
 };
 
-type Job = { agent: string; task: string; cwd?: string; model?: string; cursorMode?: CursorMode; worktree?: boolean; force?: boolean };
+type Job = { agent: string; task: string; cwd?: string; model?: string; cursorMode?: CursorMode; worktree?: boolean; force?: boolean; sandbox?: boolean };
 
 /** What a foreground cursor task reports in details.results[i].cursor. */
 type CursorFacts = {
@@ -215,6 +226,7 @@ const BUILTINS: Record<string, Omit<Agent, "name">> = {
 
 const DESCRIPTION =
 	"Delegate to an isolated fresh-context subagent (subprocess). Single {agent, task} or parallel {tasks}. Use for recon, plans, independent review, parallel exploration. scout=read-only pi, worker=edits (pi), " +
+	"sandbox: true runs the task in Botsun's workers VM instead (the repo is copied in; pi runs as botsun-worker with -ne -na and read-only tools; scout only until the patch gate). " +
 	"cursor=Cursor's agent CLI instead of pi (needs the opt-in cursor-agent extension; billed to the user's Cursor account; edits land uncommitted in a new git worktree unless worktree: false; cursorMode plan/ask is read-only). " +
 	"A cursor task must be self-contained and must never contain PII, PHI, secrets or credentials.";
 
@@ -296,7 +308,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 								: Array.isArray(frontmatter.tools)
 									? (frontmatter.tools as unknown[]).filter((t): t is string => typeof t === "string").join(",")
 									: undefined;
-						const { mode, worktree, network, force } = frontmatter;
+						const { mode, worktree, network, force, sandbox } = frontmatter;
 						out.push({
 							name: frontmatter.name,
 							tools,
@@ -307,6 +319,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 							...(typeof worktree === "boolean" ? { worktree } : {}),
 							...(typeof network === "boolean" ? { network } : {}),
 							...(typeof force === "boolean" ? { force } : {}),
+							...(typeof sandbox === "boolean" ? { sandbox } : {}),
 						});
 					} catch {
 						/* skip bad file */
@@ -344,7 +357,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 			// a per-task model wins over the agent's.
 			const single: Job[] =
 				params.agent && params.task
-					? [{ agent: params.agent, task: params.task, cwd: params.cwd, cursorMode: params.cursorMode, worktree: params.worktree, force: params.force }]
+					? [{ agent: params.agent, task: params.task, cwd: params.cwd, cursorMode: params.cursorMode, worktree: params.worktree, force: params.force, sandbox: params.sandbox }]
 					: [];
 			const jobs = (params.tasks ?? single) as Job[];
 			if (jobs.length === 0 || jobs.length > MAX_TASKS || (params.tasks && params.agent)) {
@@ -376,6 +389,25 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 				return currentScript && !currentScript.startsWith("/$bunfs/root/") && fs.existsSync(currentScript)
 					? { cmd: process.execPath, args: [currentScript, ...args] }
 					: { cmd: "pi", args };
+			};
+
+			// A sandboxed pi child: Botsun's `worker exec` replaces piInvocation (see
+			// extensions/subagent/sandbox.ts). Its stdout is the guest pi's JSONL, so everything
+			// below — parsing, the bg filter, the children row, stop — is unchanged.
+			const sandboxed = (job: Job, agent: Agent) => job.sandbox ?? agent.sandbox ?? false;
+			const sandboxChild = async (job: Job, agent: Agent): Promise<{ invocation: { cmd: string; args: string[] }; model?: string } | { error: string }> => {
+				const { sandboxInvocation } = await import("./sandbox.ts");
+				const version = (sdk as unknown as { VERSION?: string }).VERSION;
+				const model = job.model ?? agent.model ?? defaultModel;
+				const spec = sandboxInvocation({
+					cwd: job.cwd ?? ctx.cwd,
+					task: job.task,
+					prompt: systemPrompt(agent.prompt),
+					agent: job.agent,
+					model,
+					version,
+				});
+				return "error" in spec ? spec : { invocation: spec, model };
 			};
 
 			// A cursor task's run, checked up front so a problem fails that task only.
@@ -435,6 +467,12 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						continue;
 					}
 					if (agent.runner === "cursor") {
+						// A cursor agent has no VM path, and a sandbox request never falls back to a Mac run
+						// (sandbox.ts): refuse this task instead, one line, nothing started.
+						if (sandboxed(job, agent)) {
+							lines.push(`[${job.agent}] ${(await import("./sandbox.ts")).unsandboxable(job.agent)}`);
+							continue;
+						}
 						const prep = await cursorSpec(job, agent);
 						if ("error" in prep) {
 							lines.push(`[${job.agent}] ${prep.error}`);
@@ -450,13 +488,24 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						lines.push("error" in reply ? `[${job.agent}] failed: ${reply.error}` : `[${job.agent}] bg ${reply.id} · log ${reply.logPath} · ${prep.spec.model} · ${where}`);
 						continue;
 					}
-					const args = ["--mode", "json", "-p", "--no-session"];
-					const model = job.model ?? agent.model ?? defaultModel;
-					if (model) args.push("--model", model);
-					if (agent.tools) args.push("--tools", agent.tools);
-					args.push("--append-system-prompt", systemPrompt(agent.prompt)); // accepts text or path
-					args.push(`Task: ${job.task}`);
-					const inv = piInvocation(args);
+					let model = job.model ?? agent.model ?? defaultModel;
+					let inv: { cmd: string; args: string[] };
+					if (sandboxed(job, agent)) {
+						const prep = await sandboxChild(job, agent);
+						if ("error" in prep) {
+							lines.push(`[${job.agent}] ${prep.error}`);
+							continue;
+						}
+						inv = prep.invocation;
+						model = prep.model;
+					} else {
+						const args = ["--mode", "json", "-p", "--no-session"];
+						if (model) args.push("--model", model);
+						if (agent.tools) args.push("--tools", agent.tools);
+						args.push("--append-system-prompt", systemPrompt(agent.prompt)); // accepts text or path
+						args.push(`Task: ${job.task}`);
+						inv = piInvocation(args);
+					}
 					const command = `PI_SUBAGENT_CHILD=1 ${[inv.cmd, ...inv.args].map(q).join(" ")} | ${q(process.execPath)} -e ${q(PROGRESS_FILTER)}`;
 					const reply = await new Promise<{ id: string; logPath: string } | { error: string } | null>((resolve) => {
 						const req = {
@@ -585,17 +634,29 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 			const runOne = async (job: Job, index: number): Promise<Result> => {
 				const agent = byName.get(job.agent);
 				if (!agent) return { agent: job.agent, task: job.task, ok: false, output: `Unknown agent "${job.agent}". Available: ${[...byName.keys()].join(", ")}.` };
-				if (agent.runner === "cursor") return runCursorJob(job, agent, index);
-				const args = ["--mode", "json", "-p", "--no-session"];
-				const model = job.model ?? agent.model ?? defaultModel;
-				if (model) args.push("--model", model);
-				if (agent.tools) args.push("--tools", agent.tools);
-				const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-				const tmpFile = path.join(tmpDir, "system.md");
-				await fs.promises.writeFile(tmpFile, systemPrompt(agent.prompt), { mode: 0o600 });
-				args.push("--append-system-prompt", tmpFile);
-				args.push(`Task: ${job.task}`);
-				const invocation = piInvocation(args);
+				if (agent.runner === "cursor") {
+					if (sandboxed(job, agent)) return { agent: job.agent, task: job.task, ok: false, output: (await import("./sandbox.ts")).unsandboxable(job.agent) };
+					return runCursorJob(job, agent, index);
+				}
+				let model = job.model ?? agent.model ?? defaultModel;
+				let invocation: { cmd: string; args: string[] };
+				let tmpDir: string | undefined;
+				if (sandboxed(job, agent)) {
+					const prep = await sandboxChild(job, agent);
+					if ("error" in prep) return { agent: job.agent, task: job.task, ok: false, output: prep.error };
+					invocation = prep.invocation;
+					model = prep.model;
+				} else {
+					const args = ["--mode", "json", "-p", "--no-session"];
+					if (model) args.push("--model", model);
+					if (agent.tools) args.push("--tools", agent.tools);
+					tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
+					const tmpFile = path.join(tmpDir, "system.md");
+					await fs.promises.writeFile(tmpFile, systemPrompt(agent.prompt), { mode: 0o600 });
+					args.push("--append-system-prompt", tmpFile);
+					args.push(`Task: ${job.task}`);
+					invocation = piInvocation(args);
+				}
 				const own = new AbortController();
 				const child = kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, stop: () => own.abort() });
 				try {
@@ -664,7 +725,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					return { agent: job.agent, task: job.task, ok: true, output: capped(final || "(no output)"), usage };
 				} finally {
 					child.finish("failed"); // an exception above: never left running
-					fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+					if (tmpDir) fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
 				}
 			};
 
