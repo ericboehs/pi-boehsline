@@ -288,6 +288,17 @@ test("renderMarkdown sanitises marked's output before it reaches the DOM", () =>
   assert.equal(el.querySelectorAll("p")[1].textContent, "over", "a styled paragraph keeps its text");
 });
 
+test("renderMarkdown keeps botsun: links, and DOMPurify's own URI list besides", () => {
+  const { calls } = stubHost({ html: "<p>x</p>" });
+  render.renderMarkdown("# md");
+  const uri = calls[0].config.ALLOWED_URI_REGEXP;
+  assert.ok(uri instanceof RegExp, "MD_CLEAN names the URI rule");
+  for (const ok of ["botsun://session/abc", "BOTSUN://x", "https://x.test/", "http://x", "mailto:a@b.c", "tel:+1", "matrix:r/x", "/rel/path", "#frag", "page.html", "?q=1"])
+    assert.ok(uri.test(ok), `${ok} kept`);
+  for (const bad of ["javascript:alert(1)", "data:text/html,x", "vbscript:x", "botsunx://x", "file:///etc/passwd"])
+    assert.ok(!uri.test(bad), `${bad} stripped`);
+});
+
 test("renderMarkdown drops the fetches DOMPurify's defaults keep", () => {
   const html = [
     '<img src="/track.gif" srcset="/x.png 2x"><img src="data:image/png;base64,AA">',

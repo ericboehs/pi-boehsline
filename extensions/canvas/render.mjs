@@ -105,6 +105,10 @@ function highlightGuess(code) {
 const MD_CLEAN = {
   FORBID_TAGS: ["style", "form", "input", "button", "textarea", "select", "video", "audio", "source", "picture", "track"],
   FORBID_ATTR: ["style", "srcset", "background", "poster"],
+  // DOMPurify's own default URI list plus botsun: (Botsun's session links), so a botsun:// href in
+  // a page-drawn message survives instead of going to plain text. Botsun syncs this file
+  // (`botsun render sync`); its host still decides which schemes open.
+  ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|botsun):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
 };
 const DATA_IMG = /^data:/i;
 
