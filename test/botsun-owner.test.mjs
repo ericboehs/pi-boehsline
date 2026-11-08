@@ -46,13 +46,15 @@ async function server(path = join(home, `s${++n}.sock`)) {
 	const conns = new Set();
 	const srv = createServer((c) => {
 		conns.add(c);
-		let buf = "";
+		// Bytes, not strings: a chunk can end inside a multi-byte character, and one decoded on its own
+		// would come out as a replacement character.
+		let buf = Buffer.alloc(0);
 		c.on("data", (d) => {
-			buf += d;
+			buf = Buffer.concat([buf, d]);
 			let i;
-			while ((i = buf.indexOf("\n")) >= 0) {
-				lines.push(JSON.parse(buf.slice(0, i)));
-				buf = buf.slice(i + 1);
+			while ((i = buf.indexOf(0x0a)) >= 0) {
+				lines.push(JSON.parse(buf.subarray(0, i).toString("utf8")));
+				buf = buf.subarray(i + 1);
 			}
 		});
 		c.on("close", () => conns.delete(c));
@@ -61,6 +63,11 @@ async function server(path = join(home, `s${++n}.sock`)) {
 	const stop = () => new Promise((r) => { for (const c of conns) c.destroy(); srv.close(() => r()); });
 	cleanups.push(() => srv.listening && stop());
 	return { path, lines, conns, stop, types: () => lines.map((l) => l.type) };
+}
+
+/** One line down to the session, as Botsun writes one (a features line, a color, an icon). */
+function down(srv, msg) {
+	for (const c of srv.conns) c.write(`${JSON.stringify(msg)}\n`);
 }
 
 async function mount({ ctx: over = {}, sessionName } = {}) {
@@ -1179,7 +1186,7 @@ test("hello carries the nonce reply's features (no nonce minted); a reload sends
 	assert.ok(srv.lines.find((l) => l.type === "features").features.includes("stash"));
 });
 
-test("hello carries the model id and the models the phone's picker offers", async () => {
+test("hello carries the model id and the first page of the models the phone's picker offers", async () => {
 	const srv = await server();
 	process.env.BOTSUN_OWNER_SOCK = srv.path;
 	const m = await mount({ ctx: {
@@ -1188,12 +1195,143 @@ test("hello carries the model id and the models the phone's picker offers", asyn
 			{ provider: "anthropic", id: "claude-opus-5-5", name: "Claude Opus 5.5", reasoning: true },
 			{ provider: "anthropic", id: "claude-haiku-4-5", name: "Claude Haiku 4.5" },
 		] },
+		// The session's scoped models (the enabledModels setting or --models): the picker's Scoped tab.
+		scopedModels: [{ model: { provider: "anthropic", id: "claude-haiku-4-5" } }],
 	} });
 	await m.fire("session_start", { reason: "startup" });
 	await until(() => srv.types().includes("hello"));
 	const hello = srv.lines.find((l) => l.type === "hello");
 	assert.equal(hello.model.id, "claude-opus-5-5");
-	assert.deepEqual(hello.models.map((x) => [x.id, x.reasoning]), [["claude-opus-5-5", true], ["claude-haiku-4-5", false]]);
+	assert.deepEqual(hello.models.map((x) => [x.id, x.reasoning, x.scoped]),
+		[["claude-haiku-4-5", false, true], ["claude-opus-5-5", true, false]]);
+	await sleep(100);
+	assert.deepEqual(srv.types(), ["hello"], "nothing more without the host's features line");
+
+	// The host says it takes pages: the whole list follows, scoped ones first whichever way the
+	// registry lists them, and the one page says it is the last.
+	down(srv, { v: 1, type: "features", features: ["model_pages"] });
+	await until(() => srv.types().includes("models"));
+	const page = srv.lines.find((l) => l.type === "models");
+	assert.deepEqual(page.models.map((x) => [x.id, x.scoped]), [["claude-haiku-4-5", true], ["claude-opus-5-5", false]]);
+	assert.equal(page.first, true);
+	assert.equal(page.last, true);
+	assert.equal(srv.lines.filter((l) => l.type === "models").length, 1);
+});
+
+test("a catalogue goes in pages only when the host takes them; the last page says so", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const many = Array.from({ length: 400 }, (_, i) => ({
+		provider: "openrouter", id: `model-${i}`, name: `مدل رقم ${i} — 模型 №${i} – modèle numéro ${i}`,
+	}));
+	const m = await mount({ ctx: {
+		modelRegistry: { getAvailable: () => many },
+		scopedModels: [{ model: { provider: "openrouter", id: "model-390" } }],
+	} });
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const hello = srv.lines.find((l) => l.type === "hello");
+	assert.ok(Buffer.byteLength(JSON.stringify(hello.models)) <= 24 * 1024, "hello's page fits its own budget");
+	assert.equal(hello.models[0].id, "model-390", "the scoped model comes first in hello's page too");
+	await sleep(100);
+	assert.equal(srv.lines.filter((l) => l.type === "models").length, 0, "no host features, no pages");
+
+	down(srv, { v: 1, type: "features", features: ["model_pages"] });
+	await until(() => srv.lines.some((l) => l.type === "models" && l.last === true));
+	const pages = srv.lines.filter((l) => l.type === "models");
+	assert.ok(pages.length > 1, "400 multi-byte names are more than one page");
+	for (const page of pages) {
+		assert.ok(Buffer.byteLength(JSON.stringify(page.models)) <= 48 * 1024, "a page is under the byte budget");
+	}
+	assert.deepEqual(pages.map((p) => p.first), pages.map((_, i) => i === 0), "only the first says first");
+	assert.deepEqual(pages.map((p) => p.last), pages.map((_, i) => i === pages.length - 1), "only the last says last");
+	assert.equal(pages.flatMap((p) => p.models).length, 400, "none is cut");
+	assert.equal(pages.flatMap((p) => p.models)[0].id, "model-390", "the scoped model comes first");
+});
+
+test("a host from before the pages gets one page, scoped models first, and never a second", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const many = Array.from({ length: 900 }, (_, i) => ({
+		provider: "openrouter", id: `model-${i}`, name: `模型 ${i} – ${'é'.repeat(40)}`,
+	}));
+	const m = await mount({ ctx: { modelRegistry: { getAvailable: () => many } } });
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	// Its features line names other things: it doesn't take pages.
+	down(srv, { v: 1, type: "features", features: ["images", "files"] });
+	await sleep(100);
+	assert.equal(srv.lines.filter((l) => l.type === "models").length, 0, "hello's page is all it gets on connect");
+
+	await m.fire("session_start", { reason: "reload" });
+	await until(() => srv.types().includes("models"));
+	const pages = srv.lines.filter((l) => l.type === "models");
+	assert.equal(pages.length, 1, "one line, so an old host keeps a list and not just its tail");
+	assert.ok(Buffer.byteLength(JSON.stringify(pages[0].models)) <= 48 * 1024, "that page is under the byte budget");
+	assert.ok(pages[0].models.length < 900, "which is a page, not the catalogue");
+	assert.equal(pages[0].first, true);
+	assert.equal(pages[0].last, true);
+	assert.equal(Buffer.byteLength(JSON.stringify(pages[0].models)) > 40 * 1024, true, "and it is not trimmed past need");
+});
+
+test("a hello sends the catalogue once: the host's features line is the only sender for a host that takes pages", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const many = Array.from({ length: 400 }, (_, i) => ({
+		provider: "openrouter", id: `model-${i}`, name: `模型 ${i} – ${'é'.repeat(40)}`,
+	}));
+	const at = (id) => ({ ctx: {
+		sessionManager: { getSessionFile: () => `/tmp/sessions/${id}.jsonl`, getSessionId: () => id },
+		modelRegistry: { getAvailable: () => many },
+	} });
+	const models = () => srv.lines.filter((l) => l.type === "models");
+	const a = await mount(at("sandbox-pal"));
+	await a.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	down(srv, { v: 1, type: "features", features: ["model_pages"] });
+	await until(() => models().some((l) => l.last === true));
+	const pagesPerSend = models().length;
+	assert.ok(pagesPerSend > 1, "400 multi-byte names are more than one page");
+
+	// It leaves that conversation and comes back: a hello again, on the same connection.
+	await a.fire("session_shutdown", { reason: "resume" });
+	const b = await mount(at("sid-other"));
+	await b.fire("session_start", { reason: "resume" });
+	await until(() => srv.types().includes("session"));
+	await b.fire("session_shutdown", { reason: "resume" });
+	await sleep(100); // the switch away sent the catalogue for its own conversation (one send)
+	const mark = srv.lines.length;
+	const before = models().length;
+	const c = await mount(at("sandbox-pal"));
+	await c.fire("session_start", { reason: "resume" });
+	await until(() => srv.types().filter((t) => t === "hello").length >= 2);
+	await sleep(100);
+	assert.equal(models().length, before, "hello alone sends no page: this host answers it with its features line");
+
+	down(srv, { v: 1, type: "features", features: ["model_pages"] });
+	await until(() => srv.lines.slice(mark).some((l) => l.type === "models" && l.last === true));
+	await sleep(50);
+	const sent = srv.lines.slice(mark).filter((l) => l.type === "models");
+	assert.equal(sent.length, pagesPerSend, "one sequence, not two: the features line's send is the hello's catalogue");
+	assert.equal(sent.flatMap((p) => p.models).length, 400, "the whole catalogue, once");
+});
+
+test("modelPages budgets a page by its bytes, not its count", async () => {
+	const { modelPages, PHONE_MODELS_BYTES, HELLO_MODELS_BYTES } = await import("../extensions/opt-in/botsun-owner/index.ts");
+	// 80 characters, but 220 bytes: the field caps are characters, so a page of these holds a
+	// fraction of the models a page of ASCII names does.
+	const name = `${'模'.repeat(60)}${'é'.repeat(20)}`;
+	assert.equal(name.length, 80);
+	assert.equal(Buffer.byteLength(name), 220);
+	const list = Array.from({ length: 900 }, (_, i) => ({ provider: "openrouter", id: `model-${i}`, name, reasoning: true, scoped: false }));
+	const pages = modelPages(list);
+	assert.ok(pages.length > 1, "900 of them is more than one page");
+	for (const page of pages) assert.ok(Buffer.byteLength(JSON.stringify(page)) <= PHONE_MODELS_BYTES, "a page is under the budget");
+	assert.equal(pages.flat().length, 900, "none is cut");
+	assert.ok(pages[0].length < 200, "far fewer than 100 per page: it is measured, not counted");
+	assert.ok(Buffer.byteLength(JSON.stringify([...pages[0], list[0]])) > PHONE_MODELS_BYTES, "one more model would have overrun the page");
+	assert.deepEqual(modelPages([]).map((p) => p.length), [0], "no models is one empty page");
+	assert.deepEqual(modelPages(list.slice(0, 3), HELLO_MODELS_BYTES).map((p) => p.length), [3], "hello's smaller budget holds a few");
 });
 
 test("the phone pushes, takes and drops the session's message stash, signed", async () => {

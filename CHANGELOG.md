@@ -22,6 +22,7 @@
 
 ### Changed
 
+- botsun-owner: the phone's model picker gets the whole catalogue (up to 1,000 models, scoped ones first) instead of an arbitrary first 120, and each model says whether it is one of the session's scoped models (`enabledModels` / `--models`). The list goes on `models` lines after hello, and Botsun negotiates the shape: a host that lists `model_pages` in its features line gets pages of at most 48 KB of JSON (measured, not counted, since the field caps are characters), the first saying `first: true` and the last `last: true`, which is when the host publishes the list. A host from before that gets one page, scoped models first, since it replaces its list on every `models` line. hello keeps a first page of its own, under 24 KB. A host that takes pages gets the catalogue once per hello (from its features line), not twice.
 - auto-session-name: names are Title Case with spaces, read like a character on the job (the thing being worked on plus one role noun: **Chicken Door Alert Tamer**, **Flaky CI Wrangler**), and may run to 30 characters. Acronyms and brand casing (CI, GitHub) are kept; a kebab-case reply is still split and title-cased.
 - footer: a session name saved with outer quotes (`/name "Foo Bar"` before the pi fork stripped them) shows without them.
 - agent-link: a spaced session name answers to its lowercase, hyphenated handle and its prefixes (`@chicken-door` for "Chicken Door Tamer"), in @mentions, autocomplete, and `to`. Autocomplete inserts the handle, since a space ends an @mention.

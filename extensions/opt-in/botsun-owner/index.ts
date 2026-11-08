@@ -179,6 +179,9 @@ interface Conn {
 	colorApplied?: { sessionId: string; color: string; at: number };
 	/** The subagents list Botsun was last sent (JSON): a line goes only when it changed. */
 	subagentsSent?: string;
+	/** What the host says it takes (its features line: model_pages for a paged catalogue), and so what
+	 * this session may send it. Undefined until that line arrives: until then, only what an older host takes. */
+	hostFeatures?: Set<string>;
 }
 
 const store = globalThis as unknown as { [STORE]?: Conn };
@@ -659,11 +662,29 @@ export function serverLine(c: Conn, line: string): boolean {
 	if (v === 1 && type === "name") return applyName(c, msg as Record<string, unknown>);
 	if (v === 1 && type === "icons") return applyIcons(c, msg as Record<string, unknown>);
 	if (v === 1 && type === "icon") return applyIconReply(c, msg as Record<string, unknown>);
+	if (v === 1 && type === "features") return applyHostFeatures(c, msg as Record<string, unknown>);
 	if (v !== 1 || type !== "sandbox_token") return false;
 	if (typeof token !== "string" || !SANDBOX_TOKEN.test(token)) return false;
 	if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < 1 || ttl > SANDBOX_TOKEN_MAX_S) return false;
 	if (c.boundId !== c.sessionId) return true; // for a conversation pi has left: read, not kept
 	c.sandboxToken = { token, expiresAt: Date.now() + ttl * 1000 };
+	return true;
+}
+
+/** As many host features as Botsun's own list keeps (OwnerSessions::MAX_FEATURES). */
+export const HOST_FEATURES_MAX = 32;
+
+/**
+ * What the host takes (its features line, sent after every hello): the names it knows, capped as
+ * the host caps its own list. It decides what this session may send in a shape an older host would
+ * read wrong: a paged model list, or one page.
+ */
+function applyHostFeatures(c: Conn, msg: Record<string, unknown>): boolean {
+	if (!Array.isArray(msg.features)) return false;
+	const names = msg.features.filter((name): name is string => typeof name === "string" && /^[a-z0-9_]{1,40}$/.test(name));
+	c.hostFeatures = new Set(names.slice(0, HOST_FEATURES_MAX));
+	// The catalogue: hello carried only its first page, and this host can hold all of it.
+	if (c.hostFeatures.has("model_pages")) sendModels(c);
 	return true;
 }
 
@@ -1649,6 +1670,9 @@ function featureList(c: Conn): string[] {
 		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 	})();
 	return ["say", "say_call", "answer_call", "close_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close", "name",
+		// This pi sends a catalogue in pages (sendModels) when the host says it appends them: the host
+		// answers this with its own features line (OwnerSessions' HOST_FEATURES).
+		"model_pages",
 		"subagents", "subagent_chats", ...(hasStash ? ["stash"] : []), ...(c.reload ? ["reload"] : []),
 		...(c.restart && restartTarget() ? ["restart"] : [])];
 }
@@ -1699,8 +1723,12 @@ function sendHello(c: Conn): void {
 		commands: (() => {
 			try { return c.commands?.() ?? []; } catch { return []; }
 		})(),
+		// A first page only, and a small one: hello must stay under the host's line limit, and a
+		// catalogue is bigger than that. A host that takes pages gets the whole list on models
+		// lines once it says so (serverLine's features line, sendModels); for one that doesn't,
+		// this page is the whole list.
 		models: (() => {
-			try { return c.models?.() ?? []; } catch { return []; }
+			try { return modelPages(c.models?.() ?? [], HELLO_MODELS_BYTES)[0] ?? []; } catch { return []; }
 		})(),
 		stash: stashLine(c),
 		footer: footerLine(),
@@ -1747,6 +1775,8 @@ function connect(c: Conn): void {
 		c.delay = retryBase();
 		debug("connected");
 		sendHello(c);
+		// The rest of the catalogue follows once the host says it takes pages (its features line):
+		// a host from before that replaces its list on every models line.
 	});
 	// Botsun writes this session's saved color, and a sandbox VM's bridge its token too
 	// (serverLine). Read line by line, at most SERVER_LINE_MAX each, so the socket can't stall.
@@ -1929,13 +1959,72 @@ export interface PhoneModel {
 	id: string;
 	name: string;
 	reasoning: boolean;
+	/** One of the session's scoped models (the `enabledModels` setting or `--models`). */
+	scoped: boolean;
 }
 
-/** The models pi can use here (auth configured), for the phone's picker. */
-export function phoneModels(ctx: Pick<ExtensionContext, "modelRegistry">): PhoneModel[] {
-	return (ctx.modelRegistry.getAvailable() as Array<{ provider: string; id: string; name?: string; reasoning?: boolean }>)
-		.slice(0, 120)
-		.map((m) => ({ provider: String(m.provider).slice(0, 80), id: String(m.id).slice(0, 120), name: String(m.name || m.id).slice(0, 80), reasoning: m.reasoning === true }));
+/** The most models the phone is sent: its picker searches them, so it gets the catalogue. */
+export const PHONE_MODELS_MAX = 1000;
+/**
+ * The bytes of JSON one models line carries for its list. The host drops a line over its 64 KB
+ * limit (a sandbox relay refuses the whole batch), and the field caps are characters, not bytes:
+ * a page is measured, not counted, so 100 models of multi-byte names can't overrun it.
+ */
+export const PHONE_MODELS_BYTES = 48 * 1024;
+/** What hello's own models field may take: hello carries commands and the rest of the snapshot too. */
+export const HELLO_MODELS_BYTES = 24 * 1024;
+
+/**
+ * The models pi can use here (auth configured), for the phone's picker: the session's scoped
+ * models first (so a cut list keeps them), then the rest of the catalogue.
+ */
+export function phoneModels(ctx: Pick<ExtensionContext, "modelRegistry" | "scopedModels">): PhoneModel[] {
+	const scoped = new Set((ctx.scopedModels ?? []).map((s) => `${s?.model?.provider}/${s?.model?.id}`));
+	const available = ctx.modelRegistry.getAvailable() as Array<{ provider: string; id: string; name?: string; reasoning?: boolean }>;
+	const models = available.map((m): PhoneModel => ({
+		provider: String(m.provider).slice(0, 80), id: String(m.id).slice(0, 120),
+		name: String(m.name || m.id).slice(0, 80), reasoning: m.reasoning === true, scoped: scoped.has(`${m.provider}/${m.id}`),
+	}));
+	const ordered = [...models.filter((m) => m.scoped), ...models.filter((m) => !m.scoped)];
+	return ordered.slice(0, PHONE_MODELS_MAX);
+}
+
+/**
+ * A list split into pages of at most `max` bytes of JSON each (one model at a time, so a model
+ * bigger than a page is still alone on its own). An empty list is one empty page.
+ */
+export function modelPages(list: PhoneModel[], max = PHONE_MODELS_BYTES): PhoneModel[][] {
+	const pages: PhoneModel[][] = [];
+	let page: PhoneModel[] = [];
+	let bytes = 0;
+	for (const model of list) {
+		const size = Buffer.byteLength(JSON.stringify(model), "utf8") + 1; // and its comma
+		if (page.length > 0 && bytes + size > max) {
+			pages.push(page);
+			page = [];
+			bytes = 0;
+		}
+		page.push(model);
+		bytes += size;
+	}
+	if (page.length > 0 || pages.length === 0) pages.push(page);
+	return pages;
+}
+
+/**
+ * The phone's model list. A host that lists `model_pages` takes it in pages, the first saying
+ * `first: true` (it replaces what the host had) and the last `last: true` (the host publishes the
+ * list only then, so a read never sees half of it). A host from before that replaces its list on
+ * every models line, so it gets one page only, scoped models first: a second page would leave it
+ * holding just the tail. Either way a page stays under PHONE_MODELS_BYTES.
+ */
+export function sendModels(c: Conn, models?: PhoneModel[]): void {
+	let list: PhoneModel[];
+	try { list = (models ?? c.models?.() ?? []).slice(0, PHONE_MODELS_MAX); } catch { return; }
+	const pages = c.hostFeatures?.has("model_pages") ? modelPages(list) : [modelPages(list)[0] ?? []];
+	pages.forEach((page, i) => {
+		try { write(c, "models", { models: page, first: i === 0, last: i === pages.length - 1 }); } catch {}
+	});
 }
 
 function modelOf(ctx: ExtensionContext, model?: unknown, thinking?: string): Conn["model"] {
@@ -2179,6 +2268,9 @@ function main(pi: ExtensionAPI): void {
 				conn.promptDepth = 0;
 				conn.model = modelOf(ctx);
 				sendHello(conn);
+				// The catalogue follows once, not twice: a host that takes pages answers this hello
+				// with its features line (applyHostFeatures), and that send is the one.
+				if (!conn.closed && !conn.hostFeatures?.has("model_pages")) sendModels(conn);
 				return;
 			}
 			const model = modelOf(ctx);
@@ -2196,7 +2288,7 @@ function main(pi: ExtensionAPI): void {
 			// A reload may have added or dropped commands: the phone's "/" list follows.
 			try { write(conn, "commands", { commands: commands() }); } catch {}
 			try { reportFeatures(conn); } catch {}
-			try { write(conn, "models", { models: models() }); } catch {}
+			try { sendModels(conn, models()); } catch {}
 			// And what the phone shows from hello: context use and the stash, fresh, not after the next run.
 			write(conn, "context", { context: (() => { try { return context(); } catch { return null; } })() });
 			write(conn, "stash", { stash: stashLine(conn) });
