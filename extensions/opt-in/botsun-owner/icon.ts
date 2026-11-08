@@ -138,3 +138,30 @@ export function lookOf(msg: Record<string, unknown>, catalog?: IconCatalog | nul
 	const look = typeof msg.look === "string" ? goodLook(msg.look, catalog) : null;
 	return { look, color: goodColor(msg.color, catalog) };
 }
+
+/** As many looks' words as Botsun's own pages hold together. */
+const NOTES_MAX = 400;
+/** One look's words, and no more: the line is a page, and a suggestion's prompt stays small. */
+const ABOUT_MAX = 80;
+/** What a look's words may not carry: control characters, the line and paragraph separators, and
+ * the direction marks (a note is one line of a prompt, down the same socket a color comes down). */
+const NOTE_BAD = /[\p{Cc}\u2028\u2029\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+
+/**
+ * A looks line's page: {look id: what it draws}, for #21's auto-name to give a small model the
+ * words to pick one by. Checked whole: a page with one bad name or word is dropped, not half taken.
+ */
+export function takeLookNotes(msg: Record<string, unknown>): Record<string, string> | null {
+	const raw = msg.looks;
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	const entries = Object.entries(raw as Record<string, unknown>);
+	if (entries.length === 0 || entries.length > NOTES_MAX) return null;
+	const out: Record<string, string> = Object.create(null);
+	for (const [id, about] of entries) {
+		if (!LOOK.test(id)) return null;
+		if (typeof about !== "string" || about.length === 0 || about.length > ABOUT_MAX) return null;
+		if (NOTE_BAD.test(about)) return null;
+		out[id] = about;
+	}
+	return out;
+}

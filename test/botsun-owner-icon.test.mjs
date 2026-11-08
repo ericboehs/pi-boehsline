@@ -9,7 +9,8 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
-import { iconCompletions, iconLineFields, parseIconArgs, takeCatalog } from "../extensions/opt-in/botsun-owner/icon.ts";
+import { iconCompletions, iconLineFields, parseIconArgs, takeCatalog, takeLookNotes } from "../extensions/opt-in/botsun-owner/icon.ts";
+import { namingCatalog, suggestIcon } from "../lib/icon-suggestion.ts";
 import { stubPi } from "./helpers/stub-pi.mjs";
 
 const home = mkdtempSync(join(tmpdir(), "botsun-icon-"));
@@ -33,6 +34,19 @@ const CATALOG = {
 	colors: ["pink", "mint"],
 	look: null,
 };
+// What each look draws (#21's auto-name picks by it): a page of the set, first and last.
+const LOOKS = { v: 1, type: "looks", first: true, last: true, looks: { heart: "a heart", "hyrule.fairy": "a tiny winged fairy" } };
+
+test("a looks page is taken whole, and only in Botsun's own shapes", () => {
+	assert.deepEqual({ ...takeLookNotes(LOOKS) }, { heart: "a heart", "hyrule.fairy": "a tiny winged fairy" });
+	assert.equal(takeLookNotes({ looks: {} }), null, "an empty page");
+	assert.equal(takeLookNotes({ looks: { "Hyrule.Fairy": "a fairy" } }), null, "a look's name is as Botsun sends it: lowercase, at most one dot");
+	assert.equal(takeLookNotes({ looks: { heart: "a\rheart" } }), null, "a word is one line of plain text");
+	assert.equal(takeLookNotes({ looks: { heart: "a\u202eheart" } }), null, "and never a direction mark");
+	assert.equal(takeLookNotes({ looks: { heart: "x".repeat(81) } }), null, "nor longer than a page has room for");
+	assert.equal(takeLookNotes({ looks: ["heart"] }), null);
+	assert.equal(takeLookNotes({}), null);
+});
 
 test("parseIconArgs: pick, set, keep color, clear, and a bad line", () => {
 	assert.deepEqual(parseIconArgs(""), { kind: "pick" });
@@ -70,6 +84,11 @@ test("completions come from the catalog, and auto and off need none", () => {
 
 test("/icon needs Botsun when nothing is connected, and sends the line when it is", async () => {
 	const lines = [];
+	// A /icon whose answer is held back, so a suggestion can be offered while one is in flight.
+	let hold = false;
+	const held = [];
+	const answerTo = (msg) => ({ v: 1, type: "icon", id: msg.id, ok: msg.look !== "nope", look: msg.look ?? null, color: msg.color,
+		error: msg.look === "nope" ? "unknown look" : undefined });
 	let sock;
 	const path = join(home, "owner.sock");
 	const srv = createServer((c) => {
@@ -82,10 +101,16 @@ test("/icon needs Botsun when nothing is connected, and sends the line when it i
 				const msg = JSON.parse(buf.slice(0, i));
 				lines.push(msg);
 				buf = buf.slice(i + 1);
-				if (msg.type === "hello") c.write(`${JSON.stringify(CATALOG)}\n`);
-				if (msg.type === "icon") {
-					c.write(`${JSON.stringify({ v: 1, type: "icon", id: msg.id, ok: msg.look !== "nope", look: msg.look ?? null, color: msg.color, error: msg.look === "nope" ? "unknown look" : undefined })}\n`);
+				if (msg.type === "hello") {
+					c.write(`${JSON.stringify(CATALOG)}\n`);
+					c.write(`${JSON.stringify(LOOKS)}\n`);
 				}
+				if (msg.type !== "icon") continue;
+				if (hold) {
+					held.push(msg);
+					continue;
+				}
+				c.write(`${JSON.stringify(answerTo(msg))}\n`);
 			}
 		});
 	});
@@ -119,9 +144,17 @@ test("/icon needs Botsun when nothing is connected, and sends the line when it i
 
 	await s.fire("session_start", { reason: "startup" }, ctx);
 	await until(() => lines.some((l) => l.type === "hello"));
+	// This pi picks a look with a session's name: its hello says so, or the host sends no words.
+	assert.ok(lines.find((l) => l.type === "hello").features.includes("look_notes"));
 	// The catalog is written as the hello arrives. Wait until the command can see it.
 	await until(() => icon.getArgumentCompletions("h").some((c) => c.value === "heart"));
 	assert.equal(mod.sessionIcon()?.look ?? null, null, "nothing saved: the catalog's look is null");
+	// #21: what the namer picks from, with the words the host sent and none for a look it didn't.
+	await until(() => namingCatalog()?.looks?.some((l) => l.about === "a tiny winged fairy"));
+	assert.deepEqual(namingCatalog(), {
+		looks: [{ id: "heart", about: "a heart" }, { id: "ghost" }, { id: "hyrule.fairy", about: "a tiny winged fairy" }],
+		colors: ["pink", "mint"],
+	});
 
 	notes.length = 0;
 	await icon.handler("nope pink", ctx);
@@ -153,7 +186,41 @@ test("/icon needs Botsun when nothing is connected, and sends the line when it i
 	assert.equal(notes.at(-1)[1], "icon: automatic");
 	assert.deepEqual(mod.sessionIcon(), { look: null, color: null });
 
+	// #21: auto-session-name's look and color go out as a suggestion (if_unset), so Botsun stores
+	// one only while nothing is saved there, and never over a pick.
+	const icons = () => lines.filter((l) => l.type === "icon");
+	const before = icons().length;
+	assert.equal(suggestIcon({ look: "heart", color: "pink" }), true);
+	await until(() => icons().length > before);
+	const suggestion = icons().at(-1);
+	assert.deepEqual([suggestion.look, suggestion.color, suggestion.if_unset], ["heart", "pink", true]);
+	assert.match(suggestion.id, /^[0-9a-f]{16}$/);
+
+	const unsent = icons().length;
+	suggestIcon({ look: "nope", color: "plaid" });
+	await sleep(60);
+	assert.equal(icons().length, unsent, "a look or color Botsun doesn't offer is never sent");
+
+	// A /icon of this session's own on its way: a suggestion waits for it rather than racing it.
+	hold = true;
+	const awaited = icon.handler("hyrule.fairy", ctx);
+	await until(() => held.length === 1);
+	const inFlight = icons().length;
+	suggestIcon({ look: "heart", color: "pink" });
+	await sleep(60);
+	assert.equal(icons().length, inFlight, "a pick in flight is not raced");
+	hold = false;
+	sock.write(`${JSON.stringify(answerTo(held[0]))}\n`);
+	await awaited;
+
+	await icon.handler("ghost mint", ctx); // a pick of this session's own
+	const afterPick = icons().length;
+	suggestIcon({ look: "hyrule.fairy", color: "pink" });
+	await sleep(60);
+	assert.equal(icons().length, afterPick, "a saved look is a pick: a suggestion never covers one");
+
 	await s.fire("session_shutdown", { reason: "quit" });
+	assert.equal(suggestIcon({ look: "heart" }), false, "nothing takes a suggestion after shutdown");
 	sock?.destroy();
 	await new Promise((r) => srv.close(() => r()));
 });

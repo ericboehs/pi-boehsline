@@ -14,10 +14,16 @@
  * session already sends it. An explicit PI_AUTO_NAME_MODEL list never falls
  * back, so it can pin naming to free models. With no usable model at all it
  * stays quiet.
+ *
+ * With Botsun connected (botsun-owner hands its icon catalog over, lib/icon-suggestion.ts) the
+ * same call also picks a look and a color for the session's Home row, from those Botsun offers:
+ * the reply is JSON, the name plus the look and the color, and a bad or missing look just means a
+ * name alone. Botsun keeps a suggestion only while nothing is saved there.
  */
 
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { namingCatalog, suggestIcon, validSuggestion, type NamingCatalog } from "../../lib/icon-suggestion.ts";
 
 /**
  * Opencode Go models only: they're covered by the flat subscription, unlike
@@ -246,24 +252,97 @@ export const NAMING_PROMPT = [
   "what time is it in Tokyo -> Tokyo Clock Whisperer",
 ].join("\n");
 
+/** What to add to the prompt when Botsun offers looks: pick one that fits, and one color. */
+export function lookPrompt(catalog: NamingCatalog): string {
+	const looks = catalog.looks.map((l) => (l.about ? `${l.id}: ${l.about}` : l.id)).join("\n");
+	return [
+		"Then dress the session: pick the one look whose meaning fits what the conversation is about, and one color, from these Botsun offers. A cactus tamer gets a cactus; a leak, a drop.",
+		`Reply with only JSON, no markdown: {"name": "Canvas Leak Plumber", "look": "drop", "color": "blue"}`,
+		"Looks (id: what it draws):",
+		looks,
+		`Colors: ${catalog.colors.join(", ")}`,
+	].join("\n");
+}
+
+/** The text of a reply, thinking left out. */
+function textOf(content: { type?: string; text?: string }[] | undefined): string {
+	return (content || [])
+		.filter((c) => c?.type === "text" && c.text)
+		.map((c) => c.text as string)
+		.join("")
+		.trim();
+}
+
+/** The first JSON object in a reply, past the fences a model likes to wrap it in. */
+function jsonObject(raw: string): Record<string, unknown> | null {
+	const text = raw.trim();
+	const start = text.indexOf("{");
+	const end = text.lastIndexOf("}");
+	if (start < 0 || end <= start) return null;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text.slice(start, end + 1));
+	} catch {
+		return null;
+	}
+	return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+}
+
+/** A name, and (when Botsun's catalog was offered) a look and color it allows, from a reply. */
+export interface NamingReply {
+	name: string;
+	look?: string;
+	color?: string;
+}
+
+/**
+ * The model's reply as a name and a look. Its JSON is the name with the look and color to dress
+ * the session in, each checked against what Botsun offers (#21: an unoffered look is dropped, and
+ * the name still lands). A reply that isn't JSON is a name alone, as it always was.
+ */
+export function parseNamingReply(raw: string, catalog: NamingCatalog | null = null): NamingReply {
+	const obj = jsonObject(raw);
+	// Asked for JSON (a catalog armed the call) and got a broken object: no name, so the next
+	// model (or /auto-name) tries again, rather than a title made of the JSON's words.
+	if (!obj && catalog && raw.includes("{")) return { name: "" };
+	if (!obj) return { name: titleFromContent([{ type: "text", text: raw }]) };
+	const name = typeof obj.name === "string" ? sanitizeName(obj.name) : "";
+	if (!name) return { name: "" };
+	const suggestion = validSuggestion(obj, catalog);
+	if (!suggestion) return { name };
+	return suggestion.color ? { name, look: suggestion.look, color: suggestion.color } : { name, look: suggestion.look };
+}
+
 /** The session model may spend tokens reasoning even with thinking off; titles stay short anyway. */
 const FALLBACK_MAX_TOKENS = 1024;
 
-/** generateTitle's error when there is no model it could ask at all. */
+/** generateNaming's error when there is no model it could ask at all. */
 export const NO_NAMING_MODEL = "no naming model with credentials";
 
-/**
- * Ask each candidate in turn for a title. Provider errors (stopReason "error",
- * e.g. Ollama's 402 free-tier refusal) come back as results, not throws, so
- * they are checked explicitly. Throws with every model's reason if none work.
- */
+/** A title alone, for a caller that only wants the words. */
 export async function generateTitle(
   ctx: Pick<ExtensionContext, "modelRegistry"> & { model?: unknown },
   source: string,
   state: NamerState = {},
   specs: string[] = parseModelList(process.env.PI_AUTO_NAME_MODEL),
 ): Promise<string> {
-  if (!source.trim()) return "";
+  return (await generateNaming(ctx, source, state, specs)).name;
+}
+
+/**
+ * Ask each candidate in turn for a title, and (when catalog offers looks) a look and a color to
+ * dress the session in. Provider errors (stopReason "error", e.g. Ollama's 402 free-tier refusal)
+ * come back as results, not throws, so they are checked explicitly. Throws with every model's
+ * reason if none work.
+ */
+export async function generateNaming(
+  ctx: Pick<ExtensionContext, "modelRegistry"> & { model?: unknown },
+  source: string,
+  state: NamerState = {},
+  specs: string[] = parseModelList(process.env.PI_AUTO_NAME_MODEL),
+  catalog: NamingCatalog | null = null,
+): Promise<NamingReply> {
+  if (!source.trim()) return { name: "" };
   const reg = ctx.modelRegistry as unknown as NamingRegistry;
   if (typeof reg?.complete !== "function") throw new Error("modelRegistry.complete unavailable");
   const listed = candidateModels(ctx, specs, state, false);
@@ -281,12 +360,11 @@ export async function generateTitle(
       const res = await reg.complete(
         model,
         {
-          systemPrompt:
-            NAMING_PROMPT,
+          systemPrompt: catalog ? `${NAMING_PROMPT}\n\n${lookPrompt(catalog)}` : NAMING_PROMPT,
           messages: [{ role: "user", content: source.slice(0, 2000) }],
         },
         {
-          maxTokens: usingFallback ? FALLBACK_MAX_TOKENS : 64,
+          maxTokens: usingFallback ? FALLBACK_MAX_TOKENS : catalog ? 160 : 64,
           cacheRetention: "none",
           signal: AbortSignal.timeout(15_000),
           sessionId: randomUUID(),
@@ -297,10 +375,10 @@ export async function generateTitle(
         errors.push(`${modelKey(model)}: ${summarizeError(res.errorMessage || res.stopReason)}`);
         continue;
       }
-      const title = titleFromContent(res?.content);
-      if (title) {
+      const naming = parseNamingReply(textOf(res?.content), catalog);
+      if (naming.name) {
         state.preferred = modelKey(model);
-        return title;
+        return naming;
       }
       errors.push(`${modelKey(model)}: no usable title (${res?.stopReason || "empty"})`);
     } catch (e) {
@@ -318,11 +396,15 @@ export default function (pi: ExtensionAPI) {
   async function applyGeneratedName(ctx: ExtensionContext, opts: { force: boolean }): Promise<string> {
     const source = recentContext(ctx.sessionManager.getBranch() || []);
     if (!source) return "";
-    const title = await generateTitle(ctx, source, namer);
-    if (!title) return "";
+    // What Botsun offers to dress the session in: null with no Botsun, and then the name is all.
+    const naming = await generateNaming(ctx, source, namer, undefined, namingCatalog());
+    if (!naming.name) return "";
     if (!opts.force && isUserGivenName(pi.getSessionName())) return "";
-    pi.setSessionName(title);
-    return title;
+    pi.setSessionName(naming.name);
+    // Handed to botsun-owner, which sends it only when nothing is saved (and Botsun stores it only
+    // then too): a suggestion never covers a pick. Nothing listening: nothing happens.
+    if (naming.look) suggestIcon({ look: naming.look, color: naming.color });
+    return naming.name;
   }
 
   pi.on("session_start", (_event, ctx) => {

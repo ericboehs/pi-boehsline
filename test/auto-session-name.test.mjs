@@ -12,15 +12,21 @@ import {
   DEFAULT_NAME_MODELS,
   NAMING_PROMPT,
   NO_NAMING_MODEL,
+  generateNaming,
   generateTitle,
   hasHistory,
   isUserGivenName,
+  lookPrompt,
   parseModelList,
+  parseNamingReply,
   recentContext,
   sanitizeName,
   summarizeError,
   titleFromContent,
 } from "../extensions/auto-session-name/index.ts";
+import autoSessionName from "../extensions/auto-session-name/index.ts";
+import { onIconSuggestion, provideIconCatalog } from "../lib/icon-suggestion.ts";
+import { stubPi } from "./helpers/stub-pi.mjs";
 
 test("empty and derived peer ids are not user-given", () => {
   assert.equal(isUserGivenName(undefined), false);
@@ -269,4 +275,140 @@ test("generateTitle reports every model's failure when none work", async () => {
     generateTitle({ modelRegistry: reg }, "user: hi", {}, ["a/one", "b/two"]),
     /a\/one: 402 pay up; b\/two: socket hang up/,
   );
+});
+
+// #21: with Botsun connected, the same call picks a look and a color for the session's Home row,
+// and each is checked against the catalog Botsun sent.
+const CATALOG = {
+  looks: [
+    { id: "drop", about: "a water drop" },
+    { id: "nature.cactus", about: "a cactus" },
+    { id: "hyrule.fairy" },
+  ],
+  colors: ["green", "blue"],
+};
+
+test("parseNamingReply reads the name with a look and color, and keeps the name when they don't fit", () => {
+  assert.deepEqual(parseNamingReply('{"name":"Cactus Winter Keeper","look":"nature.cactus","color":"green"}', CATALOG), {
+    name: "Cactus Winter Keeper",
+    look: "nature.cactus",
+    color: "green",
+  });
+  assert.deepEqual(parseNamingReply('```json\n{"name":"Canvas Leak Plumber","look":"drop"}\n```', CATALOG), {
+    name: "Canvas Leak Plumber",
+    look: "drop",
+  }, "a fence is not part of the JSON");
+  assert.deepEqual(parseNamingReply('{"name":"Cactus Winter Keeper","look":"nature.tumbleweed","color":"green"}', CATALOG), {
+    name: "Cactus Winter Keeper",
+  }, "a look Botsun doesn't offer is dropped, and the name still lands");
+  assert.deepEqual(parseNamingReply('{"name":"Cactus Winter Keeper","look":"drop","color":"plaid"}', CATALOG), {
+    name: "Cactus Winter Keeper",
+    look: "drop",
+  }, "so is a color: the look stays, in whatever color the session draws");
+  assert.deepEqual(parseNamingReply('{"name":"Cactus Winter Keeper","look":"DROP"}', CATALOG), {
+    name: "Cactus Winter Keeper",
+    look: "drop",
+  });
+  assert.deepEqual(parseNamingReply('{"name":"Cactus Winter Keeper","look":"drop"}', null), { name: "Cactus Winter Keeper" },
+    "with no catalog nothing is taken: there is nothing to check it against");
+  assert.deepEqual(parseNamingReply("Chicken Door Alert Tamer", CATALOG), { name: "Chicken Door Alert Tamer" },
+    "a reply that isn't JSON is a name alone, as it always was");
+  assert.deepEqual(parseNamingReply('{"look":"drop"}', CATALOG), { name: "" }, "no name is no title");
+  assert.deepEqual(parseNamingReply("", CATALOG), { name: "" });
+});
+
+test("lookPrompt offers every look with its words, the palette, and the JSON shape", () => {
+  const prompt = lookPrompt(CATALOG);
+  assert.match(prompt, /drop: a water drop/);
+  assert.match(prompt, /nature\.cactus: a cactus/);
+  assert.match(prompt, /^hyrule\.fairy$/m, "a look Botsun didn't send words for is listed by name");
+  assert.match(prompt, /Colors: green, blue/);
+  assert.match(prompt, /\{"name": "Canvas Leak Plumber", "look": "drop", "color": "blue"\}/);
+});
+
+test("generateNaming asks for the JSON with Botsun's catalog, and a plain name without one", async () => {
+  const models = [{ provider: "opencode-go", id: "deepseek-v4.1-flash" }];
+  const prompts = [];
+  const reply = (text) => ({ stopReason: "stop", content: [{ type: "text", text }] });
+  const asked = [];
+  const reg = {
+    ...fakeRegistry(models, {}),
+    complete: async (model, req, opts) => {
+      asked.push([req.systemPrompt, opts.maxTokens]);
+      prompts.push(req.systemPrompt);
+      return reply('{"name":"Cactus Winter Keeper","look":"nature.cactus","color":"green"}');
+    },
+  };
+  const ctx = { modelRegistry: reg };
+  const naming = await generateNaming(ctx, "user: my cactus keeps dying", {}, DEFAULT_NAME_MODELS, CATALOG);
+  assert.deepEqual(naming, { name: "Cactus Winter Keeper", look: "nature.cactus", color: "green" });
+  assert.match(asked[0][0], /^Name this conversation like a character on the job/);
+  assert.match(asked[0][0], /nature\.cactus: a cactus/);
+  assert.ok(asked[0][1] > 64, "the look and color need room past a bare name");
+
+  const plain = {
+    ...fakeRegistry(models, {}),
+    complete: async (_model, req, opts) => {
+      asked.push([req.systemPrompt, opts.maxTokens]);
+      return reply("Cactus Winter Keeper");
+    },
+  };
+  assert.deepEqual(await generateNaming({ modelRegistry: plain }, "user: hi", {}, DEFAULT_NAME_MODELS), {
+    name: "Cactus Winter Keeper",
+  });
+  assert.equal(asked.at(-1)[0], NAMING_PROMPT, "no catalog: the prompt is the one that asks for a name only");
+  assert.equal(asked.at(-1)[1], 64);
+});
+
+test("a named session hands Botsun's owner its look and color, and only when there is one", async () => {
+  const s = stubPi();
+  let name;
+  s.pi.getSessionName = () => name;
+  s.pi.setSessionName = (next) => {
+    name = next;
+  };
+  const suggestions = [];
+  const stop = onIconSuggestion((suggestion) => suggestions.push(suggestion));
+  provideIconCatalog(() => CATALOG);
+  const ctx = (text) => ({
+    hasUI: true,
+    ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+    sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", content: "my cactus keeps dying" } }] },
+    modelRegistry: fakeRegistry([{ provider: "opencode-go", id: "deepseek-v4.1-flash" }], {
+      "opencode-go/deepseek-v4.1-flash": { stopReason: "stop", content: [{ type: "text", text }] },
+    }),
+  });
+  try {
+    autoSessionName(s.pi);
+    await s.fire("agent_settled", {}, ctx('{"name":"Cactus Winter Keeper","look":"nature.cactus","color":"green"}'));
+    assert.equal(name, "Cactus Winter Keeper");
+    assert.deepEqual(suggestions, [{ look: "nature.cactus", color: "green" }], "handed over once, after the name");
+
+    name = undefined;
+    s.handlers.get("agent_settled").length = 0;
+    autoSessionName(s.pi);
+    await s.fire("agent_settled", {}, ctx("Cactus Winter Keeper"));
+    assert.equal(name, "Cactus Winter Keeper", "no look in the reply: the name still lands");
+    assert.equal(suggestions.length, 1, "and nothing is suggested");
+
+    // No Botsun: no catalog, so no look is asked for and none is suggested.
+    name = undefined;
+    provideIconCatalog(null);
+    s.handlers.get("agent_settled").length = 0;
+    autoSessionName(s.pi);
+    await s.fire("agent_settled", {}, ctx('{"name":"Cactus Winter Keeper","look":"nature.cactus"}'));
+    assert.equal(name, "Cactus Winter Keeper");
+    assert.equal(suggestions.length, 1, "nothing to check a look against, so none goes");
+  } finally {
+    stop();
+    provideIconCatalog(null);
+  }
+});
+
+test("parseNamingReply lands no name from a broken JSON reply when it asked for JSON", () => {
+  assert.deepEqual(parseNamingReply('{"name":"Cactus Winter Keeper","look":"nature.cac', CATALOG), { name: "" });
+  assert.deepEqual(parseNamingReply('Sure! {"name": broken} here', CATALOG), { name: "" });
+  // No catalog: a plain reply is a name, as always.
+  assert.equal(parseNamingReply("Cactus Winter Keeper").name, "Cactus Winter Keeper");
+  assert.equal(parseNamingReply("Cactus Winter Keeper", CATALOG).name, "Cactus Winter Keeper");
 });

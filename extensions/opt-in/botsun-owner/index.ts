@@ -39,7 +39,8 @@ import { optIn } from "../../../lib/opt-in.ts";
 import { canonicalAnswer, canonicalAnswerV2, invalidAnswer, onPromptsChange, openPrompts, type RemotePrompt } from "../../../lib/remote-prompts.ts";
 import { messageV2, messageV3, validHost, validScope } from "../../../lib/signing-v2.ts";
 import { checkPin, isPinsError, pin, ratchet, shortFingerprint, signVersionOf, type KeyKind } from "./pins.ts";
-import { ICON_DISCONNECTED, iconCompletions, iconLineFields, lookOf, looksOf, parseIconArgs, takeCatalog, type IconCatalog, type IconReply } from "./icon.ts";
+import { ICON_DISCONNECTED, iconCompletions, iconLineFields, lookOf, looksOf, parseIconArgs, takeCatalog, takeLookNotes, type IconCatalog, type IconReply } from "./icon.ts";
+import { onIconSuggestion, provideIconCatalog, type IconSuggestion, type NamingCatalog } from "../../../lib/icon-suggestion.ts";
 import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
 import { latestUsage, onUsageChange, type ProviderUsageSnapshot } from "../../../lib/usage-snapshot.ts";
@@ -170,6 +171,10 @@ interface Conn {
 	/** The icon catalog Botsun sent, and the look it last said this session has. #22 reads icon. */
 	icons?: IconCatalog;
 	icon?: { look: string | null; color: string | null };
+	/** What each look draws, from Botsun's looks lines (#21's auto-name picks by it), and the pages
+	 * of a set still arriving: a set is published only on its last page, so it never reads half. */
+	iconNotes?: Record<string, string>;
+	iconNotesHeld?: Record<string, string>;
 	iconWait?: { id: string; timer: ReturnType<typeof setTimeout>; resolve: (reply: IconReply) => void };
 	/** The last claim Botsun was told or sent (JSON): a change to it is reported, one Botsun sent is not. */
 	colorSaid?: string;
@@ -642,6 +647,7 @@ const ICON_WAIT_MS = 5_000;
  *   (applyColor). Botsun on the Mac and a sandbox VM's bridge both send it.
  * - "name": a rename from the phone's info sheet.
  * - "icons": the icon catalog and the current look, answered to hello and session.
+ * - "looks": a page of what each look draws, for a pi whose hello lists "look_notes".
  * - "icon": the answer to an icon line this session sent (/icon).
  * - "sandbox_token": a sandbox session's VM-tool token, from its VM's bridge only
  *   (vm/owner-bridge.mjs, after Botsun bound this session's hello to its template and Eric started
@@ -661,6 +667,7 @@ export function serverLine(c: Conn, line: string): boolean {
 	if (v === 1 && type === "color") return applyColor(c, msg as Record<string, unknown>);
 	if (v === 1 && type === "name") return applyName(c, msg as Record<string, unknown>);
 	if (v === 1 && type === "icons") return applyIcons(c, msg as Record<string, unknown>);
+	if (v === 1 && type === "looks") return applyLookNotes(c, msg as Record<string, unknown>);
 	if (v === 1 && type === "icon") return applyIconReply(c, msg as Record<string, unknown>);
 	if (v === 1 && type === "features") return applyHostFeatures(c, msg as Record<string, unknown>);
 	if (v !== 1 || type !== "sandbox_token") return false;
@@ -718,6 +725,24 @@ function applyIcons(c: Conn, msg: Record<string, unknown>): boolean {
 }
 
 /**
+ * A page of the looks' words: merged into the held set, published on the last page (the first
+ * starts a new set, so an unfinished set is never read). A page Botsun sent for a look this
+ * catalog doesn't offer stays harmless: the naming catalogue reads only the catalog's looks.
+ */
+function applyLookNotes(c: Conn, msg: Record<string, unknown>): boolean {
+	const page = takeLookNotes(msg);
+	if (!page) return false;
+	const held = { ...(msg.first === true ? {} : (c.iconNotesHeld ?? {})), ...page };
+	if (msg.last !== true) {
+		c.iconNotesHeld = held;
+		return true;
+	}
+	c.iconNotesHeld = undefined;
+	c.iconNotes = held;
+	return true;
+}
+
+/**
  * The answer to the icon line this session sent. Only the id it is waiting on is taken: another
  * connection's answer, or a replay, is not this command's. What it says the look is now is checked
  * against the catalog, and an error is stripped before it reaches the TUI.
@@ -743,6 +768,38 @@ function failIconWait(c: Conn, error: string): void {
 	c.iconWait = undefined;
 	clearTimeout(wait.timer);
 	wait.resolve({ ok: false, error });
+}
+
+/**
+ * What Botsun offers a session's icon as, for #21's auto-name: every look, with what it draws when
+ * the host sent that, and the palette. Null with no connection, or before the catalog arrives (a
+ * host from before the looks lines sends ids only, and those pick a look just as well).
+ */
+function namingCatalogFor(c: Conn | undefined): NamingCatalog | null {
+	if (!c || c.closed || !c.connected || !c.icons) return null;
+	const looks = looksOf(c.icons).map((id) => {
+		const about = c.iconNotes?.[id];
+		return about ? { id, about } : { id };
+	});
+	return { looks, colors: [...c.icons.colors] };
+}
+
+/**
+ * #21's suggestion, as an icon line Botsun saves only if nothing is: a look this session has saved
+ * is a choice (/icon here, or the phone's sheet) and is left alone, as a pick in flight is. No
+ * answer is waited on: the suggestion is not a command, and nothing on screen says it landed.
+ */
+function suggestIconLine(c: Conn | undefined, suggestion: IconSuggestion): void {
+	if (!c || c.closed || !c.connected || !c.sock) return;
+	if (!c.sessionId || c.boundId !== c.sessionId) return;
+	if (!c.icons || !looksOf(c.icons).includes(suggestion.look)) return;
+	if (c.icon?.look) return;
+	if (c.iconWait) return;
+	const id = randomBytes(8).toString("hex");
+	const line: Record<string, unknown> = { id, look: suggestion.look, if_unset: true };
+	if (suggestion.color) line.color = suggestion.color;
+	debug(`icon suggestion: ${suggestion.look}${suggestion.color ? `, ${suggestion.color}` : ""}`);
+	write(c, "icon", line);
 }
 
 /** The current look, for a footer avatar (#22). Null until Botsun has said, or after a session switch. */
@@ -1670,6 +1727,9 @@ function featureList(c: Conn): string[] {
 		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 	})();
 	return ["say", "say_call", "answer_call", "close_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close", "name",
+		// This pi picks a look with a session's name (#21) and wants what each draws with it: the host
+		// answers with its looks pages (OwnerSessions' LOOK_NOTES).
+		"look_notes",
 		// This pi sends a catalogue in pages (sendModels) when the host says it appends them: the host
 		// answers this with its own features line (OwnerSessions' HOST_FEATURES).
 		"model_pages",
@@ -2403,6 +2463,10 @@ function main(pi: ExtensionAPI): void {
 		lastUsage = key;
 		write(conn, "usage", { usage });
 	});
+	// #21: what Botsun offers, and where a new session's look and color go. Both read the live
+	// connection, so a reconnect's fresh catalog is what the next name picks from.
+	provideIconCatalog(() => namingCatalogFor(conn));
+	const stopSuggestions = onIconSuggestion((suggestion) => suggestIconLine(conn, suggestion));
 	// The session's subagents (lib/children.ts): a start or an end at once, progress at most once a second.
 	bindChildren(pi.events);
 	let subagentsTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2422,6 +2486,8 @@ function main(pi: ExtensionAPI): void {
 		subagentsTimer.unref?.();
 	});
 	pi.on("session_shutdown", () => {
+		provideIconCatalog(null);
+		stopSuggestions();
 		stopAsk();
 		stopStash();
 		stopFooter();
