@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_DENY_CONFIG, DEFAULT_SECRET_COMMANDS, type DenyConfig, type SecretCommandConfig } from "./hard-deny.ts";
 import {
 	DEFAULT_REVIEWER_MODEL,
 	REVIEW_TIMEOUT_MS,
@@ -35,6 +36,8 @@ interface GuardianConfigFile {
 	timeoutMs?: unknown;
 	policy?: unknown;
 	review?: unknown;
+	deny?: unknown;
+	secretCommands?: unknown;
 }
 
 type ConfigSource = "environment" | "project" | "global" | "default";
@@ -45,6 +48,10 @@ export interface GuardianConfig {
 	timeoutMs: number;
 	policy?: string;
 	review: Record<string, ReviewLevel>;
+	/** Hard deny (hard-deny.ts): global `deny.paths`/`deny.commands` replace the defaults, a project's only add. */
+	deny: DenyConfig;
+	/** Secret CLIs reviewed as private-data reads (hard-deny.ts): global lists replace, a project's patterns add. */
+	secretCommands: SecretCommandConfig;
 	globalPath: string;
 	projectPath: string;
 	globalConfigPresent: boolean;
@@ -130,6 +137,27 @@ export function loadGuardianConfig(
 		warnings,
 	);
 	const review = mergeReviewRules(globalReview, projectReview);
+	const globalDeny = parseDeny(globalConfig.deny, globalPath, warnings);
+	const projectDeny = parseDeny(projectConfig.deny, projectPath, warnings);
+	// A project adds paths only: its regular expressions would run in every tool call, and one
+	// that backtracks badly would hang pi.
+	if (projectDeny.commands) warnings.push(`Ignored deny.commands in ${projectPath}: only the global config may add command rules.`);
+	if (projectDeny.allow) warnings.push(`Ignored deny.allow in ${projectPath}: only the global config may make exceptions.`);
+	if (globalDeny.paths?.length === 0) warnings.push(`deny.paths in ${globalPath} is empty: the deny list protects no folders.`);
+	const deny: DenyConfig = {
+		paths: [...new Set([...(globalDeny.paths ?? DEFAULT_DENY_CONFIG.paths), ...(projectDeny.paths ?? [])])],
+		commands: [...(globalDeny.commands ?? DEFAULT_DENY_CONFIG.commands)],
+		allow: [...(globalDeny.allow ?? DEFAULT_DENY_CONFIG.allow ?? [])],
+		// The config files themselves: an approved write must not empty the list.
+		protect: [globalPath, projectPath],
+	};
+	const globalSecret = parseRegexLists(globalConfig.secretCommands, ["patterns", "allow"], "secretCommands", globalPath, warnings);
+	const projectSecret = parseRegexLists(projectConfig.secretCommands, ["patterns", "allow"], "secretCommands", projectPath, warnings);
+	if (projectSecret.allow || projectSecret.patterns) warnings.push(`Ignored secretCommands in ${projectPath}: only the global config may set them.`);
+	const secretCommands: SecretCommandConfig = {
+		patterns: [...(globalSecret.patterns ?? DEFAULT_SECRET_COMMANDS.patterns)],
+		allow: [...(globalSecret.allow ?? DEFAULT_SECRET_COMMANDS.allow)],
+	};
 
 	return {
 		model: modelValue?.value ?? DEFAULT_REVIEWER_MODEL,
@@ -144,6 +172,8 @@ export function loadGuardianConfig(
 						.join("\n\n")
 				: undefined,
 		review,
+		deny,
+		secretCommands,
 		globalPath,
 		projectPath,
 		globalConfigPresent: existsSync(globalPath),
@@ -181,6 +211,8 @@ const CONFIG_FILE_KEYS = new Set([
 	"timeoutMs",
 	"policy",
 	"review",
+	"deny",
+	"secretCommands",
 ]);
 
 const REVIEW_LEVEL_RANK: Record<ReviewLevel, number> = {
@@ -240,6 +272,70 @@ function validateConfigFile(
 	if (config.policy !== undefined && typeof config.policy !== "string") {
 		warnings.push(`Invalid policy in ${path}: expected a string.`);
 	}
+}
+
+function parseDeny(value: unknown, path: string, warnings: string[]): Partial<DenyConfig> {
+	if (value === undefined) return {};
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		warnings.push(`Invalid deny in ${path}: expected an object with paths and/or commands.`);
+		return {};
+	}
+	const out: Partial<DenyConfig> = {};
+	const record = value as Record<string, unknown>;
+	for (const key of Object.keys(record)) {
+		if (key !== "paths" && key !== "commands" && key !== "allow") warnings.push(`Unsupported deny.${key} in ${path}.`);
+	}
+	for (const key of ["paths", "commands", "allow"] as const) {
+		const list = record[key];
+		if (list === undefined) continue;
+		if (!Array.isArray(list) || !list.every((item) => typeof item === "string" && item.trim())) {
+			warnings.push(`Invalid deny.${key} in ${path}: expected an array of non-empty strings.`);
+			continue;
+		}
+		if (key === "commands") {
+			const bad = list.filter((item) => {
+				try {
+					new RegExp(item, "i");
+					return false;
+				} catch {
+					return true;
+				}
+			});
+			if (bad.length) warnings.push(`Invalid deny.commands in ${path}: ${bad.length} not a regular expression.`);
+			out.commands = list.filter((item) => !bad.includes(item)).map((item) => item.trim());
+		} else out[key] = list.map((item) => item.trim());
+	}
+	return out;
+}
+
+function parseRegexLists(value: unknown, keys: string[], name: string, path: string, warnings: string[]): Record<string, string[] | undefined> {
+	if (value === undefined) return {};
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		warnings.push(`Invalid ${name} in ${path}: expected an object with ${keys.join(" and/or ")}.`);
+		return {};
+	}
+	const record = value as Record<string, unknown>;
+	for (const key of Object.keys(record)) if (!keys.includes(key)) warnings.push(`Unsupported ${name}.${key} in ${path}.`);
+	const out: Record<string, string[] | undefined> = {};
+	for (const key of keys) {
+		const list = record[key];
+		if (list === undefined) continue;
+		if (!Array.isArray(list) || !list.every((item) => typeof item === "string" && item.trim())) {
+			warnings.push(`Invalid ${name}.${key} in ${path}: expected an array of regular expressions.`);
+			continue;
+		}
+		const good = list.filter((item) => {
+			try {
+				new RegExp(item, "i");
+				return true;
+			} catch {
+				return false;
+			}
+		});
+		if (good.length < list.length) warnings.push(`Invalid ${name}.${key} in ${path}: ${list.length - good.length} not a regular expression.`);
+		out[key] = good;
+	}
+	return out;
 }
 
 function parseReviewRules(

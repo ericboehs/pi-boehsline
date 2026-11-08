@@ -13,6 +13,7 @@ import {
 	shouldReviewPath,
 	type GuardianReviewResult,
 } from "./gate.ts";
+import { DEFAULT_SECRET_COMMANDS, secretCommandIn, type SecretCommandConfig } from "./hard-deny.ts";
 import type { GuardianAction } from "./review.ts";
 import {
 	commandReferencesPrivateData,
@@ -71,14 +72,18 @@ export function actionFromToolCall(
 	cwd: string,
 	rules: Record<string, ReviewLevel>,
 	directoryScanCache?: DirectoryScanCache,
+	secretCommands: SecretCommandConfig = DEFAULT_SECRET_COMMANDS,
 ): GuardianAction | undefined {
 	if (isToolCallEventType("bash", event)) {
-		if ((rules["bash.command"] ?? "always") === "off") return;
+		// A secret CLI (`op read`, …) is reviewed as a private-data read even with bash review off.
+		const secretCli = secretCommandIn(event.input.command, secretCommands);
+		if ((rules["bash.command"] ?? "always") === "off" && !secretCli) return;
 		return {
 			tool: "bash",
 			payload: {
 				command: event.input.command,
-				private_data_read: commandReferencesPrivateData(event.input.command, cwd),
+				private_data_read: !!secretCli || commandReferencesPrivateData(event.input.command, cwd),
+				...(secretCli ? { secret_cli: secretCli, review_reasons: [`hands out secrets: ${secretCli}`] } : {}),
 			},
 			cwd,
 		};

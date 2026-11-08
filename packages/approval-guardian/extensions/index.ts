@@ -5,6 +5,8 @@ import type {
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { denyBashCommand, denyReason, denyToolPath } from "../src/hard-deny.ts";
 import {
 	collectGuardianMessages,
 	DIRECT_USER_INPUT_ENTRY_TYPE,
@@ -467,11 +469,21 @@ export default function approvalGuardian(
 				projectTrusted: ctx.isProjectTrusted(),
 			});
 			syncConfigurationWarnings(ctx, config.warnings);
+			// Secret folders and keychain dumps: refused outright, before any reviewer. Only the
+			// user's /approval-guardian bypass (checked above) lets them through.
+			const denied = isToolCallEventType("bash", event)
+				? denyBashCommand(event.input.command, ctx.cwd, config.deny)
+				: denyToolPath(event.toolName, event.input as Record<string, unknown>, ctx.cwd, config.deny);
+			if (denied) {
+				ctx.ui.notify(`Approval Guardian blocked ${event.toolName}: ${denied.why} (${denied.target} is on the deny list).`, "error");
+				return { block: true, reason: denyReason(denied) };
+			}
 			const action = actionFromToolCall(
 				event,
 				ctx.cwd,
 				config.review,
 				directoryScanCache,
+				config.secretCommands,
 			);
 			if (!action) return;
 

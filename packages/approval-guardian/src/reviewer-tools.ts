@@ -9,6 +9,7 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { ReviewLevel } from "./config.ts";
+import { DEFAULT_DENY_CONFIG, denyToolPath } from "./hard-deny.ts";
 import { actionFromToolCall } from "./tool-actions.ts";
 
 export type ReviewerToolName = "read" | "grep" | "find" | "ls";
@@ -44,6 +45,8 @@ export function reviewerInvestigationTouchesPrivateData(
 		cwd,
 		REVIEWER_PRIVATE_READ_RULES,
 	);
+	// The deny list's folders (default list) are never the reviewer's to read either.
+	if (denyToolPath(toolName, input, cwd, DEFAULT_DENY_CONFIG)) return true;
 	return action?.payload.private_data_read === true;
 }
 

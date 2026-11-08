@@ -67,6 +67,20 @@ While Guardian is enabled, only a valid reviewer response with `outcome: "allow"
 
 Private-data access additionally requires explicit authorization in captured direct-user input and reviewer `user_authorization: "high"`. Only input Pi reports to Guardian as interactive or RPC counts as direct authorization; expanded skill/template bodies, extension-injected user-role messages, and unmarked legacy messages remain untrusted. Earlier-loaded input-transform extensions are inside Pi's trusted extension boundary because extensions already run with full system permissions. After upgrading or resuming an older session, repeat the exact private-source authorization if needed. The reviewer cannot inspect the pending private target while deciding whether access is authorized.
 
+## Deny list (Boehsline)
+
+Some folders hold secrets no reviewer should be able to approve reading: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gh`, `~/.config/op`, `~/.netrc`, `~/.docker/config.json`, `~/.kube`, `~/Library/Keychains`, browser profiles and cookies, and the rest of `DEFAULT_DENY_PATHS` in `src/hard-deny.ts`, plus keychain dumps (`dump-keychain`, `security export`). Inside them, `~/.ssh/config`, `known_hosts`, `authorized_keys`, `*.pub` and `~/.aws/config` stay readable (`deny.allow`). A tool call that reaches one is blocked before the reviewer runs, and the reason tells the model not to work around it. Only `/approval-guardian bypass` lets it through.
+
+Path tools are exact (`~`, relative paths and symlinks resolved). Bash is best effort: any word that names a deny root, resolves into one, or (in code) names one home-relative, and recursive readers pointed above one. Programs that use a key without printing it (`ssh -i`, `ssh-add`, `ssh-keygen -f`, `kubectl --kubeconfig`) may still name it, and `ssh host` or `git push` name nothing.
+
+```json
+{ "deny": { "paths": ["~/.ssh", "~/secrets"], "commands": ["\\bvault read\\b"] } }
+```
+
+In the global `approval-guardian.json` a list replaces the defaults; in a trusted project's it only adds.
+
+Secret CLIs are a softer case: `security find-generic-password -w`, `gh auth token`, `op read`, `op item`, `op inject`, `op run`, `op signin`, `op document` and `op vault` (direct, piped, in `$(…)` or `sh -c`) are reviewed as a private-data read, so they need the user's explicit authorization, even with bash review off. `secretCommands.patterns` and `secretCommands.allow` (default allow: `fnox`) configure it; a project may add patterns but not exemptions.
+
 ## Private-data rules
 
 The classifier targets common credential and private-data locations without attempting to be a full DLP system.
