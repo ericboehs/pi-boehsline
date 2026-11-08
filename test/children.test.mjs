@@ -19,6 +19,7 @@ import {
 	LOG_BYTES,
 	LOG_ENTRIES,
 	MAX_CHILDREN,
+	modelWindow,
 	PAGE_BYTES,
 	onChildrenChange,
 	pollOnce,
@@ -56,7 +57,7 @@ function bus({ kill = true, killed = true } = {}) {
 }
 
 test("a foreground pi child's JSON events: turns, the tool it runs, its text, usage, masked", () => {
-	const c = trackChild({ kind: "pi", agent: "scout", task: "look at the widget", model: "anthropic/claude", sessionId: "s-1" });
+	const c = trackChild({ kind: "pi", agent: "scout", task: "look at the widget", model: "anthropic/claude", window: 200_000, sessionId: "s-1" });
 	const seen = [];
 	for (const line of fixture) {
 		c.piLine(line);
@@ -75,7 +76,8 @@ test("a foreground pi child's JSON events: turns, the tool it runs, its text, us
 		"> The widget test fails on line 12. Fix: return nil.",
 	]);
 	assert.equal(k.lastText, "The widget test fails on line 12.\nFix: return nil.");
-	assert.deepEqual({ ...k.usage, cost: Number(k.usage.cost.toFixed(4)) }, { input: 4400, output: 130, cacheRead: 3000, cacheWrite: 0, cost: 0.0038 });
+	assert.deepEqual({ ...k.usage, cost: Number(k.usage.cost.toFixed(4)) }, { input: 4400, output: 130, cacheRead: 3000, cacheWrite: 0, context: 2930, cost: 0.0038 });
+	assert.equal(k.window, 200_000, "its model's window, for the phone's context bar");
 	assert.equal(k.model, "anthropic/claude");
 	assert.equal(k.sessionId, "s-1");
 	c.finish("done");
@@ -88,6 +90,42 @@ test("a foreground pi child's JSON events: turns, the tool it runs, its text, us
 	const said = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s-1" });
 	said.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Set API_TOKEN=abc123 first." }] } });
 	assert.equal(one(said.id).lastText, "Set API_TOKEN=••• first.", "its words are masked too");
+});
+
+test("a child's model names its context window, exactly and only", () => {
+	const models = [
+		{ provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 },
+		{ provider: "openrouter", id: "qwen/qwen3-coder:exacto", contextWindow: 262_144 },
+		{ provider: "x", id: "no-window" },
+	];
+	assert.equal(modelWindow("anthropic/claude-sonnet-4-5", models), 200_000, "provider and id");
+	assert.equal(modelWindow("claude-sonnet-4-5", models), 200_000, "a bare id");
+	assert.equal(modelWindow("anthropic/claude-sonnet-4-5:high", models), 200_000, "a thinking suffix isn't part of it");
+	assert.equal(modelWindow("openrouter/qwen/qwen3-coder:exacto", models), 262_144, "an id with a colon keeps it");
+	assert.equal(modelWindow("anthropic/claude", models), undefined, "never a fuzzy match: another model's window");
+	assert.equal(modelWindow("x/no-window", models), undefined, "a model pi doesn't say the window of");
+	assert.equal(modelWindow(undefined, models), undefined);
+	assert.equal(modelWindow("", models), undefined);
+	// A bare id two providers both offer names neither of them: their windows may differ.
+	const shared = [
+		{ provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 },
+		{ provider: "openrouter", id: "claude-sonnet-4-5", contextWindow: 1_000_000 },
+	];
+	assert.equal(modelWindow("claude-sonnet-4-5", shared), undefined, "an ambiguous bare id");
+	assert.equal(modelWindow("openrouter/claude-sonnet-4-5", shared), 1_000_000, "its provider names it exactly");
+	assert.equal(modelWindow("anthropic/claude-sonnet-4-5", shared), 200_000);
+	const unknown = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s" });
+	assert.deepEqual([one(unknown.id).window, one(unknown.id).usage], [undefined, undefined], "nothing known: both absent");
+});
+
+test("a usage-less assistant message says nothing about its context, not 0", () => {
+	const c = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s" });
+	c.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }] } });
+	assert.equal(one(c.id).usage.context, undefined, "no usage at all: no bar's worth of context");
+	c.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } });
+	assert.deepEqual(one(c.id).usage, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, "a zeroed usage adds no context, so the phone draws no 0% bar");
+	c.piEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }], usage: { input: 900, output: 100 } } });
+	assert.equal(one(c.id).usage.context, 1000, "a turn that says it sets it");
 });
 
 test("labels for pi tools and Cursor steps", () => {
@@ -237,6 +275,24 @@ test("a background pi child: the progress filter's log, then bg's exit", () => {
 	const killed = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s", bg: { id: "ee33ff", logPath: log } });
 	events.handlers.get("bg:jobs")([{ id: "ee33ff", endedAt: Date.now(), exitCode: null, signal: null, killedByUser: true }]);
 	assert.equal(one(killed.id).state, "stopped", "killed from /bg, not the phone");
+});
+
+test("a background pi child says its last turn's context, from a banner that has one", () => {
+	const events = bus();
+	bindChildren(events);
+	const newer = join(dir, "pi-ctx.log");
+	writeFileSync(newer, "· turn 1 · 4 files look fine\n── result · 3 turns · 4.4k in (3.0k cached) / 130 out · 1.2k ctx · $0.0038 ──\nFine.\n");
+	const c = trackChild({ kind: "pi", agent: "scout", task: "t", model: "anthropic/claude", window: 200_000, sessionId: "s", bg: { id: "aa11bb", logPath: newer } });
+	pollOnce();
+	const k = one(c.id);
+	assert.deepEqual({ ...k.usage, cost: Number(k.usage.cost.toFixed(4)) }, { input: 4400, cacheRead: 3000, output: 130, cacheWrite: 0, context: 1200, cost: 0.0038 });
+	assert.equal(k.window, 200_000);
+	const older = join(dir, "pi-old.log");
+	writeFileSync(older, "── result · 2 turns · 1.3k in (1.0k cached) / 50 out · $0.0010 ──\n4 files\n");
+	const o = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s", bg: { id: "bb22cc", logPath: older } });
+	pollOnce();
+	assert.equal(one(o.id).usage.context, undefined, "an older log says only the run's totals: no context, not theirs");
+	assert.deepEqual(one(o.id).usage, { input: 1300, cacheRead: 1000, output: 50, cacheWrite: 0, cost: 0.001 });
 });
 
 test("a background Cursor run: steps, its worktree and its answer from the runner's log", () => {

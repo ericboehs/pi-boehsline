@@ -23,6 +23,10 @@
  * LOG_ENTRIES or LOG_BYTES: past either, the oldest work goes first; the task and the newest
  * entry always stay. A background or Cursor child's is what its log or run state says, its steps
  * as tool calls. An edit whose event carried a patch is on that call's arguments.
+ *
+ * A pi child also says how full its conversation is: usage.context is the last turn's input,
+ * cache reads and writes and output, and window is the context window of the model it runs
+ * (modelWindow; known only when pi's own models name it). Cursor runs report no such thing.
  */
 
 import { randomBytes } from "node:crypto";
@@ -38,6 +42,12 @@ export interface ChildUsage {
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
+	/**
+	 * What its conversation holds after its last turn: that turn's input, cache reads and writes,
+	 * and output. Absent until a turn says (a Cursor run, or a background pi child whose log only
+	 * totals the run).
+	 */
+	context?: number;
 	/** Dollars. */
 	cost: number;
 }
@@ -61,6 +71,8 @@ export interface ChildInfo {
 	/** Its last work lines, oldest first. A failed step starts with "✗ ", a note with "> ". */
 	tail: string[];
 	usage?: ChildUsage;
+	/** The context window of the model it runs, when pi knows that model (a pi child's). */
+	window?: number;
 	/** A Cursor run's worktree. */
 	worktree?: string;
 	/** The pi session it was started in. */
@@ -604,11 +616,38 @@ export function onChildrenChange(fn: Listener): () => void {
 	return () => s.listeners.delete(fn);
 }
 
+// ---- a child's model
+
+/** pi's thinking levels, which a model string may name after a colon ("claude-sonnet-4-5:high"). */
+const THINKING_SUFFIX = /:(off|minimal|low|medium|high|xhigh|max)$/i;
+
+/**
+ * The context window the model string `model` names ("provider/id", a bare id, either with a
+ * ":thinking" suffix), from the models pi can use; undefined when none of them is that model.
+ * Only an exact match counts: a fuzzy one could show one model's conversation against another's
+ * window, and a bare id two providers both offer names neither of them. The child runs whatever
+ * pi picks, so this is what the phone draws from, best effort.
+ */
+export function modelWindow(
+	model: string | undefined,
+	models: ReadonlyArray<{ provider?: string; id?: string; contextWindow?: unknown }>,
+): number | undefined {
+	const wanted = oneLine(String(model ?? "")).toLowerCase().replace(THINKING_SUFFIX, "");
+	if (!wanted) return undefined;
+	const whole = (m: { provider?: string; id?: string }) => `${m.provider ?? ""}/${m.id ?? ""}`.toLowerCase();
+	const byId = models.filter((m) => String(m.id ?? "").toLowerCase() === wanted);
+	const hit = models.find((m) => whole(m) === wanted) ?? (byId.length === 1 ? byId[0] : undefined);
+	const window = hit?.contextWindow;
+	return typeof window === "number" && Number.isFinite(window) && window > 0 ? Math.round(window) : undefined;
+}
+
 export interface ChildStart {
 	kind: ChildKind;
 	agent: string;
 	task: string;
 	model?: string;
+	/** The context window of its model (modelWindow), when known. */
+	window?: number;
 	sessionId: string | null;
 	worktree?: string;
 	/** Aborts a foreground child (its own AbortController). */
@@ -668,6 +707,7 @@ export function trackChild(start: ChildStart): ChildHandle {
 		agent: clean(start.agent, 40) || "subagent",
 		task: clean(start.task, TASK_MAX),
 		...(start.model ? { model: clean(start.model, 80) } : {}),
+		...(start.window ? { window: start.window } : {}),
 		state: "running",
 		startedAt: Date.now(),
 		turns: 0,
@@ -881,6 +921,10 @@ class PiParser {
 				usage.cacheRead += n(u.cacheRead);
 				usage.cacheWrite += n(u.cacheWrite);
 				usage.cost += n(cost);
+				// The window is the last turn's alone: what was sent (cached or not) and what came back.
+				// A message with no usage says nothing, not 0: the phone draws no bar rather than an empty one.
+				const context = n(u.input) + n(u.cacheRead) + n(u.cacheWrite) + n(u.output);
+				if (context > 0) usage.context = context;
 				rec.usage = usage;
 				rec.live = "";
 				const blocks = assistantBlocks(rec, m);
@@ -937,7 +981,8 @@ const kNum = (s: string | undefined) => {
 };
 
 const PI_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "web_fetch", "web_search", "subagent", "cursor"]);
-const PI_RESULT = /^── result · (\d+) turns · ([\d.]+k?) in \(([\d.]+k?) cached\) \/ ([\d.]+k?) out(?: · \$([\d.]+))? ──$/;
+const PI_RESULT =
+	/^── result · (\d+) turns · ([\d.]+k?) in \(([\d.]+k?) cached\) \/ ([\d.]+k?) out(?: · ([\d.]+k?) ctx)?(?: · \$([\d.]+))? ──$/;
 
 /** One line of the subagent progress filter's output (a background pi child's log). */
 function piLogLine(rec: Rec, line: string): void {
@@ -953,7 +998,9 @@ function piLogLine(rec: Rec, line: string): void {
 		bg.result = true;
 		closeOpen(rec);
 		rec.turns = Number(banner[1]);
-		rec.usage = { input: kNum(banner[2]), cacheRead: kNum(banner[3]), output: kNum(banner[4]), cacheWrite: 0, cost: Number(banner[5] ?? 0) || 0 };
+		rec.usage = { input: kNum(banner[2]), cacheRead: kNum(banner[3]), output: kNum(banner[4]), cacheWrite: 0, cost: Number(banner[6] ?? 0) || 0 };
+		// The filter's last turn, when this pi-boehsline's writes one (older logs say only the totals).
+		if (banner[5]) rec.usage.context = kNum(banner[5]);
 		rec.activity = WRITING;
 		return;
 	}

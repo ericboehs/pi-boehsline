@@ -161,7 +161,7 @@ test("the progress filter prints a line per turn, a usage banner, then the answe
     [
       "· turn 1 · bash ls pi-extensions",
       "· turn 2 · 4 files",
-      "── result · 2 turns · 1.3k in (1.0k cached) / 50 out · $0.0010 ──",
+      "── result · 2 turns · 1.3k in (1.0k cached) / 50 out · 1.2k ctx · $0.0010 ──",
       "4 files",
       "",
     ].join("\n"),
@@ -185,15 +185,17 @@ test("the progress filter exits non-zero when the child produced no answer", asy
 });
 
 /** Run one foreground task with process.argv[1] (the child pi script) swapped out. */
-async function runWithChild(script, env = {}) {
+async function runWithChild(script, env = {}, setup) {
   const { writeFileSync } = await import("node:fs");
   const file = path.join(mkdtempSync(path.join(tmpdir(), "pi-subagent-child-")), "child.mjs");
   if (script !== undefined) writeFileSync(file, script);
   const saved = { argv1: process.argv[1], ...Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]])) };
   process.argv[1] = script === undefined ? path.join(path.dirname(file), "missing.mjs") : file;
   Object.assign(process.env, env);
+  const h = mount();
+  setup?.(h);
   try {
-    return textOf(await mount().run({ agent: "scout", task: "look around" }));
+    return textOf(await h.run({ agent: "scout", task: "look around" }));
   } finally {
     process.argv[1] = saved.argv1;
     for (const k of Object.keys(env)) {
@@ -202,6 +204,45 @@ async function runWithChild(script, env = {}) {
     }
   }
 }
+
+/** A child script that answers one turn with the usage given. */
+const answeringChild = (usage) =>
+  `process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "looked" }]${usage ? `, usage: ${JSON.stringify(usage)}` : ""} } }) + "\\n");`;
+
+test("a spawned pi child gets its window from pi's own models, not from the child", async () => {
+  const { listChildren, resetChildren } = await import("../lib/children.ts");
+  resetChildren();
+  const text = await runWithChild(answeringChild({ input: 900, output: 100 }), {}, (h) => {
+    h.ctx.sessionManager = { getSessionId: () => "s-win" };
+    h.ctx.model = { provider: "anthropic", id: "claude-sonnet-4-5" };
+    h.ctx.modelRegistry = { getAvailable: () => [{ provider: "anthropic", id: "claude-sonnet-4-5", contextWindow: 200_000 }] };
+  });
+  assert.match(text, /looked/);
+  const [kid] = listChildren("s-win");
+  assert.equal(kid.model, "anthropic/claude-sonnet-4-5", "the parent's model, which the child runs");
+  assert.equal(kid.window, 200_000, "its model's window, from the registry the parent's ctx carries");
+  assert.equal(kid.usage.context, 1000, "and the last turn's context from the child's own events");
+  resetChildren();
+});
+
+test("a registry that can't be read leaves the window out, and the child still runs", async () => {
+  const { listChildren, resetChildren } = await import("../lib/children.ts");
+  resetChildren();
+  const text = await runWithChild(answeringChild({ input: 900, output: 100 }), {}, (h) => {
+    h.ctx.sessionManager = { getSessionId: () => "s-nowin" };
+    h.ctx.model = { provider: "anthropic", id: "claude-sonnet-4-5" };
+    h.ctx.modelRegistry = {
+      getAvailable: () => {
+        throw new Error("no models");
+      },
+    };
+  });
+  assert.match(text, /looked/);
+  const [kid] = listChildren("s-nowin");
+  assert.equal(kid.window, undefined, "best effort: no window rather than a failed child");
+  assert.equal(kid.usage.context, 1000);
+  resetChildren();
+});
 
 test("a child killed by a signal is a failure, and its partial reply is kept", async () => {
   const text = await runWithChild(`

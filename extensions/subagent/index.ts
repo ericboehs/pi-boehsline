@@ -39,7 +39,7 @@ const BG_WAKE_CHARS = 24 * 1024; // background: log tail carried by the bg exten
 // turn out, then a result banner and the final answer. Exit 1 when there is no
 // answer, so the bg extension reports the job as failed.
 const PROGRESS_FILTER = `
-let buf = "", turns = 0, final = "";
+let buf = "", turns = 0, final = "", last = 0;
 const u = { input: 0, cached: 0, output: 0, cost: 0 };
 const short = (s, n) => { s = String(s ?? "").replace(/\\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
 const onLine = (line) => {
@@ -50,6 +50,8 @@ const onLine = (line) => {
   const mu = m.usage ?? {};
   u.input += (mu.input ?? 0) + (mu.cacheRead ?? 0) + (mu.cacheWrite ?? 0); u.cached += mu.cacheRead ?? 0;
   u.output += mu.output ?? 0; u.cost += mu.cost?.total ?? 0;
+  // What the conversation holds after this turn: the last one's, not the run's total.
+  last = (mu.input ?? 0) + (mu.cacheRead ?? 0) + (mu.cacheWrite ?? 0) + (mu.output ?? 0);
   const calls = []; let text = "";
   for (const p of m.content ?? []) {
     if (p.type === "text" && p.text) { text = p.text; final = p.text; }
@@ -62,7 +64,7 @@ process.stdin.on("data", (d) => { buf += d; const ls = buf.split("\\n"); buf = l
 process.stdin.on("end", () => {
   if (buf.trim()) onLine(buf);
   const k = (n) => n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
-  console.log("── result · " + turns + " turns · " + k(u.input) + " in (" + k(u.cached) + " cached) / " + k(u.output) + " out" + (u.cost ? " · $" + u.cost.toFixed(4) : "") + " ──");
+  console.log("── result · " + turns + " turns · " + k(u.input) + " in (" + k(u.cached) + " cached) / " + k(u.output) + " out" + (last ? " · " + k(last) + " ctx" : "") + (u.cost ? " · $" + u.cost.toFixed(4) : "") + " ──");
   console.log(final || "(no output)");
   process.exitCode = final ? 0 : 1;
 });
@@ -359,6 +361,15 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 			const kids = await import("../../lib/children.ts");
 			kids.bindChildren(pi.events);
 			const sessionId = kids.sessionOf(ctx);
+			// The window the phone draws a pi child's context bar against: its model's, when pi's own
+			// models name it (a child may fail over or be given a model this session can't resolve).
+			const windowOf = (model: string | undefined): number | undefined => {
+				try {
+					return kids.modelWindow(model, ctx.modelRegistry.getAvailable());
+				} catch {
+					return undefined;
+				}
+			};
 
 			const piInvocation = (args: string[]) => {
 				const currentScript = process.argv[1];
@@ -463,7 +474,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						if (!req.accepted) resolve(null); // no listener: the bg extension isn't loaded
 					});
 					if (reply === null) return noBg;
-					if (!("error" in reply)) kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, sessionId, bg: reply });
+					if (!("error" in reply)) kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, bg: reply });
 					lines.push("error" in reply ? `[${job.agent}] failed: ${reply.error}` : `[${job.agent}] bg ${reply.id} · log ${reply.logPath}`);
 				}
 				return {
@@ -586,7 +597,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 				args.push(`Task: ${job.task}`);
 				const invocation = piInvocation(args);
 				const own = new AbortController();
-				const child = kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, sessionId, stop: () => own.abort() });
+				const child = kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, stop: () => own.abort() });
 				try {
 					const usage = newTally();
 					let final = "";

@@ -1254,7 +1254,9 @@ export const SUBAGENTS_BYTES = 56 * 1024;
 /** Progress (a new tool, a turn) goes at most this often; a start or an end at once. */
 export const SUBAGENTS_EVERY_MS = 1_000;
 
-/** One child as Botsun takes it (snake_case). */
+/** One child as Botsun takes it (snake_case). `context` and `window` are what the phone's
+ * context bar needs: absent when the child hasn't said (a Cursor run, a pi child whose model pi
+ * doesn't know), so an older phone reads the line as before. */
 function childWire(k: ChildInfo, tail: number, text: number): Record<string, unknown> {
 	return {
 		id: k.id,
@@ -1272,6 +1274,8 @@ function childWire(k: ChildInfo, tail: number, text: number): Record<string, unk
 		...(k.usage
 			? { usage: { input: k.usage.input, output: k.usage.output, cache_read: k.usage.cacheRead, cache_write: k.usage.cacheWrite, cost: k.usage.cost } }
 			: {}),
+		...(k.usage?.context !== undefined ? { context: Math.round(k.usage.context) } : {}),
+		...(k.window !== undefined ? { window: Math.round(k.window) } : {}),
 		...(k.worktree ? { worktree: k.worktree } : {}),
 	};
 }

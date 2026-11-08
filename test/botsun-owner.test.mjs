@@ -2946,6 +2946,15 @@ test("subagents: a start or an end goes at once, progress at most once a second,
 	const done = subs()[2].children[0];
 	assert.deepEqual([done.state, done.last_text, typeof done.ended_at], ["done", "All fine", "number"]);
 	assert.equal(done.usage, undefined);
+	// A turn's usage and the model's window ride along, for the phone's context bar.
+	const withCtx = kids.trackChild({ kind: "pi", agent: "worker", task: "t", model: "anthropic/claude", window: 200_000, sessionId: "sid-a" });
+	withCtx.piEvent({
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 900, output: 100, cacheRead: 0, cacheWrite: 0 } },
+	});
+	await until(() => subs().some((l) => l.children.some((k) => k.id === withCtx.id && k.context !== undefined)), 3000);
+	const moved2 = subs().at(-1).children.find((k) => k.id === withCtx.id);
+	assert.deepEqual([moved2.context, moved2.window], [1_000, 200_000], "the last turn's context and its window");
 	kids.resetChildren();
 });
 
@@ -2954,7 +2963,7 @@ test("subagentsLine keeps the line under the host's limit, running children's ta
 	const kid = (i, state) => ({
 		id: `p-${String(i).padStart(10, "0")}`, kind: "pi", agent: "worker", task: "t".repeat(200), state, startedAt: 1, turns: 3,
 		activity: "a".repeat(120), lastText: "x".repeat(600), tail: Array.from({ length: 30 }, () => "y".repeat(160)), sessionId: "s",
-		...(state === "running" ? {} : { endedAt: 2 }), usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 },
+		...(state === "running" ? {} : { endedAt: 2 }), usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, context: 1_234, cost: 0.5 }, window: 200_000,
 	});
 	const all = [...Array.from({ length: 8 }, (_, i) => kid(i, "done")), ...Array.from({ length: 8 }, (_, i) => kid(i + 8, "running"))];
 	const line = subagentsLine(all);
@@ -2963,6 +2972,9 @@ test("subagentsLine keeps the line under the host's limit, running children's ta
 	const tails = (state) => line.filter((k) => k.state === state).map((k) => k.tail.length);
 	assert.ok(Math.min(...tails("running")) > Math.max(...tails("done")));
 	assert.deepEqual(line[0].usage, { input: 1, output: 2, cache_read: 3, cache_write: 4, cost: 0.5 });
+	assert.deepEqual([line[0].context, line[0].window], [1_234, 200_000], "what the phone's context bar reads");
+	const bare = subagentsLine([{ ...kid(0, "running"), window: undefined, usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }])[0];
+	assert.deepEqual([bare.context, bare.window], [undefined, undefined], "nothing known: both left out");
 	assert.deepEqual(subagentsLine(all.slice(0, 2)).map((k) => k.tail.length), [30, 30], "a small list goes whole");
 	const tiny = subagentsLine(all, 2_000);
 	assert.ok(tiny.length > 0 && tiny.length < 16 && tiny.every((k) => k.state === "running"), "past it, finished ones drop first");
