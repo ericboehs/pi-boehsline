@@ -5,6 +5,13 @@
 /** Said when this pi has no live connection to Botsun. Exact: the command and its test share it. */
 export const ICON_DISCONNECTED = "/icon needs Botsun";
 
+/**
+ * pi event a footer avatar listens on: `{ look, color }` (null look: automatic, so ask Botsun's
+ * saved look again), sent the moment /icon is picked (before Botsun answers), and again when
+ * Botsun's answer or icons line says otherwise.
+ */
+export const ICON_EVENT = "botsun:icon";
+
 export interface IconCatalog {
 	shapes: string[];
 	sets: Record<string, string[]>;

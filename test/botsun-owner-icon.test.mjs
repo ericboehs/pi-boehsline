@@ -137,6 +137,9 @@ test("/icon needs Botsun when nothing is connected, and sends the line when it i
 			setWidget: () => {},
 		},
 	};
+	// The footer avatar's feed: each look change, the pick's before Botsun has answered.
+	const announced = [];
+	s.pi.events.on("botsun:icon", (v) => announced.push({ ...v, answered: lines.filter((l) => l.type === "icon").length }));
 	const icon = s.commands.get("icon");
 	assert.ok(icon, "the command is registered");
 	await icon.handler("", ctx);
@@ -157,8 +160,14 @@ test("/icon needs Botsun when nothing is connected, and sends the line when it i
 	});
 
 	notes.length = 0;
+	announced.length = 0;
 	await icon.handler("nope pink", ctx);
 	assert.equal(notes.at(-1)[1], "unknown look");
+	// Announced before the line went out, then put back when Botsun refused it.
+	assert.deepEqual(announced, [
+		{ look: "nope", color: "pink", answered: 0 },
+		{ look: null, color: null, answered: 1 },
+	]);
 	const sent = lines.find((l) => l.type === "icon" && l.look === "nope");
 	assert.equal(sent.color, "pink");
 	assert.match(sent.id, /^[0-9a-f]{16}$/);
@@ -177,6 +186,8 @@ test("/icon needs Botsun when nothing is connected, and sends the line when it i
 	assert.equal(direct.color, "mint");
 	assert.equal(notes.at(-1)[1], "icon: ghost, mint");
 	assert.deepEqual(mod.sessionIcon(), { look: "ghost", color: "mint" });
+	assert.deepEqual(announced.at(-1), { look: "ghost", color: "mint", answered: lines.filter((l) => l.type === "icon").length - 1 },
+		"the pick is drawn before its line is answered, and the answer, the same, says nothing new");
 
 	notes.length = 0;
 	await icon.handler("auto", ctx);

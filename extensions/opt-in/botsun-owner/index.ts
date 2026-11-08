@@ -39,7 +39,8 @@ import { optIn } from "../../../lib/opt-in.ts";
 import { canonicalAnswer, canonicalAnswerV2, invalidAnswer, onPromptsChange, openPrompts, type RemotePrompt } from "../../../lib/remote-prompts.ts";
 import { messageV2, messageV3, validHost, validScope } from "../../../lib/signing-v2.ts";
 import { checkPin, isPinsError, pin, ratchet, shortFingerprint, signVersionOf, type KeyKind } from "./pins.ts";
-import { ICON_DISCONNECTED, iconCompletions, iconLineFields, lookOf, looksOf, parseIconArgs, takeCatalog, takeLookNotes, type IconCatalog, type IconReply } from "./icon.ts";
+import { canDrawIcons, pickDrawn, type PickItem } from "./icon-picker.ts";
+import { ICON_DISCONNECTED, ICON_EVENT, iconCompletions, iconLineFields, lookOf, looksOf, parseIconArgs, takeCatalog, takeLookNotes, type IconCatalog, type IconReply } from "./icon.ts";
 import { onIconSuggestion, provideIconCatalog, type IconSuggestion, type NamingCatalog } from "../../../lib/icon-suggestion.ts";
 import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
@@ -720,8 +721,20 @@ function applyIcons(c: Conn, msg: Record<string, unknown>): boolean {
 	if (!catalog) return false;
 	c.icons = catalog;
 	const look = lookOf(msg, catalog);
-	if (look) c.icon = look;
+	if (look) setIcon(c, look);
 	return true;
+}
+
+// pi's event bus, for ICON_EVENT: set by main, so a look change (a pick, Botsun's word) redraws a
+// footer avatar at once instead of on its next poll.
+let iconBus: ExtensionAPI["events"] | undefined;
+
+/** This session's look, as Botsun said or a /icon pick expects it, announced when it changes. */
+function setIcon(c: Conn, look: { look: string | null; color: string | null }): void {
+	const same = c.icon?.look === look.look && c.icon?.color === look.color;
+	c.icon = look;
+	if (same) return;
+	try { iconBus?.emit?.(ICON_EVENT, { ...look }); } catch {}
 }
 
 /**
@@ -754,7 +767,7 @@ function applyIconReply(c: Conn, msg: Record<string, unknown>): boolean {
 	clearTimeout(wait.timer);
 	if (msg.ok === true) {
 		const look = lookOf(msg, c.icons) ?? { look: null, color: null };
-		c.icon = look;
+		setIcon(c, look);
 		wait.resolve({ ok: true, ...look, unset: msg.unset === true, cleared: msg.cleared === true });
 	} else {
 		wait.resolve({ ok: false, error: cleanError(msg.error) });
@@ -809,7 +822,7 @@ export function sessionIcon(): { look: string | null; color: string | null } | n
 	return c.icon ?? null;
 }
 
-async function pickIcon(ctx: ExtensionContext, catalog: IconCatalog | undefined): Promise<{ kind: "clear" } | { kind: "set"; look: string; color?: string } | undefined> {
+async function pickIcon(ctx: ExtensionContext, catalog: IconCatalog | undefined, current?: { look: string | null; color: string | null }): Promise<{ kind: "clear" } | { kind: "set"; look: string; color?: string } | undefined> {
 	if (!catalog) {
 		ctx.ui.notify("Botsun hasn't sent its icons yet", "info");
 		return;
@@ -818,7 +831,24 @@ async function pickIcon(ctx: ExtensionContext, catalog: IconCatalog | undefined)
 		ctx.ui.notify("usage: /icon <look> [color]", "info");
 		return;
 	}
-	const look = await ctx.ui.select("Session icon", [...looksOf(catalog), "automatic"]);
+	const looks = looksOf(catalog);
+	// Drawn when the terminal can: each look in the color it would keep, then the look in each color.
+	if (ctx.mode === "tui" && typeof ctx.ui.custom === "function" && canDrawIcons()) {
+		const sessionColor = process.env.PI_SESSION_COLOR;
+		const keep = current?.color && catalog.colors.includes(current.color) ? current.color
+			: sessionColor && catalog.colors.includes(sessionColor) ? sessionColor
+			: catalog.colors.includes("gray") ? "gray" : catalog.colors[0];
+		const lookItems: PickItem[] = [...looks.map((l) => ({ value: l, label: l, look: l, color: keep })), { value: "automatic", label: "automatic" }];
+		const look = await pickDrawn(ctx, "Session icon", lookItems, current?.look ?? undefined);
+		if (look === undefined) return;
+		if (look === "automatic") return { kind: "clear" };
+		const colorItems: PickItem[] = [...catalog.colors.map((c) => ({ value: c, label: c, look, color: c })), { value: "keep color", label: "keep color", look, color: keep }];
+		const color = await pickDrawn(ctx, `Icon color: ${look}`, colorItems, keep);
+		if (color === undefined) return;
+		if (color === "keep color") return { kind: "set", look };
+		return { kind: "set", look, color };
+	}
+	const look = await ctx.ui.select("Session icon", [...looks, "automatic"]);
 	if (look === undefined) return;
 	if (look === "automatic") return { kind: "clear" };
 	const color = await ctx.ui.select("Icon color", [...catalog.colors, "keep color"]);
@@ -2109,6 +2139,7 @@ function sessionInfo(ctx: ExtensionContext): { cwd: string; sessionFile: string 
 }
 
 function main(pi: ExtensionAPI): void {
+	iconBus = pi.events;
 	// Subagent children are not Eric's sessions.
 	if (process.env.PI_SUBAGENT_CHILD === "1") return;
 
@@ -2154,10 +2185,22 @@ function main(pi: ExtensionAPI): void {
 				ctx.ui.notify(parsed.error, "error");
 				return;
 			}
-			const request = parsed.kind === "pick" ? await pickIcon(ctx, conn.icons) : parsed;
+			const request = parsed.kind === "pick" ? await pickIcon(ctx, conn.icons, conn.icon) : parsed;
 			if (!request) return;
+			if (!conn.connected) {
+				ctx.ui.notify(ICON_DISCONNECTED, "error");
+				return;
+			}
+			// Drawn now, not when Botsun answers: the footer avatar takes the pick at once, and
+			// Botsun's answer (or a refusal) puts it right.
+			const before = conn.icon;
+			const sentAt = Date.now();
+			if (request.kind === "set") setIcon(conn, { look: request.look, color: request.color ?? before?.color ?? null });
+			else setIcon(conn, { look: null, color: null });
 			const reply = await sendIcon(conn, request);
+			debug(`icon answer in ${Date.now() - sentAt} ms`);
 			if (!reply.ok) {
+				setIcon(conn, before ?? { look: null, color: null });
 				ctx.ui.notify(reply.error ?? "Botsun refused the icon", "error");
 				return;
 			}
