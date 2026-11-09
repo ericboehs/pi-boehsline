@@ -26,7 +26,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { newStashId, onStashChange, stashChanged, stashStack, type StashEntry } from "../../lib/stash-store.ts";
+import { newStashId, onStashChange, stashChanged, stashStack, takeRemoteSubmit, type StashEntry } from "../../lib/stash-store.ts";
 
 const WIDGET_KEY = "message-stash";
 /** Full-text preview lines for the selected stash in the panel. */
@@ -391,6 +391,8 @@ export default function stash(pi: ExtensionAPI) {
   // the now-empty editor (mirrors Claude Code's behavior).
   pi.on("before_agent_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
+    // A message sent from the phone: the phone restores the stash into its own composer.
+    if (takeRemoteSubmit()) return;
     const stack = stackFor(ctx);
     if (stack.length === 0) return;
     if (ctx.ui.getEditorText().trim().length > 0) return;

@@ -42,7 +42,7 @@ import { checkPin, isPinsError, pin, ratchet, shortFingerprint, signVersionOf, t
 import { canDrawIcons, pickDrawn, type PickItem } from "./icon-picker.ts";
 import { ICON_DISCONNECTED, ICON_EVENT, iconCompletions, iconLineFields, lookOf, looksOf, parseIconArgs, takeCatalog, takeLookNotes, type IconCatalog, type IconReply } from "./icon.ts";
 import { onIconSuggestion, provideIconCatalog, type IconSuggestion, type NamingCatalog } from "../../../lib/icon-suggestion.ts";
-import { onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
+import { markRemoteSubmit, onStashChange, pushStash, stashStack, takeStash } from "../../../lib/stash-store.ts";
 import { latestFooter, onFooterChange, tapFooter, type FooterChip } from "../../../lib/footer-snapshot.ts";
 import { latestUsage, onUsageChange, type ProviderUsageSnapshot } from "../../../lib/usage-snapshot.ts";
 import { bindChildren, type ChildInfo, childTranscript, listChildren, onChildrenChange, stopChild } from "../../../lib/children.ts";
@@ -1721,6 +1721,8 @@ function runIsQuiet(): boolean {
 function sendUser(pi: ExtensionAPI, content: string | UserContent[], options?: Parameters<ExtensionAPI["sendUserMessage"]>[1]): void {
 	inputAt = Date.now();
 	try { pi.events?.emit?.(QUIET_MINE_EVENT, {}); } catch {}
+	// The stash's auto-restore goes to the phone that sent this, not the terminal's editor.
+	markRemoteSubmit();
 	pi.sendUserMessage(content, options);
 }
 // Whether the approval guardian is bypassed (its state event), for the phone's red title.

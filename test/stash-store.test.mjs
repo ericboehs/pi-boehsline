@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { pushStash, stashChanged, stashStack, takeStash } from "../lib/stash-store.ts";
+import { markRemoteSubmit, pushStash, stashChanged, stashStack, takeRemoteSubmit, takeStash } from "../lib/stash-store.ts";
 
 const stacks = () => globalThis.__piMessageStash;
 
@@ -33,4 +33,14 @@ test("read-only lookups across many sessions don't pile up empty entries", () =>
 	pushStash("store-keep", "keep me");
 	stashStack("store-other");
 	assert.deepEqual(stacks().get("store-keep").map((e) => e.text), ["keep me"]);
+});
+
+test("a phone submit is taken once, and only within its window", () => {
+	assert.equal(takeRemoteSubmit(1000), false, "nothing marked");
+	markRemoteSubmit(1000);
+	assert.equal(takeRemoteSubmit(3000), true, "marked 2 s ago");
+	assert.equal(takeRemoteSubmit(3000), false, "taken once");
+	markRemoteSubmit(1000);
+	assert.equal(takeRemoteSubmit(7000), false, "a stale mark (a steer that started no run) is dropped");
+	assert.equal(takeRemoteSubmit(7001), false);
 });

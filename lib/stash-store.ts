@@ -86,3 +86,23 @@ export function takeStash(sessionId: string, id: string): StashEntry | null {
 	stashChanged(sessionId);
 	return entry ?? null;
 }
+
+const REMOTE_KEY = "__piMessageStashRemoteAt";
+
+/**
+ * botsun-owner calls this just before it submits a message that came from the phone. The stash
+ * extension's auto-restore (the top stash back into the editor after a submit) then leaves the
+ * stack alone, so the phone, where the message was typed, takes the stash back instead of the
+ * terminal. One pi process runs one session at a time, so this is a single timestamp.
+ */
+export function markRemoteSubmit(now = Date.now()): void {
+	(globalThis as Record<string, unknown>)[REMOTE_KEY] = now;
+}
+
+/** True (once) when a phone submit was marked in the last `windowMs`; clears the mark either way. */
+export function takeRemoteSubmit(now = Date.now(), windowMs = 5000): boolean {
+	const root = globalThis as Record<string, unknown>;
+	const at = root[REMOTE_KEY];
+	delete root[REMOTE_KEY];
+	return typeof at === "number" && now - at >= 0 && now - at <= windowMs;
+}
