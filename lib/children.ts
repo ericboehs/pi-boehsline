@@ -643,6 +643,12 @@ export function modelWindow(
 
 export interface ChildStart {
 	kind: ChildKind;
+	/**
+	 * Its id, when the caller minted it ahead of time with newChildId (a sandboxed
+	 * child: Botsun needs the id before the child starts). Must look like an id;
+	 * anything else is replaced.
+	 */
+	id?: string;
 	agent: string;
 	task: string;
 	model?: string;
@@ -691,6 +697,14 @@ function makeId(kind: ChildKind): string {
 	return `${kind === "cursor" ? "c" : "p"}-${randomBytes(5).toString("hex")}`;
 }
 
+/** An id a child will have, minted ahead of trackChild (Botsun validates the shape). */
+const CHILD_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+/** Mint a child id ("p-<10 hex>" for pi, "c-<10 hex>" for cursor) before the child starts. */
+export function newChildId(kind: ChildKind): string {
+	return makeId(kind);
+}
+
 /** Start tracking a child. The oldest finished one goes past MAX_CHILDREN (the oldest at all, if none has). */
 export function trackChild(start: ChildStart): ChildHandle {
 	const s = store();
@@ -702,7 +716,7 @@ export function trackChild(start: ChildStart): ChildHandle {
 		s.children.delete(victim.id);
 	}
 	const rec: Rec = {
-		id: makeId(start.kind),
+		id: start.id && CHILD_ID.test(start.id) ? start.id : makeId(start.kind),
 		kind: start.kind,
 		agent: clean(start.agent, 40) || "subagent",
 		task: clean(start.task, TASK_MAX),

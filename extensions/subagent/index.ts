@@ -395,7 +395,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 			// extensions/subagent/sandbox.ts). Its stdout is the guest pi's JSONL, so everything
 			// below — parsing, the bg filter, the children row, stop — is unchanged.
 			const sandboxed = (job: Job, agent: Agent) => job.sandbox ?? agent.sandbox ?? false;
-			const sandboxChild = async (job: Job, agent: Agent): Promise<{ invocation: { cmd: string; args: string[] }; model?: string } | { error: string }> => {
+			const sandboxChild = async (job: Job, agent: Agent, childId?: string): Promise<{ invocation: { cmd: string; args: string[] }; model?: string } | { error: string }> => {
 				const { sandboxInvocation } = await import("./sandbox.ts");
 				const version = (sdk as unknown as { VERSION?: string }).VERSION;
 				const model = job.model ?? agent.model ?? defaultModel;
@@ -404,6 +404,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					task: job.task,
 					prompt: systemPrompt(agent.prompt),
 					agent: job.agent,
+					...(childId ? { child: childId } : {}),
 					model,
 					version,
 				});
@@ -490,8 +491,11 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					}
 					let model = job.model ?? agent.model ?? defaultModel;
 					let inv: { cmd: string; args: string[] };
+					let childId: string | undefined;
 					if (sandboxed(job, agent)) {
-						const prep = await sandboxChild(job, agent);
+						// The id comes before the invocation: Botsun's run is that child's Computer.
+						childId = kids.newChildId("pi");
+						const prep = await sandboxChild(job, agent, childId);
 						if ("error" in prep) {
 							lines.push(`[${job.agent}] ${prep.error}`);
 							continue;
@@ -523,7 +527,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						if (!req.accepted) resolve(null); // no listener: the bg extension isn't loaded
 					});
 					if (reply === null) return noBg;
-					if (!("error" in reply)) kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, bg: reply });
+					if (!("error" in reply)) kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, ...(childId ? { id: childId } : {}), bg: reply });
 					lines.push("error" in reply ? `[${job.agent}] failed: ${reply.error}` : `[${job.agent}] bg ${reply.id} · log ${reply.logPath}`);
 				}
 				return {
@@ -641,8 +645,11 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 				let model = job.model ?? agent.model ?? defaultModel;
 				let invocation: { cmd: string; args: string[] };
 				let tmpDir: string | undefined;
+				let childId: string | undefined;
 				if (sandboxed(job, agent)) {
-					const prep = await sandboxChild(job, agent);
+					// The id comes before the invocation: Botsun's run is that child's Computer.
+					childId = kids.newChildId("pi");
+					const prep = await sandboxChild(job, agent, childId);
 					if ("error" in prep) return { agent: job.agent, task: job.task, ok: false, output: prep.error };
 					invocation = prep.invocation;
 					model = prep.model;
@@ -658,7 +665,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					invocation = piInvocation(args);
 				}
 				const own = new AbortController();
-				const child = kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, stop: () => own.abort() });
+				const child = kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, ...(childId ? { id: childId } : {}), stop: () => own.abort() });
 				try {
 					const usage = newTally();
 					let final = "";

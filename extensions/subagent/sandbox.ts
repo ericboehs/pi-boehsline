@@ -31,6 +31,9 @@ export const READ_ONLY_TOOLS = "read,grep,find,ls";
 /** Where Botsun lives when nothing overrides it. */
 export const DEFAULT_BOTSUN = join(homedir(), "Code", "github.com", "ericboehs", "botsun", "bin", "botsun");
 
+/** Botsun's id shape for a pi child (a sandboxed run's --child). */
+export const CHILD_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
 export type SandboxRequest = {
 	/** The folder to copy in: a git repo (or a subdirectory of one). */
 	cwd: string;
@@ -40,6 +43,8 @@ export type SandboxRequest = {
 	prompt: string;
 	/** Agent name, checked against SANDBOX_AGENTS. */
 	agent: string;
+	/** The pi child this run is for (lib/children.ts trackChild's id), so the phone can show its Computer. */
+	child?: string;
 	model?: string;
 	/** This pi's version, so the VM's pi can be checked against it. */
 	version?: string;
@@ -85,5 +90,9 @@ export function sandboxInvocation(req: SandboxRequest, env: NodeJS.ProcessEnv = 
 	if (req.prompt?.trim()) args.push("--prompt", req.prompt);
 	if (req.model?.trim()) args.push("--model", req.model.trim());
 	if (req.version?.trim()) args.push("--pi-version", req.version.trim());
+	// A bad child id is dropped, never an error: the run still happens, just without
+	// a Computer row (Botsun validates the id too).
+	const child = req.child?.trim();
+	if (child && CHILD_ID.test(child)) args.push("--child", child);
 	return { cmd: sandboxBin(env), args };
 }

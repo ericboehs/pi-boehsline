@@ -58,6 +58,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [approval-guardian](extensions/opt-in/approval-guardian/README.md) | Fail-closed gate: a reviewer model checks risky tool calls | `/approval-guardian` |
 | [auto-bundle](extensions/opt-in/auto-bundle/README.md) | Re-runs `~/bin/pi-bundle` in the background when pi updates |  |
 | [botsun-owner](extensions/opt-in/botsun-owner/README.md) | Puts this session on the phone through Botsun: status, replies, `ask` answers, slash commands, model picks, all signed |  |
+| [computer](extensions/computer/README.md) | Drives this session's Botsun Computer (the Linux desktop's Chromium) from the agent | `computer` tool |
 | [cursor-agent](extensions/opt-in/cursor-agent/README.md) | Delegates tasks to Cursor's agent CLI, with live steps and each run's real cost | `cursor` tool, `/cursor-usage`, `/cursor-worktrees` |
 | [image-prune](extensions/opt-in/image-prune/README.md) | Shrinks big tool result images on arrival, and swaps old images for a note with their path past a size threshold | `/image-prune` |
 | [watch](extensions/opt-in/watch/README.md) | Slack, bot feed and notification watcher with digests and drafts | `/watch`, `watch_items` tool |

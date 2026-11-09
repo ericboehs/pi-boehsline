@@ -22,7 +22,8 @@ process.env.PI_CODING_AGENT_DIR ??= mkdtempSync(path.join(tmpdir(), "pi-agent-sa
 delete process.env.PI_SUBAGENT_CHILD;
 
 const { default: subagent } = await import("../extensions/subagent/index.ts");
-const { DEFAULT_BOTSUN, sandboxBin, sandboxInvocation, SANDBOX_AGENTS, READ_ONLY_TOOLS, unsandboxable } = await import("../extensions/subagent/sandbox.ts");
+const { CHILD_ID, DEFAULT_BOTSUN, sandboxBin, sandboxInvocation, SANDBOX_AGENTS, READ_ONLY_TOOLS, unsandboxable } = await import("../extensions/subagent/sandbox.ts");
+const { listChildren, newChildId } = await import("../lib/children.ts");
 
 function mount({ agents = {} } = {}) {
 	const handlers = new Map();
@@ -97,6 +98,44 @@ test("a sandboxed scout's child is Botsun's worker exec, with the task and the p
 		// Botsun, not here: nothing of it may be passed from the extension.
 		for (const flag of ["--tools", "-ne", "-na", "--mode"]) assert.ok(!argv.includes(flag), `${flag} is Botsun's to decide`);
 		assert.equal(READ_ONLY_TOOLS, "read,grep,find,ls");
+	} finally {
+		for (const [key, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+});
+
+test("a sandboxed run names its pi child: --child is appended for a real id, dropped for a bad one", () => {
+	const id = newChildId("pi");
+	assert.match(id, CHILD_ID);
+	const withChild = sandboxInvocation({ cwd: "/x", task: "t", prompt: "p", agent: "scout", child: id }, {});
+	assert.deepEqual(withChild.args.slice(-2), ["--child", id]);
+	const withoutChild = sandboxInvocation({ cwd: "/x", task: "t", prompt: "p", agent: "scout" }, {});
+	assert.equal(withoutChild.args.includes("--child"), false, "no id, no flag");
+	for (const bad of ["bad/id", "-leading", "x".repeat(65), ""]) {
+		const dropped = sandboxInvocation({ cwd: "/x", task: "t", prompt: "p", agent: "scout", child: bad }, {});
+		assert.equal(dropped.args.includes("--child"), false, `${JSON.stringify(bad)} is dropped, not refused`);
+		assert.equal("error" in dropped, false, "a bad id is never an error");
+	}
+});
+
+test("the --child a sandboxed run gets is the id of the child row trackChild made for it", async () => {
+	const fake = fakeBotsun();
+	const saved = { BOTSUN_BIN: process.env.BOTSUN_BIN, ARGS_FILE: process.env.ARGS_FILE };
+	process.env.BOTSUN_BIN = fake.bin;
+	process.env.ARGS_FILE = fake.argsFile;
+	try {
+		const h = mount();
+		const result = await h.run({ agent: "scout", task: "look", sandbox: true });
+		assert.equal(result.details?.results?.[0]?.ok, true);
+		const argv = fake.argv();
+		const childId = argv[argv.indexOf("--child") + 1];
+		assert.match(childId, CHILD_ID, "Botsun would take this id");
+		const tracked = listChildren().find((c) => c.id === childId);
+		assert.ok(tracked, "the id names this job's tracked child");
+		assert.equal(tracked.agent, "scout");
+		assert.equal(tracked.task, "look");
 	} finally {
 		for (const [key, value] of Object.entries(saved)) {
 			if (value === undefined) delete process.env[key];
