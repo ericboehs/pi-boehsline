@@ -20,19 +20,52 @@ import { Type } from "typebox";
 import { sessionOf } from "../../lib/children.ts";
 import { optIn } from "../../lib/opt-in.ts";
 import { sandboxBin } from "../subagent/sandbox.ts";
-import { capBytes, click, evaluate, httpUrl, listTargets, openCdp, pressKey, screenshot, typeText } from "./cdp.ts";
-import { KeepAlive, openDesk, releaseDesk, type DeskRunner, type DeskSession, type TimerFns } from "./desk.ts";
+import { capBytes, click, drag, evaluate, fileInputNode, hover, httpUrl, listTargets, openCdp, pressKey, screenshot, scroll, setFileInput, typeText, waitFor } from "./cdp.ts";
+import type { MouseButton } from "./cdp.ts";
+import { KeepAlive, openDesk, putFile, releaseDesk, type DeskRunner, type DeskSession, type TimerFns } from "./desk.ts";
 
-const ACTIONS = ["open", "navigate", "screenshot", "click", "type", "key", "eval", "tabs", "release"] as const;
+const ACTIONS = [
+	"open",
+	"navigate",
+	"screenshot",
+	"click",
+	"hover",
+	"drag",
+	"scroll",
+	"type",
+	"key",
+	"eval",
+	"tabs",
+	"wait",
+	"upload",
+	"release",
+] as const;
+
+const BUTTONS = ["left", "right", "middle"] as const;
 
 const Params = Type.Object({
 	action: StringEnum(ACTIONS),
 	url: Type.Optional(Type.String({ description: "navigate: the http(s) URL to open" })),
-	x: Type.Optional(Type.Number({ description: "click: x in the page's CSS pixels" })),
-	y: Type.Optional(Type.Number({ description: "click: y in the page's CSS pixels" })),
+	x: Type.Optional(Type.Number({ description: "click, hover, scroll, drag: x in the page's CSS pixels" })),
+	y: Type.Optional(Type.Number({ description: "click, hover, scroll, drag: y in the page's CSS pixels" })),
+	toX: Type.Optional(Type.Number({ description: "drag: where the drag ends, x in CSS pixels" })),
+	toY: Type.Optional(Type.Number({ description: "drag: where the drag ends, y in CSS pixels" })),
+	steps: Type.Optional(Type.Number({ description: "drag: interpolated moves between press and release (default 12)" })),
+	button: Type.Optional(StringEnum(BUTTONS, { description: "click: left (default), right (a context menu) or middle" })),
+	clickCount: Type.Optional(Type.Number({ description: "click: 1 (default) or 2 for a double-click" })),
+	deltaX: Type.Optional(Type.Number({ description: "scroll: horizontal CSS pixels (default 0)" })),
+	deltaY: Type.Optional(Type.Number({ description: "scroll: vertical CSS pixels, positive scrolls down (default 600)" })),
 	text: Type.Optional(Type.String({ description: "type: the text to insert" })),
-	key: Type.Optional(Type.String({ description: "key: Enter, Tab, Escape, Backspace or an arrow" })),
+	key: Type.Optional(
+		Type.String({
+			description:
+				"key: a key or a + combo — Enter, Tab, Escape, Backspace, Delete, Space, Home, End, PageDown, ArrowLeft, F5, a, Control+a, Control+Shift+t, Alt+ArrowLeft, Meta+l, Shift+Tab",
+		}),
+	),
 	expression: Type.Optional(Type.String({ description: "eval: the JavaScript expression to evaluate" })),
+	selector: Type.Optional(Type.String({ description: "upload: a CSS selector of an <input type=file>; wait: a CSS selector to wait for" })),
+	path: Type.Optional(Type.String({ description: "upload: a file on this Mac to put on the desk and select (a leading `~/` is expanded)" })),
+	timeoutMs: Type.Optional(Type.Number({ description: "wait: how long to wait for the selector (default 5000, max 30000)" })),
 });
 
 /** What tests inject; every field has a real default. */
@@ -112,14 +145,19 @@ export function computerExtension(deps: ComputerDeps = {}) {
 			name: "computer",
 			label: "Computer",
 			description:
-				"Drive this pi session's own Linux desktop's Chromium, which Eric can watch and use from his phone: open (lease the desk), navigate, screenshot, click, type, key, eval, tabs, release.",
+				"Drive this pi session's own Linux desktop's Chromium, which Eric can watch and use from his phone: open (lease the desk), navigate, screenshot, click (left/right/middle, double), hover, drag, scroll, type, key (any key or Control+Shift+t combo), eval, tabs, wait for a selector, upload a file, release.",
 			parameters: Params,
 
 			renderCall(args, theme) {
 				let line = theme.fg("toolTitle", theme.bold("computer ")) + theme.fg("muted", String(args.action ?? ""));
 				if (args.url) line += ` ${theme.fg("accent", String(args.url))}`;
 				if (args.key) line += ` ${theme.fg("accent", String(args.key))}`;
-				if (args.x !== undefined && args.y !== undefined) line += ` ${theme.fg("dim", `${args.x},${args.y}`)}`;
+				if (args.selector) line += ` ${theme.fg("accent", capBytes(String(args.selector), 60))}`;
+				if (args.path) line += ` ${theme.fg("dim", capBytes(String(args.path), 60))}`;
+				if (args.x !== undefined && args.y !== undefined) {
+					line += ` ${theme.fg("dim", `${args.x},${args.y}`)}`;
+					if (args.toX !== undefined && args.toY !== undefined) line += ` ${theme.fg("dim", `→ ${args.toX},${args.toY}`)}`;
+				}
 				if (args.expression) line += ` ${theme.fg("dim", capBytes(String(args.expression), 60))}`;
 				return new Text(line, 0, 0);
 			},
@@ -170,13 +208,78 @@ export function computerExtension(deps: ComputerDeps = {}) {
 						}
 						case "click": {
 							if (params.x === undefined || params.y === undefined) return text("computer: click needs x and y.");
+							const clickCount = params.clickCount ?? 1;
 							const client = await openCdp(open.cdpSocket);
 							try {
-								await click(client, params.x, params.y);
+								await click(client, params.x, params.y, { button: params.button as MouseButton | undefined, clickCount });
 							} finally {
 								client.close();
 							}
-							return text(`clicked ${params.x},${params.y}`);
+							const button = (params.button as MouseButton | undefined) ?? "left";
+							const what = clickCount === 2 ? "double-clicked" : clickCount === 3 ? "triple-clicked" : "clicked";
+							return text(`${what} ${params.x},${params.y}${button === "left" ? "" : ` (${button})`}`);
+						}
+						case "hover": {
+							if (params.x === undefined || params.y === undefined) return text("computer: hover needs x and y.");
+							const client = await openCdp(open.cdpSocket);
+							try {
+								await hover(client, params.x, params.y);
+							} finally {
+								client.close();
+							}
+							return text(`hovered ${params.x},${params.y}`);
+						}
+						case "drag": {
+							if (params.x === undefined || params.y === undefined || params.toX === undefined || params.toY === undefined) {
+								return text("computer: drag needs x, y, toX and toY.");
+							}
+							const client = await openCdp(open.cdpSocket);
+							try {
+								await drag(client, params.x, params.y, { toX: params.toX, toY: params.toY, steps: params.steps });
+							} finally {
+								client.close();
+							}
+							return text(`dragged ${params.x},${params.y} → ${params.toX},${params.toY}`);
+						}
+						case "scroll": {
+							const client = await openCdp(open.cdpSocket);
+							try {
+								return text(await scroll(client, { x: params.x, y: params.y, deltaX: params.deltaX, deltaY: params.deltaY }));
+							} finally {
+								client.close();
+							}
+						}
+						case "wait": {
+							if (!params.selector?.trim()) return text("computer: wait needs a selector.");
+							const client = await openCdp(open.cdpSocket);
+							try {
+								await waitFor(client, params.selector, params.timeoutMs);
+							} finally {
+								client.close();
+							}
+							return text(`${params.selector} is in the page`);
+						}
+						case "upload": {
+							if (!params.selector?.trim()) return text("computer: upload needs a selector.");
+							if (!params.path?.trim()) return text("computer: upload needs a path to a file on this Mac.");
+							const client = await openCdp(open.cdpSocket);
+							let backendNodeId: number;
+							try {
+								// The input is checked before the copy, so a wrong selector leaves no file behind.
+								backendNodeId = await fileInputNode(client, params.selector);
+							} finally {
+								client.close();
+							}
+							const put = await putFile(sessionId, params.path, runOpts());
+							if ("error" in put) return text(put.error);
+							// A second connection (the first is closed): the backend node id survives it, a nodeId would not.
+							const uploader = await openCdp(open.cdpSocket);
+							try {
+								await setFileInput(uploader, backendNodeId, put.path);
+							} finally {
+								uploader.close();
+							}
+							return text(`uploaded ${params.path} → ${put.path} (${put.bytes} bytes) into ${params.selector}`);
 						}
 						case "type": {
 							if (!params.text) return text("computer: type needs text.");

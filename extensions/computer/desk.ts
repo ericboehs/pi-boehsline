@@ -9,8 +9,9 @@
  */
 
 import { execFile } from "node:child_process";
+import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, resolve, sep } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 
 /** One CLI call at most (Botsun's own lease work is the slow part). */
 export const CLI_TIMEOUT_MS = 120_000;
@@ -134,6 +135,55 @@ export async function releaseDesk(sessionId: string, deps: DeskDeps): Promise<{ 
 	} catch (err) {
 		return { error: `computer: Botsun could not release the desk: ${(err as Error).message}` };
 	}
+}
+
+/** `desk put --session ID <path>`'s one JSON line: where the file landed in the guest, and its size. */
+export interface PutLine {
+	path?: string;
+	bytes?: number;
+}
+
+export type PutResult = { path: string; bytes: number } | { error: string };
+
+/** `~/x` → `<home>/x`, `~` → `<home>`; anything else unchanged. */
+export function expandHome(path: string, home: string = homedir()): string {
+	if (path === "~") return home;
+	if (path.startsWith("~/")) return join(home, path.slice(2));
+	if (path.startsWith(`~${sep}`)) return join(home, path.slice(2));
+	return path;
+}
+
+/**
+ * Copy a file on this Mac onto the desk, through `desk put --session ID <path>`,
+ * and read the guest path it prints. The path is checked here first, so a typo or
+ * a directory never reaches the CLI.
+ *
+ * `~/` is expanded and the result made absolute: the CLI's parser treats any
+ * argv starting with `--` as a flag (`parse` in botsun's cli.rb has no `--`
+ * terminator), and an absolute path can never look like one.
+ */
+export async function putFile(sessionId: string, hostPath: string, deps: DeskDeps): Promise<PutResult> {
+	const given = typeof hostPath === "string" ? hostPath.trim() : "";
+	if (!given) return { error: "computer: upload needs a path to a file on this Mac." };
+	const file = resolve(expandHome(given, deps.home));
+	let info: Awaited<ReturnType<typeof stat>>;
+	try {
+		info = await stat(file);
+	} catch {
+		return { error: `computer: upload: there is no such file on this Mac (${file}).` };
+	}
+	if (info.isDirectory()) return { error: `computer: upload takes a file, not a directory (${file}).` };
+	if (!info.isFile()) return { error: `computer: upload takes a regular file (${file}).` };
+	let stdout: string;
+	try {
+		stdout = await (deps.run ?? runCli)(deps.bin, ["desk", "put", "--session", sessionId, file], deps.timeoutMs ?? CLI_TIMEOUT_MS);
+	} catch (err) {
+		return { error: `computer: Botsun could not put the file on the desk: ${(err as Error).message}` };
+	}
+	const line = parseDeskOutput(stdout) as PutLine | null;
+	if (!line || typeof line.path !== "string" || !line.path.trim()) return { error: "computer: Botsun's desk put printed no guest path." };
+	const bytes = typeof line.bytes === "number" && Number.isFinite(line.bytes) ? line.bytes : info.size;
+	return { path: line.path.trim(), bytes };
 }
 
 /** The timer functions the keep-alive uses; tests pass fakes. */
