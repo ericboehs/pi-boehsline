@@ -26,6 +26,12 @@
  *   - "quiet:run"      { quiet: boolean }                       on agent_start, and on a flip
  *   - "quiet:attention" { kind, text, at, source? } | null     set, and null when cleared
  *   - "quiet:mine"     {}                                       another extension marks Eric's next input
+ *   - "quiet:split"    { quiet: true }                          a background message joined his run
+ *
+ * A split: a background message (a bg job's result, a subagent's: pi.sendMessage, role
+ * "custom") queued as a follow-up while his run was going is delivered after his run's final
+ * reply, and pi carries on in the same run. His part is over: botsun-owner settles it, so its
+ * finished push brings his answer, and the rest is a quiet run like any other background one.
  */
 
 import { appendFileSync, chmodSync, mkdirSync, readFileSync } from "node:fs";
@@ -38,6 +44,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 
 export const RUN_EVENT = "quiet:run";
+export const SPLIT_EVENT = "quiet:split";
 export const ATTENTION_EVENT = "quiet:attention";
 export const MINE_EVENT = "quiet:mine";
 export const STATE_KEY = Symbol.for("pi-boehsline.quiet");
@@ -236,6 +243,8 @@ export default function quiet(pi: ExtensionAPI): void {
   let mineMarkAt = 0;
   /** The low-level run in progress, or null between runs. */
   let active: { quiet: boolean } | null = null;
+  /** The last assistant message ended the turn with no tool calls: what follows is a follow-up. */
+  let afterFinalReply = false;
   /** notify_user ran during this run. */
   let notifiedThisRun = false;
   let notifiedLine: { kind: Kind; text: string } | null = null;
@@ -355,6 +364,30 @@ export default function quiet(pi: ExtensionAPI): void {
     };
   });
 
+  pi.on("message_end", (event) => {
+    const message = (event as { message?: { role?: string; stopReason?: string } }).message;
+    if (message?.role === "assistant") afterFinalReply = message.stopReason !== "toolUse";
+  });
+
+  // A background message delivered after his run's final reply: split (see the header).
+  pi.on("message_start", (event) => {
+    const role = (event as { message?: { role?: string } }).message?.role;
+    if (role === "assistant") {
+      afterFinalReply = false;
+      return;
+    }
+    if (role !== "custom" || !afterFinalReply) return;
+    afterFinalReply = false;
+    if (!active || active.quiet || settings.mode === "off") return;
+    active.quiet = true;
+    mineSinceSettle = false;
+    notifiedThisRun = false;
+    notifiedLine = null;
+    snapshot.quiet = true;
+    emit(SPLIT_EVENT, { quiet: true }); // before quiet:run, so botsun-owner settles his part first
+    publishRun(true);
+  });
+
   pi.on("agent_start", () => {
     const continuing = active !== null;
     const quietRun = settings.mode !== "off" && !mineSinceSettle;
@@ -369,6 +402,7 @@ export default function quiet(pi: ExtensionAPI): void {
   pi.on("session_start", () => {
     settings = readSettings();
     active = null;
+    afterFinalReply = false;
     mineSinceSettle = false;
     mineMarkAt = 0;
     notifiedThisRun = false;
@@ -380,6 +414,7 @@ export default function quiet(pi: ExtensionAPI): void {
   pi.on("agent_settled", (_event, ctx) => {
     const run = active;
     active = null;
+    afterFinalReply = false;
     const wasQuiet = run?.quiet === true && settings.mode !== "off";
     const notified = notifiedThisRun;
     const line = notifiedLine;

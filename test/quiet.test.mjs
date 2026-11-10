@@ -235,6 +235,42 @@ test("origin: a steer from Eric mid-run flips the run and announces it", async (
   assert.equal(h.stateNow().quiet, false, "the settled state still describes the last run");
 });
 
+test("split: a background message after his run's final reply makes the rest quiet", async () => {
+  const h = await mount();
+  const splits = [];
+  h.pi.events.on("quiet:split", (event) => splits.push(event));
+  await h.run("interactive");
+  await h.fire("message_start", { message: { role: "assistant" } }, h.ctx);
+  await h.fire("message_end", { message: { role: "assistant", stopReason: "toolUse" } }, h.ctx);
+  await h.fire("message_start", { message: { role: "custom" } }, h.ctx); // a steer-time message mid-work
+  assert.equal(splits.length, 0, "not after a tool call");
+  await h.fire("message_start", { message: { role: "assistant" } }, h.ctx);
+  await h.fire("message_end", { message: { role: "assistant", stopReason: "stop" } }, h.ctx);
+  await h.fire("agent_end", { messages: [] }, h.ctx);
+  await h.start(); // pi carries on with the queued follow-up
+  await h.fire("message_start", { message: { role: "custom" } }, h.ctx);
+  assert.deepEqual(splits, [{ quiet: true }]);
+  assert.equal(h.stateNow().quiet, true);
+  assert.deepEqual(h.runs.at(-1), { quiet: true });
+  await h.settle();
+  assert.match(h.digest(), /quiet:|classifier/, "the background part settles as a quiet run");
+});
+
+test("split: none for a quiet run, a user message, or quietMode off", async () => {
+  const h = await mount();
+  const splits = [];
+  h.pi.events.on("quiet:split", (event) => splits.push(event));
+  await h.run("extension");
+  await h.fire("message_end", { message: { role: "assistant", stopReason: "stop" } }, h.ctx);
+  await h.fire("message_start", { message: { role: "custom" } }, h.ctx);
+  await h.settle();
+  await h.run("interactive");
+  await h.fire("message_end", { message: { role: "assistant", stopReason: "stop" } }, h.ctx);
+  await h.fire("message_start", { message: { role: "user" } }, h.ctx);
+  assert.equal(splits.length, 0);
+  assert.equal(h.stateNow().quiet, false);
+});
+
 test("origin: his prompt that never started a run doesn't make the next background run his", async () => {
   const h = await mount();
   await h.input("interactive"); // no model: pi emitted input, then threw; no run, no settle

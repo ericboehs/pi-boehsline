@@ -1710,6 +1710,7 @@ const PROMPT_STARTING_MS = 10_000;
 const QUIET_MINE_EVENT = "quiet:mine";
 const QUIET_RUN_EVENT = "quiet:run";
 const QUIET_ATTENTION_EVENT = "quiet:attention";
+const QUIET_SPLIT_EVENT = "quiet:split";
 const QUIET_STATE = Symbol.for("pi-boehsline.quiet");
 
 /** False when the quiet extension is not loaded: every run is Eric's. */
@@ -2260,6 +2261,17 @@ function main(pi: ExtensionAPI): void {
 		if (conn.quietSent === quiet) return;
 		conn.quietSent = quiet;
 		try { write(conn, "busy", { quiet }); } catch {}
+	});
+	// A background message joined his run after its final reply (the quiet extension's split):
+	// his part ends here, so Botsun settles it (its finished push brings his answer), and a quiet
+	// run starts. split: true tells Botsun this busy isn't him moving on (it keeps the held push).
+	pi.events?.on?.(QUIET_SPLIT_EVENT, () => {
+		if (!conn || conn.closed || !conn.busy || conn.quietSent === true) return;
+		try {
+			write(conn, "idle");
+			conn.quietSent = true;
+			write(conn, "busy", { quiet: true, split: true });
+		} catch {}
 	});
 	// A quiet run's attention (notify_user or the classifier): the phone shows it.
 	pi.events?.on?.(QUIET_ATTENTION_EVENT, (attention: unknown) => {

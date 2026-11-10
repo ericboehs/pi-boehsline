@@ -3226,6 +3226,27 @@ test("busy carries quiet, repeats when a run flips, and an attention line follow
 	delete globalThis[QUIET_STATE];
 });
 
+test("a split settles his run (idle) and starts a quiet one marked split, once", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+
+	globalThis[QUIET_STATE] = { quiet: false, attention: null };
+	await m.fire("agent_start");
+	await until(() => srv.lines.some((line) => line.type === "busy"));
+	m.pi.events.emit("quiet:split", { quiet: true });
+	m.pi.events.emit("quiet:run", { quiet: true }); // the quiet extension's flip right after: no third busy
+	await until(() => srv.lines.filter((line) => line.type === "busy").length >= 2);
+	const tail = srv.lines.filter((line) => ["busy", "idle"].includes(line.type)).map((line) => [line.type, line.quiet, line.split]);
+	assert.deepEqual(tail, [["busy", false, undefined], ["idle", undefined, undefined], ["busy", true, true]]);
+	m.pi.events.emit("quiet:split", { quiet: true });
+	await new Promise((r) => setTimeout(r, 30));
+	assert.equal(srv.lines.filter((line) => line.type === "busy").length, 2, "an already-quiet run isn't split again");
+	delete globalThis[QUIET_STATE];
+});
+
 test("every sendUser marks its next input as Eric's before sending it", async () => {
 	const key = phoneKey();
 	writeKeys({ 7: key.raw.toString("base64") });
