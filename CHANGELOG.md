@@ -41,6 +41,7 @@
 
 ### Fixed
 
+- botsun-owner: switching model sends the context use at once, so Botsun's info sheet shows the new model's window instead of the old one until the next run.
 - stash: a message sent from the Botsun phone no longer auto-restores the top stash into the terminal editor; the phone restores it into its own composer (botsun-owner marks phone submits in `lib/stash-store.ts`).
 
 - auto-session-name: a quiet miss (no naming model with credentials, as in a window started without them, or the session's own model failing) no longer ends automatic naming for the session: it counts as a failure, so a later turn tries again, up to the same 3 tries and still without a warning. The name is also asked for as soon as the first assistant reply with text is in (not awaited, the turn goes on), rather than only when the turn settles; settle still tries when that didn't happen.

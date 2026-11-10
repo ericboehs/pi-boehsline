@@ -1390,6 +1390,19 @@ test("context use goes in hello and after each run", async () => {
 	assert.deepEqual(srv.lines.find((l) => l.type === "context").context, { tokens: 50_000, window: 200_000, percent: 25 });
 });
 
+test("context use follows /model: the new model's window, at once", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	let window = 200_000;
+	const m = await mount({ ctx: { getContextUsage: () => ({ tokens: 50_000, contextWindow: window, percent: (50_000 / window) * 100 }) } });
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	window = 1_000_000;
+	await m.fire("model_select", { model: { provider: "anthropic", id: "claude-opus-5-5", name: "Claude Opus 5.5" } });
+	await until(() => srv.types().includes("context"));
+	assert.deepEqual(srv.lines.find((l) => l.type === "context").context, { tokens: 50_000, window: 1_000_000, percent: 5 });
+});
+
 test("the footer's chips go to the phone, only the ones it shows, at most once a second", async () => {
 	const { publishFooter } = await import("../lib/footer-snapshot.ts");
 	const srv = await server();

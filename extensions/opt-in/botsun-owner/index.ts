@@ -2497,6 +2497,8 @@ function main(pi: ExtensionAPI): void {
 		if (!conn || conn.closed) return;
 		conn.model = modelOf(ctx, (event as { model?: unknown }).model);
 		write(conn, "model", { model: conn.model });
+		// The window is the model's: the info sheet's "of 200k" follows the switch, not the next run.
+		try { write(conn, "context", { context: phoneContext(ctx) }); } catch {}
 	});
 	pi.on("thinking_level_select", (event, ctx) => {
 		if (!conn || conn.closed) return;
