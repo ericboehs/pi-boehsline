@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- subagent, children: a background pi subagent's commands show whole on the phone. The progress filter cut each turn's calls to 110 characters for its log line (and split on a " | " inside a command), and the children tracker read only that line, so a long command showed as `git show o…`. The filter now also writes each turn's calls in full (strings capped at 4000 characters) to a sidecar JSONL named by its argument, and the tracker reads that turn from it, falling back to the log line; the sidecar is deleted when the child ends. The log lines (and so the bg completion message) are unchanged.
+
 ### Added
 
 - quiet, botsun-owner: a background message (a bg job's or subagent's result, `pi.sendMessage`, role `custom`) delivered after the final reply of a run Eric started splits the run. pi carries on in the same run, so before this the run ended on the background reply and its finished push on Botsun carried that, not his answer. quiet emits `quiet:split` and treats the rest as a quiet run (no hint, digest and classifier at settle); botsun-owner writes `idle` and then `busy` with `quiet: true, split: true`, so Botsun settles his part (its push brings his answer) and keeps that push held (Botsun 7215704). A custom message after a tool call (mid-work) doesn't split, nor does one in a quiet run or with `quietMode: "off"`.

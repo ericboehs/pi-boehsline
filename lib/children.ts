@@ -30,7 +30,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { closeSync, openSync, readSync } from "node:fs";
+import { closeSync, openSync, readSync, rmSync } from "node:fs";
 import { maskSecrets } from "../extensions/opt-in/op-broker/broker.ts";
 import { commandRunsCursorRunner, type CursorDiffInfo, type CursorEditArg, maskDiffSecrets, readJobDetails, trustCursorDiff, trustEdit } from "./cursor-diff.ts";
 
@@ -159,6 +159,9 @@ interface BgSource {
 	logPath: string;
 	offset: number;
 	carry: string;
+	/** A pi child's sidecar of each turn's calls in full (the progress filter's argument):
+	 * read up to the turn its log line names, so a command is shown whole, not cut to 110. */
+	calls?: { path: string; offset: number; carry: string; turns: Map<number, { name: string; arguments: Record<string, unknown> }[]> };
 	/** In the result block (pi: after the banner; cursor: the answer under its banner). */
 	result: boolean;
 	resultLines: string[];
@@ -659,7 +662,7 @@ export interface ChildStart {
 	/** Aborts a foreground child (its own AbortController). */
 	stop?: () => void;
 	/** A background child: its bg job, followed through the log and bg:jobs. */
-	bg?: { id: string; logPath: string };
+	bg?: { id: string; logPath: string; callsPath?: string };
 }
 
 /** What a child's tracker can do: its source feeds it, then it ends. */
@@ -742,6 +745,7 @@ export function trackChild(start: ChildStart): ChildHandle {
 	addEntry(rec, { role: "user", content: [{ type: "text", text: cleanText(start.task, TASK_TEXT) }] });
 	if (start.bg) {
 		rec.bg = { id: start.bg.id, logPath: start.bg.logPath, offset: 0, carry: "", result: false, resultLines: [], full: false, keep: false };
+		if (start.bg.callsPath) rec.bg.calls = { path: start.bg.callsPath, offset: 0, carry: "", turns: new Map() };
 	}
 	s.children.set(rec.id, rec);
 	notify(true);
@@ -822,6 +826,13 @@ function end(rec: Rec, state: Exclude<ChildState, "running">, patch: ChildFinish
 	rec.live = "";
 	delete rec.stop;
 	closeOpen(rec);
+	if (rec.bg?.calls) {
+		// Its log is read to the end by now (bgEnded): the sidecar has nothing more to give.
+		try {
+			rmSync(rec.bg.calls.path, { force: true });
+		} catch {}
+		delete rec.bg.calls;
+	}
 	const reply = cleanText(full, REPLY_TEXT);
 	if (reply && (state === "done" || rec.bg?.result) && !lastTexts(rec).includes(reply)) addText(rec, reply);
 	if (patch.diff) addCursorDiff(rec, patch.diff);
@@ -1029,14 +1040,22 @@ function piLogLine(rec: Rec, line: string): void {
 	if (PI_TOOLS.has(first)) {
 		let last = THINKING;
 		const blocks: ChildBlock[] = [];
-		calls.forEach((call, k) => {
-			const sp = call.indexOf(" ");
-			const name = sp < 0 ? call : call.slice(0, sp);
-			const arg = sp < 0 ? "" : call.slice(sp + 1);
-			const key = name === "bash" ? "command" : name === "grep" || name === "find" ? "pattern" : name === "web_fetch" ? "url" : name === "web_search" ? "query" : "path";
-			last = toolLabel(name, { [key]: arg });
+		// The sidecar's calls in full when it has this turn (the log line is cut, and splits on a " | "
+		// inside a command too); the log line's otherwise.
+		const whole = fullCalls(rec, rec.turns);
+		const parsed = whole?.length
+			? whole
+			: calls.map((call) => {
+					const sp = call.indexOf(" ");
+					const name = sp < 0 ? call : call.slice(0, sp);
+					const arg = sp < 0 ? "" : call.slice(sp + 1);
+					const key = name === "bash" ? "command" : name === "grep" || name === "find" ? "pattern" : name === "web_fetch" ? "url" : name === "web_search" ? "query" : "path";
+					return { name, arguments: { [key]: arg } as Record<string, unknown> };
+				});
+		parsed.forEach(({ name, arguments: args }, k) => {
+			last = toolLabel(name, args);
 			pushTail(rec, last);
-			if (blocks.length < BLOCKS_MAX) blocks.push(callBlock(rec, `bg-${rec.seq}-${k}`, name, { [key]: arg }, last));
+			if (blocks.length < BLOCKS_MAX) blocks.push(callBlock(rec, `bg-${rec.seq}-${k}`, name, args, last));
 		});
 		if (blocks.length > 0) addEntry(rec, { role: "assistant", content: blocks });
 		rec.activity = last;
@@ -1124,6 +1143,53 @@ function cursorLogLine(rec: Rec, line: string): void {
 		const open = [...rec.open].find(([, c]) => c.label === label)?.[0];
 		addResult(rec, open ?? call(), "", step[1] === "✗");
 	}
+}
+
+const CALLS_MAX = 2 * 1024 * 1024;
+
+/** Turn `turn`'s calls in full from the child's sidecar, read on as far as it goes (its turns are
+ * written before their log lines, so a line's turn is there); undefined without one. Turns before
+ * it are dropped as read. */
+function fullCalls(rec: Rec, turn: number): { name: string; arguments: Record<string, unknown> }[] | undefined {
+	const side = rec.bg?.calls;
+	if (!side) return undefined;
+	if (!side.turns.has(turn) && side.offset < CALLS_MAX) {
+		let fd: number | undefined;
+		try {
+			fd = openSync(side.path, "r");
+			const buf = Buffer.alloc(READ_MAX);
+			for (;;) {
+				const n = readSync(fd, buf, 0, READ_MAX, side.offset);
+				if (n <= 0) break;
+				side.offset += n;
+				const lines = (side.carry + buf.subarray(0, n).toString("utf8")).split("\n");
+				side.carry = lines.pop() ?? "";
+				if (side.carry.length > READ_MAX) side.carry = "";
+				for (const l of lines) {
+					try {
+						const v = JSON.parse(l) as { turn?: unknown; calls?: unknown };
+						if (typeof v.turn === "number" && Array.isArray(v.calls)) {
+							const calls = v.calls.filter(
+								(c): c is { name: string; arguments: Record<string, unknown> } =>
+									!!c && typeof c === "object" && typeof (c as { name?: unknown }).name === "string" && !!(c as { arguments?: unknown }).arguments && typeof (c as { arguments?: unknown }).arguments === "object",
+							);
+							side.turns.set(v.turn, calls);
+						}
+					} catch {
+						// A bad line: that turn keeps its log line's form.
+					}
+				}
+				if (n < READ_MAX || side.offset >= CALLS_MAX) break;
+			}
+		} catch {
+			// No sidecar (yet): the log line's form.
+		} finally {
+			if (fd !== undefined) closeSync(fd);
+		}
+	}
+	const calls = side.turns.get(turn);
+	for (const k of side.turns.keys()) if (k <= turn) side.turns.delete(k);
+	return calls;
 }
 
 /** What's new in a background child's log, parsed. */

@@ -4,7 +4,7 @@
  * here in a temp dir. No child process, no model.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, beforeEach, test } from "node:test";
@@ -275,6 +275,23 @@ test("a background pi child: the progress filter's log, then bg's exit", () => {
 	const killed = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s", bg: { id: "ee33ff", logPath: log } });
 	events.handlers.get("bg:jobs")([{ id: "ee33ff", endedAt: Date.now(), exitCode: null, signal: null, killedByUser: true }]);
 	assert.equal(one(killed.id).state, "stopped", "killed from /bg, not the phone");
+});
+
+test("a background pi child's commands come whole from the filter's sidecar, not cut to the log line's 110", () => {
+	const events = bus();
+	bindChildren(events);
+	const log = join(dir, "pi-side.log");
+	const calls = join(dir, "pi-side.calls.jsonl");
+	const long = "cd ~/Code/example/a-very-long-repository-name && git fetch -q origin && git show origin/main:pom.xml | grep -n version";
+	writeFileSync(calls, JSON.stringify({ turn: 1, calls: [{ name: "bash", arguments: { command: long } }] }) + "\n");
+	writeFileSync(log, `· turn 1 · bash ${long.slice(0, 104)}…\n· turn 2 · bash bin/test\n`);
+	const c = trackChild({ kind: "pi", agent: "scout", task: "t", sessionId: "s", bg: { id: "side11", logPath: log, callsPath: calls } });
+	pollOnce();
+	const page = childTranscript("s", c.id);
+	const commands = page.entries.flatMap((e) => (e.message.role === "assistant" ? e.message.content : [])).filter((b) => b.type === "toolCall").map((b) => b.arguments.command);
+	assert.deepEqual(commands, [long, "bin/test"], "turn 2 has no sidecar line: the log line's form");
+	events.handlers.get("bg:jobs")([{ id: "side11", endedAt: Date.now(), exitCode: 0 }]);
+	assert.equal(existsSync(calls), false, "the sidecar goes when the child ends");
 });
 
 test("a background pi child says its last turn's context, from a banner that has one", () => {

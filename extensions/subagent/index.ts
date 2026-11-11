@@ -40,6 +40,15 @@ const BG_WAKE_CHARS = 24 * 1024; // background: log tail carried by the bg exten
 // answer, so the bg extension reports the job as failed.
 const PROGRESS_FILTER = `
 let buf = "", turns = 0, final = "", last = 0;
+// Each turn's calls in full (the log line is cut to 110 characters for reading), one JSON line per
+// turn in the file named by its first argument, for the children tracker: a command shown whole on the phone. Strings
+// over 4000 characters (a write's content) are cut; a failed write only loses the full form.
+const callsPath = process.argv[1];
+const fs = callsPath ? require("node:fs") : null;
+const capArgs = (v, d = 0) => typeof v === "string" ? (v.length > 4000 ? v.slice(0, 4000) : v)
+  : Array.isArray(v) ? (d > 2 ? [] : v.slice(0, 20).map((x) => capArgs(x, d + 1)))
+  : v && typeof v === "object" ? (d > 2 ? {} : Object.fromEntries(Object.entries(v).slice(0, 30).map(([k, x]) => [k, capArgs(x, d + 1)])))
+  : v;
 const u = { input: 0, cached: 0, output: 0, cost: 0 };
 const short = (s, n) => { s = String(s ?? "").replace(/\\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
 const onLine = (line) => {
@@ -52,11 +61,12 @@ const onLine = (line) => {
   u.output += mu.output ?? 0; u.cost += mu.cost?.total ?? 0;
   // What the conversation holds after this turn: the last one's, not the run's total.
   last = (mu.input ?? 0) + (mu.cacheRead ?? 0) + (mu.cacheWrite ?? 0) + (mu.output ?? 0);
-  const calls = []; let text = "";
+  const calls = [], full = []; let text = "";
   for (const p of m.content ?? []) {
     if (p.type === "text" && p.text) { text = p.text; final = p.text; }
-    if (p.type === "toolCall") { const a = p.arguments ?? {}; calls.push(p.name + " " + (a.command ?? a.path ?? a.pattern ?? a.url ?? "")); }
+    if (p.type === "toolCall") { const a = p.arguments ?? {}; calls.push(p.name + " " + (a.command ?? a.path ?? a.pattern ?? a.url ?? "")); full.push({ name: p.name, arguments: capArgs(a) }); }
   }
+  if (fs && full.length > 0) { try { fs.appendFileSync(callsPath, JSON.stringify({ turn: turns, calls: full }) + "\\n"); } catch {} }
   console.log("· turn " + turns + " · " + (short(calls.join(" | "), 110) || short(text, 110) || "(no text)"));
 };
 process.stdin.setEncoding("utf8");
@@ -510,7 +520,9 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						args.push(`Task: ${job.task}`);
 						inv = piInvocation(args);
 					}
-					const command = `PI_SUBAGENT_CHILD=1 ${[inv.cmd, ...inv.args].map(q).join(" ")} | ${q(process.execPath)} -e ${q(PROGRESS_FILTER)}`;
+					// The filter's sidecar of each turn's calls in full (kids' callsPath): its argument.
+					const callsPath = path.join(os.tmpdir(), `pi-subagent-calls-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.jsonl`);
+					const command = `PI_SUBAGENT_CHILD=1 ${[inv.cmd, ...inv.args].map(q).join(" ")} | ${q(process.execPath)} -e ${q(PROGRESS_FILTER)} ${q(callsPath)}`;
 					const reply = await new Promise<{ id: string; logPath: string } | { error: string } | null>((resolve) => {
 						const req = {
 							command,
@@ -527,7 +539,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						if (!req.accepted) resolve(null); // no listener: the bg extension isn't loaded
 					});
 					if (reply === null) return noBg;
-					if (!("error" in reply)) kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, ...(childId ? { id: childId } : {}), bg: reply });
+					if (!("error" in reply)) kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, ...(childId ? { id: childId } : {}), bg: { ...reply, callsPath } });
 					lines.push("error" in reply ? `[${job.agent}] failed: ${reply.error}` : `[${job.agent}] bg ${reply.id} · log ${reply.logPath}`);
 				}
 				return {
