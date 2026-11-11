@@ -1449,6 +1449,29 @@ test("a chip tap from the phone flips the footer's display, display chips only",
 	stop();
 });
 
+// The held words go out a tick after session_compact (releaseHeld), once pi takes a prompt again.
+const settle = (ms = 5) => new Promise((r) => setTimeout(r, ms));
+
+test("compaction: held words wait until pi stops counting the compaction as running", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	// pi emits session_compact while isIdle() is still false (its compaction controller is still set),
+	// and a prompt then is refused. The words must wait, and then go in as a prompt, not a steer.
+	let idle = false;
+	m.ctx.isIdle = () => idle;
+	await m.fire("session_before_compact", { reason: "manual" });
+	const { nonce } = await ask({ type: "nonce" });
+	const text = "the share sheet one";
+	await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) });
+	await m.fire("session_compact", { reason: "manual" });
+	await settle(20);
+	assert.equal(m.sent.length, 0, "not while pi still counts the compaction");
+	idle = true;
+	await settle(400);
+	assert.deepEqual(m.sent.at(-1), { content: text, options: undefined });
+});
+
 test("compaction: the phone hears of it, and a reply meanwhile waits for it to end", async () => {
 	const key = phoneKey();
 	writeKeys({ 7: key.raw.toString("base64") });
@@ -1459,7 +1482,7 @@ test("compaction: the phone hears of it, and a reply meanwhile waits for it to e
 	const text = "and then the docs";
 	assert.deepEqual(await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) }), { ok: true, delivered: "prompt" });
 	assert.equal(m.sent.length, 0, "pi refuses a prompt mid-compaction");
-	await m.fire("session_compact", { reason: "threshold" });
+	await m.fire("session_compact", { reason: "threshold" }); await settle();
 	assert.deepEqual(m.sent.at(-1), { content: text, options: undefined });
 });
 
@@ -1900,7 +1923,7 @@ test("a locked phone's close waits out a compaction, even one that runs while pi
 	};
 	await m.fire("session_before_compact", { reason: "threshold" });
 	assert.equal((await callClose()).error, CLOSE_CALL_BUSY);
-	await m.fire("session_compact", { reason: "threshold" });
+	await m.fire("session_compact", { reason: "threshold" }); await settle();
 	await sleep(50);
 	assert.deepEqual(log, [], "nothing aborted, nothing shut down");
 	assert.deepEqual(await callClose(), { ok: true });
@@ -1982,7 +2005,7 @@ test("a locked phone's close counts words this extension released after a stop o
 		// Held through a compaction, then released at its end.
 		await m.fire("session_before_compact", { reason: "threshold" });
 		conn.inject("and this", false);
-		await m.fire("session_compact", { reason: "threshold" });
+		await m.fire("session_compact", { reason: "threshold" }); await settle();
 		assert.deepEqual(m.sent.map((s) => s.content), ["try the other fix", "and this"]);
 		assert.equal((await callClose()).error, CLOSE_CALL_BUSY, "released after a compaction");
 		later(20_002);
@@ -2025,7 +2048,7 @@ test("a locked phone's close checks again at shutdown: a turn started since its 
 	closing = conn.close({ idleOnly: true });
 	await m.fire("session_before_compact", { reason: "threshold" });
 	closing.shutdown();
-	await m.fire("session_compact", { reason: "threshold" });
+	await m.fire("session_compact", { reason: "threshold" }); await settle();
 	closing = conn.close({ idleOnly: true });
 	conn.framing = new Promise(() => {}); // a video reply on its way in
 	assert.equal(conn.close({ idleOnly: true }), null, "refused while its frames are extracted");

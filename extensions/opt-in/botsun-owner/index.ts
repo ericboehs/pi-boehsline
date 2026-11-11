@@ -2309,7 +2309,8 @@ function main(pi: ExtensionAPI): void {
 		const setSessionName = (name: string) => pi.setSessionName(name);
 		// Eric's own words, as if typed: steer into a running turn, else start one.
 		const inject = (content: string | UserContent[], busy: boolean) => {
-			if (compacting) held.push(content);
+			// held still waiting (a compaction just ended, see releaseHeld): stay behind them.
+			if (compacting || held.length > 0) held.push(content);
 			else sendUser(pi, content, busy ? { deliverAs: "steer" } : undefined);
 		};
 		// Released call words. queue: a follow-up once the turn ends (a prompt when idle). steer: as a
@@ -2639,10 +2640,24 @@ function main(pi: ExtensionAPI): void {
 		if (!compacting) return;
 		compacting = null;
 		if (conn && !conn.closed) try { write(conn, "compacting", { reason: null }); } catch {}
+		setTimeout(() => releaseHeld(ctx), 0);
+	};
+	// pi emits session_compact while the compaction still counts as running, and a prompt sent then
+	// is refused ("Cannot submit a prompt while compaction is in progress") asynchronously, past any
+	// try/catch: the phone's words were lost (2026-11-10). Release them once the session takes them:
+	// idle (a prompt) or in a running turn (a steer). After a minute, send anyway.
+	const releaseHeld = (ctx: ExtensionContext, waitedMs = 0) => {
+		if (compacting || held.length === 0) return;
+		const idle = ctx.isIdle();
+		const running = conn?.busy === true;
+		if (!idle && !running && waitedMs < 60_000) {
+			setTimeout(() => releaseHeld(ctx, waitedMs + 250), 250);
+			return;
+		}
 		const out = held;
 		held = [];
 		out.forEach((content, i) => {
-			const options = i > 0 ? { deliverAs: "followUp" as const } : ctx.isIdle() ? undefined : { deliverAs: "steer" as const };
+			const options = i > 0 ? { deliverAs: "followUp" as const } : idle ? undefined : { deliverAs: "steer" as const };
 			try { sendUser(pi, content, options); } catch {}
 		});
 	};
