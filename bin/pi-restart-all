@@ -243,7 +243,9 @@ restart_one() {
     respawn)
       tmux -S "$socket" respawn-pane -k -t "$pane" -c "$cwd" "$(printf '%q' "$sh") -ic $(printf '%q' "$(with_secrets "$pi_cmd"); exec $(printf '%q' "$sh") -i")" ;;
     type)
-      if ! tmux -S "$socket" send-keys -t "$pane" -l "$pi_cmd" || ! tmux -S "$socket" send-keys -t "$pane" Enter; then
+      # The shell may predate the secrets it should hold (started before the keychain unlocked):
+      # load them again, so the new pi has them either way.
+      if ! tmux -S "$socket" send-keys -t "$pane" -l "$(with_secrets "$pi_cmd")" || ! tmux -S "$socket" send-keys -t "$pane" Enter; then
         say "$name: couldn't type the command, not resumed ($pi_cmd)"; return
       fi ;;
     *)
