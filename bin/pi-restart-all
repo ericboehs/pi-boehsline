@@ -154,6 +154,38 @@ type_command() {
   return 1
 }
 
+# A shell started with -c never reaches an idle prompt, so the fnox hook that loads the
+# keychain's secrets into the environment (COPILOT_TOKEN, which pi's github-copilot provider reads)
+# never runs there: load them first, or pi comes back without its Copilot models.
+with_secrets() { printf '%s' "command -v fnox >/dev/null && eval \"\$(fnox hook-env -s zsh --if-missing ignore 2>/dev/null)\"; $1"; }
+
+# The pane's tmux session and window name, read before pi leaves: the pane may close with it.
+pane_place() { tmux -S "$1" display-message -p -t "$2" '#{session_name}	#{window_name}' 2>/dev/null; }
+
+# A new window (or the tmux session again, when it closed with its last pane) running pi inside a
+# login shell, so the window outlives pi; prints its pane id.
+new_window() {
+  local socket="$1" tsession="$2" wname="$3" dir="$4" cmd="$5" sh="${SHELL:-/bin/zsh}" run
+  run="$(printf '%q' "$sh") -ic $(printf '%q' "$(with_secrets "$cmd"); exec $(printf '%q' "$sh") -i")"
+  [ -d "$dir" ] || dir="$HOME"
+  tmux -S "$socket" new-window -d -P -F '#{pane_id}' -t "$tsession:" -n "$wname" -c "$dir" "$run" 2>/dev/null ||
+    tmux -S "$socket" new-session -d -P -F '#{pane_id}' -s "$tsession" -n "$wname" -c "$dir" "$run" 2>/dev/null ||
+    tmux -S "$socket" new-window -d -P -F '#{pane_id}' -t "$tsession:" -n "$wname" -c "$dir" "$run" # lost a race to recreate it
+}
+
+# Whether the pane shows a plain shell, waiting up to 5s: the shell's prompt hooks can run a
+# moment after pi exits.
+shell_in_pane() {
+  local deadline=$((SECONDS + 5))
+  while :; do
+    case "$(tmux -S "$1" display-message -p -t "$2" '#{pane_current_command}' 2>/dev/null)" in
+      zsh|bash|sh|-zsh|-bash|login) return 0 ;;
+    esac
+    [ $SECONDS -lt $deadline ] || return 1
+    sleep 0.5
+  done
+}
+
 restart_one() {
   local rec="$1" pid pane socket session cwd name
   pid=$(field "$rec" pid); pane=$(field "$rec" pane); socket=$(field "$rec" socket)
@@ -171,6 +203,10 @@ restart_one() {
   fi
 
   pi_in_pane "$socket" "$pane" "$pid" || { say "$name: pid $pid is no longer that pane's pi"; return; }
+  local place tsession wname
+  place=$(pane_place "$socket" "$pane"); tsession=${place%%$'\t'*}; wname=${place#*$'\t'}
+  [ -n "$tsession" ] || tsession=pi
+  [ -n "$wname" ] && [ "$wname" != node ] && [ "$wname" != pi ] || wname=$(basename "$cwd")
   say "$name: asking pid $pid to stop when idle"
   kill -USR2 "$pid" 2>/dev/null || { say "$name: pid $pid is gone"; return; }
   local deadline=$((SECONDS + wait_s))
@@ -191,21 +227,33 @@ restart_one() {
 
   local sh="${SHELL:-/bin/zsh}" pi_cmd
   pi_cmd=$(resume_command "$session" "$resume" "$cd_opt")
+  # A pane that closed with pi, or runs something else now: pi goes into a new window instead.
+  # A dead pane (remain-on-exit) is respawned; a pane back at its shell gets the command typed.
+  local how
   if ! tmux -S "$socket" display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1; then
-    say "$name: the pane closed with pi, not resumed ($pi_cmd)"
-    return
-  fi
-  if [ "$(tmux -S "$socket" display-message -p -t "$pane" '#{pane_dead}')" = 1 ]; then
-    tmux -S "$socket" respawn-pane -k -t "$pane" -c "$cwd" "$(printf '%q' "$sh") -ic $(printf '%q' "$pi_cmd; exec $(printf '%q' "$sh") -i")"
+    how="the pane closed with pi"
+  elif [ "$(tmux -S "$socket" display-message -p -t "$pane" '#{pane_dead}')" = 1 ]; then
+    how="respawn"
+  elif shell_in_pane "$socket" "$pane"; then
+    how="type"
   else
-    case "$(tmux -S "$socket" display-message -p -t "$pane" '#{pane_current_command}')" in
-      zsh|bash|sh|-zsh|-bash|login) ;;
-      *) say "$name: the pane runs something else now, not resumed ($pi_cmd)"; return ;;
-    esac
-    if ! tmux -S "$socket" send-keys -t "$pane" -l "$pi_cmd" || ! tmux -S "$socket" send-keys -t "$pane" Enter; then
-      say "$name: couldn't type the command, not resumed ($pi_cmd)"; return
-    fi
+    how="the pane runs $(tmux -S "$socket" display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null) now"
   fi
+  case "$how" in
+    respawn)
+      tmux -S "$socket" respawn-pane -k -t "$pane" -c "$cwd" "$(printf '%q' "$sh") -ic $(printf '%q' "$(with_secrets "$pi_cmd"); exec $(printf '%q' "$sh") -i")" ;;
+    type)
+      if ! tmux -S "$socket" send-keys -t "$pane" -l "$pi_cmd" || ! tmux -S "$socket" send-keys -t "$pane" Enter; then
+        say "$name: couldn't type the command, not resumed ($pi_cmd)"; return
+      fi ;;
+    *)
+      local new_pane
+      if ! new_pane=$(new_window "$socket" "$tsession" "$wname" "$cwd" "$pi_cmd"); then
+        say "$name: $how, and no new window would open: not resumed ($pi_cmd)"; return
+      fi
+      say "$name: $how: resuming in a new window $tsession:$wname ($new_pane)"
+      pane="$new_pane"; name="$pane ($(basename "$cwd"))" ;;
+  esac
 
   local fresh
   if ! fresh=$(new_record "$socket" "$pane" "$([ $resume = 1 ] && echo "$session")" "$pid"); then
