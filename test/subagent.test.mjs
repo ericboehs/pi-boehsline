@@ -19,6 +19,10 @@ import test from "node:test";
 
 // Hermetic agent discovery: no user agents/*.md, so only the built-ins exist.
 process.env.PI_CODING_AGENT_DIR = mkdtempSync(path.join(tmpdir(), "pi-agent-subagent-test-"));
+// Run as a subagent's "pi" (process.argv[1] is this file, so piInvocation names it): never run the
+// suite again. A test that ran a whole child command instead of its filter half once recursed
+// through here into thousands of processes and took the machine down (2026-11-10).
+if (process.env.PI_SUBAGENT_CHILD) process.exit(0);
 delete process.env.PI_SUBAGENT_CHILD;
 
 const { default: subagent } = await import("../extensions/subagent/index.ts");
@@ -45,6 +49,14 @@ function mount({ active = ["read", "bash"], registered = ["read", "bash", "tool_
     onBgStart: (listener) => (bgListener = listener),
     ctx,
   };
+}
+
+/** The filter half of `<child> | '<node>' -e '<filter>' ...`, and never the whole command: running
+ * the child half would start a real child (or this file again). */
+function filterOf(command) {
+  const at = command.indexOf(` | '${process.execPath}' -e `);
+  assert.ok(at > 0, "the command pipes into the filter");
+  return command.slice(at + 3);
 }
 
 const textOf = (result) => result.content.map((part) => part.text ?? "").join("\n");
@@ -142,7 +154,7 @@ test("the progress filter prints a line per turn, a usage banner, then the answe
 
   // The filter half of `<child> | '<node>' -e '<filter>'`. Split on the node
   // path, not " | ": the filter source itself contains " | ".
-  const filter = command.slice(command.indexOf(` | '${process.execPath}' -e `) + 3);
+  const filter = filterOf(command);
   const turn = (content, usage) => JSON.stringify({ type: "message_end", message: { role: "assistant", content, usage } });
   const jsonl = [
     JSON.stringify({ type: "session" }),
@@ -177,7 +189,7 @@ test("the progress filter exits non-zero when the child produced no answer", asy
     r.reply({ id: "abc123", logPath: "/tmp/x.log" });
   });
   await h.run({ agent: "scout", task: "count", background: true });
-  const filter = command.slice(command.indexOf(` | '${process.execPath}' -e `) + 3);
+  const filter = filterOf(command);
   assert.throws(
     () => execFileSync("bash", ["-c", filter], { input: "", encoding: "utf8", stdio: "pipe" }),
     (error) => error.status === 1 && /\(no output\)/.test(error.stdout),
