@@ -8,8 +8,11 @@
  *   memories (not proposed/ or archive/, nothing outside the collection), and
  *   returns hits from `search.collections` as a separate list. Any error or a
  *   5 s timeout returns null, and the caller falls back to built-in search.
- * - `scheduleUpdate()` runs `qmd update` in the background, debounced, after
- *   writes, when the collection exists.
+ * - `scheduleUpdate()` runs `qmd update -c memory` in the background, debounced,
+ *   after writes, when the collection exists. `updateDetached()` (the CLI) runs
+ *   the same detached, and skips while its last one still runs: a nightly review
+ *   verifies memories minutes apart, and a whole-index `qmd update` per verify
+ *   stacked a dozen at once (2026-11-10, load 400).
  *
  * qmd runs without a shell, in the memory root (so no project-local .qmd
  * config is picked up), with the query after `--` so it can't be read as an
@@ -19,6 +22,9 @@
  */
 
 import { spawn } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { oneLine } from "./render.ts";
 import { COLLECTION } from "./settings.ts";
 import { ID } from "./store.ts";
@@ -26,6 +32,19 @@ import { ID } from "./store.ts";
 export const COLLECTION_NAME = "memory";
 const MAX_OUT = 4 * 1024 * 1024;
 const MAX_QUERY = 500;
+/** Only the memory collection: the rest of the index is qmd-update-job's (every 30 min). */
+const UPDATE_ARGS = ["update", "-c", COLLECTION_NAME];
+
+/** Whether a pid is a live process (signal 0 checks without sending anything). */
+function alive(pid: number): boolean {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (e) {
+		return (e as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
 
 export interface OutsideHit {
 	collection: string;
@@ -56,6 +75,8 @@ export interface QmdOptions {
 	debounceMs?: number;
 	log?: (msg: string) => void;
 	env?: NodeJS.ProcessEnv;
+	/** Where updateDetached keeps its running child's pid (tests); default in the temp dir. */
+	updatePidFile?: string;
 }
 
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
@@ -211,15 +232,26 @@ export function qmdClient(opts: QmdOptions): Qmd {
 			if (opts.mode === "off" || timer) return;
 			timer = setTimeout(async () => {
 				timer = undefined;
-				if (await hasMemory()) await run(["update"], 300_000);
+				if (await hasMemory()) await run(UPDATE_ARGS, 300_000);
 			}, debounceMs);
 			timer.unref?.();
 		},
 
 		async updateDetached() {
 			if (!(await hasMemory())) return;
-			const child = spawn(bin, ["update"], { cwd: opts.root, env, stdio: "ignore", detached: true });
+			const pidFile = opts.updatePidFile ?? join(tmpdir(), `pi-memory-qmd-update-${process.getuid?.() ?? 0}.pid`);
+			let last = NaN;
+			try {
+				last = Number(readFileSync(pidFile, "utf8").trim());
+			} catch {}
+			if (alive(last)) return; // the running one indexes this write too, or the next one will
+			const child = spawn(bin, UPDATE_ARGS, { cwd: opts.root, env, stdio: "ignore", detached: true });
 			child.on("error", () => {});
+			if (child.pid) {
+				try {
+					writeFileSync(pidFile, `${child.pid}\n`);
+				} catch {}
+			}
 			child.unref();
 		},
 

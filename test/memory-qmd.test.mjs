@@ -172,3 +172,20 @@ test("updates after writes are debounced into one background qmd update", async 
 	assert.deepEqual(calls(logFile).map((c) => c.argv[0]), ["collection", "update"]);
 	q.dispose();
 });
+
+test("a detached update indexes only the memory collection, and never stacks on a running one", async () => {
+	const p = pool();
+	const { env: e, logFile } = env({ QMD_COLLECTIONS: "memory" });
+	const pidFile = join(p.root, "..", "update.pid");
+	writeFileSync(pidFile, `${process.pid}\n`); // a live process: one is still running
+	const q = qmdClient({ root: p.root, mode: "auto", env: e, updatePidFile: pidFile });
+	await q.updateDetached();
+	await new Promise((r) => setTimeout(r, 200));
+	assert.equal(calls(logFile).filter((c) => c.argv[0] === "update").length, 0);
+
+	writeFileSync(pidFile, "999999\n"); // gone
+	await q.updateDetached();
+	for (let i = 0; i < 50 && !calls(logFile).some((c) => c.argv[0] === "update"); i++) await new Promise((r) => setTimeout(r, 20));
+	assert.deepEqual(calls(logFile).filter((c) => c.argv[0] === "update").map((c) => c.argv), [["update", "-c", "memory"]]);
+	assert.notEqual(Number(readFileSync(pidFile, "utf8")), 999999, "the new child's pid is kept");
+});
