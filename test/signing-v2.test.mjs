@@ -12,7 +12,7 @@ import { digestHex, fieldsPayload, messageV2, messageV3, validHost } from "../li
 
 const FIXTURE = new URL("./fixtures/signing-v2.json", import.meta.url);
 /** sha256 of the fixture as copied from Botsun; a change here means re-copying it on purpose. */
-const FIXTURE_SHA256 = "4e56dcbdc3b64b67519a4a1e8d37623993be5465d2c510b2f9bbe2eb07d0fa8d";
+const FIXTURE_SHA256 = "79f009bda679a3d8ddf6251a8e05793c545129b1b8da39842002d95acfaf6d98";
 const BOTSUN_FIXTURE = "/Users/ericboehs/Code/github.com/ericboehs/botsun/test/fixtures/signing-v2.json";
 const P256_SPKI = Buffer.from("3059301306072a8648ce3d020106082a8648ce3d030107034200", "hex");
 
@@ -43,7 +43,7 @@ function payloadOf(v) {
 
 test("every vector: payload, digest and message match Ruby's, and the signature verifies", () => {
 	assert.equal(fixture.version, 2);
-	assert.equal(fixture.vectors.length, 23);
+	assert.equal(fixture.vectors.length, 25);
 	for (const v of fixture.vectors) {
 		const payload = payloadOf(v);
 		if ("expect_payload_b64" in v) assert.equal(Buffer.from(payload).toString("base64"), v.expect_payload_b64, v.name);
@@ -93,7 +93,7 @@ test("messageV2 and canonicalAnswerV2 refuse fields that could smuggle a line", 
 
 const FIXTURE_V3 = new URL("./fixtures/signing-v3.json", import.meta.url);
 /** sha256 of the v3 fixture as copied from Botsun; a change here means re-copying it on purpose. */
-const FIXTURE_V3_SHA256 = "3bc34ddcc82d1cb902c751d40f089f6f91e5379285a11a35668b043f14dbda43";
+const FIXTURE_V3_SHA256 = "f54447b841821ca97706915523325ca1c2b623d00f46e63daa697a3628bfdf37";
 const BOTSUN_FIXTURE_V3 = "/Users/ericboehs/Code/github.com/ericboehs/botsun/test/fixtures/signing-v3.json";
 const bytesV3 = readFileSync(FIXTURE_V3);
 const fixtureV3 = JSON.parse(bytesV3.toString("utf8"));
@@ -109,7 +109,7 @@ test("v3: the fixture is byte-identical to Botsun's, when Botsun is checked out 
 
 test("v3: every vector's message matches Ruby's and verifies; with another host (or as v2) it doesn't", () => {
 	assert.equal(fixtureV3.version, 3);
-	assert.equal(fixtureV3.vectors.length, 24);
+	assert.equal(fixtureV3.vectors.length, 26);
 	const hosts = new Set(fixtureV3.vectors.map((v) => v.host));
 	assert.ok(hosts.has("botsun.boehs.com:8443") && hosts.has("coop.botsun.boehs.com:8443"));
 	for (const v of fixtureV3.vectors) {

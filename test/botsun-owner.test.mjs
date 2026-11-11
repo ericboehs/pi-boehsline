@@ -6,7 +6,7 @@
  * agent-link registry (~/.claude/sessions) never touch the real ones.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1178,6 +1178,7 @@ test("hello carries the nonce reply's features (no nonce minted); a reload sends
 	await until(() => srv.types().includes("hello") && existsSync(join(ownerDir, `${process.pid}.sock`)));
 	const hello = srv.lines.find((l) => l.type === "hello");
 	assert.ok(hello.features.includes("close"));
+	assert.ok(hello.features.includes("say_id"), "a say may carry the phone's own id");
 	assert.ok(!hello.features.includes("stash"));
 	assert.deepEqual(hello.features, (await ask({ type: "nonce" })).features, "the same list the nonce reply advertises");
 	m.pi.getCommands = () => [{ name: "stash", source: "extension" }];
@@ -3083,6 +3084,148 @@ test("v3 ratchet: a v2 reply held before the device's first v3 can't be confirme
 	assert.equal((await readSignVersions())["7"].sign_version, 3);
 	assert.equal((await confirm(stale.held)).error, "this phone signs v3: v2 is refused (update Botsun and the app)");
 	assert.ok(m.sent.length >= 1);
+});
+
+// ---- Message ids (say_id): a resend never delivers twice --------------------
+// test/fixtures/signing-v2.json is a byte-identical copy of Botsun's vectors: the payloads a say's
+// own id is signed over, with an id and without one.
+const botsunVectors = JSON.parse(readFileSync(new URL("./fixtures/signing-v2.json", import.meta.url), "utf8"));
+const botsunVector = (name) => {
+	const v = botsunVectors.vectors.find((x) => x.name === name);
+	assert.ok(v, `Botsun's vectors have "${name}"`);
+	return v;
+};
+const vectorImages = (v) => (v.inputs?.images ?? []).map((i) => ({ data: i.data, mime_type: i.mime_type }));
+const vectorFiles = (v) => (v.inputs?.files ?? []).map((f) => ({ name: f.name, data: f.data }));
+// The phone's own id for a message, as Botsun's vectors make one.
+const SAID = "0b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
+
+/** The payload Botsun's OwnerSessions.signed_payload makes for a say (built here, not by the code
+ * under test): the text, or the lines v1 hashes, after a v2 magic and the id when there is one. */
+function botsunSayPayload(text, clientId, images = [], files = []) {
+	const hex = (b) => createHash("sha256").update(b).digest("hex");
+	if (!images.length && !files.length) {
+		return clientId ? `botsun-propose-text-v2\n${clientId}\n${text}` : `botsun-propose-text-v1\n${text}`;
+	}
+	const lines = [hex(Buffer.from(text, "utf8")), ...images.map((i) => hex(Buffer.from(i.data, "base64"))),
+		...files.map((f) => `file ${hex(Buffer.from(f.name, "utf8"))} ${hex(Buffer.from(f.data, "base64"))}`)].join("\n");
+	return clientId ? `botsun-say-attach-v2\n${clientId}\n${lines}` : lines;
+}
+
+test("say_id: the payload is Botsun's, with an id and byte for byte the old one without", async () => {
+	const { sayDigest } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const digestOf = (payload) => createHash("sha256").update(payload, "utf8").digest("hex");
+	for (const name of ["plain text say", "session say_images", "session say_attach, empty text",
+		"session say with the phone's message id", "session say_images with the phone's message id"]) {
+		const v = botsunVector(name);
+		// The oldest vectors have no inputs: "plain text say" is its payload's own text.
+		const text = v.inputs?.text ?? v.expect_payload.split("\n").slice(1).join("\n");
+		const { payload } = sayDigest(text, vectorImages(v), vectorFiles(v), v.inputs?.client_id);
+		assert.equal(payload, v.expect_payload, name);
+		assert.equal(digestOf(payload), v.expect_digest, `${name}: the digest Botsun signs`);
+	}
+	assert.equal(botsunVector("session say with the phone's message id").inputs.client_id, SAID);
+	assert.equal(sayDigest("ship it", [], []).payload, "botsun-propose-text-v1\nship it", "no id: the old bytes exactly");
+	assert.equal(sayDigest("ship it", [], [], SAID).payload, `botsun-propose-text-v2\n${SAID}\nship it`);
+});
+
+test("say_id: a say carrying the phone's id goes in once; a resend answers duplicate", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	assert.ok((await ask({ type: "nonce" })).features.includes("say_id"), "the nonce reply says it takes ids");
+	const say = async (text, clientId, { scope = "sid-a" } = {}) => {
+		const { nonce } = await ask({ type: "nonce" });
+		const signature = signV2(key, nonce, "session", "say", botsunSayPayload(text, clientId), { scope });
+		return ask({ type: "say", text, nonce, device_id: 7, sig_v: 2, signature, ...(clientId ? { client_id: clientId } : {}) });
+	};
+	assert.deepEqual(await say("once", SAID), { ok: true, delivered: "prompt" });
+	// The same message again (its first answer was lost on the way to the phone).
+	assert.deepEqual(await say("once", SAID), { ok: true, delivered: "duplicate" });
+	assert.equal(m.sent.length, 1, "the duplicate put nothing in");
+	// Its own id is another message, and one with no id is never a duplicate.
+	assert.deepEqual(await say("once", "11111111-2222-4333-8444-555555555555"), { ok: true, delivered: "prompt" });
+	assert.deepEqual(await say("again"), { ok: true, delivered: "prompt" });
+	assert.deepEqual(await say("again"), { ok: true, delivered: "prompt" });
+	assert.equal(m.sent.length, 4);
+	// The same id with other words (an app bug) is delivered, never dropped as a repeat.
+	assert.deepEqual(await say("other words", SAID), { ok: true, delivered: "prompt" });
+	assert.equal(m.sent.length, 5);
+
+	// The id is this conversation's: the same one after a /new is another message.
+	await m.fire("session_shutdown", { reason: "new" });
+	const b = await mount({
+		ctx: { sessionManager: { getSessionFile: () => "/tmp/sessions/b.jsonl", getSessionId: () => "sid-b" } },
+	});
+	await b.fire("session_start", { reason: "new" });
+	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)));
+	assert.deepEqual(await say("once", SAID, { scope: "sid-b" }), { ok: true, delivered: "prompt" });
+	assert.deepEqual(await say("once", SAID, { scope: "sid-b" }), { ok: true, delivered: "duplicate" });
+	assert.equal(b.sent.length, 1);
+});
+
+test("say_id: a photo message carrying the phone's id goes in once too", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	const photo = { data: Buffer.from("fake jpeg bytes").toString("base64"), mime_type: "image/jpeg" };
+	const say = async () => {
+		const { nonce } = await ask({ type: "nonce" });
+		const payload = botsunSayPayload("what's this?", SAID, [photo]);
+		return ask({ type: "say", text: "what's this?", images: [photo], client_id: SAID, nonce, device_id: 7, sig_v: 2,
+			signature: signV2(key, nonce, "session", "say_images", payload) });
+	};
+	assert.deepEqual(await say(), { ok: true, delivered: "prompt" });
+	assert.deepEqual(m.sent.at(-1).content, [{ type: "text", text: "what's this?" }, { type: "image", data: photo.data, mimeType: "image/jpeg" }]);
+	assert.deepEqual(await say(), { ok: true, delivered: "duplicate" }, "a resend of the same photo message");
+	assert.equal(m.sent.length, 1, "the duplicate put nothing in");
+});
+
+test("say_id: an id swapped, stripped or added is refused, and so is a bad one or v1's", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	const other = "11111111-2222-4333-8444-555555555555";
+	const post = async (req, payload, clientId) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "say", nonce, device_id: 7, ...(clientId === undefined ? {} : { client_id: clientId }),
+			sig_v: 2, signature: signV2(key, nonce, "session", "say", payload), ...req });
+	};
+	// Only v2 carries the id in what the phone signed: a v1 signature's id isn't signed at all.
+	let { nonce } = await ask({ type: "nonce" });
+	assert.equal((await ask({ type: "say", text: "other", client_id: SAID, nonce, device_id: 7,
+		signature: signed(key, 7, nonce, "sid-a", "other") })).error, "a message id is signed with v2 or newer");
+	// One id signed, another sent (or the id dropped from, or added to, a signed request).
+	assert.equal((await post({ text: "other" }, botsunSayPayload("other", SAID), other)).error, "signature does not verify",
+		"an id swapped after signing");
+	assert.equal((await post({ text: "other" }, botsunSayPayload("other", SAID))).error, "signature does not verify",
+		"an id stripped after signing");
+	assert.equal((await post({ text: "other" }, botsunSayPayload("other"), SAID)).error, "signature does not verify",
+		"an id added after signing");
+	// Its shape is checked before the signature (as Botsun refuses them).
+	for (const bad of [SAID.toUpperCase(), "not-a-uuid", "", 7]) {
+		({ nonce } = await ask({ type: "nonce" }));
+		assert.equal((await ask({ type: "say", text: "other", client_id: bad, nonce, device_id: 7, sig_v: 2,
+			signature: signV2(key, nonce, "session", "say", botsunSayPayload("other", SAID)) })).error,
+		"client_id must be a lowercase UUID", JSON.stringify(bad));
+	}
+	assert.equal(m.sent.length, 0, "none of the refused ones went in");
+});
+
+test("say_id: an id whose delivery was refused isn't recorded, so the next try goes in", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	const say = async (text) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "say", text, client_id: SAID, nonce, device_id: 7, sig_v: 2,
+			signature: signV2(key, nonce, "session", "say", botsunSayPayload(text, SAID)) });
+	};
+	assert.equal((await say("/model")).error, "say which model, e.g. /model opus (the picker needs the keyboard)");
+	assert.equal(m.sent.length, 0);
+	assert.deepEqual(await say("ship it"), { ok: true, delivered: "prompt" }, "the id wasn't recorded by the refused one");
+	assert.deepEqual(await say("ship it"), { ok: true, delivered: "duplicate" });
+	assert.equal(m.sent.length, 1);
 });
 
 // ---- Subagents (lib/children.ts): the session's children to Botsun, and the phone's stop ----

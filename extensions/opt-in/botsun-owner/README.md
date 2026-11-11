@@ -56,8 +56,8 @@ Each session also listens on its own socket, `~/.local/state/botsun/owner/<pid>.
 
 | request | kind | decision | payload |
 |---|---|---|---|
-| `say`, text only | `session` | `say` | `botsun-propose-text-v1\n<text>` |
-| `say` with photos / files | `session` | `say_images` / `say_attach` | the lines v1 hashes: `sha256(text)`, then one per photo / file |
+| `say`, text only | `session` | `say` | `botsun-propose-text-v1\n<text>`, or `botsun-propose-text-v2\n<client id>\n<text>` with the phone's id for the message |
+| `say` with photos / files | `session` | `say_images` / `say_attach` | the lines v1 hashes: `sha256(text)`, then one per photo / file; with the phone's id, `botsun-say-attach-v2\n<client id>\n<lines>` |
 | `say_audio` (call key) | `session` | `say_audio` | `<wav sha256>` and, with a proposal, `\n<proposal sha256>` |
 | `say` with `key: "call"` (call key, v2 only, text only) | `session` | `say_call` | `botsun-propose-text-v1\n<text>` |
 | `answer` with `key: "call"` (call key, v2 only, one pick) | `session` | `answer_call` | `canonicalAnswerV2` of the open prompt's one question and `[{picks: [i]}]` (as for `answer`), so only kind and decision tell it from a main-key answer |
@@ -69,6 +69,8 @@ Each session also listens on its own socket, `~/.local/state/botsun/owner/<pid>.
 | `close` with `key: "call"` (call key, v2 only) | `session` | `close_call` | `close` |
 | `reload` (v2 only) | `session` | `reload` | `reload` |
 | `restart` (v2 only) | `session` | `restart` | `restart` |
+
+**Message ids (`say_id`):** a `say` may carry the phone's own id for that message, `client_id`: a lowercase UUID the app makes in its outbox and sends the same on every try. This version lists `say_id` in `features`, so Botsun sends one; only a `say` signed v2 or newer takes one, since v1 doesn't sign the payload it rides in. The id is signed too, on a line of its own right after the v2 magic (`botsun-propose-text-v2` for text, `botsun-say-attach-v2` with photos or files), so it can't be swapped, stripped or added under the same signature, and a `say` with no id signs exactly the bytes it always did. A repeat of one this session already delivered in this conversation answers `{ok: true, delivered: "duplicate"}` and puts nothing in, so a resend whose first answer was lost goes in once. The ids are kept in memory only (this conversation, the device and the id, the last 64), and only once the delivery went in, so a refused or failed one can be retried. Botsun keeps its own table (per device and session, a day) before the request ever reaches here.
 
 **Signing v3** (`sig_v: 3`; feature `sign_v3`; Botsun's `docs/plans/host-signing.md`): v2 with the host's authority on the line after the magic, `botsun-sign-v3\n<host>\n<device>\n<nonce>\n<kind>\n<scope>\n<decision>\n<sha256(payload)>`, so a signature the phone made for one host never verifies on another. Kinds, decisions and payloads are v2's (the table above). `<host>` is lowercase `fqdn:port` with the port always written (`/^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?:[0-9]{1,5}$/`, e.g. `botsun.boehs.com:8443`); this session reads it from the top-level `"host"` that Botsun writes in `owner-keys.json`. A v3 request when that file has no valid `host` is refused: "owner-keys.json has no valid host: v3 is refused (update Botsun)". Built by `messageV3` in `lib/signing-v2.ts`, pinned by `test/fixtures/signing-v3.json` (a byte-identical copy of Botsun's). Anything that says "v2 only" below (the call key's `say`, `close`, sensitive answers) means v2 or newer.
 
@@ -102,7 +104,7 @@ What pinning can and can't do: it protects against a Botsun whose logic is compr
 
 | request | does |
 |---|---|
-| `say` | Eric's words as if typed (steering a running turn), with photos; files are saved to `~/.local/state/botsun/inbox/<pid>/` and named in the message. With `key: "call"` (feature `say_call`): text only, signed v2 with the phone's call key (decision `say_call`), so the Watch can reply while the iPhone is locked; photos, files, v1, and text starting with `/` (a command, skill or template, e.g. `/bypass on`) or `!` are refused, and it never runs a command |
+| `say` | Eric's words as if typed (steering a running turn), with photos; files are saved to `~/.local/state/botsun/inbox/<pid>/` and named in the message. With `client_id` (feature `say_id`): a resend of a message this session already delivered answers `{ok, delivered: "duplicate"}` and puts nothing in (see message ids above). With `key: "call"` (feature `say_call`): text only, signed v2 with the phone's call key (decision `say_call`), so the Watch can reply while the iPhone is locked; photos, files, v1, and text starting with `/` (a command, skill or template, e.g. `/bypass on`) or `!` are refused, and it never runs a command |
 | `say_audio` | a call into the session: the transcribed words, signed over the audio with the call key. With `hold: true` they're verified and held (`{ok, held: id}`) instead of put in; with `proposal_sha256` the hash of an answer read back to him is signed with them |
 | `release` | `{ids, mode}` from the voice helper: held words go in as `queue` (a follow-up after the turn), `steer`, or `interrupt` (steer; abort the run first only when the released words themselves say stop, then send them once pi settles). It adds no words, so it isn't signed |
 | `confirm` | `{id, ask_id, answers}` from the voice helper: his held reply means yes to the answer read back on the call. Answers the open `ask` only when that utterance was signed with this answer's hash (`say_audio` with `proposal_sha256`, an extra line of the signed message) and its words don't say no (`saysNo`). Never a `sensitive` prompt: "answer this one on the phone screen or the keyboard" |

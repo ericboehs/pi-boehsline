@@ -79,6 +79,16 @@ const FRAMES_TIMEOUT_MS = 20_000;
 const VIDEO_NAME = /\.(mp4|mov|m4v)$/i;
 const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/heic", "image/webp", "image/gif"]);
 const TEXT_MAX = 20_000;
+/** A message's id as the phone makes it (sent as client_id, signed in the payload): a lowercase UUID.
+ * Botsun refuses anything else (OwnerSessions / WebDevice CLIENT_ID). */
+export const CLIENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** The v2 magics a message's own id rides after: Botsun's OwnerSessions::PROPOSE_TEXT_ID and
+ * SAY_ATTACH_ID (signed_payload). Without an id the payloads are the old bytes exactly. */
+const PROPOSE_TEXT_ID = "botsun-propose-text-v2";
+const PROPOSE_TEXT = "botsun-propose-text-v1";
+const SAY_ATTACH_ID = "botsun-say-attach-v2";
+/** How many delivered message ids this process remembers (the phone's recent sends, not history). */
+const SAID_MAX = 64;
 /** Streaming text to Botsun: at most this often, and at most this much (the end is kept). */
 const STREAM_EVERY_MS = 250;
 const STREAM_MAX = 20_000;
@@ -189,6 +199,10 @@ interface Conn {
 	colorApplied?: { sessionId: string; color: string; at: number };
 	/** The subagents list Botsun was last sent (JSON): a line goes only when it changed. */
 	subagentsSent?: string;
+	/** The message ids (session, device and id) this process delivered, oldest first: a say carrying
+	 * one already delivered here is answered "duplicate" and not delivered again (Botsun's own table
+	 * is the first guard; this one holds even if Botsun loses it). In memory only, never a file. */
+	said?: Map<string, string>;
 	/** What the host says it takes (its features line: model_pages for a paged catalogue), and so what
 	 * this session may send it. Undefined until that line arrives: until then, only what an older host takes. */
 	hostFeatures?: Set<string>;
@@ -221,22 +235,31 @@ export function ownerMessage(deviceId: string, nonce: string, sessionId: string,
  * v1: decision and digest. v2: the same decision, over a payload: text only is
  * "botsun-propose-text-v1\n<text>" (as Botsun's vectors); with photos or files, the lines v1
  * hashes (sha256(text), then one per photo / file).
+ *
+ * A message's own id (the phone's client_id) is signed too, on a line of its own after a v2 magic
+ * (Botsun's OwnerSessions.signed_payload): "botsun-propose-text-v2\n<id>\n<text>", or
+ * "botsun-say-attach-v2\n<id>\n<lines>" with photos or files. With no id the bytes are exactly
+ * the old form, so the id can't be swapped, dropped or added under the same signature.
  */
-function sayDigest(text: string, images: Image[], files: File[]): { decision: string; digest: string; payload: string } {
+export function sayDigest(text: string, images: Image[], files: File[], clientId?: string):
+	{ decision: string; digest: string; payload: string } {
 	const textHash = sha256hex(Buffer.from(text, "utf8"));
 	let decision = "say";
 	let digest = textHash;
-	let payload = `botsun-propose-text-v1\n${text}`;
+	// Text's v2 payload replaces the magic's line; an attachment's is the v1 lines with a new magic.
+	let payload = clientId ? `${PROPOSE_TEXT_ID}\n${clientId}\n${text}` : `${PROPOSE_TEXT}\n${text}`;
 	if (files.length) {
 		// "say_attach": sha256(text), then "image <sha256>" per photo, "file <sha256(name)> <sha256(data)>" per file.
 		decision = "say_attach";
-		payload = [textHash, ...images.map((i) => `image ${sha256hex(Buffer.from(i.data, "base64"))}`),
+		const lines = [textHash, ...images.map((i) => `image ${sha256hex(Buffer.from(i.data, "base64"))}`),
 			...files.map((f) => `file ${sha256hex(Buffer.from(f.name, "utf8"))} ${sha256hex(Buffer.from(f.data, "base64"))}`)].join("\n");
-		digest = sha256hex(payload);
+		digest = sha256hex(lines);
+		payload = clientId ? `${SAY_ATTACH_ID}\n${clientId}\n${lines}` : lines;
 	} else if (images.length) {
 		decision = "say_images";
-		payload = [textHash, ...images.map((i) => sha256hex(Buffer.from(i.data, "base64")))].join("\n");
-		digest = sha256hex(payload);
+		const lines = [textHash, ...images.map((i) => sha256hex(Buffer.from(i.data, "base64")))].join("\n");
+		digest = sha256hex(lines);
+		payload = clientId ? `${SAY_ATTACH_ID}\n${clientId}\n${lines}` : lines;
 	}
 	return { decision, digest, payload };
 }
@@ -627,11 +650,51 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (typeof text !== "string" || text.length > TEXT_MAX || (!text.trim() && !images.length && !files.length)) {
 		return { error: "text must be 1 to 20000 characters (or attach something)" };
 	}
-	const say = sayDigest(text, images, files);
+	// The phone's own id for this message, if it sent one: a lowercase UUID, and signed with v2 or
+	// newer (which is what carries it in the payload), so it can't be swapped, dropped or added.
+	if (r.client_id !== undefined && (typeof r.client_id !== "string" || !CLIENT_ID.test(r.client_id))) {
+		return { error: "client_id must be a lowercase UUID" };
+	}
+	const clientId = r.client_id as string | undefined;
+	if (clientId && !atLeastV2(r)) return { error: "a message id is signed with v2 or newer" };
+	const say = sayDigest(text, images, files, clientId);
 	const denied = verifyDevice(c, r, { decision: say.decision, digest: () => say.digest,
 		v2: { kind: "session", decision: say.decision, payload: () => say.payload } });
 	if (denied) return { error: denied };
-	return deliverSay(c, text, images, files);
+	// The same message again (its first answer was lost on the way to the phone): it went in once.
+	// Only the same id with the same message is a repeat: an id reused for other words (an app bug)
+	// is delivered, never dropped.
+	const said = clientId ? saidKey(c, r, clientId) : undefined;
+	const digest = said ? say.digest : "";
+	if (said && saidBefore(c, said, digest)) return { ok: true, delivered: "duplicate" };
+	const outcome = deliverSay(c, text, images, files);
+	return outcome instanceof Promise
+		? outcome.then((reply) => saidDone(c, said, digest, reply))
+		: saidDone(c, said, digest, outcome);
+}
+
+/** The key a delivered message id is remembered under: this conversation, the device that signed it
+ * and the id (Botsun's table is per device and session too). */
+const saidKey = (c: Conn, r: Record<string, unknown>, clientId: string): string =>
+	`${c.sessionId}:${deviceIdOf(r)}:${clientId}`;
+
+/** Whether this process already delivered this conversation's message id from this device, with
+ * these same words (its payload digest). */
+const saidBefore = (c: Conn, key: string, digest: string): boolean => c.said?.get(key) === digest;
+
+/** Remembers a delivered message id, oldest forgotten first. Process only: never a file or a log. */
+function saidNow(c: Conn, key: string, digest: string): void {
+	const said = (c.said ??= new Map());
+	said.delete(key); // the newest use is the last one out
+	said.set(key, digest);
+	while (said.size > SAID_MAX) said.delete(said.keys().next().value as string);
+}
+
+/** Records the id only once the reply says it went in: a refused or failed delivery leaves it
+ * unrecorded, so the phone's next try of the same message is delivered. */
+function saidDone(c: Conn, key: string | undefined, digest: string, reply: Record<string, unknown>): Record<string, unknown> {
+	if (key && !("error" in reply)) saidNow(c, key, digest);
+	return reply;
 }
 
 /** A sandbox session token as Botsun mints it (lib/botsun/sandbox_tokens.rb, SandboxTokens::FORMAT). */
@@ -1768,7 +1831,7 @@ function featureList(c: Conn): string[] {
 	const hasStash = (() => {
 		try { return c.commands?.().some((x) => x.name === "stash") ?? false; } catch { return false; }
 	})();
-	return ["say", "say_call", "answer_call", "close_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close", "name",
+	return ["say", "say_id", "say_call", "answer_call", "close_call", "images", "files", "say_audio", "hold", "stop", "confirm", "confirm_text", "stream", "ask", "sign_v2", "sign_v3", "ask_v2", "close", "name",
 		// This pi picks a look with a session's name (#21) and wants what each draws with it: the host
 		// answers with its looks pages (OwnerSessions' LOOK_NOTES).
 		"look_notes",
