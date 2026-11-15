@@ -3433,3 +3433,16 @@ test("every sendUser marks its next input as Eric's before sending it", async ()
 	);
 	assert.deepEqual(order, ["mark", "send"], "the mark is emitted synchronously before pi gets the message");
 });
+
+test("each session's prompt names it as itself, and drops the name when it has none", async () => {
+	const { identityText, applyIdentity } = await import(`../extensions/opt-in/botsun-owner/index.ts?i=${Math.random()}`);
+	const sections = {};
+	applyIdentity(sections, "  Victor\n ");
+	assert.match(sections["session-identity"], /^You are Victor: that is this session's name\./);
+	assert.match(sections["session-identity"], /may call you Victor/);
+	applyIdentity(sections, "");
+	assert.equal(sections["session-identity"], undefined, "an unnamed session claims no name");
+	assert.equal(identityText(undefined), undefined);
+	assert.equal(identityText("x".repeat(200)).includes("x".repeat(81)), false, "a long name is cut");
+	applyIdentity(undefined, "Victor"); // no sections: nothing to do, no throw
+});

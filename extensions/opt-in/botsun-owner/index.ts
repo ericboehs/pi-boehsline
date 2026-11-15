@@ -2213,6 +2213,26 @@ function sessionInfo(ctx: ExtensionContext): { cwd: string; sessionFile: string 
 	return { cwd: ctx.cwd, sessionFile, sessionId };
 }
 
+// Who this session is: its pi session name, so it answers to it ("Victor, what's left?") and
+// never takes another session's name, or the phone app's, as its own. A named section, so the
+// prompt only changes when the name does (pi patches just that section).
+const IDENTITY_SECTION = "session-identity";
+export function identityText(name: string | undefined): string | undefined {
+	const clean = (name ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+	if (!clean) return undefined;
+	return (
+		`You are ${clean}: that is this session's name. The user may call you ${clean} in chat, from the phone or on a ` +
+		`voice call; answer to it and use it when you refer to yourself. Other sessions have names of their own, and ` +
+		`the phone app that relays to you is not you.`
+	);
+}
+export function applyIdentity(sections: Record<string, string> | undefined, name: string | undefined): void {
+	if (!sections) return;
+	const text = identityText(name);
+	if (text) sections[IDENTITY_SECTION] = text;
+	else delete sections[IDENTITY_SECTION];
+}
+
 function main(pi: ExtensionAPI): void {
 	iconBus = pi.events;
 	// Subagent children are not Eric's sessions.
@@ -2658,8 +2678,9 @@ function main(pi: ExtensionAPI): void {
 	});
 
 	// A slow input handler can outlast PROMPT_STARTING_MS: the turn's last step before it starts.
-	pi.on("before_agent_start", () => {
+	pi.on("before_agent_start", (event) => {
 		inputAt = Date.now();
+		applyIdentity(event.systemPromptOptions?.sections, pi.getSessionName());
 		return undefined;
 	});
 	pi.on("agent_start", () => {

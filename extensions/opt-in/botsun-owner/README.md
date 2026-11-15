@@ -4,6 +4,13 @@
 
 Puts this pi session on Eric's phone through Botsun: it shows in the Sessions list (name, folder, transcript, working, idle or waiting on a prompt), and Eric can reply, attach photos and files, call into it, answer its `ask` questions, run slash commands, switch models, and reload or restart it from the phone. Everything that changes the session is signed on the phone and checked here, not just by Botsun.
 
+## The session knows its name
+
+Before each run the extension sets a `session-identity` section of the system prompt from the pi
+session name (`/name`): "You are Victor: that is this session's name…". The session answers to
+its name in chat, from the phone and on a call, and doesn't take another session's name or the
+phone app's as its own. A session with no name gets no section.
+
 ## Reporting state
 
 **Where:** a Unix socket at `~/.local/state/botsun/owner.sock`, or `$BOTSUN_OWNER_SOCK`. Botsun's web process creates and listens on it; this extension only connects. When it isn't there (Botsun not running), the extension retries quietly every 5 seconds, backing off to once a minute, and sends the full state when it connects.
