@@ -6,10 +6,11 @@ Puts this pi session on Eric's phone through Botsun: it shows in the Sessions li
 
 ## The session knows its name
 
-Before each run the extension sets a `session-identity` section of the system prompt from the pi
-session name (`/name`): "You are Victor: that is this session's name…". The session answers to
-its name in chat, from the phone and on a call, and doesn't take another session's name or the
-phone app's as its own. A session with no name gets no section.
+Before each run the extension sets a `session-identity` section of the system prompt from the name
+the phone shows (agent-link's, else the pi session name, `/name`): "This session is named
+Victor…". The session answers to that name in chat, from the phone and on a call, and doesn't
+take another session's name or the phone app's as its own. A session with no name gets no
+section. A forked session keeps its parent's name until it's renamed.
 
 ## Reporting state
 

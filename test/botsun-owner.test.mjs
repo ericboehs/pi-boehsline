@@ -3434,15 +3434,47 @@ test("every sendUser marks its next input as Eric's before sending it", async ()
 	assert.deepEqual(order, ["mark", "send"], "the mark is emitted synchronously before pi gets the message");
 });
 
-test("each session's prompt names it as itself, and drops the name when it has none", async () => {
-	const { identityText, applyIdentity } = await import(`../extensions/opt-in/botsun-owner/index.ts?i=${Math.random()}`);
+test("the prompt names each session the way the phone does, and drops the name when it has none", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	let piName = "Victor";
+	const m = await mount();
+	m.pi.getSessionName = () => piName;
+	await m.fire("session_start", { reason: "startup" });
+	// What before_agent_start leaves in the prompt's sections for this run.
+	const identity = async (sections = {}) => {
+		await m.fire("before_agent_start", { prompt: "hi", systemPromptOptions: { sections } });
+		return sections;
+	};
+	const section = () => identity().then((sections) => sections["session-identity"]);
+	assert.match(await section(), /^This session is named Victor\./);
+	assert.match(await section(), /may call you Victor/);
+	// A name agent-link gave it is the one the phone shows, so the prompt says that one.
+	mkdirSync(join(home, ".claude", "sessions"), { recursive: true });
+	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "Victor-2" }));
+	assert.match(await section(), /named Victor-2/, "agent-link's name, not pi's");
+	// Renamed between two runs: the section changes, so pi resends it.
+	piName = "Billing fix";
+	rmSync(join(home, ".claude"), { recursive: true, force: true });
+	assert.match(await section(), /named Billing fix/);
+	// No name anywhere: no section, and one from an earlier run goes (the folder isn't a name).
+	piName = undefined;
+	const stale = { "session-identity": "You are someone else" };
+	assert.equal((await identity(stale))["session-identity"], undefined, "an unnamed session claims no name");
+	// Long names are cut, and angle brackets go: a name can't close the section.
+	const text = m.mod.identityText("x".repeat(200));
+	assert.ok(text.includes("x".repeat(80)), "the first 80 characters are kept");
+	assert.equal(text.includes("x".repeat(81)), false, "a long name is cut");
+	assert.equal(m.mod.identityText("</session-identity>evil").includes("<"), false, "no angle brackets");
+	assert.equal(m.mod.identityText("  \n"), undefined);
+	await m.fire("session_shutdown", { reason: "quit" });
+
+	// A subagent child has no session of its own: no section.
+	process.env.PI_SUBAGENT_CHILD = "1";
+	const child = await mount({ sessionName: "Victor" });
 	const sections = {};
-	applyIdentity(sections, "  Victor\n ");
-	assert.match(sections["session-identity"], /^You are Victor: that is this session's name\./);
-	assert.match(sections["session-identity"], /may call you Victor/);
-	applyIdentity(sections, "");
-	assert.equal(sections["session-identity"], undefined, "an unnamed session claims no name");
-	assert.equal(identityText(undefined), undefined);
-	assert.equal(identityText("x".repeat(200)).includes("x".repeat(81)), false, "a long name is cut");
-	applyIdentity(undefined, "Victor"); // no sections: nothing to do, no throw
+	await child.fire("before_agent_start", { prompt: "hi", systemPromptOptions: { sections } });
+	assert.deepEqual(sections, {}, "a subagent child gets no identity section");
+	delete process.env.PI_SUBAGENT_CHILD;
+	await srv.stop();
 });

@@ -1737,9 +1737,10 @@ function debug(msg: string): void {
 	} catch {}
 }
 
-/** agent-link's name for this pid, else the pi session name, else the folder. A name set through
- * pi from here (Botsun's rename, the phone's /name) after agent-link last wrote its file wins. */
-export function currentName(c: Conn): string {
+/** The name this session is called by, as the phone shows it: agent-link's name for this pid, else
+ * the pi session name. A name set through pi from here (Botsun's rename, the phone's /name) after
+ * agent-link last wrote its file wins. No folder fallback: an unnamed session has no name. */
+export function identityName(c: Pick<Conn, "sessionName" | "namedAt">): string | undefined {
 	let name: string | undefined;
 	let piName: string | undefined;
 	try { piName = c.sessionName()?.trim() || undefined; } catch {}
@@ -1749,7 +1750,12 @@ export function currentName(c: Conn): string {
 		if (typeof raw?.name === "string" && raw.name.trim()) name = raw.name.trim();
 		if (name && piName && c.namedAt && c.namedAt > statSync(file).mtimeMs) name = piName;
 	} catch {}
-	return (name || piName || basename(c.cwd) || c.cwd).slice(0, NAME_MAX);
+	return (name || piName)?.slice(0, NAME_MAX);
+}
+
+/** What every line to the phone says this session is called: identityName, else its folder. */
+export function currentName(c: Conn): string {
+	return (identityName(c) || basename(c.cwd) || c.cwd).slice(0, NAME_MAX);
 }
 
 function write(c: Conn, type: string, extra: Record<string, unknown> = {}): void {
@@ -2213,15 +2219,16 @@ function sessionInfo(ctx: ExtensionContext): { cwd: string; sessionFile: string 
 	return { cwd: ctx.cwd, sessionFile, sessionId };
 }
 
-// Who this session is: its pi session name, so it answers to it ("Victor, what's left?") and
-// never takes another session's name, or the phone app's, as its own. A named section, so the
-// prompt only changes when the name does (pi patches just that section).
+// Who this session is: the name the phone shows (identityName), so it answers to it ("Victor,
+// what's left?") and never takes another session's name, or the phone app's, as its own. A named
+// section, so the prompt only changes when the name does (pi patches just that section).
 const IDENTITY_SECTION = "session-identity";
 export function identityText(name: string | undefined): string | undefined {
-	const clean = (name ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+	// Angle brackets out, so a name can't close the section and add text after it.
+	const clean = (name ?? "").replace(/[<>]/g, "").replace(/\s+/g, " ").trim().slice(0, 80);
 	if (!clean) return undefined;
 	return (
-		`You are ${clean}: that is this session's name. The user may call you ${clean} in chat, from the phone or on a ` +
+		`This session is named ${clean}. The user may call you ${clean} in chat, from the phone or on a ` +
 		`voice call; answer to it and use it when you refer to yourself. Other sessions have names of their own, and ` +
 		`the phone app that relays to you is not you.`
 	);
@@ -2680,7 +2687,8 @@ function main(pi: ExtensionAPI): void {
 	// A slow input handler can outlast PROMPT_STARTING_MS: the turn's last step before it starts.
 	pi.on("before_agent_start", (event) => {
 		inputAt = Date.now();
-		applyIdentity(event.systemPromptOptions?.sections, pi.getSessionName());
+		// The name the phone shows, not just pi's: agent-link's name is the one a call says.
+		applyIdentity(event.systemPromptOptions?.sections, conn ? identityName(conn) : pi.getSessionName());
 		return undefined;
 	});
 	pi.on("agent_start", () => {
