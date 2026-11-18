@@ -63,9 +63,12 @@ export const ERROR_POST_EVERY_MS = 3_600_000;
 export const BACKLOG_AFTER_MS = 3_600_000;
 export const SHOW_LIMIT = 20;
 
+/** 60 s, doubling, capped at 15 min. */
+export const nextBackoff = (prev: number): number => (prev ? Math.min(prev * 2, BACKOFF_MAX_MS) : BACKOFF_START_MS);
+
 const REGISTRY_KEY = Symbol.for("pi-boehsline.watchers");
 
-interface Registry {
+export interface Registry {
 	/** The running host, if any: one per process, whatever reloads happened. */
 	host?: { instance: string; teardown: () => void };
 	/** Guardian verdict cache and call counts survive reloads. */
@@ -96,8 +99,10 @@ export interface HostOptions {
 	now?: () => number;
 	env?: NodeJS.ProcessEnv;
 	alive?: (pid: number) => boolean;
-	/** Overrides the model call (tests). Receives the resolved guardian config. */
+	/** Overrides the model call (tests). Approval checks still apply. */
 	complete?: CompleteFn;
+	/** The process-wide registry (tests use their own to act as separate processes). */
+	registry?: Registry;
 }
 
 interface Runtime {
@@ -132,7 +137,7 @@ export function createWatchers(opts: HostOptions = {}) {
 		const now = opts.now ?? Date.now;
 		const env = opts.env ?? process.env;
 		const batchMs = opts.batchMs ?? BATCH_MS;
-		const reg = registry();
+		const reg = opts.registry ?? registry();
 		const guardian = opts.complete || opts.now ? new Guardian({ now, timeoutMs: opts.guardianTimeoutMs }) : (reg.guardian ??= new Guardian());
 
 		let ctxRef: ExtensionContext | undefined;
@@ -271,7 +276,7 @@ export function createWatchers(opts: HostOptions = {}) {
 
 		function failure(w: Runtime, reason: string) {
 			w.lastError = reason;
-			w.backoffMs = w.backoffMs ? Math.min(w.backoffMs * 2, BACKOFF_MAX_MS) : BACKOFF_START_MS;
+			w.backoffMs = nextBackoff(w.backoffMs);
 			const t = now();
 			if (w.errorPostedAt === undefined || t - w.errorPostedAt >= ERROR_POST_EVERY_MS) {
 				w.errorPostedAt = t;
