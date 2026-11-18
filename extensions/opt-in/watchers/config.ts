@@ -11,13 +11,14 @@
 
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 export type TomlValue = string | number | boolean | TomlValue[] | { [key: string]: TomlValue };
 export type TomlTable = { [key: string]: TomlValue };
 
 export const ID_RE = /^[A-Za-z0-9._-]{1,40}$/;
-export const ENV_PASS_RE = /^(GH|GITHUB)_[A-Z0-9_]{1,60}$/;
+/** Passed to every script: gh and GitHub tooling read these. */
+export const ENV_PASS_RE = /^(GH|GITHUB)_[A-Za-z0-9_]{1,60}$/;
 export const INTERVAL_FLOOR_MS = 30_000;
 
 class Cursor {
@@ -206,8 +207,13 @@ export function parseToml(text: string): TomlTable {
 // ── the config ──
 
 export interface GuardianConfig {
-	/** "provider/id"; no default ships, by design. */
-	model?: string;
+	/**
+	 * Session provider -> judge "provider/id". The judge follows the session's
+	 * current model provider, re-resolved at each batch. No default ships.
+	 */
+	byProvider: Record<string, string>;
+	/** Used when the session provider isn't mapped or its judge can't run. Must be approved. */
+	fallback?: string;
 	approved: string[];
 	fail: "closed";
 	/** Guardian calls allowed per watcher per hour. */
@@ -222,7 +228,6 @@ export interface WatcherConfig {
 	me: string;
 	wake: "actionable" | "never";
 	urlHosts: string[];
-	passEnv: string[];
 	/** Local quiet hours, [startHour, endHour): wakes become silent lines. */
 	quiet: [number, number];
 	/** The table as written, passed to the script on stdin. */
@@ -266,9 +271,28 @@ export function buildConfig(t: TomlTable, home = homedir()): WatchersConfig {
 	const warnings: string[] = [];
 	const g = isTable(t.guardian) ? t.guardian : {};
 	if (g.fail !== undefined && g.fail !== "closed") warnings.push(`guardian.fail = "${String(g.fail)}" is not supported; failing closed`);
+	const approved = strings(g.approved) ?? [];
+	const isRef = (v: unknown): v is string => typeof v === "string" && /^[^/\s]+\/[^\s]+$/.test(v);
+	const byProvider: Record<string, string> = {};
+	if (g.by_provider !== undefined && !isTable(g.by_provider)) warnings.push("guardian.by_provider must be an inline table of provider = \"provider/id\"; ignored");
+	for (const [provider, ref] of Object.entries(isTable(g.by_provider) ? g.by_provider : {})) {
+		if (!isRef(ref)) warnings.push(`guardian.by_provider.${provider} must be "provider/id"; ignored`);
+		else if (!approved.includes(ref)) warnings.push(`guardian.by_provider.${provider} = "${ref}" is not on guardian.approved; ignored`);
+		else byProvider[provider] = ref;
+	}
+	let fallback: string | undefined;
+	const fb = g.fallback ?? g.model;
+	if (g.model !== undefined) warnings.push("guardian.model is deprecated; use guardian.fallback (and guardian.by_provider)");
+	if (g.fallback !== undefined && g.model !== undefined) warnings.push("guardian.model ignored: guardian.fallback is set");
+	if (fb !== undefined) {
+		if (!isRef(fb)) warnings.push(`guardian.fallback must be "provider/id"; ignored`);
+		else if (!approved.includes(fb)) warnings.push(`guardian.fallback = "${fb}" is not on guardian.approved; ignored`);
+		else fallback = fb;
+	}
 	const guardian: GuardianConfig = {
-		model: typeof g.model === "string" && g.model.includes("/") ? g.model : undefined,
-		approved: strings(g.approved) ?? [],
+		byProvider,
+		fallback,
+		approved,
 		fail: "closed",
 		callsPerHour: typeof g.calls_per_hour === "number" && g.calls_per_hour > 0 ? Math.min(g.calls_per_hour, 200) : 200,
 	};
@@ -304,11 +328,9 @@ export function buildConfig(t: TomlTable, home = homedir()): WatchersConfig {
 		}
 		const wake = w.wake === "never" ? "never" : "actionable";
 		if (w.wake !== undefined && w.wake !== "never" && w.wake !== "actionable") warnings.push(`${where}: wake must be actionable or never; using actionable`);
-		const passEnv = (strings(w.pass_env) ?? []).filter((name) => {
-			const ok = ENV_PASS_RE.test(name);
-			if (!ok) warnings.push(`${where}: pass_env ${name} is not a GH_* or GITHUB_* variable; ignored`);
-			return ok;
-		});
+		if (w.pass_env !== undefined) warnings.push(`${where}: pass_env is no longer needed (GH_* and GITHUB_* always pass); ignored`);
+		const me = typeof w.me === "string" ? w.me : "";
+		if (!me) warnings.push(`${where}: me is empty, so the actor check is off and your own activity can wake the agent`);
 		let quiet = parseQuiet(w.quiet_hours);
 		if (!quiet) {
 			warnings.push(`${where}: quiet_hours must look like "22-07"; using 22-07`);
@@ -320,10 +342,9 @@ export function buildConfig(t: TomlTable, home = homedir()): WatchersConfig {
 			command: [expandHome(command[0] as string, home), ...command.slice(1)],
 			matchCwd: expandHome(match.cwd, home),
 			intervalMs: Math.max(INTERVAL_FLOOR_MS, intervalMs),
-			me: typeof w.me === "string" ? w.me : "",
+			me,
 			wake,
 			urlHosts: (strings(w.url_hosts) ?? ["github.com"]).map((h) => h.toLowerCase()),
-			passEnv,
 			quiet,
 			raw: w,
 		});
@@ -337,7 +358,7 @@ export interface LoadResult extends WatchersConfig {
 	error?: string;
 }
 
-const EMPTY_GUARDIAN: GuardianConfig = { approved: [], fail: "closed", callsPerHour: 200 };
+const EMPTY_GUARDIAN: GuardianConfig = { byProvider: {}, approved: [], fail: "closed", callsPerHour: 200 };
 
 /** Read and parse the config file. Never throws; problems land in `error` or `warnings`. */
 export function loadConfig(path: string, home = homedir()): LoadResult {
@@ -345,18 +366,20 @@ export function loadConfig(path: string, home = homedir()): LoadResult {
 	try {
 		text = readFileSync(path, "utf8");
 	} catch {
-		return { path, missing: true, guardian: { ...EMPTY_GUARDIAN }, watchers: [], warnings: [] };
+		return { path, missing: true, guardian: { ...EMPTY_GUARDIAN, byProvider: {} }, watchers: [], warnings: [] };
+	}
+	// The mode warning comes first, and even when the file doesn't parse.
+	const modeWarnings: string[] = [];
+	try {
+		if ((statSync(path).mode & 0o077) !== 0) modeWarnings.push(`${path} is readable by others; chmod 600 it`);
+	} catch {
+		// raced away; the text is already read
 	}
 	try {
 		const cfg = buildConfig(parseToml(text), home);
-		try {
-			if ((statSync(path).mode & 0o077) !== 0) cfg.warnings.unshift(`${path} is readable by others; chmod 600 it`);
-		} catch {
-			// raced away; the text is already read
-		}
-		return { path, ...cfg };
+		return { path, ...cfg, warnings: [...modeWarnings, ...cfg.warnings] };
 	} catch (e) {
-		return { path, error: (e as Error).message, guardian: { ...EMPTY_GUARDIAN }, watchers: [], warnings: [] };
+		return { path, error: (e as Error).message, guardian: { ...EMPTY_GUARDIAN, byProvider: {} }, watchers: [], warnings: modeWarnings };
 	}
 }
 
@@ -378,7 +401,10 @@ export function matchesCwd(matchCwd: string, cwd: string): boolean {
 
 /**
  * command[0] must be an absolute path to a file the user owns that nobody
- * else can write. Returns why not, or undefined when it's fine.
+ * else can write, in folders only the user or root can change (a sticky,
+ * world-writable folder like /tmp is fine: others can't replace your
+ * entries there). Returns why not, or undefined when it's fine. Checked at
+ * start and again before every run.
  */
 export function commandProblem(cmd0: string, uid = process.getuid?.() ?? -1): string | undefined {
 	if (!isAbsolute(cmd0)) return `command[0] must be an absolute path (got ${cmd0})`;
@@ -391,5 +417,44 @@ export function commandProblem(cmd0: string, uid = process.getuid?.() ?? -1): st
 	if (!st.isFile()) return `command[0] is not a file: ${cmd0}`;
 	if (uid >= 0 && st.uid !== uid) return `command[0] is not owned by you: ${cmd0}`;
 	if (st.mode & 0o022) return `command[0] is group- or world-writable: ${cmd0}`;
+	// Both the folders as written and the real ones (after symlinks).
+	for (const start of new Set([dirname(cmd0), dirname(real(cmd0))])) {
+		for (let dir = start; ; dir = dirname(dir)) {
+			let d: ReturnType<typeof statSync>;
+			try {
+				d = statSync(dir);
+			} catch {
+				return `command[0]'s folder can't be checked: ${dir}`;
+			}
+			if (uid >= 0 && d.uid !== uid && d.uid !== 0) return `command[0]'s folder ${dir} is not owned by you or root`;
+			if (d.mode & 0o022 && !(d.mode & 0o1000)) return `command[0]'s folder ${dir} is group- or world-writable`;
+			if (dirname(dir) === dir) break;
+		}
+	}
 	return undefined;
+}
+
+/** Pick the guardian's judge for the session's current provider. */
+export interface JudgeChoice {
+	/** "provider/id" to call, or undefined when the guardian is unavailable. */
+	model?: string;
+	/** Why this judge (or why none), for /watchers. */
+	reason: string;
+}
+
+/**
+ * `problem(ref)` says why an approved model can't run right now (not found,
+ * no credentials), or undefined when it can. An unmapped provider or a
+ * mapped judge that can't run goes to `fallback` if set; never to another
+ * provider's mapping.
+ */
+export function pickJudge(g: GuardianConfig, provider: string | undefined, problem: (ref: string) => string | undefined): JudgeChoice {
+	const ok = (ref: string) => g.approved.includes(ref) && !problem(ref);
+	const why = (ref: string) => (g.approved.includes(ref) ? problem(ref) : "not on guardian.approved");
+	const mapped = provider ? g.byProvider[provider] : undefined;
+	const session = `session provider ${provider ?? "unknown"}`;
+	if (mapped && ok(mapped)) return { model: mapped, reason: session };
+	const miss = mapped ? `${mapped}: ${why(mapped)}` : `${session} is not in guardian.by_provider`;
+	if (g.fallback && ok(g.fallback)) return { model: g.fallback, reason: `fallback; ${miss}` };
+	return { reason: g.fallback ? `${miss}; fallback ${g.fallback}: ${why(g.fallback)}` : `${miss}; no guardian.fallback` };
 }

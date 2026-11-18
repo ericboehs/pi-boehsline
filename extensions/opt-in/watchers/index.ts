@@ -30,28 +30,31 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { optIn } from "../../../lib/opt-in.ts";
-import { commandProblem, loadConfig, type LoadResult, matchesCwd, type WatcherConfig } from "./config.ts";
+import { commandProblem, type JudgeChoice, loadConfig, type LoadResult, matchesCwd, pickJudge, type WatcherConfig } from "./config.ts";
 import { forceInfo, parseOutput, textFor, type WatchEvent } from "./contract.ts";
 import { applyVerdicts, type Delivered, formatMessage, freeTexts, wakeGate, WAKES_PER_HOUR, wantsWake } from "./delivery.ts";
 import { type CompleteFn, Guardian } from "./guardian.ts";
 import {
 	acquireLock,
+	acquireRunLock,
 	clearNext,
-	commitNext,
+	commitState,
 	defaultStateRoot,
 	dryRunDir,
 	ensureDir,
 	holdsLock,
-	isAlive,
 	killAll,
 	type LockInfo,
+	lockOwnerAlive,
 	readHost,
 	readLock,
 	readWakes,
 	recordWake,
 	releaseLock,
+	releaseRunLock,
 	runScript,
 	SeenStore,
+	takeNext,
 	writeHost,
 } from "./state.ts";
 
@@ -73,6 +76,8 @@ export interface Registry {
 	host?: { instance: string; teardown: () => void };
 	/** Guardian verdict cache and call counts survive reloads. */
 	guardian?: Guardian;
+	/** Session wake timestamps per watcher: a /reload keeps them; new, resume and fork reset them. */
+	sessionWakes?: Map<string, number[]>;
 }
 
 const registry = (): Registry => {
@@ -98,11 +103,17 @@ export interface HostOptions {
 	guardianTimeoutMs?: number;
 	now?: () => number;
 	env?: NodeJS.ProcessEnv;
-	alive?: (pid: number) => boolean;
+	alive?: (lock: LockInfo) => boolean;
 	/** Overrides the model call (tests). Approval checks still apply. */
 	complete?: CompleteFn;
 	/** The process-wide registry (tests use their own to act as separate processes). */
 	registry?: Registry;
+}
+
+interface PendingState {
+	/** The run that wrote it; an older run's state never overwrites a newer one's. */
+	seq: number;
+	data: Buffer;
 }
 
 interface Runtime {
@@ -118,6 +129,12 @@ interface Runtime {
 	batchTimer?: ReturnType<typeof setTimeout>;
 	pending: WatchEvent[];
 	pendingIds: Set<string>;
+	/** The script state that goes with `pending`: committed once that batch is delivered. */
+	pendingState?: PendingState;
+	/** Batches between the 30 s timer and send (waiting on the guardian). */
+	flushing: number;
+	runSeq: number;
+	committedSeq: number;
 	lastRunAt?: number;
 	lastOkAt?: number;
 	lastError?: string;
@@ -127,10 +144,14 @@ interface Runtime {
 	contractErrors: number;
 	sessionWakes: number[];
 	recent: Delivered[];
-	guardianNote?: string;
+	secretNotified: boolean;
 }
 
-type Outgoing = { w: Runtime; delivered: Delivered[]; guardianFailed: boolean } | { w: Runtime; note: string };
+type Outgoing =
+	| { w: Runtime; delivered: Delivered[]; guardianFailed: boolean; state?: PendingState }
+	| { w: Runtime; note: string; seenIds?: string[]; state?: PendingState };
+
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 160);
 
 export function createWatchers(opts: HostOptions = {}) {
 	return (pi: ExtensionAPI) => {
@@ -156,37 +177,97 @@ export function createWatchers(opts: HostOptions = {}) {
 
 		// ── the guardian's model ──
 
-		function guardianCall(w: Runtime): CompleteFn | undefined {
+		const splitRef = (ref: string): [string, string] => {
+			const slash = ref.indexOf("/");
+			return [ref.slice(0, slash), ref.slice(slash + 1)];
+		};
+
+		function findModel(ref: string) {
+			const registry = ctxRef?.modelRegistry;
+			if (!registry) return undefined;
+			try {
+				return registry.find(...splitRef(ref));
+			} catch {
+				return undefined;
+			}
+		}
+
+		/**
+		 * The judge for the session's current provider, resolved fresh each time
+		 * (so a /model switch takes effect at the next batch).
+		 */
+		function resolveJudge(): JudgeChoice {
 			const g = config?.guardian;
-			if (!g?.model) {
-				w.guardianNote = "no [guardian].model configured";
-				return undefined;
-			}
-			if (!g.approved.includes(g.model)) {
-				w.guardianNote = `${g.model} is not on [guardian].approved`;
-				return undefined;
-			}
-			if (opts.complete) {
-				w.guardianNote = undefined;
-				return opts.complete;
+			if (!g) return { reason: "no config" };
+			let provider: string | undefined;
+			try {
+				provider = ctxRef?.model?.provider;
+			} catch {
+				provider = undefined; // a stale context
 			}
 			const registry = ctxRef?.modelRegistry;
-			const slash = g.model.indexOf("/");
-			const model = registry?.find(g.model.slice(0, slash), g.model.slice(slash + 1));
-			if (!registry || !model) {
-				w.guardianNote = `${g.model} not found`;
-				return undefined;
-			}
-			if (!registry.hasConfiguredAuth(model)) {
-				w.guardianNote = `no credentials for ${g.model}`;
-				return undefined;
-			}
-			w.guardianNote = undefined;
-			// No tools: the judge can't act, only answer.
-			return (req, o) => registry.complete(model, req, o);
+			return pickJudge(g, provider, (ref) => {
+				if (!registry) return opts.complete ? undefined : "no model registry";
+				const model = findModel(ref);
+				if (!model) return "not found";
+				try {
+					return registry.hasConfiguredAuth(model) ? undefined : "no credentials";
+				} catch {
+					return "no credentials";
+				}
+			});
+		}
+
+		function guardianCall(): { complete: CompleteFn; judge: string } | undefined {
+			const choice = resolveJudge();
+			if (!choice.model) return undefined;
+			if (opts.complete) return { complete: opts.complete, judge: choice.model };
+			const registry = ctxRef?.modelRegistry;
+			const model = findModel(choice.model);
+			if (!registry || !model) return undefined;
+			// No tools: the judge can't act, only answer. No `reasoning`: thinking off.
+			return { judge: choice.model, complete: (req, o) => registry.streamSimple(model, req, o).result() };
 		}
 
 		// ── delivery ──
+
+		/** Forget ids that won't be delivered, so a later run can queue them again. */
+		function release(item: Outgoing) {
+			if ("delivered" in item) for (const d of item.delivered) item.w.pendingIds.delete(d.id);
+		}
+
+		/** After pi took the message: mark seen, then commit the script state that went with it. */
+		function markDelivered(w: Runtime, ids: string[], state: PendingState | undefined) {
+			w.seen.add(ids, now());
+			if (state && state.seq > w.committedSeq && holdsLock(w.dir, instance)) {
+				commitState(w.dir, state.data);
+				w.committedSeq = state.seq;
+			}
+		}
+
+		/** sendMessage, whether it returns or throws or rejects. `then` runs once pi has the message. */
+		function post(item: Outgoing, message: Parameters<ExtensionAPI["sendMessage"]>[0], options: Parameters<ExtensionAPI["sendMessage"]>[1], then: () => void) {
+			const { w } = item;
+			const fail = (e: unknown) => {
+				release(item);
+				w.lastError = `send failed: ${errText(e)}`;
+			};
+			let r: unknown;
+			try {
+				r = pi.sendMessage(message, options);
+			} catch (e) {
+				return fail(e);
+			}
+			const after = () => {
+				try {
+					then();
+				} catch (e) {
+					w.lastError = `after send: ${errText(e)}`;
+				}
+			};
+			if (r && typeof (r as Promise<void>).then === "function") (r as Promise<void>).then(after, fail);
+			else after();
+		}
 
 		function send(item: Outgoing) {
 			if (compacting) {
@@ -194,8 +275,17 @@ export function createWatchers(opts: HostOptions = {}) {
 				return;
 			}
 			const { w } = item;
+			// Only the holder posts. A session that lost the lock mid-batch drops it; the new holder's runs bring it again.
+			if (!holdsLock(w.dir, instance)) {
+				w.holder = false;
+				release(item);
+				return;
+			}
 			if ("note" in item) {
-				pi.sendMessage({ customType: MSG_TYPE, display: true, content: item.note, details: { watcher: w.cfg.id, events: [] } }, { triggerTurn: false });
+				const { note, seenIds = [], state } = item;
+				post(item, { customType: MSG_TYPE, display: true, content: note, details: { watcher: w.cfg.id, events: [] } }, { triggerTurn: false }, () =>
+					markDelivered(w, seenIds, state),
+				);
 				return;
 			}
 			const { delivered, guardianFailed } = item;
@@ -216,21 +306,21 @@ export function createWatchers(opts: HostOptions = {}) {
 			// A waking message carries structured fields only; titles and excerpts stay out.
 			const content = formatMessage(w.cfg.id, delivered, wake);
 			const message = { customType: MSG_TYPE, display: true, content, details: { watcher: w.cfg.id, events: delivered, wake } };
-			if (wake) pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true });
 			// Info lines: no deliverAs. While a turn runs pi queues them for its end.
-			else pi.sendMessage(message, { triggerTurn: false });
-			// Seen only after delivery: a crash may repeat an event, never lose one.
-			w.seen.add(
-				delivered.map((d) => d.id),
-				t,
-			);
-			for (const d of delivered) w.pendingIds.delete(d.id);
-			w.recent.push(...delivered);
-			w.recent.splice(0, Math.max(0, w.recent.length - SHOW_LIMIT));
+			const options = wake ? ({ deliverAs: "followUp", triggerTurn: true } as const) : { triggerTurn: false };
 			if (wake) {
+				// Counted when tried, so a failing send can't loop past the cap.
 				w.sessionWakes.push(t);
 				recordWake(w.dir, t);
 			}
+			post(item, message, options, () => {
+				// Seen, and the script state committed, only after delivery: a crash may repeat an event, never lose one.
+				const ids = delivered.map((d) => d.id);
+				for (const id of ids) w.pendingIds.delete(id);
+				markDelivered(w, ids, item.state);
+				w.recent.push(...delivered);
+				w.recent.splice(0, Math.max(0, w.recent.length - SHOW_LIMIT));
+			});
 		}
 
 		function flushOutbox() {
@@ -242,28 +332,50 @@ export function createWatchers(opts: HostOptions = {}) {
 		async function flushBatch(w: Runtime) {
 			w.batchTimer = undefined;
 			const batch = w.pending.splice(0);
+			const state = w.pendingState;
+			w.pendingState = undefined;
 			if (!batch.length || !started) return;
-			const items = freeTexts(batch);
-			const call = items.length ? guardianCall(w) : undefined;
-			const verdicts = items.length ? await guardian.check(w.cfg.id, items.map((i) => i.text), call, config?.guardian.callsPerHour ?? 200) : [];
-			if (!started || runtimes.get(w.cfg.id) !== w) return;
-			const delivered = applyVerdicts(batch, verdicts);
-			guardian.statsFor(w.cfg.id).withheld += delivered.filter((d) => d.withheld).length;
-			if (verdicts.some((v) => v === "secret" || v === "sensitive"))
-				notify(`watchers · ${w.cfg.id}: withheld a credential-like string from an event (see /watchers show ${w.cfg.id})`, "warning");
-			send({ w, delivered, guardianFailed: verdicts.includes("unavailable") });
+			let handed = false;
+			w.flushing++;
+			try {
+				const items = freeTexts(batch);
+				const call = items.length ? guardianCall() : undefined;
+				const verdicts = items.length
+					? await guardian.check(w.cfg.id, items.map((i) => i.text), call?.complete, config?.guardian.callsPerHour ?? 200, call?.judge)
+					: [];
+				if (!started || runtimes.get(w.cfg.id) !== w) return;
+				const delivered = applyVerdicts(batch, verdicts);
+				guardian.statsFor(w.cfg.id).withheld += delivered.filter((d) => d.withheld).length;
+				if (!w.secretNotified && verdicts.some((v) => v === "secret" || v === "sensitive")) {
+					w.secretNotified = true;
+					notify(`watchers · ${w.cfg.id}: withheld a credential-like string from an event (see /watchers show ${w.cfg.id}); not repeated this session`, "warning");
+				}
+				handed = true;
+				send({ w, delivered, guardianFailed: verdicts.includes("unavailable"), state });
+			} catch (e) {
+				if (started && runtimes.get(w.cfg.id) === w) failure(w, `delivery failed: ${errText(e)}`);
+			} finally {
+				w.flushing--;
+				// Not handed to send: let a later run queue these ids again.
+				if (!handed) for (const ev of batch) w.pendingIds.delete(ev.id);
+			}
 		}
 
-		function enqueue(w: Runtime, events: WatchEvent[]) {
+		function enqueue(w: Runtime, events: WatchEvent[], state?: PendingState) {
 			for (const ev of events) {
 				w.pending.push(ev);
 				w.pendingIds.add(ev.id);
 			}
+			// The newest run's state covers everything pending.
+			if (state && (!w.pendingState || state.seq > w.pendingState.seq)) w.pendingState = state;
 			if (!w.batchTimer && w.pending.length) {
 				w.batchTimer = setTimeout(() => void flushBatch(w), batchMs);
 				w.batchTimer.unref?.();
 			}
 		}
+
+		/** Nothing of this watcher's is waiting to be delivered. */
+		const idle = (w: Runtime) => !w.pending.length && !w.flushing && !w.pendingIds.size && !outbox.some((o) => o.w === w);
 
 		// ── polling ──
 
@@ -280,17 +392,22 @@ export function createWatchers(opts: HostOptions = {}) {
 			const t = now();
 			if (w.errorPostedAt === undefined || t - w.errorPostedAt >= ERROR_POST_EVERY_MS) {
 				w.errorPostedAt = t;
-				send({ w, note: `[watch ${w.cfg.id}] error: ${reason}; retrying with backoff (/watchers for details)` });
+				try {
+					send({ w, note: `[watch ${w.cfg.id}] error: ${reason}; retrying with backoff (/watchers for details)` });
+				} catch {
+					// the reason is in /watchers
+				}
 			}
 			schedule(w, w.backoffMs);
 		}
 
 		const lockInfo = (): LockInfo => ({ pid: process.pid, startedAt: now(), instance });
+		const alive = opts.alive ?? lockOwnerAlive;
 
 		/** Hold the lock, or learn who does. A dead holder's lock is taken over. */
 		function ensureHolder(w: Runtime, force = false): boolean {
 			if (w.holder && holdsLock(w.dir, instance)) return true;
-			const r = acquireLock(w.dir, lockInfo(), { force, alive: opts.alive ?? isAlive });
+			const r = acquireLock(w.dir, lockInfo(), { force, alive });
 			w.holder = r.ok;
 			w.heldBy = r.ok ? undefined : r.holder;
 			return r.ok;
@@ -300,16 +417,35 @@ export function createWatchers(opts: HostOptions = {}) {
 			w.timer = undefined;
 			if (!started || runtimes.get(w.cfg.id) !== w) return;
 			if (w.paused || w.problem) return;
+			try {
+				await pollOnce(w);
+			} catch (e) {
+				if (started && runtimes.get(w.cfg.id) === w) failure(w, `poll failed: ${errText(e)}`);
+			}
+		}
+
+		async function pollOnce(w: Runtime) {
 			if (!ensureHolder(w)) return schedule(w, w.cfg.intervalMs);
 			if (w.running) return schedule(w, w.cfg.intervalMs);
+			// Re-checked before every run: the script or its folder may have changed since start.
+			const problem = commandProblem(w.cfg.command[0] as string);
+			if (problem) return failure(w, problem);
+			// One run in the folder at a time, even when a takeover overlaps a run still in flight elsewhere.
+			if (!acquireRunLock(w.dir, lockInfo(), { now: now(), alive })) return schedule(w, w.cfg.intervalMs);
 			w.running = true;
 			const started_ = now();
+			const seq = ++w.runSeq;
 			let r: Awaited<ReturnType<typeof runScript>>;
+			let next: Buffer | undefined;
 			try {
 				clearNext(w.dir);
 				r = await runScript(w.cfg, { cwd: ctxRef?.cwd ?? process.cwd(), stateDir: w.dir, timeoutMs: opts.runTimeoutMs, env, children });
+				// Take the run's state before the run lock goes, so no other run can clear it.
+				if (!r.error && r.code === 0) next = takeNext(w.dir);
+				else clearNext(w.dir);
 			} finally {
 				w.running = false;
+				releaseRunLock(w.dir, instance);
 			}
 			if (!started || runtimes.get(w.cfg.id) !== w) return;
 			w.lastRunAt = started_;
@@ -317,11 +453,16 @@ export function createWatchers(opts: HostOptions = {}) {
 			if (r.error || r.code !== 0) return failure(w, r.error ?? `exit ${r.code}`);
 			const out = parseOutput(r.stdout, w.cfg.urlHosts);
 			if (out.fatal) return failure(w, out.fatal);
-			commitNext(w.dir);
-			w.contractErrors += out.errors.length;
+			// Taken over during the run: commit nothing, send nothing.
+			if (!holdsLock(w.dir, instance)) {
+				w.holder = false;
+				return schedule(w, w.cfg.intervalMs);
+			}
+			w.contractErrors += out.errorCount;
 			w.lastOkAt = started_;
 			w.lastError = undefined;
 			w.backoffMs = 0;
+			const state = next ? { seq, data: next } : undefined;
 			const fresh = out.events.map((e) => forceInfo(e, w.cfg.me)).filter((e) => !w.seen.has(e.id) && !w.pendingIds.has(e.id));
 			const host = readHost(w.dir);
 			const backlog = host.lastPollAt === undefined || started_ - host.lastPollAt > BACKLOG_AFTER_MS;
@@ -332,9 +473,16 @@ export function createWatchers(opts: HostOptions = {}) {
 				send({
 					w,
 					note: `[watch ${w.cfg.id}] ${ids.length} event${ids.length === 1 ? "" : "s"} since ${host.lastPollAt === undefined ? "the first check" : "the last check over an hour ago"}; caught up, not listed.`,
+					seenIds: ids,
+					state,
 				});
-				w.seen.add(ids, now());
-			} else enqueue(w, dedupeIds(fresh));
+			} else if (fresh.length) enqueue(w, dedupeIds(fresh), state);
+			else if (state && idle(w) && state.seq > w.committedSeq) {
+				// Nothing new and nothing in flight: commit now. With events still in flight the state
+				// is dropped instead; the next run re-reads the older state and dedupe absorbs the repeats.
+				commitState(w.dir, state.data);
+				w.committedSeq = seq;
+			}
 			schedule(w, w.cfg.intervalMs);
 		}
 
@@ -347,15 +495,18 @@ export function createWatchers(opts: HostOptions = {}) {
 				if (w.batchTimer) clearTimeout(w.batchTimer);
 				w.timer = w.batchTimer = undefined;
 				releaseLock(w.dir, instance);
+				releaseRunLock(w.dir, instance);
 			}
 			killAll(children);
+			// Undelivered batches go; their script state was never committed and their ids never
+			// marked seen, so the next run brings them again.
 			outbox = [];
 			compacting = false;
 			runtimes = new Map();
 			if (reg.host?.instance === instance) reg.host = undefined;
 		}
 
-		function start(ctx: ExtensionContext) {
+		function start(ctx: ExtensionContext, reason?: string) {
 			// Idempotent: whatever ran before (a missed shutdown, a reload) goes first.
 			reg.host?.teardown();
 			ctxRef = ctx;
@@ -363,6 +514,9 @@ export function createWatchers(opts: HostOptions = {}) {
 			started = true;
 			compacting = false;
 			reg.host = { instance, teardown };
+			// Session wake counts survive a /reload (same session); new, resume and fork start over.
+			const carried = reason === "reload" ? reg.sessionWakes : undefined;
+			reg.sessionWakes = new Map();
 			config = loadConfig(opts.configPath ?? defaultConfigPath(env));
 			if (config.error) notify(`watchers · ${config.error}`, "warning");
 			for (const warning of config.warnings) notify(`watchers · ${warning}`, "warning");
@@ -380,11 +534,16 @@ export function createWatchers(opts: HostOptions = {}) {
 					running: false,
 					pending: [],
 					pendingIds: new Set(),
+					flushing: 0,
+					runSeq: 0,
+					committedSeq: 0,
 					backoffMs: 0,
 					contractErrors: 0,
-					sessionWakes: [],
+					sessionWakes: carried?.get(cfg.id) ?? [],
 					recent: [],
+					secretNotified: false,
 				};
+				reg.sessionWakes.set(cfg.id, w.sessionWakes);
 				runtimes.set(cfg.id, w);
 				if (w.problem) {
 					notify(`watchers · ${cfg.id}: ${w.problem}; not running`, "warning");
@@ -400,9 +559,9 @@ export function createWatchers(opts: HostOptions = {}) {
 			meeting = !!(data as { active?: boolean } | undefined)?.active;
 		});
 
-		pi.on("session_start", (_e, ctx) => {
+		pi.on("session_start", (e, ctx) => {
 			if (!shouldStart(ctx.mode, env)) return;
-			start(ctx);
+			start(ctx, (e as { reason?: string } | undefined)?.reason);
 		});
 
 		pi.on("session_shutdown", () => {
@@ -429,11 +588,12 @@ export function createWatchers(opts: HostOptions = {}) {
 			const t = now();
 			const g = guardian.statsFor(w.cfg.id);
 			const role = w.problem ? `disabled (${w.problem})` : w.paused ? "paused" : w.holder ? "polling" : w.heldBy ? `held by pid ${w.heldBy.pid}` : "waiting for the lock";
+			const judge = resolveJudge();
 			return [
 				`${w.cfg.id} · ${role}`,
 				`  last run ${clock(w.lastRunAt)}${w.lastError ? ` · error: ${w.lastError}` : w.lastOkAt ? " · ok" : ""}${w.backoffMs ? ` · backoff ${Math.round(w.backoffMs / 1000)}s` : ""}${w.stderrTail && w.lastError ? ` · stderr: ${w.stderrTail}` : ""}`,
 				`  contract errors ${w.contractErrors} · seen ${w.seen.size} · wakes ${w.sessionWakes.filter((x) => t - x < 3_600_000).length}/${WAKES_PER_HOUR} session, ${readWakes(w.dir, t).length}/${WAKES_PER_HOUR} watcher (last hour)`,
-				`  guardian ${config?.guardian.model ?? "none"}${w.guardianNote ? ` (unavailable: ${w.guardianNote})` : ""} · calls ${g.calls} (${guardian.callsLastHour(w.cfg.id)}/${config?.guardian.callsPerHour ?? 200} this hour) · failures ${g.failures} · capped ${g.capped} · cache hits ${g.cacheHits} · secrets ${g.secrets} · withheld ${g.withheld}`,
+				`  guardian ${judge.model ? `judge ${judge.model} (${judge.reason})` : `unavailable (${judge.reason})`} · calls ${g.calls} (${guardian.callsLastHour(w.cfg.id)}/${config?.guardian.callsPerHour ?? 200} this hour) · failures ${g.failures} · capped ${g.capped} · cache hits ${g.cacheHits} · secrets ${g.secrets} · withheld ${g.withheld}`,
 			].join("\n");
 		}
 
@@ -466,7 +626,7 @@ export function createWatchers(opts: HostOptions = {}) {
 					const extra = [e.title ? "title" : "", e.untrusted ? "excerpt" : ""].filter(Boolean).join("+");
 					return `- ${e.kind === "act" ? "[act] " : ""}${textFor(e)}${extra ? ` · has ${extra} (guarded on delivery)` : ""}${seen}`;
 				});
-				return [`${w.cfg.id} test (dry run, nothing committed): ${out.events.length} events, ${out.errors.length} dropped${out.errors.length ? ` (${[...new Set(out.errors)].join(", ")})` : ""}`, ...lines].join("\n");
+				return [`${w.cfg.id} test (dry run, nothing committed): ${out.events.length} events, ${out.errorCount} dropped${out.errors.length ? ` (${[...new Set(out.errors)].join(", ")})` : ""}`, ...lines].join("\n");
 			} finally {
 				rmSync(dir, { recursive: true, force: true });
 			}

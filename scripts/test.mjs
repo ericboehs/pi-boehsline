@@ -18,6 +18,8 @@ import { testEnv } from "./test-env.mjs";
 // Globs, not shell-expanded paths: node --test expands them itself (>= 21).
 const SUITE = [
   "test/*.test.mjs",
+  // Named too, so it's plainly in the suite (node --test runs a file once).
+  "test/watchers.test.mjs",
   "packages/goal/test/*.test.mjs",
   "packages/scheduler/test/*.test.mjs",
   // The security gate: its own tests, not just the opt-in wrapper's.

@@ -6,22 +6,27 @@
  *   wakes.json     wake timestamps (cross-session cap)
  *   host.json      {lastPollAt}: drives the backlog summary
  *   holder.lock    {pid, startedAt, instance}: only the holder polls
- *   state.json     the script's own state; it writes state.json.next and the
- *                  host renames it over only on exit 0 outside a dry run
+ *   run.lock       {pid, startedAt, instance}: held for one script run, so two
+ *                  runs never share the folder (even across a takeover)
+ *   state.json     the script's own state; it writes state.json.next only.
+ *                  After exit 0 (outside a dry run) the host takes that file
+ *                  and writes it over state.json once the run's events are
+ *                  delivered. No other *.next is ever touched.
  *
  * Pure node, no pi imports.
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
 	closeSync,
 	copyFileSync,
 	existsSync,
 	fsyncSync,
+	linkSync,
 	mkdirSync,
 	mkdtempSync,
 	openSync,
-	readdirSync,
 	readFileSync,
 	renameSync,
 	rmSync,
@@ -30,7 +35,8 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { WatcherConfig } from "./config.ts";
+import { ENV_PASS_RE, type WatcherConfig } from "./config.ts";
+import { normalize } from "./contract.ts";
 
 export const SEEN_TTL_MS = 14 * 24 * 3_600_000;
 export const RUN_TIMEOUT_MS = 45_000;
@@ -46,11 +52,11 @@ export function ensureDir(dir: string): string {
 }
 
 /** Write via a temp file, fsync, rename. */
-export function writeAtomic(file: string, data: string): void {
+export function writeAtomic(file: string, data: string | Buffer): void {
 	const tmp = `${file}.${process.pid}.tmp`;
 	const fd = openSync(tmp, "w", 0o600);
 	try {
-		writeSync(fd, data);
+		writeSync(fd, typeof data === "string" ? Buffer.from(data) : data);
 		fsyncSync(fd);
 	} finally {
 		closeSync(fd);
@@ -155,43 +161,111 @@ export const isAlive = (pid: number): boolean => {
 	}
 };
 
-export function readLock(dir: string): LockInfo | undefined {
-	const l = readJson<LockInfo>(join(dir, "holder.lock"));
-	return l && Number.isInteger(l.pid) && typeof l.instance === "string" ? l : undefined;
+/** When a pid's process started (ms), from `ps -o lstart=`; undefined if unknown. */
+export function pidStartedAt(pid: number): number | undefined {
+	try {
+		const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2000, env: { PATH: "/bin:/usr/bin", LC_ALL: "C" } });
+		const t = Date.parse(r.stdout.trim());
+		return Number.isFinite(t) ? t : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /**
- * Take the holder lock with O_EXCL. A lock whose pid is dead (or that can't
- * be read) is stale and replaced. `force` replaces a live holder (takeover).
- * Returns the live holder when the lock is someone else's.
+ * The lock's owner still runs: its pid is alive and that process started
+ * before the lock was written (else the pid was reused). `ps` has 1 s
+ * resolution, so allow 2 s.
+ */
+export function lockOwnerAlive(l: LockInfo): boolean {
+	if (!isAlive(l.pid)) return false;
+	if (l.pid === process.pid) return true;
+	const started = pidStartedAt(l.pid);
+	return started === undefined || started <= l.startedAt + 2000;
+}
+
+function readLockFile(file: string): LockInfo | undefined {
+	const l = readJson<LockInfo>(file);
+	return l && Number.isInteger(l.pid) && typeof l.instance === "string" && typeof l.startedAt === "number" ? l : undefined;
+}
+
+export function readLock(dir: string): LockInfo | undefined {
+	return readLockFile(join(dir, "holder.lock"));
+}
+
+function createExclusive(file: string, me: LockInfo): boolean {
+	try {
+		const fd = openSync(file, "wx", 0o600);
+		try {
+			writeSync(fd, JSON.stringify(me));
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+		return true;
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+		return false;
+	}
+}
+
+/**
+ * Remove the lock at `file` only if it's still the one judged stale. It's
+ * renamed aside first (atomic), then checked; a lock someone else created in
+ * between is put back (link fails if yet another one appeared, and then that
+ * one stands).
+ */
+function removeIfSame(file: string, judged: LockInfo | undefined): void {
+	const aside = `${file}.stale-${process.pid}-${randomBytes(4).toString("hex")}`;
+	try {
+		renameSync(file, aside);
+	} catch {
+		return; // already gone
+	}
+	const got = readLockFile(aside);
+	const same = judged ? got?.instance === judged.instance && got?.startedAt === judged.startedAt : got === undefined;
+	if (!same) {
+		try {
+			linkSync(aside, file);
+		} catch {
+			// a newer lock exists; it wins
+		}
+	}
+	rmSync(aside, { force: true });
+}
+
+function takeLock(
+	file: string,
+	me: LockInfo,
+	stale: (l: LockInfo) => boolean,
+	force: boolean,
+): { ok: true } | { ok: false; holder: LockInfo } {
+	for (let attempt = 0; attempt < 3; attempt++) {
+		if (createExclusive(file, me)) return { ok: true };
+		const cur = readLockFile(file);
+		if (cur?.instance === me.instance) return { ok: true };
+		if (cur && !force && !stale(cur)) return { ok: false, holder: cur };
+		removeIfSame(file, cur);
+	}
+	const cur = readLockFile(file);
+	if (cur?.instance === me.instance) return { ok: true };
+	if (cur) return { ok: false, holder: cur };
+	return createExclusive(file, me) ? { ok: true } : { ok: false, holder: readLockFile(file) ?? me };
+}
+
+/**
+ * Take the holder lock with O_EXCL. A lock whose owner is gone (dead pid, a
+ * reused pid, or unreadable) is stale and replaced, race-free. `force`
+ * replaces a live holder (takeover). Returns the live holder when the lock is
+ * someone else's.
  */
 export function acquireLock(
 	dir: string,
 	me: LockInfo,
-	opts: { force?: boolean; alive?: (pid: number) => boolean } = {},
+	opts: { force?: boolean; alive?: (l: LockInfo) => boolean } = {},
 ): { ok: true } | { ok: false; holder: LockInfo } {
-	const file = join(dir, "holder.lock");
-	const alive = opts.alive ?? isAlive;
-	for (let attempt = 0; attempt < 3; attempt++) {
-		try {
-			const fd = openSync(file, "wx", 0o600);
-			try {
-				writeSync(fd, JSON.stringify(me));
-				fsyncSync(fd);
-			} finally {
-				closeSync(fd);
-			}
-			return { ok: true };
-		} catch (e) {
-			if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-		}
-		const cur = readLock(dir);
-		if (cur?.instance === me.instance) return { ok: true };
-		if (cur && alive(cur.pid) && !opts.force) return { ok: false, holder: cur };
-		rmSync(file, { force: true });
-	}
-	const cur = readLock(dir);
-	return cur && cur.instance !== me.instance ? { ok: false, holder: cur } : { ok: true };
+	const alive = opts.alive ?? lockOwnerAlive;
+	return takeLock(join(dir, "holder.lock"), me, (l) => !alive(l), !!opts.force);
 }
 
 export function holdsLock(dir: string, instance: string): boolean {
@@ -199,59 +273,71 @@ export function holdsLock(dir: string, instance: string): boolean {
 }
 
 export function releaseLock(dir: string, instance: string): void {
-	if (holdsLock(dir, instance)) rmSync(join(dir, "holder.lock"), { force: true });
+	if (holdsLock(dir, instance)) removeIfSame(join(dir, "holder.lock"), readLock(dir));
+}
+
+/** How long a run lock may be held before it's stale whoever holds it: the run timeout plus slack. */
+export const RUN_LOCK_MAX_MS = 60_000;
+
+/**
+ * The per-run lock (`run.lock`, O_EXCL): at most one script run in the folder
+ * at a time, even when a takeover overlaps a run still in flight. Stale when
+ * its owner is gone or it's older than RUN_LOCK_MAX_MS.
+ */
+export function acquireRunLock(dir: string, me: LockInfo, opts: { now?: number; alive?: (l: LockInfo) => boolean } = {}): boolean {
+	const alive = opts.alive ?? lockOwnerAlive;
+	const now = opts.now ?? Date.now();
+	return takeLock(join(dir, "run.lock"), me, (l) => !alive(l) || now - l.startedAt > RUN_LOCK_MAX_MS, false).ok;
+}
+
+export function releaseRunLock(dir: string, instance: string): void {
+	const file = join(dir, "run.lock");
+	const cur = readLockFile(file);
+	if (cur?.instance === instance) removeIfSame(file, cur);
 }
 
 // ── script state files ──
 
-const NEXT = /\.next$/;
+export const STATE_FILE = "state.json";
+export const NEXT_FILE = "state.json.next";
 
-/** Delete leftover *.next files from a run that didn't commit. */
+/** Delete a leftover state.json.next from a run that didn't commit. Nothing else. */
 export function clearNext(dir: string): string[] {
-	const gone: string[] = [];
-	for (const name of safeList(dir)) {
-		if (NEXT.test(name)) {
-			rmSync(join(dir, name), { force: true });
-			gone.push(name);
-		}
-	}
-	return gone;
+	if (!existsSync(join(dir, NEXT_FILE))) return [];
+	rmSync(join(dir, NEXT_FILE), { force: true });
+	return [NEXT_FILE];
 }
 
-/** Rename every *.next over its live file. Only after exit 0, never in a dry run. */
-export function commitNext(dir: string): string[] {
-	const done: string[] = [];
-	for (const name of safeList(dir)) {
-		if (!NEXT.test(name)) continue;
-		const from = join(dir, name);
-		try {
-			const fd = openSync(from, "r");
-			try {
-				fsyncSync(fd);
-			} finally {
-				closeSync(fd);
-			}
-		} catch {
-			continue;
-		}
-		renameSync(from, join(dir, name.replace(NEXT, "")));
-		done.push(name);
-	}
-	return done;
-}
-
-function safeList(dir: string): string[] {
+/** Take the run's state.json.next (read and remove it), to commit once its events are delivered. */
+export function takeNext(dir: string): Buffer | undefined {
+	const file = join(dir, NEXT_FILE);
+	let data: Buffer;
 	try {
-		return readdirSync(dir);
+		data = readFileSync(file);
 	} catch {
-		return [];
+		return undefined;
 	}
+	rmSync(file, { force: true });
+	return data;
+}
+
+/** Write a taken state over state.json (temp, fsync, rename). */
+export function commitState(dir: string, data: Buffer): void {
+	writeAtomic(join(dir, STATE_FILE), data);
+}
+
+/** Commit state.json.next now, if there is one. Only state.json; never any other file. */
+export function commitNext(dir: string): string[] {
+	const data = takeNext(dir);
+	if (!data) return [];
+	commitState(dir, data);
+	return [NEXT_FILE];
 }
 
 /** A throwaway copy of the state dir for a dry run: the script reads its state but nothing it writes survives. */
 export function dryRunDir(dir: string): string {
 	const tmp = mkdtempSync(join(tmpdir(), "pi-watchers-dry-"));
-	if (existsSync(join(dir, "state.json"))) copyFileSync(join(dir, "state.json"), join(tmp, "state.json"));
+	if (existsSync(join(dir, STATE_FILE))) copyFileSync(join(dir, STATE_FILE), join(tmp, STATE_FILE));
 	return tmp;
 }
 
@@ -267,11 +353,14 @@ export interface RunResult {
 	stderrTail: string;
 }
 
-/** Only these variables reach the script. */
+/** The fixed names that reach the script, besides GH_* and GITHUB_*. */
+export const ENV_BASE = ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME"];
+
+/** Only these variables reach the script: ENV_BASE, every GH_* and GITHUB_*, and the WATCHER_* ones. */
 export function scriptEnv(cfg: WatcherConfig, stateDir: string, dryRun: boolean, env: NodeJS.ProcessEnv = process.env): Record<string, string> {
 	const out: Record<string, string> = {};
-	for (const k of ["PATH", "HOME", "LANG"]) if (env[k]) out[k] = env[k] as string;
-	for (const k of cfg.passEnv) if (env[k]) out[k] = env[k] as string;
+	for (const k of ENV_BASE) if (env[k]) out[k] = env[k] as string;
+	for (const [k, v] of Object.entries(env)) if (v && ENV_PASS_RE.test(k)) out[k] = v;
 	out.WATCHER_ID = cfg.id;
 	out.WATCHER_STATE_DIR = stateDir;
 	out.WATCHER_ME = cfg.me;
@@ -360,7 +449,7 @@ export function runScript(cfg: WatcherConfig, opts: RunOptions): Promise<RunResu
 				} catch {
 					// the group is gone
 				}
-			const tail = stderr.trim().split("\n").at(-1)?.slice(0, 200) ?? "";
+			const tail = stderrTail(stderr);
 			if (!error && code !== 0) error = signal ? `killed by ${signal}` : `exit ${code}`;
 			resolve({ code, signal, stdout: Buffer.concat(chunks), error, stderrTail: tail });
 		};
@@ -370,6 +459,15 @@ export function runScript(cfg: WatcherConfig, opts: RunOptions): Promise<RunResu
 		});
 		child.on("close", finish);
 	});
+}
+
+// biome-ignore lint/suspicious/noControlCharactersInRegex: escape sequences are the point
+const ANSI = /\u001B\[[0-?]*[ -/]*[@-~]|\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)?|\u001B[@-_]/g;
+
+/** stderr's last non-empty line, escape sequences and invisible characters gone, at most 200 characters. */
+export function stderrTail(stderr: string): string {
+	const last = stderr.replace(ANSI, "").trim().split("\n").at(-1) ?? "";
+	return normalize(last, 200);
 }
 
 export function killAll(children: Set<ChildProcess>): void {
