@@ -30,6 +30,7 @@ import {
 	readFileSync,
 	renameSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 	writeSync,
 } from "node:fs";
@@ -152,7 +153,11 @@ export interface LockInfo {
 	instance: string;
 }
 
+/** A pid a lock may name: 0, -1 and 1 would make `kill(pid, 0)` signal a group or init, which always "lives". */
+export const validPid = (pid: unknown): pid is number => Number.isInteger(pid) && (pid as number) > 1;
+
 export const isAlive = (pid: number): boolean => {
+	if (!validPid(pid)) return false;
 	try {
 		process.kill(pid, 0);
 		return true;
@@ -161,12 +166,24 @@ export const isAlive = (pid: number): boolean => {
 	}
 };
 
-/** When a pid's process started (ms), from `ps -o lstart=`; undefined if unknown. */
-export function pidStartedAt(pid: number): number | undefined {
+/** `ps -o etime=` ([[dd-]hh:]mm:ss) in seconds; undefined if it doesn't parse. */
+export function parseEtime(s: string): number | undefined {
+	const m = /^(?:(?:(\d+)-)?(\d{1,2}):)?(\d{1,2}):(\d{2})$/.exec(s.trim());
+	if (!m) return undefined;
+	const [, d = "0", h = "0", mi = "0", se = "0"] = m;
+	return ((Number(d) * 24 + Number(h)) * 60 + Number(mi)) * 60 + Number(se);
+}
+
+/**
+ * When a pid's process started (ms), from its elapsed time (`ps -o etime=`),
+ * so the answer doesn't depend on any time zone; undefined if unknown.
+ */
+export function pidStartedAt(pid: number, now = Date.now()): number | undefined {
+	if (!validPid(pid)) return undefined;
 	try {
-		const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 2000, env: { PATH: "/bin:/usr/bin", LC_ALL: "C" } });
-		const t = Date.parse(r.stdout.trim());
-		return Number.isFinite(t) ? t : undefined;
+		const r = spawnSync("ps", ["-o", "etime=", "-p", String(pid)], { encoding: "utf8", timeout: 2000, env: { PATH: "/bin:/usr/bin", LC_ALL: "C", TZ: "UTC" } });
+		const secs = parseEtime(r.stdout ?? "");
+		return secs === undefined ? undefined : now - secs * 1000;
 	} catch {
 		return undefined;
 	}
@@ -178,7 +195,7 @@ export function pidStartedAt(pid: number): number | undefined {
  * resolution, so allow 2 s.
  */
 export function lockOwnerAlive(l: LockInfo): boolean {
-	if (!isAlive(l.pid)) return false;
+	if (!validPid(l.pid) || !isAlive(l.pid)) return false;
 	if (l.pid === process.pid) return true;
 	const started = pidStartedAt(l.pid);
 	return started === undefined || started <= l.startedAt + 2000;
@@ -193,19 +210,39 @@ export function readLock(dir: string): LockInfo | undefined {
 	return readLockFile(join(dir, "holder.lock"));
 }
 
+/**
+ * Create the lock with its content in one step: write a temp file, then
+ * link it into place (link fails if the lock exists). A reader never sees
+ * an empty or half-written lock.
+ */
 function createExclusive(file: string, me: LockInfo): boolean {
+	const tmp = `${file}.new-${process.pid}-${randomBytes(4).toString("hex")}`;
 	try {
-		const fd = openSync(file, "wx", 0o600);
+		const fd = openSync(tmp, "wx", 0o600);
 		try {
 			writeSync(fd, JSON.stringify(me));
 			fsyncSync(fd);
 		} finally {
 			closeSync(fd);
 		}
+		linkSync(tmp, file);
 		return true;
 	} catch (e) {
 		if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
 		return false;
+	} finally {
+		rmSync(tmp, { force: true });
+	}
+}
+
+/** An unreadable lock this young counts as live (it may be mid-replace); older, it's stale. */
+export const UNREADABLE_LIVE_MS = 2000;
+
+function unreadableAndYoung(file: string): boolean {
+	try {
+		return Date.now() - statSync(file).mtimeMs < UNREADABLE_LIVE_MS;
+	} catch {
+		return false; // gone
 	}
 }
 
@@ -239,23 +276,25 @@ function takeLock(
 	me: LockInfo,
 	stale: (l: LockInfo) => boolean,
 	force: boolean,
-): { ok: true } | { ok: false; holder: LockInfo } {
+): { ok: true } | { ok: false; holder?: LockInfo } {
 	for (let attempt = 0; attempt < 3; attempt++) {
 		if (createExclusive(file, me)) return { ok: true };
 		const cur = readLockFile(file);
 		if (cur?.instance === me.instance) return { ok: true };
 		if (cur && !force && !stale(cur)) return { ok: false, holder: cur };
+		if (!cur && !force && unreadableAndYoung(file)) return { ok: false };
 		removeIfSame(file, cur);
 	}
 	const cur = readLockFile(file);
 	if (cur?.instance === me.instance) return { ok: true };
 	if (cur) return { ok: false, holder: cur };
-	return createExclusive(file, me) ? { ok: true } : { ok: false, holder: readLockFile(file) ?? me };
+	return createExclusive(file, me) ? { ok: true } : { ok: false, holder: readLockFile(file) };
 }
 
 /**
- * Take the holder lock with O_EXCL. A lock whose owner is gone (dead pid, a
- * reused pid, or unreadable) is stale and replaced, race-free. `force`
+ * Take the holder lock, created atomically (temp file, then link). A lock
+ * whose owner is gone (dead pid, a reused pid, a pid of 1 or less, or
+ * unreadable for over 2 s) is stale and replaced, race-free. `force`
  * replaces a live holder (takeover). Returns the live holder when the lock is
  * someone else's.
  */
@@ -263,7 +302,7 @@ export function acquireLock(
 	dir: string,
 	me: LockInfo,
 	opts: { force?: boolean; alive?: (l: LockInfo) => boolean } = {},
-): { ok: true } | { ok: false; holder: LockInfo } {
+): { ok: true } | { ok: false; holder?: LockInfo } {
 	const alive = opts.alive ?? lockOwnerAlive;
 	return takeLock(join(dir, "holder.lock"), me, (l) => !alive(l), !!opts.force);
 }
