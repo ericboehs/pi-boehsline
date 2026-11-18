@@ -2209,7 +2209,30 @@ export async function renderMermaid(el, source, opts = {}) {
         const v = n.getAttribute(a);
         if (v != null && !DATA_IMG.test(v.trim())) n.removeAttribute(a);
       }
+    floorMermaid(el.querySelector("svg"));
   } catch (e) {
     el.replaceChildren(h("div", { class: "err" }, `mermaid: ${e.message || e}`), h("pre", {}, source));
   }
+}
+
+// How far a diagram may shrink to fit its box. Mermaid draws at width 100% with its natural
+// width as the max, so a wide one (a before/after pair side by side, a long LR chain) shrank
+// until its labels were a few pixels tall. It now fits down to this share of its drawn size and
+// past that keeps that size, and the .mmd box scrolls sideways.
+export const MMD_MIN_SCALE = 0.75;
+
+/** The width style for a diagram drawn `natural` px wide: fits, but never under the floor. */
+export function mermaidWidth(natural, min = MMD_MIN_SCALE) {
+  if (!(natural > 0)) return null;
+  return { width: "100%", maxWidth: `${natural}px`, minWidth: `${Math.round(natural * min)}px` };
+}
+
+function floorMermaid(svg) {
+  if (!svg) return;
+  const box = svg.viewBox && svg.viewBox.baseVal;
+  const natural = (box && box.width) || parseFloat(svg.style.maxWidth) || 0;
+  const style = mermaidWidth(natural);
+  if (!style) return;
+  svg.removeAttribute("width");
+  Object.assign(svg.style, style);
 }

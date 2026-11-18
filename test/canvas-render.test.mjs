@@ -1167,3 +1167,10 @@ test("the page draws jobs with render.mjs's renderer, styled by render.css", () 
   // The log folded open shows the whole command, wrapped (the phone's cards have no hover title).
   assert.match(css, /\n\.job:has\(> details\.job-tail\[open\]\) > \.job-cmd \{ white-space: pre-wrap;/);
 });
+
+test("mermaidWidth fits a diagram but keeps it readable past the floor", () => {
+  assert.deepEqual(render.mermaidWidth(1600), { width: "100%", maxWidth: "1600px", minWidth: "1200px" });
+  assert.deepEqual(render.mermaidWidth(400, 0.5), { width: "100%", maxWidth: "400px", minWidth: "200px" });
+  assert.equal(render.mermaidWidth(0), null);
+  assert.equal(render.mermaidWidth(NaN), null);
+});
