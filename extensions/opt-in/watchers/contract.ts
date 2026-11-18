@@ -18,14 +18,20 @@ export const ACTOR_RE = /^[A-Za-z0-9-]{1,39}(\[bot\])?$/;
 export const SUBJECT_RE = /^(pr|issue):\d{1,7}$/;
 export const SHA_RE = /^[0-9a-f]{7,40}$/;
 export const VERBS = ["PUSH", "CI", "COMMENT", "REVIEW", "MERGED", "CLOSED", "OPENED"] as const;
+/** The contract's states, compared uppercased (scripts may send `open`, `success`, `inline`, …). */
 export const STATES = [
-	// CI
-	"SUCCESS", "FAILURE", "PENDING", "ERROR", "CANCELLED", "TIMED_OUT", "SKIPPED", "NEUTRAL", "ACTION_REQUIRED", "IN_PROGRESS", "QUEUED", "STALE",
-	// reviews
-	"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED",
 	// PRs and issues
-	"OPEN", "CLOSED", "MERGED", "DRAFT",
+	"OPEN", "CLOSED", "MERGED",
+	// comments
+	"CONVERSATION", "INLINE",
+	// reviews
+	"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING",
+	// CI
+	"SUCCESS", "FAILURE",
 ] as const;
+/** An actor the script couldn't resolve (say, a commit email with no account). Never wakes. */
+export const UNKNOWN_ACTOR = "unknown";
+export const MAX_ERRORS = 50;
 
 export type Verb = (typeof VERBS)[number];
 export type Kind = "act" | "info";
@@ -48,20 +54,33 @@ export interface WatchEvent {
 
 export type ParseResult = { ok: true; event: WatchEvent } | { ok: false; error: string };
 
-// Bidi embeddings, overrides and isolates; marks; zero-width characters; BOM.
-const INVISIBLE = /[\u202A-\u202E\u2066-\u2069\u200B-\u200F\u2060-\u2064\u061C\uFEFF\u180E\u00AD]/g;
 // C0 and C1 controls (tabs and newlines too; whitespace collapses after).
-// biome-ignore lint/suspicious/noControlCharactersInRegex: that's the point
-const CONTROLS = /[\u0000-\u001F\u007F-\u009F]/g;
+const CONTROLS = /\p{Cc}/gu;
+// Everything a reader can't see but a model can: format characters (bidi
+// embeddings, overrides and isolates, zero-width characters, BOM, soft hyphen),
+// private-use, lone surrogates and unassigned code points, Unicode tag
+// characters (ASCII smuggling), variation selectors, the combining grapheme
+// joiner, interlinear annotation marks and the Hangul fillers.
+const INVISIBLE = /[\p{Cf}\p{Co}\p{Cs}\p{Cn}\u{E0000}-\u{E007F}\uFE00-\uFE0F\u{E0100}-\u{E01EF}\u034F\uFFF9-\uFFFB\u115F\u1160\u3164\uFFA0]/gu;
 
-/** NFKC; strip bidi, zero-width and control characters; collapse whitespace; cut to `max` code points. */
+/** NFKC; strip control, format, invisible and unassigned characters; collapse whitespace; cut to `max` code points. */
 export function normalize(text: string, max: number): string {
-	const s = text.normalize("NFKC").replace(INVISIBLE, "").replace(CONTROLS, " ").replace(/\s+/g, " ").trim();
+	const s = text.normalize("NFKC").replace(CONTROLS, " ").replace(INVISIBLE, "").replace(/\s+/g, " ").trim();
 	const chars = Array.from(s);
 	return chars.length > max ? chars.slice(0, max).join("").trimEnd() : s;
 }
 
-/** https only, host on the list, at most URL_MAX characters. Anything else is dropped. */
+/**
+ * The URL paths a watcher may link to: a PR or issue (optionally its files,
+ * checks or commits tab), a commit, or an Actions run. Only structured tokens,
+ * so a URL can't carry free text past the guardian.
+ */
+export const URL_PATH_RE =
+	/^\/[\w.-]+\/[\w.-]+\/(?:(?:pull)\/\d{1,7}(?:\/(?:files|checks|commits))?|issues\/\d{1,7}|commit\/[0-9a-f]{7,40}|actions\/runs\/\d{1,15}(?:\/job\/\d{1,15})?)$/;
+/** The only fragments kept: anchors to a comment or review. Anything else is cut off. */
+export const URL_HASH_RE = /^#(?:issuecomment-\d{1,15}|discussion_r\d{1,15}|pullrequestreview-\d{1,15})$/;
+
+/** https only, host on the list, a structured path, at most URL_MAX characters. No query; only a comment anchor. Anything else is dropped. */
 export function checkUrl(url: unknown, hosts: string[]): string | undefined {
 	if (typeof url !== "string" || url.length > URL_MAX) return undefined;
 	let u: URL;
@@ -72,7 +91,8 @@ export function checkUrl(url: unknown, hosts: string[]): string | undefined {
 	}
 	if (u.protocol !== "https:" || u.username || u.password || u.port) return undefined;
 	if (!hosts.includes(u.hostname.toLowerCase())) return undefined;
-	return u.href;
+	if (!URL_PATH_RE.test(u.pathname)) return undefined;
+	return `${u.origin}${u.pathname}${URL_HASH_RE.test(u.hash) ? u.hash : ""}`;
 }
 
 const isStr = (v: unknown): v is string => typeof v === "string";
@@ -128,38 +148,48 @@ export function parseLine(line: string, urlHosts: string[]): ParseResult {
 
 export interface OutputResult {
 	events: WatchEvent[];
+	/** The first MAX_ERRORS reasons; `errorCount` has the total. */
 	errors: string[];
+	errorCount: number;
 	/** The whole run failed (oversized or not UTF-8); nothing should be committed. */
 	fatal?: string;
 }
 
 /** A run's whole stdout. Rejects oversized and non-UTF-8 output outright. */
 export function parseOutput(stdout: Buffer, urlHosts: string[]): OutputResult {
-	if (stdout.length > MAX_STDOUT_BYTES) return { events: [], errors: [], fatal: "stdout over 1 MB" };
+	if (stdout.length > MAX_STDOUT_BYTES) return { events: [], errors: [], errorCount: 0, fatal: "stdout over 1 MB" };
 	let text: string;
 	try {
 		text = new TextDecoder("utf-8", { fatal: true }).decode(stdout);
 	} catch {
-		return { events: [], errors: [], fatal: "stdout is not UTF-8" };
+		return { events: [], errors: [], errorCount: 0, fatal: "stdout is not UTF-8" };
 	}
 	const events: WatchEvent[] = [];
 	const errors: string[] = [];
+	let errorCount = 0;
+	const fail = (e: string) => {
+		errorCount++;
+		if (errors.length < MAX_ERRORS) errors.push(e);
+	};
 	for (const line of text.split("\n")) {
 		if (!line.trim()) continue;
 		if (events.length >= MAX_EVENTS) {
-			errors.push(`more than ${MAX_EVENTS} events; the rest dropped`);
+			fail(`more than ${MAX_EVENTS} events; the rest dropped`);
 			break;
 		}
 		const r = parseLine(line, urlHosts);
 		if (r.ok) events.push(r.event);
-		else errors.push(r.error);
+		else fail(r.error);
 	}
-	return { events, errors };
+	return { events, errors, errorCount };
 }
 
-/** The user's own activity never wakes the agent. */
+/** The user's own activity, and an actor the script couldn't resolve, never wake the agent. */
 export function forceInfo(ev: WatchEvent, me: string): WatchEvent {
-	return me && ev.actor.toLowerCase() === me.toLowerCase() && ev.kind !== "info" ? { ...ev, kind: "info" } : ev;
+	if (ev.kind === "info") return ev;
+	const actor = ev.actor.toLowerCase();
+	const mine = !!me && actor === me.toLowerCase();
+	return mine || actor === UNKNOWN_ACTOR ? { ...ev, kind: "info" } : ev;
 }
 
 function subjectLabel(subject: string): string {
@@ -178,7 +208,7 @@ export function textFor(ev: WatchEvent): string {
 		case "CI":
 			return `CI ${subj}${state || " UNKNOWN"}${sha}`;
 		case "COMMENT":
-			return `COMMENT ${subj} by ${ev.actor}`;
+			return `COMMENT ${subj}${state} by ${ev.actor}`;
 		case "REVIEW":
 			return `REVIEW ${subj}${state} by ${ev.actor}`;
 		case "MERGED":
