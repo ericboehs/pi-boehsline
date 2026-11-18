@@ -5,15 +5,18 @@
  * - A host-side secret scan runs first. A hit is withheld and never sent to
  *   any provider.
  * - Then one completion per item (at most 4 at once) through pi's model layer
- *   (`ctx.modelRegistry.complete`) with `tools: []`, temperature 0, ~60 output
- *   tokens and a 10 s timeout. The item sits between per-call random-nonce
- *   delimiters; an item that contains the nonce is rejected before any call.
+ *   (`ctx.modelRegistry.streamSimple(...).result()`, with no `reasoning`, so
+ *   thinking is off) with `tools: []`, temperature 0, ~60 output tokens and a
+ *   10 s timeout that holds even if the callee ignores the abort signal. The
+ *   item sits between per-call random-nonce delimiters; an item that contains
+ *   the nonce is rejected before any call.
  * - The reply must be exactly `{"injection":bool,"sensitive":bool}` after
  *   trimming. Prose, extra keys, a tool call, `stopReason !== "stop"`, an
  *   error, a timeout, a missing or unapproved model or missing credentials
  *   all fail closed. Only the two booleans are used; no model text goes
  *   anywhere.
- * - Verdicts are cached by sha256 of the normalized text for 24 h. Failures
+ * - Verdicts are cached by judge and sha256 of the normalized text for 24 h,
+ *   so a /model switch doesn't reuse another judge's verdicts. Failures
  *   are not cached. At most `callsPerHour` calls per watcher.
  *
  * Pure node, no pi imports: the completion function is injected.
@@ -63,6 +66,7 @@ export interface CompletionRequest {
 	tools: [];
 }
 
+/** A subset of pi-ai's SimpleStreamOptions (`cacheRetention` is a StreamOptions key). No `reasoning`: thinking stays off. */
 export interface CompletionOptions {
 	maxTokens: number;
 	temperature: number;
@@ -76,7 +80,8 @@ export type CompleteFn = (req: CompletionRequest, opts: CompletionOptions) => Pr
 /** Exactly {"injection":bool,"sensitive":bool}; anything else is undefined. */
 export function parseReply(reply: CompletionReply | undefined): { injection: boolean; sensitive: boolean } | undefined {
 	if (!reply || reply.stopReason !== "stop") return undefined;
-	const blocks = reply.content ?? [];
+	// A thinking block is ignored (never read); anything else that isn't text fails.
+	const blocks = (reply.content ?? []).filter((b) => b.type !== "thinking");
 	if (!blocks.length || blocks.some((b) => b.type !== "text" || typeof b.text !== "string")) return undefined;
 	const text = blocks.map((b) => b.text).join("").trim();
 	if (!text.startsWith("{") || !text.endsWith("}")) return undefined;
@@ -150,13 +155,13 @@ export class Guardian {
 		return true;
 	}
 
-	private async one(watcher: string, text: string, complete: CompleteFn | undefined, cap: number): Promise<Verdict> {
+	private async one(watcher: string, text: string, complete: CompleteFn | undefined, cap: number, judge: string): Promise<Verdict> {
 		const s = this.statsFor(watcher);
 		if (hasSecret(text)) {
 			s.secrets++;
 			return "secret";
 		}
-		const key = sha256(text);
+		const key = `${judge}:${sha256(text)}`;
 		const hit = this.cache.get(key);
 		if (hit && this.now() - hit.at < CACHE_TTL_MS) {
 			s.cacheHits++;
@@ -178,14 +183,28 @@ export class Guardian {
 		}
 		s.calls++;
 		let parsed: ReturnType<typeof parseReply>;
+		const abort = new AbortController();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		// The timeout doesn't trust the callee to honor the signal.
+		const timeout = new Promise<undefined>((resolve) => {
+			timer = setTimeout(() => {
+				abort.abort(new Error("guardian timeout"));
+				resolve(undefined);
+			}, this.timeoutMs);
+		});
 		try {
-			const reply = await complete(
-				{ systemPrompt: SYSTEM_PROMPT, messages: [{ role: "user", content: wrapped, timestamp: this.now() }], tools: [] },
-				{ maxTokens: MAX_TOKENS, temperature: 0, signal: AbortSignal.timeout(this.timeoutMs), cacheRetention: "none" },
+			const call = Promise.resolve().then(() =>
+				complete(
+					{ systemPrompt: SYSTEM_PROMPT, messages: [{ role: "user", content: wrapped, timestamp: this.now() }], tools: [] },
+					{ maxTokens: MAX_TOKENS, temperature: 0, signal: abort.signal, cacheRetention: "none" },
+				),
 			);
-			parsed = parseReply(reply);
+			call.catch(() => {});
+			parsed = parseReply(await Promise.race([call, timeout]));
 		} catch {
 			parsed = undefined;
+		} finally {
+			clearTimeout(timer);
 		}
 		if (!parsed) {
 			s.failures++;
@@ -197,13 +216,13 @@ export class Guardian {
 	}
 
 	/** Verdicts for each text, in order. Never throws. */
-	async check(watcher: string, texts: string[], complete: CompleteFn | undefined, cap = 200): Promise<Verdict[]> {
+	async check(watcher: string, texts: string[], complete: CompleteFn | undefined, cap = 200, judge = ""): Promise<Verdict[]> {
 		const out: Verdict[] = new Array(texts.length);
 		let next = 0;
 		const worker = async () => {
 			while (next < texts.length) {
 				const i = next++;
-				out[i] = await this.one(watcher, texts[i] as string, complete, cap);
+				out[i] = await this.one(watcher, texts[i] as string, complete, cap, judge);
 			}
 		};
 		await Promise.all(Array.from({ length: Math.min(CONCURRENCY, texts.length) }, worker));
