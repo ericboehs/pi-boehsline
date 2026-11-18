@@ -31,7 +31,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { optIn } from "../../../lib/opt-in.ts";
 import { commandProblem, type JudgeChoice, loadConfig, type LoadResult, matchesCwd, pickJudge, type WatcherConfig } from "./config.ts";
-import { forceInfo, parseOutput, textFor, type WatchEvent } from "./contract.ts";
+import { forceInfo, normalize, parseOutput, textFor, type WatchEvent } from "./contract.ts";
 import { applyVerdicts, type Delivered, formatMessage, freeTexts, wakeGate, WAKES_PER_HOUR, wantsWake } from "./delivery.ts";
 import { type CompleteFn, Guardian } from "./guardian.ts";
 import {
@@ -116,6 +116,15 @@ interface PendingState {
 	data: Buffer;
 }
 
+/**
+ * Events on their way to the agent, by the lowest run seq among them. A
+ * state is committed only when no batch with the same or a lower seq is
+ * still outstanding.
+ */
+interface Batch {
+	minSeq: number;
+}
+
 interface Runtime {
 	cfg: WatcherConfig;
 	dir: string;
@@ -131,6 +140,18 @@ interface Runtime {
 	pendingIds: Set<string>;
 	/** The script state that goes with `pending`: committed once that batch is delivered. */
 	pendingState?: PendingState;
+	/** The batch `pending` will become. */
+	pendingBatch?: Batch;
+	/** Every batch not yet delivered or dropped, `pendingBatch` included. */
+	batches: Set<Batch>;
+	/** The newest state waiting on a lower-seq batch before it can be committed. */
+	deferred?: PendingState;
+	/**
+	 * A batch was released, dropped or torn down: its events weren't delivered,
+	 * so no state from a run before then may be committed. Cleared when a run
+	 * completes with nothing in flight.
+	 */
+	dirty: boolean;
 	/** Batches between the 30 s timer and send (waiting on the guardian). */
 	flushing: number;
 	runSeq: number;
@@ -148,10 +169,19 @@ interface Runtime {
 }
 
 type Outgoing =
-	| { w: Runtime; delivered: Delivered[]; guardianFailed: boolean; state?: PendingState }
-	| { w: Runtime; note: string; seenIds?: string[]; state?: PendingState };
+	| { w: Runtime; delivered: Delivered[]; guardianFailed: boolean; state?: PendingState; batch?: Batch }
+	| { w: Runtime; note: string; seenIds?: string[]; state?: PendingState; batch?: Batch };
 
-const errText = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 160);
+/** An exception's text, normalized (no control or escape characters) and capped: it reaches notes and /watchers. */
+export const errText = (e: unknown): string => {
+	let msg: string;
+	try {
+		msg = e instanceof Error ? e.message : String(e);
+	} catch {
+		msg = "unknown error";
+	}
+	return normalize(typeof msg === "string" ? msg : String(msg), 160);
+};
 
 export function createWatchers(opts: HostOptions = {}) {
 	return (pi: ExtensionAPI) => {
@@ -231,18 +261,43 @@ export function createWatchers(opts: HostOptions = {}) {
 
 		// ── delivery ──
 
+		/** A batch won't be delivered: nothing from a run before now may be committed until a run completes idle. */
+		function drop(w: Runtime, batch: Batch | undefined) {
+			if (batch) w.batches.delete(batch);
+			w.dirty = true;
+			w.deferred = undefined;
+		}
+
 		/** Forget ids that won't be delivered, so a later run can queue them again. */
 		function release(item: Outgoing) {
 			if ("delivered" in item) for (const d of item.delivered) item.w.pendingIds.delete(d.id);
+			if (item.batch) drop(item.w, item.batch);
+		}
+
+		/**
+		 * Commit the newest known state, unless the runtime is dirty or a batch
+		 * with the same or a lower seq is still outstanding (then it waits).
+		 */
+		function tryCommit(w: Runtime, state: PendingState | undefined) {
+			if (state && (!w.deferred || state.seq > w.deferred.seq)) w.deferred = state;
+			const s = w.deferred;
+			if (!s) return;
+			if (w.dirty || s.seq <= w.committedSeq) {
+				w.deferred = undefined;
+				return;
+			}
+			for (const b of w.batches) if (b.minSeq <= s.seq) return;
+			if (!holdsLock(w.dir, instance)) return;
+			commitState(w.dir, s.data);
+			w.committedSeq = s.seq;
+			w.deferred = undefined;
 		}
 
 		/** After pi took the message: mark seen, then commit the script state that went with it. */
-		function markDelivered(w: Runtime, ids: string[], state: PendingState | undefined) {
+		function markDelivered(w: Runtime, ids: string[], state: PendingState | undefined, batch: Batch | undefined) {
 			w.seen.add(ids, now());
-			if (state && state.seq > w.committedSeq && holdsLock(w.dir, instance)) {
-				commitState(w.dir, state.data);
-				w.committedSeq = state.seq;
-			}
+			if (batch) w.batches.delete(batch);
+			tryCommit(w, state);
 		}
 
 		/** sendMessage, whether it returns or throws or rejects. `then` runs once pi has the message. */
@@ -270,6 +325,7 @@ export function createWatchers(opts: HostOptions = {}) {
 		}
 
 		function send(item: Outgoing) {
+			if (runtimes.get(item.w.cfg.id) !== item.w) return drop(item.w, item.batch);
 			if (compacting) {
 				outbox.push(item);
 				return;
@@ -282,9 +338,9 @@ export function createWatchers(opts: HostOptions = {}) {
 				return;
 			}
 			if ("note" in item) {
-				const { note, seenIds = [], state } = item;
+				const { note, seenIds = [], state, batch } = item;
 				post(item, { customType: MSG_TYPE, display: true, content: note, details: { watcher: w.cfg.id, events: [] } }, { triggerTurn: false }, () =>
-					markDelivered(w, seenIds, state),
+					markDelivered(w, seenIds, state, batch),
 				);
 				return;
 			}
@@ -303,8 +359,9 @@ export function createWatchers(opts: HostOptions = {}) {
 					})
 				: { allowed: false };
 			const wake = wants && gate.allowed;
-			// A waking message carries structured fields only; titles and excerpts stay out.
-			const content = formatMessage(w.cfg.id, delivered, wake);
+			// A waking message carries structured fields only; titles and excerpts stay out, and
+			// URLs too unless their owner/name was checked against `repos`.
+			const content = formatMessage(w.cfg.id, delivered, wake, !!w.cfg.repos);
 			const message = { customType: MSG_TYPE, display: true, content, details: { watcher: w.cfg.id, events: delivered, wake } };
 			// Info lines: no deliverAs. While a turn runs pi queues them for its end.
 			const options = wake ? ({ deliverAs: "followUp", triggerTurn: true } as const) : { triggerTurn: false };
@@ -317,7 +374,7 @@ export function createWatchers(opts: HostOptions = {}) {
 				// Seen, and the script state committed, only after delivery: a crash may repeat an event, never lose one.
 				const ids = delivered.map((d) => d.id);
 				for (const id of ids) w.pendingIds.delete(id);
-				markDelivered(w, ids, item.state);
+				markDelivered(w, ids, item.state, item.batch);
 				w.recent.push(...delivered);
 				w.recent.splice(0, Math.max(0, w.recent.length - SHOW_LIMIT));
 			});
@@ -326,15 +383,17 @@ export function createWatchers(opts: HostOptions = {}) {
 		function flushOutbox() {
 			const items = outbox;
 			outbox = [];
-			for (const item of items) if (runtimes.get(item.w.cfg.id) === item.w) send(item);
+			for (const item of items) send(item);
 		}
 
 		async function flushBatch(w: Runtime) {
 			w.batchTimer = undefined;
 			const batch = w.pending.splice(0);
 			const state = w.pendingState;
+			const owner = w.pendingBatch;
 			w.pendingState = undefined;
-			if (!batch.length || !started) return;
+			w.pendingBatch = undefined;
+			if (!batch.length || !started) return drop(w, owner);
 			let handed = false;
 			w.flushing++;
 			try {
@@ -344,24 +403,29 @@ export function createWatchers(opts: HostOptions = {}) {
 					? await guardian.check(w.cfg.id, items.map((i) => i.text), call?.complete, config?.guardian.callsPerHour ?? 200, call?.judge)
 					: [];
 				if (!started || runtimes.get(w.cfg.id) !== w) return;
-				const delivered = applyVerdicts(batch, verdicts);
+				const delivered = applyVerdicts(batch, verdicts, !!w.cfg.repos);
 				guardian.statsFor(w.cfg.id).withheld += delivered.filter((d) => d.withheld).length;
 				if (!w.secretNotified && verdicts.some((v) => v === "secret" || v === "sensitive")) {
 					w.secretNotified = true;
 					notify(`watchers · ${w.cfg.id}: withheld a credential-like string from an event (see /watchers show ${w.cfg.id}); not repeated this session`, "warning");
 				}
 				handed = true;
-				send({ w, delivered, guardianFailed: verdicts.includes("unavailable"), state });
+				send({ w, delivered, guardianFailed: verdicts.includes("unavailable"), state, batch: owner });
 			} catch (e) {
 				if (started && runtimes.get(w.cfg.id) === w) failure(w, `delivery failed: ${errText(e)}`);
 			} finally {
 				w.flushing--;
 				// Not handed to send: let a later run queue these ids again.
-				if (!handed) for (const ev of batch) w.pendingIds.delete(ev.id);
+				if (!handed) {
+					for (const ev of batch) w.pendingIds.delete(ev.id);
+					drop(w, owner);
+				}
 			}
 		}
 
-		function enqueue(w: Runtime, events: WatchEvent[], state?: PendingState) {
+		function enqueue(w: Runtime, events: WatchEvent[], seq: number, state?: PendingState) {
+			if (!w.pendingBatch) w.batches.add((w.pendingBatch = { minSeq: seq }));
+			else w.pendingBatch.minSeq = Math.min(w.pendingBatch.minSeq, seq);
 			for (const ev of events) {
 				w.pending.push(ev);
 				w.pendingIds.add(ev.id);
@@ -375,7 +439,7 @@ export function createWatchers(opts: HostOptions = {}) {
 		}
 
 		/** Nothing of this watcher's is waiting to be delivered. */
-		const idle = (w: Runtime) => !w.pending.length && !w.flushing && !w.pendingIds.size && !outbox.some((o) => o.w === w);
+		const idle = (w: Runtime) => !w.pending.length && !w.flushing && !w.pendingIds.size && !w.batches.size && !outbox.some((o) => o.w === w);
 
 		// ── polling ──
 
@@ -451,7 +515,7 @@ export function createWatchers(opts: HostOptions = {}) {
 			w.lastRunAt = started_;
 			w.stderrTail = r.stderrTail;
 			if (r.error || r.code !== 0) return failure(w, r.error ?? `exit ${r.code}`);
-			const out = parseOutput(r.stdout, w.cfg.urlHosts);
+			const out = parseOutput(r.stdout, w.cfg.urlHosts, w.cfg.repos);
 			if (out.fatal) return failure(w, out.fatal);
 			// Taken over during the run: commit nothing, send nothing.
 			if (!holdsLock(w.dir, instance)) {
@@ -463,6 +527,9 @@ export function createWatchers(opts: HostOptions = {}) {
 			w.lastError = undefined;
 			w.backoffMs = 0;
 			const state = next ? { seq, data: next } : undefined;
+			// A run that completes with nothing in flight saw every undelivered event again (none is
+			// pending or seen), so commits are safe from here on.
+			if (idle(w)) w.dirty = false;
 			const fresh = out.events.map((e) => forceInfo(e, w.cfg.me)).filter((e) => !w.seen.has(e.id) && !w.pendingIds.has(e.id));
 			const host = readHost(w.dir);
 			const backlog = host.lastPollAt === undefined || started_ - host.lastPollAt > BACKLOG_AFTER_MS;
@@ -470,19 +537,18 @@ export function createWatchers(opts: HostOptions = {}) {
 			if (backlog && fresh.length) {
 				// First run, or away a long while: one count, not a flood.
 				const ids = [...new Set(fresh.map((e) => e.id))];
+				const batch: Batch = { minSeq: seq };
+				w.batches.add(batch);
 				send({
 					w,
+					batch,
 					note: `[watch ${w.cfg.id}] ${ids.length} event${ids.length === 1 ? "" : "s"} since ${host.lastPollAt === undefined ? "the first check" : "the last check over an hour ago"}; caught up, not listed.`,
 					seenIds: ids,
 					state,
 				});
-			} else if (fresh.length) enqueue(w, dedupeIds(fresh), state);
-			else if (state && idle(w) && state.seq > w.committedSeq) {
-				// Nothing new and nothing in flight: commit now. With events still in flight the state
-				// is dropped instead; the next run re-reads the older state and dedupe absorbs the repeats.
-				commitState(w.dir, state.data);
-				w.committedSeq = seq;
-			}
+			} else if (fresh.length) enqueue(w, dedupeIds(fresh), seq, state);
+			// Nothing new: commit now, or once the earlier batches still in flight are delivered.
+			else tryCommit(w, state);
 			schedule(w, w.cfg.intervalMs);
 		}
 
@@ -494,6 +560,10 @@ export function createWatchers(opts: HostOptions = {}) {
 				if (w.timer) clearTimeout(w.timer);
 				if (w.batchTimer) clearTimeout(w.batchTimer);
 				w.timer = w.batchTimer = undefined;
+				// Whatever is in flight won't be delivered by this runtime.
+				w.batches.clear();
+				w.pendingBatch = undefined;
+				drop(w, undefined);
 				releaseLock(w.dir, instance);
 				releaseRunLock(w.dir, instance);
 			}
@@ -534,6 +604,8 @@ export function createWatchers(opts: HostOptions = {}) {
 					running: false,
 					pending: [],
 					pendingIds: new Set(),
+					batches: new Set(),
+					dirty: false,
 					flushing: 0,
 					runSeq: 0,
 					committedSeq: 0,
@@ -618,7 +690,7 @@ export function createWatchers(opts: HostOptions = {}) {
 			try {
 				const r = await runScript(w.cfg, { cwd: ctx.cwd, stateDir: dir, dryRun: true, timeoutMs: opts.runTimeoutMs, env, children });
 				if (r.error || r.code !== 0) return `${w.cfg.id} test: ${r.error ?? `exit ${r.code}`}${r.stderrTail ? ` · stderr: ${r.stderrTail}` : ""}`;
-				const out = parseOutput(r.stdout, w.cfg.urlHosts);
+				const out = parseOutput(r.stdout, w.cfg.urlHosts, w.cfg.repos);
 				if (out.fatal) return `${w.cfg.id} test: ${out.fatal}`;
 				const lines = out.events.map((e0) => {
 					const e = forceInfo(e0, w.cfg.me);

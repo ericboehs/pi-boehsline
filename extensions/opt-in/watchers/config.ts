@@ -12,6 +12,7 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { REPO_RE } from "./contract.ts";
 
 export type TomlValue = string | number | boolean | TomlValue[] | { [key: string]: TomlValue };
 export type TomlTable = { [key: string]: TomlValue };
@@ -228,6 +229,12 @@ export interface WatcherConfig {
 	me: string;
 	wake: "actionable" | "never";
 	urlHosts: string[];
+	/**
+	 * Lowercased `owner/name` slugs a URL may point at; a URL to any other repo
+	 * is dropped. Unset: any slug passes, but it's kept out of waking messages
+	 * and the guardian's withheld marker.
+	 */
+	repos?: string[];
 	/** Local quiet hours, [startHour, endHour): wakes become silent lines. */
 	quiet: [number, number];
 	/** The table as written, passed to the script on stdin. */
@@ -336,6 +343,15 @@ export function buildConfig(t: TomlTable, home = homedir()): WatchersConfig {
 			warnings.push(`${where}: quiet_hours must look like "22-07"; using 22-07`);
 			quiet = [22, 7];
 		}
+		let repos: string[] | undefined;
+		if (w.repos !== undefined) {
+			const list = strings(w.repos);
+			if (!list) warnings.push(`${where}: repos must be an array of "owner/name" strings; ignored`);
+			else {
+				for (const r of list) if (!REPO_RE.test(r)) warnings.push(`${where}: repos entry "${r}" isn't "owner/name"; ignored`);
+				repos = list.filter((r) => REPO_RE.test(r)).map((r) => r.toLowerCase());
+			}
+		}
 		ids.add(id);
 		watchers.push({
 			id,
@@ -345,6 +361,7 @@ export function buildConfig(t: TomlTable, home = homedir()): WatchersConfig {
 			me,
 			wake,
 			urlHosts: (strings(w.url_hosts) ?? ["github.com"]).map((h) => h.toLowerCase()),
+			...(repos ? { repos } : {}),
 			quiet,
 			raw: w,
 		});

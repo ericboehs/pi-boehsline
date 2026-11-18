@@ -80,8 +80,15 @@ export const URL_PATH_RE =
 /** The only fragments kept: anchors to a comment or review. Anything else is cut off. */
 export const URL_HASH_RE = /^#(?:issuecomment-\d{1,15}|discussion_r\d{1,15}|pullrequestreview-\d{1,15})$/;
 
-/** https only, host on the list, a structured path, at most URL_MAX characters. No query; only a comment anchor. Anything else is dropped. */
-export function checkUrl(url: unknown, hosts: string[]): string | undefined {
+/** An `owner/name` repo slug, as `repos` lists them. */
+export const REPO_RE = /^[\w.-]{1,100}\/[\w.-]{1,100}$/;
+
+/**
+ * https only, host on the list, a structured path, at most URL_MAX characters.
+ * No query; only a comment anchor. With `repos` set (lowercased `owner/name`),
+ * the URL's slug must be on it. Anything else is dropped.
+ */
+export function checkUrl(url: unknown, hosts: string[], repos?: string[]): string | undefined {
 	if (typeof url !== "string" || url.length > URL_MAX) return undefined;
 	let u: URL;
 	try {
@@ -92,13 +99,14 @@ export function checkUrl(url: unknown, hosts: string[]): string | undefined {
 	if (u.protocol !== "https:" || u.username || u.password || u.port) return undefined;
 	if (!hosts.includes(u.hostname.toLowerCase())) return undefined;
 	if (!URL_PATH_RE.test(u.pathname)) return undefined;
+	if (repos && !repos.includes(u.pathname.split("/").slice(1, 3).join("/").toLowerCase())) return undefined;
 	return `${u.origin}${u.pathname}${URL_HASH_RE.test(u.hash) ? u.hash : ""}`;
 }
 
 const isStr = (v: unknown): v is string => typeof v === "string";
 
 /** One stdout line to an event, or why it was dropped. */
-export function parseLine(line: string, urlHosts: string[]): ParseResult {
+export function parseLine(line: string, urlHosts: string[], repos?: string[]): ParseResult {
 	if (Buffer.byteLength(line, "utf8") > MAX_LINE_BYTES) return { ok: false, error: "line over 2 KB" };
 	let o: unknown;
 	try {
@@ -139,7 +147,7 @@ export function parseLine(line: string, urlHosts: string[]): ParseResult {
 		if (u) ev.untrusted = u;
 	}
 	if (r.url !== undefined) {
-		const url = checkUrl(r.url, urlHosts);
+		const url = checkUrl(r.url, urlHosts, repos);
 		if (url) ev.url = url;
 		// An off-list or non-https URL is dropped, not the event.
 	}
@@ -156,7 +164,7 @@ export interface OutputResult {
 }
 
 /** A run's whole stdout. Rejects oversized and non-UTF-8 output outright. */
-export function parseOutput(stdout: Buffer, urlHosts: string[]): OutputResult {
+export function parseOutput(stdout: Buffer, urlHosts: string[], repos?: string[]): OutputResult {
 	if (stdout.length > MAX_STDOUT_BYTES) return { events: [], errors: [], errorCount: 0, fatal: "stdout over 1 MB" };
 	let text: string;
 	try {
@@ -177,7 +185,7 @@ export function parseOutput(stdout: Buffer, urlHosts: string[]): OutputResult {
 			fail(`more than ${MAX_EVENTS} events; the rest dropped`);
 			break;
 		}
-		const r = parseLine(line, urlHosts);
+		const r = parseLine(line, urlHosts, repos);
 		if (r.ok) events.push(r.event);
 		else fail(r.error);
 	}

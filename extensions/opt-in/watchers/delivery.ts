@@ -42,8 +42,13 @@ export function freeTexts(events: WatchEvent[]): Array<{ event: number; field: "
 	return out;
 }
 
-/** Apply verdicts (one per freeTexts item) to the events. */
-export function applyVerdicts(events: WatchEvent[], verdicts: Verdict[]): Delivered[] {
+/**
+ * Apply verdicts (one per freeTexts item) to the events. `repoChecked`: the
+ * URLs' owner/name slugs were checked against the watcher's `repos`. Only
+ * then does the withheld marker carry the URL; an unchecked slug is free
+ * text no guardian has seen.
+ */
+export function applyVerdicts(events: WatchEvent[], verdicts: Verdict[], repoChecked = false): Delivered[] {
 	const items = freeTexts(events);
 	const out: Delivered[] = events.map((ev) => {
 		const d: Delivered = { id: ev.id, kind: ev.kind, actor: ev.actor, subject: ev.subject, verb: ev.verb, text: textFor(ev) };
@@ -57,7 +62,7 @@ export function applyVerdicts(events: WatchEvent[], verdicts: Verdict[]): Delive
 		const ev = events[item.event] as WatchEvent;
 		const d = out[item.event] as Delivered;
 		const verdict = verdicts[k] ?? "unavailable";
-		const withheld = withheldText(verdict, ev.url);
+		const withheld = withheldText(verdict, repoChecked ? ev.url : undefined);
 		const shown = withheld ?? item.text;
 		if (item.field === "title") d.title = shown;
 		else d.excerpt = shown;
@@ -113,8 +118,12 @@ export function mergeBySubject(delivered: Delivered[]): Delivered[][] {
 
 const quote = (s: string) => `"${s.replace(/"/g, "'")}"`;
 
-/** One group's line. `structuredOnly` leaves out titles and excerpts (waking messages). */
-export function groupLine(group: Delivered[], structuredOnly: boolean): string {
+/**
+ * One group's line. `structuredOnly` leaves out titles and excerpts (waking
+ * messages), and the URL too unless `repoChecked`: its owner/name slug is
+ * free text, so a waking line keeps only "PR #N" and the structured fields.
+ */
+export function groupLine(group: Delivered[], structuredOnly: boolean, repoChecked = false): string {
 	const act = group.some((d) => d.kind === "act" && !d.withheld);
 	const parts = [group.map((d) => d.text).join(" · ")];
 	if (!structuredOnly) {
@@ -122,13 +131,13 @@ export function groupLine(group: Delivered[], structuredOnly: boolean): string {
 		if (title) parts.push(`title: ${quote(title)}`);
 		for (const d of group) if (d.excerpt) parts.push(`excerpt: ${quote(d.excerpt)}`);
 	}
-	const url = [...group].reverse().find((d) => d.url)?.url;
+	const url = structuredOnly && !repoChecked ? undefined : [...group].reverse().find((d) => d.url)?.url;
 	return `- ${act ? "[act] " : ""}${parts.join(" · ")}${url ? ` <${url}>` : ""}`;
 }
 
-export function formatMessage(watcherId: string, delivered: Delivered[], structuredOnly: boolean): string {
+export function formatMessage(watcherId: string, delivered: Delivered[], structuredOnly: boolean, repoChecked = false): string {
 	const groups = mergeBySubject(delivered);
-	const lines = groups.slice(0, MAX_LINES).map((g) => groupLine(g, structuredOnly));
+	const lines = groups.slice(0, MAX_LINES).map((g) => groupLine(g, structuredOnly, repoChecked));
 	if (groups.length > MAX_LINES) lines.push(`…and ${groups.length - MAX_LINES} more (/watchers show ${watcherId})`);
 	return [`[watch ${watcherId}] ${HEADER_NOTE}`, ...lines].join("\n");
 }
