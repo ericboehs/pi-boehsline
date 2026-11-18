@@ -4,7 +4,8 @@
  *
  * - A host-side secret scan runs first. A hit is withheld and never sent to
  *   any provider.
- * - Then one completion per item (at most 4 at once) through pi's model layer
+ * - Then one completion per item (at most 4 in flight, counting calls that
+ *   timed out but haven't settled; no slot within the timeout fails closed) through pi's model layer
  *   (`ctx.modelRegistry.streamSimple(...).result()`, with no `reasoning`, so
  *   thinking is off) with `tools: []`, temperature 0, ~60 output tokens and a
  *   10 s timeout that holds even if the callee ignores the abort signal. The
@@ -128,6 +129,9 @@ export class Guardian {
 	private readonly now: () => number;
 	private readonly nonce: () => string;
 	private readonly timeoutMs: number;
+	/** Calls started and not yet settled, timed-out ones included. Never above CONCURRENCY. */
+	private active = 0;
+	private readonly waiters: Array<() => boolean> = [];
 
 	constructor(deps: GuardianDeps = {}) {
 		this.now = deps.now ?? Date.now;
@@ -147,6 +151,43 @@ export class Guardian {
 		const log = (this.callLog.get(watcher) ?? []).filter((t) => t > cutoff);
 		this.callLog.set(watcher, log);
 		return log.length;
+	}
+
+	/** Calls in flight right now (tests and /watchers). */
+	get inFlight(): number {
+		return this.active;
+	}
+
+	/** Wait for one of the CONCURRENCY call slots; false if none frees up within the timeout. */
+	private slot(): Promise<boolean> {
+		if (this.active < CONCURRENCY) {
+			this.active++;
+			return Promise.resolve(true);
+		}
+		return new Promise((resolve) => {
+			let done = false;
+			const take = () => {
+				if (done) return false;
+				done = true;
+				clearTimeout(timer);
+				this.active++;
+				resolve(true);
+				return true;
+			};
+			const timer = setTimeout(() => {
+				if (done) return;
+				done = true;
+				const i = this.waiters.indexOf(take);
+				if (i >= 0) this.waiters.splice(i, 1);
+				resolve(false);
+			}, this.timeoutMs);
+			this.waiters.push(take);
+		});
+	}
+
+	private freeSlot(): void {
+		this.active--;
+		while (this.active < CONCURRENCY && this.waiters.length) (this.waiters.shift() as () => boolean)();
 	}
 
 	private takeCall(watcher: string, cap: number): boolean {
@@ -177,7 +218,14 @@ export class Guardian {
 			s.failures++;
 			return "unavailable";
 		}
+		// A slot is held until the call settles, not just until it times out, so a callee
+		// that ignores the abort signal still counts against CONCURRENCY.
+		if (!(await this.slot())) {
+			s.failures++;
+			return "unavailable";
+		}
 		if (!this.takeCall(watcher, cap)) {
+			this.freeSlot();
 			s.capped++;
 			return "unavailable";
 		}
@@ -199,7 +247,8 @@ export class Guardian {
 					{ maxTokens: MAX_TOKENS, temperature: 0, signal: abort.signal, cacheRetention: "none" },
 				),
 			);
-			call.catch(() => {});
+			const free = () => this.freeSlot();
+			call.then(free, free);
 			parsed = parseReply(await Promise.race([call, timeout]));
 		} catch {
 			parsed = undefined;
