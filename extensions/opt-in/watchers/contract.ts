@@ -192,9 +192,13 @@ export function parseOutput(stdout: Buffer, urlHosts: string[], repos?: string[]
 	return { events, errors, errorCount };
 }
 
-/** The user's own activity, and an actor the script couldn't resolve, never wake the agent. */
+/**
+ * The user's own activity, and an actor the script couldn't resolve, never wake the agent.
+ * CI is exempt: its actor is the PR author (a failure on my own PR should wake), the
+ * script decides whether it's actionable, and its text never shows the actor.
+ */
 export function forceInfo(ev: WatchEvent, me: string): WatchEvent {
-	if (ev.kind === "info") return ev;
+	if (ev.kind === "info" || ev.verb === "CI") return ev;
 	const actor = ev.actor.toLowerCase();
 	const mine = !!me && actor === me.toLowerCase();
 	return mine || actor === UNKNOWN_ACTOR ? { ...ev, kind: "info" } : ev;

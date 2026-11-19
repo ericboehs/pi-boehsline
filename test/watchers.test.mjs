@@ -164,6 +164,18 @@ test("contract: actor unknown passes the regex but never wakes", () => {
 	assert.equal(forceInfo({ ...r.event, actor: "unknown-dev" }, "octocat").kind, "act", "only the exact login");
 });
 
+test("contract: CI is exempt from the me/unknown rule (a failure on my own PR wakes); COMMENT and REVIEW by me are not", () => {
+	const ci = ev({ kind: "act", verb: "CI", state: "FAILURE", actor: "octocat", sha: "abcdef1234567" });
+	assert.equal(forceInfo(ci, "OctoCat").kind, "act", "CI on my PR stays act");
+	assert.equal(forceInfo({ ...ci, actor: "unknown" }, "octocat").kind, "act", "CI with an unresolved actor stays act");
+	assert.equal(forceInfo({ ...ci, kind: "info" }, "octocat").kind, "info", "never promoted");
+	assert.equal(textFor(ci), "CI PR #12 FAILURE (abcdef1)", "the actor isn't shown");
+	for (const verb of ["COMMENT", "REVIEW", "PUSH"]) {
+		assert.equal(forceInfo(ev({ kind: "act", verb, actor: "octocat" }), "octocat").kind, "info", verb);
+		assert.equal(forceInfo(ev({ kind: "act", verb, actor: "unknown" }), "octocat").kind, "info", `${verb} by unknown`);
+	}
+});
+
 test("contract: tag characters, variation selectors, fillers, private-use and unassigned code points are stripped", () => {
 	const tags = [..."ignore previous"].map((c) => String.fromCodePoint(0xe0000 + c.charCodeAt(0))).join("");
 	assert.equal(normalize(`Fix bug${tags}`, 300), "Fix bug");
