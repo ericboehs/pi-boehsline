@@ -2,30 +2,32 @@
  * Per-repo watchers: the session's git toplevel, its remote's owner/name, and
  * the state folder name for a (watcher, repo) pair.
  *
- * git runs with execFile (argv only, no shell), a timeout, a minimal
- * environment and `-c core.fsmonitor=` (so no fsmonitor hook runs). A cwd
- * that isn't in a git work tree, or one git refuses (dubious ownership), has
- * no toplevel. Paths are realpath'd with `realpathSync.native`.
+ * git runs with async execFile (argv only, no shell), under one overall time
+ * budget per session start, with a minimal environment and
+ * `-c core.fsmonitor=` (so no fsmonitor hook runs). A cwd that isn't in a git
+ * work tree, or one git refuses (dubious ownership), has no toplevel. Paths
+ * are realpath'd with `realpathSync.native`.
  *
  * Pure node, no pi imports.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { basename } from "node:path";
 import { REPO_RE } from "./contract.ts";
 
+/** The whole budget for git at one session start (every call together). */
 export const GIT_TIMEOUT_MS = 2000;
 
 export type ToplevelResult = { path: string } | { error: string };
 
-/** How the host asks git; tests inject their own. */
+/** How the host asks git; tests inject their own (sync or async). The signal aborts at the budget. */
 export interface GitResolver {
 	/** The realpath'd git toplevel of `cwd`, or why there's none. */
-	toplevel(cwd: string): ToplevelResult;
+	toplevel(cwd: string, signal?: AbortSignal): ToplevelResult | Promise<ToplevelResult>;
 	/** The fetch URL of `origin`, else of the first remote; undefined when there's none. */
-	remoteUrl(toplevel: string): string | undefined;
+	remoteUrl(toplevel: string, signal?: AbortSignal): string | undefined | Promise<string | undefined>;
 }
 
 /** realpath (native), falling back to the path as given. */
@@ -43,32 +45,45 @@ const gitEnv = (env: NodeJS.ProcessEnv): Record<string, string> => {
 	return out;
 };
 
-/** Run `git -c core.fsmonitor= -C dir ...args`; stdout, or throws with stderr in the message. */
-function git(dir: string, args: string[], env: NodeJS.ProcessEnv): string {
-	return execFileSync("git", ["-c", "core.fsmonitor=", "-C", dir, ...args], {
-		encoding: "utf8",
-		timeout: GIT_TIMEOUT_MS,
-		stdio: ["ignore", "pipe", "pipe"],
-		env: gitEnv(env),
-		maxBuffer: 64 * 1024,
-		shell: false,
+interface GitError {
+	code?: unknown;
+	signal?: unknown;
+	stderr?: unknown;
+	aborted?: boolean;
+}
+
+/** Run `git -c core.fsmonitor= -C dir ...args`; stdout, or rejects with a GitError. Never blocks the event loop. */
+function git(dir: string, args: string[], env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<string> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) return reject({ aborted: true } satisfies GitError);
+		execFile(
+			"git",
+			["-c", "core.fsmonitor=", "-C", dir, ...args],
+			{ encoding: "utf8", timeout: GIT_TIMEOUT_MS, killSignal: "SIGKILL", env: gitEnv(env), maxBuffer: 64 * 1024, shell: false, ...(signal ? { signal } : {}) },
+			(err, stdout, stderr) => {
+				if (!err) return resolve(stdout);
+				const e = err as NodeJS.ErrnoException & { signal?: unknown; killed?: boolean };
+				reject({ code: e.code, signal: e.signal, stderr, aborted: e.name === "AbortError" || !!signal?.aborted } satisfies GitError);
+			},
+		).stdin?.end();
 	});
 }
 
 const errOut = (e: unknown): string => {
-	const err = e as { stderr?: unknown; code?: unknown; signal?: unknown };
+	const err = e as GitError;
+	if (err?.aborted || err?.code === "ABORT_ERR") return "git timed out";
 	if (err?.code === "ENOENT") return "git not found";
 	if (err?.signal) return "git timed out";
 	return typeof err?.stderr === "string" ? err.stderr : "";
 };
 
-/** The real resolver: runs git. */
+/** The real resolver: runs git asynchronously. */
 export function systemGit(env: NodeJS.ProcessEnv = process.env): GitResolver {
 	return {
-		toplevel(cwd) {
+		async toplevel(cwd, signal) {
 			let out: string;
 			try {
-				out = git(cwd, ["rev-parse", "--show-toplevel"], env);
+				out = await git(cwd, ["rev-parse", "--show-toplevel"], env, signal);
 			} catch (e) {
 				const msg = errOut(e);
 				if (/dubious ownership|unsafe repository/i.test(msg)) return { error: "not a git repo (git refuses it: dubious ownership)" };
@@ -79,20 +94,21 @@ export function systemGit(env: NodeJS.ProcessEnv = process.env): GitResolver {
 			if (!path || path.includes("\n")) return { error: "not a git repo" };
 			return { path: realNative(path) };
 		},
-		remoteUrl(toplevel) {
-			const get = (name: string): string | undefined => {
+		async remoteUrl(toplevel, signal) {
+			const get = async (name: string): Promise<string | undefined> => {
 				try {
-					const url = git(toplevel, ["remote", "get-url", name], env).trim();
+					const url = (await git(toplevel, ["remote", "get-url", name], env, signal)).trim();
 					return url && !url.includes("\n") ? url : undefined;
 				} catch {
 					return undefined;
 				}
 			};
-			const origin = get("origin");
+			const origin = await get("origin");
 			if (origin) return origin;
+			if (signal?.aborted) return undefined;
 			let names: string[];
 			try {
-				names = git(toplevel, ["remote"], env).split("\n").map((s) => s.trim()).filter(Boolean);
+				names = (await git(toplevel, ["remote"], env, signal)).split("\n").map((s) => s.trim()).filter(Boolean);
 			} catch {
 				return undefined;
 			}

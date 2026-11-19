@@ -861,7 +861,12 @@ function setup({ guardian = 'by_provider = { acme = "acme/judge-1" }\napproved =
 function host(s, over = {}) {
 	const st = stub();
 	const peek = createWatchers({ configPath: s.config, stateRoot: s.stateRoot, batchMs: 20, env: { PATH: process.env.PATH, HOME: process.env.HOME }, registry: {}, ...over })(st.pi);
-	return { ...st, peek };
+	// session_start isn't awaited by pi (git runs async); wait for the runtimes to be up.
+	const fire = async (event, payload, ctx) => {
+		await st.fire(event, payload, ctx);
+		if (event === "session_start") await peek.ready;
+	};
+	return { ...st, fire, peek };
 }
 
 const shutdown = (h, ctx) => h.fire("session_shutdown", { reason: "quit" }, ctx);
@@ -1631,24 +1636,114 @@ test("scope = watcher: state paths are unchanged; WATCHER_CWD is passed, realpat
 	await shutdown(h, s.ctx);
 });
 
-test("repo: a real git repo resolves its toplevel from a subdir and its remote (origin, else the first remote)", { skip: !hasGit() && "git not installed" }, () => {
+test("repo: a real git repo resolves its toplevel from a subdir and its remote (origin, else the first remote)", { skip: !hasGit() && "git not installed" }, async () => {
 	const dir = tmp("watchers-git-");
 	const repo = join(dir, "Widgets");
 	mkdirSync(join(repo, "deep", "er"), { recursive: true });
 	const g = (...args) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
 	g("init", "-q");
 	const resolver = systemGit({ PATH: process.env.PATH, HOME: process.env.HOME });
-	const top = resolver.toplevel(join(repo, "deep", "er"));
+	const top = await resolver.toplevel(join(repo, "deep", "er"));
 	assert.deepEqual(top, { path: realpathSync.native(repo) });
-	assert.equal(resolver.remoteUrl(top.path), undefined, "no remotes");
+	assert.equal(await resolver.remoteUrl(top.path), undefined, "no remotes");
 	g("remote", "add", "upstream", "git@github.com:acme/widgets.git");
-	assert.equal(resolver.remoteUrl(top.path), "git@github.com:acme/widgets.git", "the first remote");
+	assert.equal(await resolver.remoteUrl(top.path), "git@github.com:acme/widgets.git", "the first remote");
 	g("remote", "add", "origin", "https://github.com/acme/gadgets.git");
-	assert.equal(resolver.remoteUrl(top.path), "https://github.com/acme/gadgets.git", "origin wins");
-	assert.deepEqual(parseRemote(resolver.remoteUrl(top.path), ["github.com"]), { host: "github.com", repo: "acme/gadgets" });
-	assert.ok("error" in resolver.toplevel(dir), "outside the repo");
+	assert.equal(await resolver.remoteUrl(top.path), "https://github.com/acme/gadgets.git", "origin wins");
+	assert.deepEqual(parseRemote(await resolver.remoteUrl(top.path), ["github.com"]), { host: "github.com", repo: "acme/gadgets" });
+	assert.ok("error" in (await resolver.toplevel(dir)), "outside the repo");
 	assert.match(repoDirName(top.path), /^widgets-[0-9a-f]{8}$/);
 	assert.equal(basename(top.path), "Widgets");
+});
+
+test("scope = watcher without auto: git is never asked and no WATCHER_REPO is exported", async () => {
+	const s = setup({ events: [] });
+	let asked = 0;
+	const git = { toplevel: () => (asked++, { path: s.work }), remoteUrl: () => (asked++, "https://github.com/acme/widgets.git") };
+	const h = host(s, { git, complete: async () => okReply() });
+	await h.fire("session_start", { reason: "startup" }, s.ctx);
+	assert.ok(h.peek.runtimes.get("widgets"));
+	await waitFor(() => existsSync(join(s.stateDir, "state.json")));
+	assert.equal(asked, 0);
+	const env = Object.fromEntries(readFileSync(join(s.scriptDir, "env.txt"), "utf8").trim().split("\n").map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
+	assert.equal(env.WATCHER_REPO, undefined);
+	assert.equal(env.WATCHER_CWD, realpathSync.native(s.work));
+	await shutdown(h, s.ctx);
+});
+
+/** Call session_start the way pi does: not awaiting anything the handler starts. */
+const rawStart = (h, ctx) => {
+	const t0 = Date.now();
+	for (const fn of h.handlers.get("session_start")) fn({ reason: "startup" }, ctx);
+	return Date.now() - t0;
+};
+
+test("git at session start: a hung git doesn't block startup or the event loop; one budget, then the watcher is skipped", async () => {
+	const s = repoSetup();
+	let aborted = 0;
+	const hung = (signal) => new Promise(() => signal?.addEventListener("abort", () => aborted++));
+	const h = host(s, { git: { toplevel: (_cwd, signal) => hung(signal), remoteUrl: () => undefined }, gitBudgetMs: 150, complete: async () => okReply() });
+	let ticks = 0;
+	const tick = setInterval(() => ticks++, 10);
+	const t0 = Date.now();
+	assert.ok(rawStart(h, s.at(s.a)) < 50, "session_start returns at once");
+	assert.equal(h.peek.runtimes.size, 0, "runtimes start after git answers");
+	await h.peek.ready;
+	const took = Date.now() - t0;
+	clearInterval(tick);
+	assert.ok(took >= 140 && took < 1000, `one budget (${took} ms)`);
+	assert.ok(ticks >= 5, `the event loop kept running (${ticks} ticks)`);
+	assert.equal(aborted, 1, "the hung call is aborted");
+	assert.equal(h.peek.runtimes.size, 0);
+	assert.match(h.peek.skipped.get("widgets"), /git timed out.*scope = "repo" needs one/);
+	await shutdown(h, s.ctx);
+});
+
+test("git at session start: the budget covers every call together; a hung remote leaves repos auto unresolved", async () => {
+	const s = repoSetup('scope = "repo"\nrepos = ["auto"]');
+	const git = {
+		toplevel: async () => (await sleep(60), { path: s.a }),
+		remoteUrl: () => new Promise(() => {}),
+	};
+	const h = host(s, { git, gitBudgetMs: 200, complete: async () => okReply() });
+	const t0 = Date.now();
+	await h.fire("session_start", { reason: "startup" }, s.at(s.a));
+	const took = Date.now() - t0;
+	assert.ok(took >= 190 && took < 400, `200 ms in all, not 200 per call (${took} ms)`);
+	const w = h.peek.runtimes.get("widgets");
+	assert.equal(w.repoKey, s.a, "a slow toplevel within the budget still counts");
+	assert.deepEqual(w.cfg.repos, [], "fail closed");
+	await shutdown(h, s.ctx);
+});
+
+test("git at session start: a shutdown while git runs starts nothing", async () => {
+	const s = repoSetup();
+	const git = { toplevel: async () => (await sleep(80), { path: s.a }), remoteUrl: () => undefined };
+	const h = host(s, { git, complete: async () => okReply() });
+	rawStart(h, s.at(s.a));
+	await shutdown(h, s.ctx);
+	await h.peek.ready;
+	assert.equal(h.peek.runtimes.size, 0);
+	assert.equal(h.peek.started, false);
+	await sleep(80);
+	assert.ok(!existsSync(join(s.scriptDir, "pid")), "the script never ran");
+});
+
+test("repo: the real resolver kills a hung git at the budget and never blocks", { skip: process.platform === "win32" && "sh script" }, async () => {
+	const bin = tmp("watchers-fakegit-");
+	writeFileSync(join(bin, "git"), "#!/bin/sh\nexec sleep 10\n", { mode: 0o755 });
+	const resolver = systemGit({ PATH: `${bin}:${process.env.PATH}`, HOME: process.env.HOME });
+	const ac = new AbortController();
+	setTimeout(() => ac.abort(), 100);
+	let ticks = 0;
+	const tick = setInterval(() => ticks++, 10);
+	const t0 = Date.now();
+	const top = await resolver.toplevel(bin, ac.signal);
+	clearInterval(tick);
+	assert.deepEqual(top, { error: "not a git repo (git timed out)" });
+	assert.ok(Date.now() - t0 < 1000);
+	assert.ok(ticks >= 5, "the event loop kept running");
+	assert.equal(await resolver.remoteUrl(bin, ac.signal), undefined, "an aborted budget asks nothing more");
 });
 
 test("opt-in: off by default; on, it registers the command and session handlers", async () => {

@@ -36,7 +36,7 @@ import { commandProblem, type JudgeChoice, loadConfig, type LoadResult, matchesC
 import { forceInfo, normalize, parseOutput, textFor, type WatchEvent } from "./contract.ts";
 import { applyVerdicts, type Delivered, formatMessage, freeTexts, wakeGate, WAKES_PER_HOUR, wantsWake } from "./delivery.ts";
 import { type CompleteFn, Guardian } from "./guardian.ts";
-import { type GitResolver, parseRemote, realNative, repoDirName, systemGit, type ToplevelResult } from "./repo.ts";
+import { GIT_TIMEOUT_MS, type GitResolver, parseRemote, realNative, repoDirName, systemGit, type ToplevelResult } from "./repo.ts";
 import {
 	acquireLock,
 	acquireRunLock,
@@ -114,6 +114,8 @@ export interface HostOptions {
 	registry?: Registry;
 	/** How git is asked for the toplevel and remote (tests inject one). */
 	git?: GitResolver;
+	/** The overall git budget per session start (tests shorten it). */
+	gitBudgetMs?: number;
 }
 
 interface PendingState {
@@ -208,6 +210,9 @@ export function createWatchers(opts: HostOptions = {}) {
 		/** Watchers that match this folder but didn't start, and why (scope = "repo" outside a git repo). */
 		let skipped = new Map<string, string>();
 		const git = opts.git ?? systemGit(env);
+		const gitBudgetMs = opts.gitBudgetMs ?? GIT_TIMEOUT_MS;
+		/** The last start, settled once git has answered (or the budget ran out) and the runtimes are up. */
+		let ready: Promise<void> = Promise.resolve();
 		let instance = "";
 		let started = false;
 		let compacting = false;
@@ -591,7 +596,7 @@ export function createWatchers(opts: HostOptions = {}) {
 			if (reg.host?.instance === instance) reg.host = undefined;
 		}
 
-		function start(ctx: ExtensionContext, reason?: string) {
+		function start(ctx: ExtensionContext, reason?: string): Promise<void> {
 			// Idempotent: whatever ran before (a missed shutdown, a reload) goes first.
 			reg.host?.teardown();
 			ctxRef = ctx;
@@ -608,32 +613,65 @@ export function createWatchers(opts: HostOptions = {}) {
 			for (const warning of config.warnings) notify(`watchers · ${warning}`, "warning");
 			const root = opts.stateRoot ?? defaultStateRoot(env);
 			const cwd = realNative(ctx.cwd);
-			// git is asked at most once per start, and only when a watcher matches.
-			let top: ToplevelResult | undefined;
-			let remote: { url?: string } | undefined;
-			const toplevel = () => {
-				if (!top) {
-					try {
-						top = git.toplevel(cwd);
-					} catch (e) {
-						top = { error: `not a git repo (${errText(e)})` };
-					}
+			const matched = config.watchers.filter((c) => matchesCwd(c.matchCwd, ctx.cwd));
+			// git is asked only when a matching watcher needs the repo (scope = "repo" or repos = ["auto"]),
+			// asynchronously, under one budget for every call together, and the runtimes start after it.
+			if (!matched.some((c) => c.scope === "repo" || c.reposAuto)) {
+				launch(matched, root, cwd, carried, { error: "not a git repo" });
+				return Promise.resolve();
+			}
+			const mine = instance;
+			return resolveRepo(cwd).then((r) => {
+				// A shutdown or another start while git ran: this start is void.
+				if (!started || instance !== mine) return;
+				launch(matched, root, cwd, carried, r.top, r.url);
+			});
+		}
+
+		/** The toplevel of `cwd` and its remote URL, within GIT_TIMEOUT_MS overall; a hung git can't hold the start. */
+		async function resolveRepo(cwd: string): Promise<{ top: ToplevelResult; url?: string }> {
+			const ac = new AbortController();
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const expired = new Promise<"timeout">((resolve) => {
+				timer = setTimeout(() => {
+					ac.abort();
+					resolve("timeout");
+				}, gitBudgetMs);
+				timer.unref?.();
+			});
+			const within = async <T>(f: () => T | Promise<T>): Promise<T | "timeout"> => {
+				try {
+					return await Promise.race([Promise.resolve().then(f), expired]);
+				} catch (e) {
+					if (ac.signal.aborted) return "timeout";
+					throw e;
 				}
-				return top;
 			};
-			const remoteUrl = (path: string) => {
-				if (!remote) {
-					try {
-						remote = { url: git.remoteUrl(path) };
-					} catch {
-						remote = {};
-					}
+			try {
+				let top: ToplevelResult;
+				try {
+					const t = await within(() => git.toplevel(cwd, ac.signal));
+					top = t === "timeout" ? { error: "not a git repo (git timed out)" } : t;
+				} catch (e) {
+					top = { error: `not a git repo (${errText(e)})` };
 				}
-				return remote.url;
-			};
-			for (const cfg0 of config.watchers) {
-				if (!matchesCwd(cfg0.matchCwd, ctx.cwd)) continue;
-				const t = toplevel();
+				if (!("path" in top)) return { top };
+				let url: string | undefined;
+				try {
+					const u = await within(() => git.remoteUrl(top.path, ac.signal));
+					url = u === "timeout" ? undefined : u;
+				} catch {
+					url = undefined;
+				}
+				return { top, url };
+			} finally {
+				if (timer) clearTimeout(timer);
+				ac.abort(); // anything still running goes
+			}
+		}
+
+		function launch(matched: WatcherConfig[], root: string, cwd: string, carried: Map<string, number[]> | undefined, t: ToplevelResult, remoteUrl?: string) {
+			for (const cfg0 of matched) {
 				const repoKey = "path" in t ? t.path : undefined;
 				if (cfg0.scope === "repo" && !repoKey) {
 					const why = "error" in t ? t.error : "not a git repo";
@@ -641,7 +679,8 @@ export function createWatchers(opts: HostOptions = {}) {
 					continue;
 				}
 				// The remote's owner/name and host, when its host is on url_hosts. Re-resolved every start.
-				const pin = repoKey ? parseRemote(remoteUrl(repoKey), cfg0.urlHosts) : undefined;
+				// Only for watchers that asked for the repo; scope = "watcher" without auto gets no pin.
+				const pin = repoKey && (cfg0.scope === "repo" || cfg0.reposAuto) ? parseRemote(remoteUrl, cfg0.urlHosts) : undefined;
 				let cfg = cfg0;
 				if (cfg0.reposAuto) {
 					// Unresolved: the explicit entries only, possibly none, so every URL is dropped (fail closed).
@@ -672,7 +711,7 @@ export function createWatchers(opts: HostOptions = {}) {
 					recent: [],
 					secretNotified: false,
 				};
-				reg.sessionWakes.set(cfg.id, w.sessionWakes);
+				(reg.sessionWakes ??= new Map()).set(cfg.id, w.sessionWakes);
 				runtimes.set(cfg.id, w);
 				if (w.problem) {
 					notify(`watchers · ${cfg.id}: ${w.problem}; not running`, "warning");
@@ -690,7 +729,8 @@ export function createWatchers(opts: HostOptions = {}) {
 
 		pi.on("session_start", (e, ctx) => {
 			if (!shouldStart(ctx.mode, env)) return;
-			start(ctx, (e as { reason?: string } | undefined)?.reason);
+			// Not awaited: pi's startup never waits on git. Tests await `ready`.
+			ready = start(ctx, (e as { reason?: string } | undefined)?.reason).catch((err) => notify(`watchers · start failed: ${errText(err)}`, "error"));
 		});
 
 		pi.on("session_shutdown", () => {
@@ -835,6 +875,9 @@ export function createWatchers(opts: HostOptions = {}) {
 			},
 			get instance() {
 				return instance;
+			},
+			get ready() {
+				return ready;
 			},
 			children,
 			guardian,
