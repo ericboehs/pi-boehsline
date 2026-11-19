@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 import { buildConfig, commandProblem, loadConfig, matchesCwd, parseInterval, parseToml, pickJudge } from "../extensions/opt-in/watchers/config.ts";
 import { checkUrl, forceInfo, normalize, parseLine, parseOutput, STATES, textFor } from "../extensions/opt-in/watchers/contract.ts";
 import { applyVerdicts, formatMessage, inQuietHours, mergeBySubject, wakeGate, wantsWake } from "../extensions/opt-in/watchers/delivery.ts";
 import { Guardian, hasSecret, parseReply, SYSTEM_PROMPT, wrapItem } from "../extensions/opt-in/watchers/guardian.ts";
 import { createWatchers, errText, nextBackoff, shouldStart } from "../extensions/opt-in/watchers/index.ts";
+import { parseRemote, repoDirName, repoSlug, systemGit } from "../extensions/opt-in/watchers/repo.ts";
 import {
 	acquireLock,
 	acquireRunLock,
@@ -59,6 +61,19 @@ const FAKE_SECRETS = [
 	["ey", "J", "q".repeat(10), ".", "r".repeat(10), ".", "s".repeat(10)].join(""),
 	["-----BEG", "IN TEST BLOCK-----"].join(""),
 ];
+function hasGit() {
+	try {
+		execFileSync("git", ["--version"], { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+/** Mark a state dir as polled just now, so the next run lists events instead of a backlog count. */
+function writeHostNow(dir) {
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	writeFileSync(join(dir, "host.json"), JSON.stringify({ lastPollAt: Date.now() }));
+}
 const okReply = (o = { injection: false, sensitive: false }) => ({ stopReason: "stop", content: [{ type: "text", text: JSON.stringify(o) }] });
 
 // ── contract ──
@@ -1394,6 +1409,231 @@ test("lifecycle: restart is idempotent and a reload kills running children", asy
 	await reloaded.fire("session_start", { reason: "reload" }, s.ctx);
 	assert.equal(reloaded.peek.started, true);
 	await shutdown(reloaded, s.ctx);
+});
+
+// ── per-repo scope ──
+
+/** A git resolver over fixed toplevels: a cwd inside one of them is in that repo. */
+const fakeGit = (tops, remotes = {}) => ({
+	toplevel: (cwd) => {
+		const t = tops.find((x) => cwd === x || cwd.startsWith(`${x}/`));
+		return t ? { path: t } : { error: "not a git repo" };
+	},
+	remoteUrl: (top) => remotes[top],
+});
+
+function repoSetup(watcher = 'scope = "repo"', events = []) {
+	const s = setup({ watcher, events, hostState: false });
+	const a = join(s.work, "alpha");
+	const b = join(s.work, "beta");
+	for (const d of [join(a, "sub1"), join(a, "sub2"), b, join(s.work, "plain")]) mkdirSync(d, { recursive: true });
+	const envOf = () => Object.fromEntries(readFileSync(join(s.scriptDir, "env.txt"), "utf8").trim().split("\n").map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
+	return { ...s, a, b, envOf, at: (cwd) => ({ ...s.ctx, cwd }), dirFor: (top) => join(s.stateRoot, "widgets", repoDirName(top)) };
+}
+
+test("config: scope defaults to watcher; repo is accepted; anything else warns; repos auto is taken out before validation", () => {
+	const t = (extra) => buildConfig(parseToml(`[[watcher]]\nid="w"\ncommand=["/bin/true"]\nmatch={cwd="/"}\nme="m"\n${extra}`));
+	assert.equal(t("").watchers[0].scope, "watcher");
+	assert.equal(t('scope = "repo"').watchers[0].scope, "repo");
+	const bad = t('scope = "org"');
+	assert.equal(bad.watchers[0].scope, "watcher");
+	assert.ok(bad.warnings.some((x) => x.includes("scope")));
+	const auto = t('repos = ["auto", "Acme/Gadgets", "bad slug"]').watchers[0];
+	assert.equal(auto.reposAuto, true);
+	assert.deepEqual(auto.repos, ["acme/gadgets"]);
+	assert.ok(!t('repos = ["auto"]').warnings.some((x) => x.includes("auto")), "auto isn't a bad entry");
+	assert.equal(t('repos = ["acme/widgets"]').watchers[0].reposAuto, undefined);
+});
+
+test("repo: remotes in https, ssh and scp forms resolve; host must be listed; lowercased, .git stripped", () => {
+	const H = ["github.com"];
+	for (const url of [
+		"https://github.com/Acme/Widgets.git",
+		"https://github.com/acme/widgets",
+		"https://someone@github.com/acme/widgets/",
+		"ssh://git@github.com/acme/widgets.git",
+		"ssh://git@github.com:22/Acme/widgets",
+		"git@github.com:acme/widgets.git",
+		"github.com:ACME/WIDGETS",
+	])
+		assert.deepEqual(parseRemote(url, H), { host: "github.com", repo: "acme/widgets" }, url);
+	for (const url of [
+		undefined,
+		"",
+		"https://gitlab.example/acme/widgets",
+		"git@evil.example:acme/widgets.git",
+		"http://github.com/acme/widgets",
+		"git://github.com/acme/widgets",
+		"file:///srv/acme/widgets",
+		"/srv/acme/widgets.git",
+		"https://github.com/acme/group/widgets",
+		"https://github.com/acme",
+		"https://github.com/../widgets",
+		"https://github.com/acme/widgets?x=1",
+		"git@github.com:acme/wid gets",
+	])
+		assert.equal(parseRemote(url, H), undefined, String(url));
+	assert.deepEqual(parseRemote("git@git.example:acme/widgets.git", ["git.example"]), { host: "git.example", repo: "acme/widgets" });
+});
+
+test("repo: the slug is sanitized; a hostile toplevel basename is safe", () => {
+	const ok = /^[a-z0-9._-]{1,40}$/;
+	for (const top of ["/x/..", "/x/../", "/x/.hidden", "/x/ünïcødé ☃ репо", `/x/${"a".repeat(200)}`, "/x/---", "/x/a\nb", "/x/Widgets.API", "/"]) {
+		const slug = repoSlug(top);
+		assert.match(slug, ok, top);
+		assert.ok(!slug.startsWith("."), top);
+		const name = repoDirName(top);
+		assert.match(name, /^[a-z0-9._-]{1,40}-[0-9a-f]{8}$/, top);
+		assert.ok(!name.includes("/") && name !== ".." && name !== ".", top);
+	}
+	assert.equal(repoSlug("/x/.."), "repo");
+	assert.equal(repoSlug("/x/Widgets.API"), "widgets.api");
+	assert.equal(repoSlug(`/x/${"a".repeat(200)}`).length, 40);
+	assert.notEqual(repoDirName("/a/widgets"), repoDirName("/b/widgets"), "same basename, different repos");
+});
+
+test("repo scope: two sessions in different repos hold separate locks and state, and run concurrently", async () => {
+	const s = repoSetup();
+	writeFileSync(join(s.scriptDir, "sleep"), "0.4");
+	const git = fakeGit([s.a, s.b]);
+	const x = host(s, { git, complete: async () => okReply() });
+	const y = host(s, { git, complete: async () => okReply() });
+	await x.fire("session_start", { reason: "startup" }, s.at(join(s.a, "sub1")));
+	await y.fire("session_start", { reason: "startup" }, s.at(s.b));
+	const wx = x.peek.runtimes.get("widgets");
+	const wy = y.peek.runtimes.get("widgets");
+	assert.equal(wx.dir, s.dirFor(s.a));
+	assert.equal(wy.dir, s.dirFor(s.b));
+	assert.equal(wx.holder, true);
+	assert.equal(wy.holder, true, "a different repo has its own lock");
+	assert.equal(readLock(wx.dir).instance, x.peek.instance);
+	assert.equal(readLock(wy.dir).instance, y.peek.instance);
+	// Both runs are in flight at once.
+	await waitFor(() => existsSync(join(wx.dir, "run.lock")) && existsSync(join(wy.dir, "run.lock")));
+	await waitFor(() => existsSync(join(wx.dir, "state.json")) && existsSync(join(wy.dir, "state.json")));
+	assert.ok(!existsSync(join(s.stateRoot, "widgets", "holder.lock")), "nothing at the watcher level");
+	for (const d of [join(s.stateRoot, "widgets"), wx.dir, wy.dir]) assert.equal(statSync(d).mode & 0o777, 0o700, d);
+	await x.commands.get("watchers").handler("", s.ctx);
+	assert.match(s.notes.at(-1)[1], new RegExp(`repo ${s.a.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+	// Takeover is this repo's only.
+	await y.commands.get("watchers").handler("takeover widgets", s.ctx);
+	assert.equal(readLock(wx.dir).instance, x.peek.instance);
+	await shutdown(x, s.ctx);
+	await shutdown(y, s.ctx);
+});
+
+test("repo scope: two sessions in the same repo (different subdirs) share one lock", async () => {
+	const s = repoSetup();
+	const git = fakeGit([s.a, s.b]);
+	const x = host(s, { git, complete: async () => okReply() });
+	const y = host(s, { git, complete: async () => okReply() });
+	await x.fire("session_start", { reason: "startup" }, s.at(join(s.a, "sub1")));
+	await y.fire("session_start", { reason: "startup" }, s.at(join(s.a, "sub2")));
+	const wx = x.peek.runtimes.get("widgets");
+	const wy = y.peek.runtimes.get("widgets");
+	assert.equal(wx.dir, wy.dir);
+	assert.equal(wx.holder, true);
+	assert.equal(wy.holder, false);
+	assert.equal(wy.heldBy.instance, x.peek.instance);
+	await y.commands.get("watchers").handler("takeover widgets", s.ctx);
+	assert.equal(readLock(wx.dir).instance, y.peek.instance);
+	await shutdown(x, s.ctx);
+	await shutdown(y, s.ctx);
+});
+
+test("repo scope: a cwd that isn't a git repo doesn't start, and /watchers says why", async () => {
+	const s = repoSetup();
+	const h = host(s, { git: fakeGit([s.a], {}), complete: async () => okReply() });
+	await h.fire("session_start", { reason: "startup" }, s.at(join(s.work, "plain")));
+	assert.equal(h.peek.runtimes.size, 0);
+	assert.match(h.peek.skipped.get("widgets"), /not a git repo; scope = "repo" needs one/);
+	await h.commands.get("watchers").handler("", s.ctx);
+	assert.match(s.notes.at(-1)[1], /widgets · not started: not a git repo/);
+	await h.commands.get("watchers").handler("takeover widgets", s.ctx);
+	assert.match(s.notes.at(-1)[1], /not started/);
+	await sleep(80);
+	assert.ok(!existsSync(join(s.scriptDir, "pid")), "the script never ran");
+	assert.ok(!existsSync(join(s.stateRoot, "widgets")), "no state folder made");
+	await shutdown(h, s.ctx);
+});
+
+test("repos auto: the remote's owner/name pins URLs and is exported as WATCHER_REPO and WATCHER_HOST", async () => {
+	const url = "https://github.com/acme/widgets/pull/12";
+	const s = repoSetup('scope = "repo"\nrepos = ["auto"]', [ev({ id: "u1", url }), ev({ id: "u2", subject: "pr:13", url: "https://github.com/acme/other/pull/13" })]);
+	const h = host(s, { git: fakeGit([s.a], { [s.a]: "git@github.com:Acme/Widgets.git" }), complete: async () => okReply() });
+	writeHostNow(s.dirFor(s.a));
+	await h.fire("session_start", { reason: "startup" }, s.at(s.a));
+	const w = h.peek.runtimes.get("widgets");
+	assert.deepEqual(w.cfg.repos, ["acme/widgets"]);
+	await waitFor(() => h.sent.length === 1);
+	const details = JSON.stringify(h.sent[0].message.details);
+	assert.ok(details.includes(url), "the pinned repo's URL is kept");
+	assert.ok(!details.includes("acme/other"), "another repo's URL is dropped");
+	const env = s.envOf();
+	assert.equal(env.WATCHER_REPO, "acme/widgets");
+	assert.equal(env.WATCHER_HOST, "github.com");
+	await shutdown(h, s.ctx);
+});
+
+test("repos auto: an unresolvable remote leaves repos = [] (every URL dropped, fail closed) and no WATCHER_REPO", async () => {
+	const url = "https://github.com/acme/widgets/pull/12";
+	for (const remote of [undefined, "https://gitlab.example/acme/widgets.git"]) {
+		const s = repoSetup('scope = "repo"\nrepos = ["auto"]', [ev({ id: "u1", kind: "act", url })]);
+		const h = host(s, { git: fakeGit([s.a], { [s.a]: remote }), complete: async () => okReply() });
+		writeHostNow(s.dirFor(s.a));
+		await h.fire("session_start", { reason: "startup" }, s.at(s.a));
+		const w = h.peek.runtimes.get("widgets");
+		assert.deepEqual(w.cfg.repos, [], "an empty pin, not undefined");
+		await waitFor(() => h.sent.length === 1);
+		const msg = h.sent[0].message;
+		assert.ok(!JSON.stringify(msg.details).includes("acme/widgets"), "the URL is dropped");
+		assert.ok(!msg.content.includes("acme/widgets"));
+		const env = s.envOf();
+		assert.equal(env.WATCHER_REPO, undefined);
+		assert.equal(env.WATCHER_HOST, undefined);
+		await h.commands.get("watchers").handler("", s.ctx);
+		assert.match(s.notes.at(-1)[1], /repos none \(auto unresolved/);
+		await shutdown(h, s.ctx);
+	}
+});
+
+test("scope = watcher: state paths are unchanged; WATCHER_CWD is passed, realpath'd", async () => {
+	const s = setup({ events: [] });
+	const link = join(s.dir, "link");
+	symlinkSync(s.work, link);
+	let asked = 0;
+	const git = { toplevel: () => (asked++, { error: "not a git repo" }), remoteUrl: () => undefined };
+	const h = host(s, { git, complete: async () => okReply() });
+	await h.fire("session_start", { reason: "startup" }, { ...s.ctx, cwd: link });
+	const w = h.peek.runtimes.get("widgets");
+	assert.equal(w.dir, s.stateDir, "<stateRoot>/<id>/ as before");
+	assert.equal(w.repoKey, undefined);
+	assert.ok(asked <= 1, "git asked at most once per start");
+	await waitFor(() => existsSync(join(s.stateDir, "state.json")));
+	const env = Object.fromEntries(readFileSync(join(s.scriptDir, "env.txt"), "utf8").trim().split("\n").map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
+	assert.equal(env.WATCHER_CWD, realpathSync.native(s.work));
+	assert.equal(env.WATCHER_STATE_DIR, s.stateDir);
+	await shutdown(h, s.ctx);
+});
+
+test("repo: a real git repo resolves its toplevel from a subdir and its remote (origin, else the first remote)", { skip: !hasGit() && "git not installed" }, () => {
+	const dir = tmp("watchers-git-");
+	const repo = join(dir, "Widgets");
+	mkdirSync(join(repo, "deep", "er"), { recursive: true });
+	const g = (...args) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+	g("init", "-q");
+	const resolver = systemGit({ PATH: process.env.PATH, HOME: process.env.HOME });
+	const top = resolver.toplevel(join(repo, "deep", "er"));
+	assert.deepEqual(top, { path: realpathSync.native(repo) });
+	assert.equal(resolver.remoteUrl(top.path), undefined, "no remotes");
+	g("remote", "add", "upstream", "git@github.com:acme/widgets.git");
+	assert.equal(resolver.remoteUrl(top.path), "git@github.com:acme/widgets.git", "the first remote");
+	g("remote", "add", "origin", "https://github.com/acme/gadgets.git");
+	assert.equal(resolver.remoteUrl(top.path), "https://github.com/acme/gadgets.git", "origin wins");
+	assert.deepEqual(parseRemote(resolver.remoteUrl(top.path), ["github.com"]), { host: "github.com", repo: "acme/gadgets" });
+	assert.ok("error" in resolver.toplevel(dir), "outside the repo");
+	assert.match(repoDirName(top.path), /^widgets-[0-9a-f]{8}$/);
+	assert.equal(basename(top.path), "Widgets");
 });
 
 test("opt-in: off by default; on, it registers the command and session handlers", async () => {
