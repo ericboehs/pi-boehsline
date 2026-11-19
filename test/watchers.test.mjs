@@ -1483,6 +1483,9 @@ test("repo: remotes in https, ssh and scp forms resolve; host must be listed; lo
 		"https://github.com/../widgets",
 		"https://github.com/acme/widgets?x=1",
 		"git@github.com:acme/wid gets",
+		"https://github.com/%zz/x",
+		"https://github.com/acme/%E0%A4%A",
+		"ssh://git@github.com/%/widgets",
 	])
 		assert.equal(parseRemote(url, H), undefined, String(url));
 	assert.deepEqual(parseRemote("git@git.example:acme/widgets.git", ["git.example"]), { host: "git.example", repo: "acme/widgets" });
@@ -1589,7 +1592,7 @@ test("repos auto: the remote's owner/name pins URLs and is exported as WATCHER_R
 
 test("repos auto: an unresolvable remote leaves repos = [] (every URL dropped, fail closed) and no WATCHER_REPO", async () => {
 	const url = "https://github.com/acme/widgets/pull/12";
-	for (const remote of [undefined, "https://gitlab.example/acme/widgets.git"]) {
+	for (const remote of [undefined, "https://gitlab.example/acme/widgets.git", "https://github.com/%zz/x"]) {
 		const s = repoSetup('scope = "repo"\nrepos = ["auto"]', [ev({ id: "u1", kind: "act", url })]);
 		const h = host(s, { git: fakeGit([s.a], { [s.a]: remote }), complete: async () => okReply() });
 		writeHostNow(s.dirFor(s.a));

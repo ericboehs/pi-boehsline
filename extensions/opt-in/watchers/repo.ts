@@ -129,7 +129,11 @@ export function parseRemote(url: string | undefined, hosts: string[]): RemoteRep
 		if (u.protocol !== "https:" && u.protocol !== "ssh:") return undefined;
 		if (u.search || u.hash) return undefined;
 		host = u.hostname;
-		path = decodeURIComponent(u.pathname);
+		try {
+			path = decodeURIComponent(u.pathname);
+		} catch {
+			return undefined; // a malformed escape such as %zz
+		}
 	} else {
 		// scp-like: [user@]host:path (no slash before the colon)
 		const m = /^(?:[A-Za-z0-9._-]+@)?([A-Za-z0-9.-]+):(?!\/\/)(.+)$/.exec(url);
