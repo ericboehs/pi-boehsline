@@ -12,7 +12,7 @@ Background watchers put short status lines into an interactive pi session, and t
 /watchers resume <id>      poll again now
 /watchers test <id>        dry run: prints the events, commits nothing, marks nothing seen
 /watchers show <id>        the last 20 delivered events (approved or withheld text only)
-/watchers takeover <id>    poll from this session instead of the one holding the lock
+/watchers takeover <id>    poll from this session instead of the one holding the lock (this repo's only, with scope = "repo")
 ```
 
 ## When it runs
@@ -44,9 +44,33 @@ interval = "60s"                    # floor 30s
 me = "octocat"                      # passed to the script; events by this actor never wake (empty: a warning)
 wake = "actionable"                 # actionable | never
 url_hosts = ["github.com"]          # https URLs on these hosts only; others are dropped
-repos = ["acme/widgets"]            # optional: URLs must point at one of these owner/name repos; others are dropped
+repos = ["acme/widgets"]            # optional: URLs must point at one of these owner/name repos; others are dropped. "auto": see below
+# scope = "watcher"                 # "watcher" (default): one instance per watcher. "repo": one per git repo; see below
 # quiet_hours = "22-07"             # local; wakes become silent lines. "off" disables
 ```
+
+## One entry for every repo
+
+With `scope = "repo"`, one `[[watcher]]` entry gives every git repo its own instance:
+
+```toml
+[[watcher]]
+id = "gh"
+command = ["~/bin/gh-watch", "--jsonl"]
+match = { cwd = "~/Code" }          # the same prefix match: every repo under ~/Code
+scope = "repo"
+repos = ["auto"]                    # pin URLs to this repo's remote
+url_hosts = ["github.com"]
+me = "octocat"
+```
+
+- **The repo key** is the git toplevel of the session's cwd (`git rev-parse --show-toplevel`, realpath'd). A session in a folder that isn't a git repo, or one git refuses (dubious ownership), doesn't start that watcher, and `/watchers` says why.
+- **State per (watcher, repo):** `<stateRoot>/<id>/<slug>-<hash>/`, where the slug is the toplevel's folder name cut down to `[a-z0-9._-]{1,40}` and the hash is the first 8 hex digits of the sha256 of the toplevel path. The holder lock, `run.lock`, `state.json(.next)`, `seen.jsonl`, `host.json` and the wake counter all live there. Sessions in different repos poll at the same time, each holding its own lock; sessions anywhere in the same repo share one. `/watchers` shows the repo, and `/watchers takeover` moves only this repo's lock.
+- **Each git worktree is its own instance:** a worktree has its own toplevel, so it gets its own folder, lock and state.
+- **`repos = ["auto"]`** resolves, at every session start, to the `owner/name` of the toplevel's `origin` remote (else its first remote), lowercased and without `.git`. https (`https://host/owner/name`), ssh (`ssh://git@host/owner/name`) and scp-style (`git@host:owner/name`) remotes work, and the host must be on `url_hosts`. `"auto"` can sit beside explicit entries. If it can't be resolved (no remote, another host, a deeper path), `repos` becomes the explicit entries only, possibly none, so every URL is dropped: it fails closed, never open. `"auto"` works with `scope = "watcher"` too, from the session's repo.
+- git is asked with argv only (no shell), a 2 s timeout, a minimal environment and `-c core.fsmonitor=`, at most once per session start.
+
+With the default `scope = "watcher"`, nothing changes: one instance per watcher in `<stateRoot>/<id>/`, polled from whichever matching session holds the lock. `WATCHER_CWD` is then the holder's cwd and changes on a takeover, so a script that works out the repo from it should use `scope = "repo"`.
 
 **Picking the judge:** the session's provider maps to a judge through `by_provider`. If the provider isn't mapped, or its judge isn't found or has no credentials, `fallback` is used. If that can't run either, the guardian is unavailable and fails closed; it never borrows another provider's judge. A model missing from `approved` is dropped from the config with a warning and is re-checked at each batch. `/watchers` shows the active judge and why, such as `judge acme/judge-small (session provider acme)` or `judge acme/judge-small (fallback; session provider other2 is not in guardian.by_provider)`. The old `model` key still works as a deprecated alias for `fallback`.
 
@@ -54,8 +78,8 @@ The supported TOML is a subset: tables, `[[watcher]]`, strings, integers, boolea
 
 ## Script contract
 
-- **Invocation:** `command`, with no shell, in its own process group, with the cwd set to the session's cwd. Stdin is the watcher's TOML table as JSON. `command[0]` is checked again before every run.
-- **Environment:** an allowlist only. That's `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `XDG_CONFIG_HOME`, every `GH_*` and `GITHUB_*` variable (gh reads its auth from `$HOME/.config/gh`), `WATCHER_ID`, `WATCHER_STATE_DIR` (`~/.local/state/pi-watchers/<id>/`, created by the host, 0700), `WATCHER_ME`, and `WATCHER_DRY_RUN=1` for `/watchers test`. Nothing else from the session's environment reaches the script.
+- **Invocation:** `command`, with no shell, in its own process group, with the cwd set to the polling session's cwd. Stdin is the watcher's TOML table as JSON. `command[0]` is checked again before every run.
+- **Environment:** an allowlist only. That's `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `XDG_CONFIG_HOME`, every `GH_*` and `GITHUB_*` variable (gh reads its auth from `$HOME/.config/gh`), `WATCHER_ID`, `WATCHER_STATE_DIR` (`~/.local/state/pi-watchers/<id>/`, created by the host, 0700), `WATCHER_ME`, `WATCHER_CWD` (the session's cwd, realpath'd; always set), `WATCHER_REPO` and `WATCHER_HOST` (the git remote's lowercased `owner/name` and host, set only when they resolve with the host on `url_hosts`; the same values `repos = ["auto"]` pins), and `WATCHER_DRY_RUN=1` for `/watchers test`. With `scope = "repo"`, `WATCHER_STATE_DIR` is `<id>/<slug>-<hash>/`. Nothing else from the session's environment reaches the script.
 - **Output:** JSON Lines on stdout, one event per line:
 
   ```json
@@ -114,4 +138,5 @@ A failure is any of these: prose or extra keys, a tool call, `stopReason` other 
 ```
 ~/.local/state/pi-watchers/<id>/   ($PI_WATCHERS_STATE_DIR overrides the root)
   seen.jsonl  wakes.json  host.json  holder.lock  run.lock  state.json
+  <slug>-<hash>/                  (scope = "repo": the same files, per repo)
 ```
