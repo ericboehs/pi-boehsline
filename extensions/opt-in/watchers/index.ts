@@ -12,7 +12,9 @@
  *
  * Only in interactive sessions (tui, rpc); never in print/json mode or in a
  * subagent child (PI_SUBAGENT_CHILD). One session per watcher polls (the
- * holder lock in the state dir); `/watchers takeover` moves it.
+ * holder lock in the state dir); `/watchers takeover` moves it. With
+ * `scope = "repo"` that's one per (watcher, git toplevel): each repo gets its
+ * own state dir and lock.
  *
  *   /watchers                  status: holder, last run, errors, wakes, guardian
  *   /watchers pause|resume <id>
@@ -34,6 +36,7 @@ import { commandProblem, type JudgeChoice, loadConfig, type LoadResult, matchesC
 import { forceInfo, normalize, parseOutput, textFor, type WatchEvent } from "./contract.ts";
 import { applyVerdicts, type Delivered, formatMessage, freeTexts, wakeGate, WAKES_PER_HOUR, wantsWake } from "./delivery.ts";
 import { type CompleteFn, Guardian } from "./guardian.ts";
+import { type GitResolver, parseRemote, realNative, repoDirName, systemGit, type ToplevelResult } from "./repo.ts";
 import {
 	acquireLock,
 	acquireRunLock,
@@ -54,6 +57,7 @@ import {
 	releaseRunLock,
 	runScript,
 	SeenStore,
+	type SessionEnv,
 	takeNext,
 	writeHost,
 } from "./state.ts";
@@ -108,6 +112,8 @@ export interface HostOptions {
 	complete?: CompleteFn;
 	/** The process-wide registry (tests use their own to act as separate processes). */
 	registry?: Registry;
+	/** How git is asked for the toplevel and remote (tests inject one). */
+	git?: GitResolver;
 }
 
 interface PendingState {
@@ -126,8 +132,13 @@ interface Batch {
 }
 
 interface Runtime {
+	/** The config, with `repos` resolved for this session ("auto" filled in). */
 	cfg: WatcherConfig;
 	dir: string;
+	/** WATCHER_CWD, WATCHER_REPO, WATCHER_HOST for this session. */
+	session: SessionEnv;
+	/** scope = "repo": the git toplevel this instance is for. */
+	repoKey?: string;
 	seen: SeenStore;
 	problem?: string;
 	paused: boolean;
@@ -194,6 +205,9 @@ export function createWatchers(opts: HostOptions = {}) {
 		let ctxRef: ExtensionContext | undefined;
 		let config: LoadResult | undefined;
 		let runtimes = new Map<string, Runtime>();
+		/** Watchers that match this folder but didn't start, and why (scope = "repo" outside a git repo). */
+		let skipped = new Map<string, string>();
+		const git = opts.git ?? systemGit(env);
 		let instance = "";
 		let started = false;
 		let compacting = false;
@@ -503,7 +517,7 @@ export function createWatchers(opts: HostOptions = {}) {
 			let next: Buffer | undefined;
 			try {
 				clearNext(w.dir);
-				r = await runScript(w.cfg, { cwd: ctxRef?.cwd ?? process.cwd(), stateDir: w.dir, timeoutMs: opts.runTimeoutMs, env, children });
+				r = await runScript(w.cfg, { cwd: ctxRef?.cwd ?? process.cwd(), stateDir: w.dir, timeoutMs: opts.runTimeoutMs, env, session: w.session, children });
 				// Take the run's state before the run lock goes, so no other run can clear it.
 				if (!r.error && r.code === 0) next = takeNext(w.dir);
 				else clearNext(w.dir);
@@ -573,6 +587,7 @@ export function createWatchers(opts: HostOptions = {}) {
 			outbox = [];
 			compacting = false;
 			runtimes = new Map();
+			skipped = new Map();
 			if (reg.host?.instance === instance) reg.host = undefined;
 		}
 
@@ -587,16 +602,58 @@ export function createWatchers(opts: HostOptions = {}) {
 			// Session wake counts survive a /reload (same session); new, resume and fork start over.
 			const carried = reason === "reload" ? reg.sessionWakes : undefined;
 			reg.sessionWakes = new Map();
+			skipped = new Map();
 			config = loadConfig(opts.configPath ?? defaultConfigPath(env));
 			if (config.error) notify(`watchers · ${config.error}`, "warning");
 			for (const warning of config.warnings) notify(`watchers · ${warning}`, "warning");
 			const root = opts.stateRoot ?? defaultStateRoot(env);
-			for (const cfg of config.watchers) {
-				if (!matchesCwd(cfg.matchCwd, ctx.cwd)) continue;
-				const dir = ensureDir(join(root, cfg.id));
+			const cwd = realNative(ctx.cwd);
+			// git is asked at most once per start, and only when a watcher matches.
+			let top: ToplevelResult | undefined;
+			let remote: { url?: string } | undefined;
+			const toplevel = () => {
+				if (!top) {
+					try {
+						top = git.toplevel(cwd);
+					} catch (e) {
+						top = { error: `not a git repo (${errText(e)})` };
+					}
+				}
+				return top;
+			};
+			const remoteUrl = (path: string) => {
+				if (!remote) {
+					try {
+						remote = { url: git.remoteUrl(path) };
+					} catch {
+						remote = {};
+					}
+				}
+				return remote.url;
+			};
+			for (const cfg0 of config.watchers) {
+				if (!matchesCwd(cfg0.matchCwd, ctx.cwd)) continue;
+				const t = toplevel();
+				const repoKey = "path" in t ? t.path : undefined;
+				if (cfg0.scope === "repo" && !repoKey) {
+					const why = "error" in t ? t.error : "not a git repo";
+					skipped.set(cfg0.id, `${why}; scope = "repo" needs one`);
+					continue;
+				}
+				// The remote's owner/name and host, when its host is on url_hosts. Re-resolved every start.
+				const pin = repoKey ? parseRemote(remoteUrl(repoKey), cfg0.urlHosts) : undefined;
+				let cfg = cfg0;
+				if (cfg0.reposAuto) {
+					// Unresolved: the explicit entries only, possibly none, so every URL is dropped (fail closed).
+					const repos = [...new Set([...(cfg0.repos ?? []), ...(pin ? [pin.repo] : [])])];
+					cfg = { ...cfg0, repos };
+				}
+				const dir = ensureDir(cfg.scope === "repo" && repoKey ? join(root, cfg.id, repoDirName(repoKey)) : join(root, cfg.id));
 				const w: Runtime = {
 					cfg,
 					dir,
+					session: { cwd, ...(pin ? { repo: pin.repo, host: pin.host } : {}) },
+					...(cfg.scope === "repo" ? { repoKey } : {}),
 					seen: new SeenStore(dir).load(now()),
 					problem: commandProblem(cfg.command[0] as string),
 					paused: false,
@@ -661,8 +718,11 @@ export function createWatchers(opts: HostOptions = {}) {
 			const g = guardian.statsFor(w.cfg.id);
 			const role = w.problem ? `disabled (${w.problem})` : w.paused ? "paused" : w.holder ? "polling" : w.heldBy ? `held by pid ${w.heldBy.pid}` : "waiting for the lock";
 			const judge = resolveJudge();
+			const repo = w.repoKey ? `  repo ${w.repoKey}${w.session.repo ? ` (${w.session.repo})` : ""}` : "";
 			return [
 				`${w.cfg.id} · ${role}`,
+				...(repo ? [repo] : []),
+				...(w.cfg.reposAuto ? [`  repos ${w.cfg.repos?.length ? w.cfg.repos.join(", ") : "none (auto unresolved: every URL is dropped)"}`] : []),
 				`  last run ${clock(w.lastRunAt)}${w.lastError ? ` · error: ${w.lastError}` : w.lastOkAt ? " · ok" : ""}${w.backoffMs ? ` · backoff ${Math.round(w.backoffMs / 1000)}s` : ""}${w.stderrTail && w.lastError ? ` · stderr: ${w.stderrTail}` : ""}`,
 				`  contract errors ${w.contractErrors} · seen ${w.seen.size} · wakes ${w.sessionWakes.filter((x) => t - x < 3_600_000).length}/${WAKES_PER_HOUR} session, ${readWakes(w.dir, t).length}/${WAKES_PER_HOUR} watcher (last hour)`,
 				`  guardian ${judge.model ? `judge ${judge.model} (${judge.reason})` : `unavailable (${judge.reason})`} · calls ${g.calls} (${guardian.callsLastHour(w.cfg.id)}/${config?.guardian.callsPerHour ?? 200} this hour) · failures ${g.failures} · capped ${g.capped} · cache hits ${g.cacheHits} · secrets ${g.secrets} · withheld ${g.withheld}`,
@@ -688,7 +748,7 @@ export function createWatchers(opts: HostOptions = {}) {
 			if (w.problem) return `${w.cfg.id}: ${w.problem}`;
 			const dir = dryRunDir(w.dir);
 			try {
-				const r = await runScript(w.cfg, { cwd: ctx.cwd, stateDir: dir, dryRun: true, timeoutMs: opts.runTimeoutMs, env, children });
+				const r = await runScript(w.cfg, { cwd: ctx.cwd, stateDir: dir, dryRun: true, timeoutMs: opts.runTimeoutMs, env, session: w.session, children });
 				if (r.error || r.code !== 0) return `${w.cfg.id} test: ${r.error ?? `exit ${r.code}`}${r.stderrTail ? ` · stderr: ${r.stderrTail}` : ""}`;
 				const out = parseOutput(r.stdout, w.cfg.urlHosts, w.cfg.repos);
 				if (out.fatal) return `${w.cfg.id} test: ${out.fatal}`;
@@ -722,12 +782,14 @@ export function createWatchers(opts: HostOptions = {}) {
 				if (!started) return say("watchers run only in interactive sessions (not print, json or subagent children).", "warning");
 				if (!sub) {
 					const lines = [...runtimes.values()].map(statusLine);
-					const other = (config?.watchers ?? []).filter((c) => !runtimes.has(c.id)).map((c) => `${c.id} · not for this folder`);
+					const other = (config?.watchers ?? [])
+						.filter((c) => !runtimes.has(c.id))
+						.map((c) => (skipped.has(c.id) ? `${c.id} · not started: ${skipped.get(c.id)}` : `${c.id} · not for this folder`));
 					const head = config?.missing ? `no config at ${config.path}` : config?.error ? `config error: ${config.error}` : "";
 					return say([head, ...(config?.warnings ?? []), ...lines, ...other].filter(Boolean).join("\n") || "No watchers configured.");
 				}
 				const w = runtimes.get(id);
-				if (!w) return say(`No watcher "${id}" for this folder. /watchers lists them.`, "warning");
+				if (!w) return say(skipped.has(id) ? `${id}: not started: ${skipped.get(id)}` : `No watcher "${id}" for this folder. /watchers lists them.`, "warning");
 				switch (sub) {
 					case "pause":
 						w.paused = true;
@@ -749,7 +811,7 @@ export function createWatchers(opts: HostOptions = {}) {
 						const before = readLock(w.dir);
 						ensureHolder(w, true);
 						if (!w.paused && !w.problem) schedule(w, 0);
-						return say(`${id}: polling from this session${before && before.instance !== instance ? ` (took over from pid ${before.pid})` : ""}.`);
+						return say(`${id}${w.repoKey ? ` (${w.repoKey})` : ""}: polling from this session${before && before.instance !== instance ? ` (took over from pid ${before.pid})` : ""}.`);
 					}
 					default:
 						return say("Usage: /watchers [pause|resume|test|show|takeover <id>]", "warning");
@@ -761,6 +823,9 @@ export function createWatchers(opts: HostOptions = {}) {
 		return {
 			get runtimes() {
 				return runtimes;
+			},
+			get skipped() {
+				return skipped;
 			},
 			get outbox() {
 				return outbox;

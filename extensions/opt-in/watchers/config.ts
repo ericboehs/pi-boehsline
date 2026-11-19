@@ -235,6 +235,14 @@ export interface WatcherConfig {
 	 * and the guardian's withheld marker.
 	 */
 	repos?: string[];
+	/**
+	 * `repos` listed "auto": the session's toplevel remote (`owner/name`, host on
+	 * url_hosts) joins `repos` at session start. Unresolved, `repos` stays the
+	 * explicit entries, possibly `[]` (fail closed), never undefined.
+	 */
+	reposAuto?: boolean;
+	/** "watcher": one instance and state folder per watcher. "repo": one per (watcher, git toplevel). */
+	scope: "watcher" | "repo";
 	/** Local quiet hours, [startHour, endHour): wakes become silent lines. */
 	quiet: [number, number];
 	/** The table as written, passed to the script on stdin. */
@@ -344,14 +352,21 @@ export function buildConfig(t: TomlTable, home = homedir()): WatchersConfig {
 			quiet = [22, 7];
 		}
 		let repos: string[] | undefined;
+		let reposAuto = false;
 		if (w.repos !== undefined) {
 			const list = strings(w.repos);
 			if (!list) warnings.push(`${where}: repos must be an array of "owner/name" strings; ignored`);
 			else {
-				for (const r of list) if (!REPO_RE.test(r)) warnings.push(`${where}: repos entry "${r}" isn't "owner/name"; ignored`);
-				repos = list.filter((r) => REPO_RE.test(r)).map((r) => r.toLowerCase());
+				// "auto" is resolved per session from the git remote, so it's taken out before validation.
+				if (list.includes("auto")) reposAuto = true;
+				const explicit = list.filter((r) => r !== "auto");
+				for (const r of explicit) if (!REPO_RE.test(r)) warnings.push(`${where}: repos entry "${r}" isn't "owner/name" or "auto"; ignored`);
+				repos = explicit.filter((r) => REPO_RE.test(r)).map((r) => r.toLowerCase());
 			}
 		}
+		let scope: "watcher" | "repo" = "watcher";
+		if (w.scope === "repo") scope = "repo";
+		else if (w.scope !== undefined && w.scope !== "watcher") warnings.push(`${where}: scope must be "watcher" or "repo"; using "watcher"`);
 		ids.add(id);
 		watchers.push({
 			id,
@@ -362,6 +377,8 @@ export function buildConfig(t: TomlTable, home = homedir()): WatchersConfig {
 			wake,
 			urlHosts: (strings(w.url_hosts) ?? ["github.com"]).map((h) => h.toLowerCase()),
 			...(repos ? { repos } : {}),
+			...(reposAuto ? { reposAuto } : {}),
+			scope,
 			quiet,
 			raw: w,
 		});
@@ -400,10 +417,10 @@ export function loadConfig(path: string, home = homedir()): LoadResult {
 	}
 }
 
-/** realpath that falls back to path.resolve for paths that don't exist. */
+/** realpath (native) that falls back to path.resolve for paths that don't exist. */
 export function real(p: string): string {
 	try {
-		return realpathSync(p);
+		return realpathSync.native(p);
 	} catch {
 		return resolve(p);
 	}

@@ -1,7 +1,8 @@
 /**
  * Watcher state on disk and the script runner.
  *
- * Per watcher, in `<stateRoot>/<id>/` (0700):
+ * Per watcher, in `<stateRoot>/<id>/` (0700); with `scope = "repo"`, per
+ * (watcher, repo) in `<stateRoot>/<id>/<slug>-<sha256(toplevel)[0:8]>/`:
  *   seen.jsonl     delivered event ids, one {"id","at"} per line; 14-day TTL
  *   wakes.json     wake timestamps (cross-session cap)
  *   host.json      {lastPollAt}: drives the backlog summary
@@ -395,14 +396,30 @@ export interface RunResult {
 /** The fixed names that reach the script, besides GH_* and GITHUB_*. */
 export const ENV_BASE = ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "XDG_CONFIG_HOME"];
 
+/** Per-session WATCHER_* values: the realpath'd session cwd, and the remote's owner/name and host when they resolve. */
+export interface SessionEnv {
+	cwd?: string;
+	repo?: string;
+	host?: string;
+}
+
 /** Only these variables reach the script: ENV_BASE, every GH_* and GITHUB_*, and the WATCHER_* ones. */
-export function scriptEnv(cfg: WatcherConfig, stateDir: string, dryRun: boolean, env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+export function scriptEnv(
+	cfg: WatcherConfig,
+	stateDir: string,
+	dryRun: boolean,
+	env: NodeJS.ProcessEnv = process.env,
+	session: SessionEnv = {},
+): Record<string, string> {
 	const out: Record<string, string> = {};
 	for (const k of ENV_BASE) if (env[k]) out[k] = env[k] as string;
 	for (const [k, v] of Object.entries(env)) if (v && ENV_PASS_RE.test(k)) out[k] = v;
 	out.WATCHER_ID = cfg.id;
 	out.WATCHER_STATE_DIR = stateDir;
 	out.WATCHER_ME = cfg.me;
+	if (session.cwd) out.WATCHER_CWD = session.cwd;
+	if (session.repo) out.WATCHER_REPO = session.repo;
+	if (session.host) out.WATCHER_HOST = session.host;
 	if (dryRun) out.WATCHER_DRY_RUN = "1";
 	return out;
 }
@@ -427,6 +444,8 @@ export interface RunOptions {
 	timeoutMs?: number;
 	maxStdout?: number;
 	env?: NodeJS.ProcessEnv;
+	/** WATCHER_CWD, WATCHER_REPO and WATCHER_HOST. */
+	session?: SessionEnv;
 	/** Live children, so shutdown can kill them. */
 	children?: Set<ChildProcess>;
 }
@@ -442,7 +461,7 @@ export function runScript(cfg: WatcherConfig, opts: RunOptions): Promise<RunResu
 		try {
 			child = spawn(cmd, args, {
 				cwd: opts.cwd,
-				env: scriptEnv(cfg, opts.stateDir, !!opts.dryRun, opts.env),
+				env: scriptEnv(cfg, opts.stateDir, !!opts.dryRun, opts.env, opts.session),
 				detached: true,
 				stdio: ["pipe", "pipe", "pipe"],
 				shell: false,
