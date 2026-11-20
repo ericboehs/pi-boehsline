@@ -111,6 +111,8 @@ export const SECTION_CSP = [
   "style-src 'self' 'unsafe-inline' https:",
   "font-src 'self' data: https:",
   "img-src 'self' data: blob:",
+  // audio and video a section carries inline (a voice sample as a data: URI) or makes itself.
+  "media-src 'self' data: blob:",
   "connect-src 'none'",
   "form-action 'none'",
   "frame-ancestors 'self'",

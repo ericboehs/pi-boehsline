@@ -902,6 +902,7 @@ test("scriptable section types get the sandbox CSP; images, PDFs and video don't
   for (const t of ["text/html; charset=utf-8", "image/svg+xml", "application/xhtml+xml", "text/xml"]) assert.ok(scriptableType(t), t);
   for (const t of ["image/png", "application/pdf", "video/mp4", "text/plain; charset=utf-8", "application/json; charset=utf-8"]) assert.ok(!scriptableType(t), t);
   assert.match(SANDBOXED_SECTION_CSP, /^default-src[\s\S]*; sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads$/);
+  assert.match(SANDBOXED_SECTION_CSP, /media-src 'self' data: blob:/, "inline audio and video (a voice sample's data: URI) play");
 });
 
 test("withKit puts the kit and frame script at the top of the head, unless the page opts out", () => {
