@@ -33,6 +33,12 @@ export interface RemotePrompt {
 	sensitive: boolean;
 	/** Delivers an answer; returns an error, or null once taken. */
 	answer(answers: RemoteAnswer[]): string | null;
+	/**
+	 * Cancels the question as Esc at the keyboard would (Eric's Cancel on the phone); returns an
+	 * error, or null once taken. Only on a prompt offered `cancellable`: a tool that doesn't race
+	 * `cancelled` would be left waiting on its TUI dialog.
+	 */
+	cancel?(): string | null;
 }
 
 interface Broker {
@@ -131,20 +137,47 @@ export function canonicalAnswerV2(id: string, questions: RemoteQuestion[], answe
 export interface OfferOptions {
 	/** See RemotePrompt.sensitive. op-broker passes true for its approval card. */
 	sensitive?: boolean;
+	/**
+	 * The phone may cancel it (RemotePrompt.cancel): `cancelled` then resolves, and the tool
+	 * closes its dialog and returns what Esc returns. The ask tool passes true.
+	 */
+	cancellable?: boolean;
 }
 
-/** Offers questions for a remote answer. `answered` resolves once one is taken; dispose when done. */
-export function offerPrompt(questions: RemoteQuestion[], opts: OfferOptions = {}): { id: string; answered: Promise<RemoteAnswer[]>; dispose(): void } {
+/**
+ * Offers questions for a remote answer. `answered` resolves once one is taken, `cancelled` once
+ * the phone cancels it (only when offered `cancellable`; otherwise it never resolves); dispose
+ * when done.
+ */
+export function offerPrompt(
+	questions: RemoteQuestion[],
+	opts: OfferOptions = {},
+): { id: string; answered: Promise<RemoteAnswer[]>; cancelled: Promise<void>; dispose(): void } {
 	const id = randomBytes(9).toString("base64url");
 	let resolve!: (a: RemoteAnswer[]) => void;
 	const answered = new Promise<RemoteAnswer[]>((r) => {
 		resolve = r;
+	});
+	let resolveCancel!: () => void;
+	const cancelled = new Promise<void>((r) => {
+		resolveCancel = r;
 	});
 	const b = broker();
 	b.prompts.set(id, {
 		id,
 		questions,
 		sensitive: opts.sensitive === true,
+		...(opts.cancellable === true
+			? {
+					cancel() {
+						if (!b.prompts.has(id)) return "that question was already answered";
+						b.prompts.delete(id);
+						changed();
+						resolveCancel();
+						return null;
+					},
+				}
+			: {}),
 		answer(answers) {
 			if (!b.prompts.has(id)) return "that question was already answered";
 			const bad = invalidAnswer(questions, answers);
@@ -159,6 +192,7 @@ export function offerPrompt(questions: RemoteQuestion[], opts: OfferOptions = {}
 	return {
 		id,
 		answered,
+		cancelled,
 		dispose() {
 			if (b.prompts.delete(id)) changed();
 		},

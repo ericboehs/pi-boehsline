@@ -2330,6 +2330,49 @@ test("v2 answer: signed over the prompt's own questions, looked up first", async
 	offered.dispose();
 });
 
+test("cancel_ask: the phone's Cancel, v2 over cancel_ask and the id, only for a cancellable prompt", async () => {
+	const { offerPrompt, openPrompts } = await import("../lib/remote-prompts.ts");
+	const { CANCEL_ASK_REFUSED, CANCEL_ASK_V1_REFUSED } = await import("../extensions/opt-in/botsun-owner/index.ts");
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const { srv } = await ownerWith(undefined);
+	const askFor = (id) => srv.lines.find((l) => l.type === "ask" && l.ask.id === id)?.ask;
+	const questions = [{ question: "Pizza?", options: [{ label: "Pepperoni" }, { label: "Mushrooms" }] }];
+
+	// Not offered cancellable (op-broker's): no flag, and a signed cancel is refused with its nonce spent.
+	const plain = offerPrompt(questions, { sensitive: true });
+	await until(() => askFor(plain.id));
+	assert.equal("cancellable" in askFor(plain.id), false);
+	const { nonce } = await ask({ type: "nonce" });
+	const plainSig = signV2(key, nonce, "session", "cancel_ask", `cancel_ask\n${plain.id}`);
+	assert.equal((await ask({ type: "cancel_ask", ask_id: plain.id, nonce, device_id: 7, sig_v: 2, signature: plainSig })).error, CANCEL_ASK_REFUSED);
+	assert.equal((await ask({ type: "stop", nonce, device_id: 7, sig_v: 2, signature: "AAAA" })).error, "nonce is expired or used", "its nonce was spent");
+	assert.ok(openPrompts().some((p) => p.id === plain.id), "still open");
+	plain.dispose();
+
+	const offered = offerPrompt(questions, { cancellable: true });
+	await until(() => askFor(offered.id));
+	assert.equal(askFor(offered.id).cancellable, true);
+	let cancelled = false;
+	offered.cancelled.then(() => (cancelled = true));
+	const send = async (payload, extra = {}) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "cancel_ask", ask_id: offered.id, nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "cancel_ask", payload), ...extra });
+	};
+	assert.equal((await send(`cancel_ask\nsomething-else`)).error, "signature does not verify", "signed for another question");
+	assert.equal((await send("stop")).error, "signature does not verify", "a stop's payload");
+	assert.equal((await send(`cancel_ask\n${offered.id}`, { sig_v: undefined })).error, CANCEL_ASK_V1_REFUSED);
+	assert.equal((await send(`cancel_ask\n${offered.id}`, { key: "call" })).error, "bad request", "main key only");
+	assert.equal((await send(`cancel_ask\n${offered.id}`, { ask_id: "../x" })).error, "bad request");
+	assert.equal(cancelled, false);
+	assert.deepEqual(await send(`cancel_ask\n${offered.id}`), { ok: true });
+	await offered.cancelled;
+	assert.equal(openPrompts().some((p) => p.id === offered.id), false, "withdrawn");
+	await until(() => srv.types().includes("ask_end"));
+	assert.equal((await send(`cancel_ask\n${offered.id}`)).error, "that question was already answered");
+	offered.dispose();
+});
+
 test("a locked phone's pick: call key, v2, decision answer_call, one pick of the open single-select question", async () => {
 	const { offerPrompt, canonicalAnswerV2 } = await import("../lib/remote-prompts.ts");
 	const { ANSWER_CALL_SENSITIVE } = await import("../extensions/opt-in/botsun-owner/index.ts");

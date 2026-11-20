@@ -448,6 +448,47 @@ test("the run's abort (the phone's Stop) cancels the ask, closes the dialog and 
 	assert.equal(openPrompts().length, 0);
 });
 
+test("the phone's Cancel ends the ask as Esc does: User cancelled, the dialog closed, the question withdrawn", async () => {
+	const { openPrompts } = await import("../lib/remote-prompts.ts");
+	let tool;
+	await askExtension({ registerTool: (def) => (tool = def) });
+	let closed = false;
+	const running = tool.execute("t1", { question: "Pizza?", options: [{ label: "Pepperoni" }] }, undefined, undefined, hangingCtx(() => (closed = true)));
+	await new Promise((r) => setTimeout(r, 10));
+	const [prompt] = openPrompts();
+	assert.equal(typeof prompt.cancel, "function", "the ask tool's question is cancellable");
+	assert.equal(prompt.cancel(), null);
+	const result = await Promise.race([running, new Promise((r) => setTimeout(() => r("hung"), 500))]);
+	assert.notEqual(result, "hung", "the tool returns once cancelled");
+	assert.equal(result.content[0].text, "User cancelled");
+	assert.equal(result.details.cancelled, true);
+	assert.deepEqual(result.details.options, ["Pepperoni"]);
+	assert.ok(closed, "the TUI dialog was closed");
+	assert.equal(openPrompts().length, 0);
+	assert.equal(prompt.cancel(), "that question was already answered");
+	assert.equal(prompt.answer([{ picks: [0] }]), "that question was already answered");
+
+	// A batch: the same, as "User cancelled" for the whole call.
+	const batch = tool.execute("t2", { questions: [{ question: "A?", options: [{ label: "x" }] }, { question: "B?", options: [{ label: "y" }] }] },
+		undefined, undefined, hangingCtx(() => {}));
+	await new Promise((r) => setTimeout(r, 10));
+	openPrompts()[0].cancel();
+	const b = await batch;
+	assert.equal(b.details.cancelled, true);
+	assert.equal(b.content[0].text, "User cancelled");
+});
+
+test("a prompt offered without cancellable can't be cancelled from the phone", async () => {
+	const { offerPrompt, openPrompts } = await import("../lib/remote-prompts.ts");
+	const offered = offerPrompt([{ question: "Allow?", options: [{ label: "Allow" }] }], { sensitive: true });
+	assert.equal(openPrompts().find((p) => p.id === offered.id).cancel, undefined);
+	let settled = false;
+	offered.cancelled.then(() => (settled = true));
+	offered.dispose();
+	await new Promise((r) => setTimeout(r, 5));
+	assert.equal(settled, false, "cancelled never resolves");
+});
+
 test("formatAnswerLines leaves out the selected line for a typed-only answer", () => {
 	assert.deepEqual(formatAnswerLines(["A", "B"], [], ["Meet in the middle"]), ["User wrote: Meet in the middle"]);
 	assert.deepEqual(formatAnswerLines(["A", "B"], ["B"], ["more"]), ["User selected: 2. B", "User wrote: more"]);

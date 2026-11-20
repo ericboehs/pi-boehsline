@@ -627,6 +627,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (r.type === "call_end") return dropHeld(c, {});
 	if (r.type === "confirm") return confirmHeld(c, r);
 	if (r.type === "answer") return r.key !== undefined ? answerCall(c, r) : answerAsk(c, r);
+	if (r.type === "cancel_ask") return cancelAsk(c, r);
 	if (r.type === "stash") return stashRequest(c, r);
 	if (r.type === "stop") return stopRequest(c, r);
 	if (r.type === "stop_child") return stopChildRequest(c, r);
@@ -1307,6 +1308,43 @@ function answerAsk(c: Conn, r: Record<string, unknown>): Record<string, unknown>
 	return error ? { error } : { ok: true };
 }
 
+/** A v1-signed cancel_ask: it takes v2 or newer only. */
+export const CANCEL_ASK_V1_REFUSED = "cancelling a question needs a v2 signature: update Botsun and the app";
+/** A prompt offered without `cancellable` (op-broker's secret approval): only answered. */
+export const CANCEL_ASK_REFUSED = "this question can't be cancelled from the phone; answer it, or press Esc in the session";
+
+/**
+ * Eric's Cancel on the phone's ask card: the tool returns what Esc at the keyboard returns ("User
+ * cancelled") and closes its dialog. Signed with the decision key, v2 or newer, over
+ * "cancel_ask\n<ask id>" (kind session, scope the session id; this session's nonce: single use),
+ * so the signature cancels that question and no other. Only a prompt offered cancellable (the ask
+ * tool's) is taken. Refusals before verifyDevice spend the nonce anyway (one try per nonce).
+ */
+function cancelAsk(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const spend = (error: string) => {
+		if (typeof r.nonce === "string") takeNonce(c, r.nonce);
+		return { error };
+	};
+	if (r.key !== undefined) return spend("bad request");
+	const id = r.ask_id;
+	if (typeof id !== "string" || !validScope(id)) return spend("bad request");
+	if (!atLeastV2(r)) return spend(CANCEL_ASK_V1_REFUSED);
+	const prompt = openPrompts().find((p) => p.id === id);
+	if (!prompt) return spend("that question was already answered");
+	if (!prompt.cancel) return spend(CANCEL_ASK_REFUSED);
+	const payload = `cancel_ask\n${id}`;
+	const denied = verifyDevice(c, r, {
+		decision: "cancel_ask",
+		digest: () => sha256hex(Buffer.from(payload, "utf8")),
+		v2: { kind: "session", decision: "cancel_ask", payload: () => payload },
+	});
+	if (denied) return { error: denied };
+	const error = prompt.cancel();
+	if (error) return { error };
+	debug("owner cancel_ask cancelled an ask");
+	return { ok: true };
+}
+
 /** A sensitive ask (op-broker's secret approval) picked on a locked phone: refused. */
 export const ANSWER_CALL_SENSITIVE = "answer this one on the unlocked phone or the keyboard";
 
@@ -1718,11 +1756,19 @@ export function stashLine(c: Pick<Conn, "sessionId">): { id: string; text: strin
 /**
  * The newest question a tool (ask) has open, as Botsun shows it; null when none. sensitive: a
  * secret's approval, which the call can't confirm (Botsun drops keys it doesn't know).
+ * cancellable: the phone may cancel it (cancel_ask); an older Botsun drops the key.
  */
-function askLine(): { id: string; questions: RemotePrompt["questions"]; sensitive?: true } | null {
+function askLine(): { id: string; questions: RemotePrompt["questions"]; sensitive?: true; cancellable?: true } | null {
 	const open = openPrompts();
 	const p = open[open.length - 1];
-	return p ? { id: p.id, questions: p.questions, ...(p.sensitive ? { sensitive: true as const } : {}) } : null;
+	return p
+		? {
+				id: p.id,
+				questions: p.questions,
+				...(p.sensitive ? { sensitive: true as const } : {}),
+				...(p.cancel ? { cancellable: true as const } : {}),
+			}
+		: null;
 }
 
 const retryBase = (): number => {
