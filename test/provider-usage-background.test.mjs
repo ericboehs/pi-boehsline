@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { mock } from "node:test";
@@ -13,6 +13,7 @@ import test, { mock } from "node:test";
 import providerUsage, {
   PROVIDER_USAGE_DEFAULTS,
   backgroundPollOnce,
+  backgroundTimerCount,
   backgroundPollPlan,
   resolveUsageDriver,
 } from "../extensions/provider-usage/index.ts";
@@ -170,7 +171,23 @@ test("two pi instances polling at once: one fetch", async (t) => {
   assert.equal(env.calls.length, 1);
 });
 
-/** Run session_start under fake timers, jump past the first background tick, and count fetches. */
+test("a hung fetch times out, releases the cache lock, and counts as failed", async (t) => {
+  const env = setup(t);
+  env.writeCache(Date.now() - 2 * INTERVAL);
+  const ctx = ctxWith("oauth");
+  // An OAuth refresh that never answers.
+  ctx.modelRegistry.getProviderAuth = () => new Promise(() => {});
+  const started = Date.now();
+  assert.equal(await backgroundPollOnce(ctx, grok, INTERVAL, 50), "failed");
+  assert.ok(Date.now() - started < 2_000);
+  assert.equal(existsSync(path.join(env.dir, "usage-cache.lock")), false, "lock released");
+  assert.match(readFileSync(path.join(env.dir, "provider-usage.log"), "utf8"), /background poll failed: timed out/);
+});
+
+/**
+ * Run session_start under fake timers, jump past the first background tick,
+ * and count fetches plus live background timers (after start, after shutdown).
+ */
 async function fetchesAfterStart(t, ctx) {
   const env = setup(t);
   env.writeCache(Date.now() - 2 * INTERVAL);
@@ -188,23 +205,30 @@ async function fetchesAfterStart(t, ctx) {
     for (const handler of handlers.get(name) ?? []) await handler({}, ctx);
   };
   providerUsage(pi);
+  const baseline = backgroundTimerCount();
+  let timers;
   mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
   try {
     await fire("session_start");
+    timers = backgroundTimerCount() - baseline;
     mock.timers.tick(20_000);
   } finally {
     mock.timers.reset();
   }
-  const deadline = Date.now() + 2_000;
+  const deadline = Date.now() + (timers > 0 ? 2_000 : 200);
   while (env.calls.length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
   await fire("session_shutdown");
-  return env.calls.length;
+  return { fetches: env.calls.length, timers, afterShutdown: backgroundTimerCount() - baseline };
 }
 
-test("the extension polls xai in the background shortly after session start", async (t) => {
-  assert.equal(await fetchesAfterStart(t, ctxWith("oauth")), 1);
+test("the extension polls xai in the background shortly after session start, and shutdown clears its timers", async (t) => {
+  assert.deepEqual(await fetchesAfterStart(t, ctxWith("oauth")), { fetches: 1, timers: 2, afterShutdown: 0 });
 });
 
 test("print mode never starts the background poll", async (t) => {
-  assert.equal(await fetchesAfterStart(t, ctxWith("oauth", { mode: "print", hasUI: false })), 0);
+  assert.deepEqual(await fetchesAfterStart(t, ctxWith("oauth", { mode: "print", hasUI: false })), { fetches: 0, timers: 0, afterShutdown: 0 });
+});
+
+test("json mode never starts the background poll", async (t) => {
+  assert.deepEqual(await fetchesAfterStart(t, ctxWith("oauth", { mode: "json", hasUI: false })), { fetches: 0, timers: 0, afterShutdown: 0 });
 });

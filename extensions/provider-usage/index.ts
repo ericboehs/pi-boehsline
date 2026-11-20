@@ -2799,6 +2799,13 @@ const BACKGROUND_TICK_MAX_MS = 5 * 60 * 1000;
 /** First check after session start, off pi's startup path. */
 const BACKGROUND_FIRST_TICK_MS = 15_000;
 const BACKGROUND_STAMP_FILE = "usage-background.json";
+/** Cap on one background fetch (auth refresh included), well inside the lock's stale window. */
+export const BACKGROUND_FETCH_TIMEOUT_MS = 45_000;
+/** Live background-poll timers across every instance, for tests and shutdown checks. */
+let liveBackgroundTimers = 0;
+export function backgroundTimerCount(): number {
+  return liveBackgroundTimers;
+}
 
 export interface BackgroundPoll {
   driver: Driver;
@@ -2876,6 +2883,7 @@ export async function backgroundPollOnce(
   ctx: ExtensionContext,
   driver: Driver,
   intervalMs: number,
+  fetchTimeoutMs = BACKGROUND_FETCH_TIMEOUT_MS,
 ): Promise<BackgroundPollResult> {
   if (!driver.background || !oauthSignedIn(ctx, driver.provider)) return "signed-out";
   if (!(await backgroundDue(driver, intervalMs))) return "fresh";
@@ -2884,7 +2892,18 @@ export async function backgroundPollOnce(
     // Another pi may have fetched while we took the lock.
     if (!(await backgroundDue(driver, intervalMs))) return "fresh";
     await writeBackgroundStamp(driver.id, Date.now());
-    const display = await driver.fetch(ctx);
+    // The lock goes stale at SHARED_LOCK_STALE_MS; a hung OAuth refresh or fetch
+    // must not hold it past that, or another pi steals it and we release theirs.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out after ${Math.round(fetchTimeoutMs / 1000)}s`)), fetchTimeoutMs);
+    });
+    let display: UsageDisplay;
+    try {
+      display = await Promise.race([driver.fetch(ctx), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
     await writeSharedEntry(driver.id, display, Date.now());
     if (backgroundWarned.delete(driver.id)) logLine(`[${driver.id}] background poll recovered`);
     return "fetched";
@@ -3093,11 +3112,13 @@ export default function providerUsage(pi: ExtensionAPI): void {
       first.unref?.();
       every.unref?.();
       backgroundTimers.push(first, every);
+      liveBackgroundTimers += 2;
     }
   }
 
   function stopBackgroundPolls(): void {
     for (const timer of backgroundTimers) clearTimeout(timer);
+    liveBackgroundTimers -= backgroundTimers.length;
     backgroundTimers = [];
   }
 
