@@ -28,6 +28,11 @@ import path from "node:path";
 import { appendFileSync, existsSync, mkdirSync, renameSync, writeFileSync, unlinkSync } from "node:fs";
 import type { Server } from "node:net";
 import { activateToolSearch } from "../../lib/tool-search.ts";
+import {
+  ReloadController, RELOAD_COMMAND, RELOAD_REPLY_TIMEOUT_MS, IDLE_TARGETS,
+  describeOutcome, outcomeFromFrame, type ReloadOutcome,
+} from "./reload.ts";
+import { randomUUID } from "node:crypto";
 
 // Debug logging: enabled by env PI_AGENT_LINK_DEBUG or the sentinel /tmp/pi-agent-link-debug.on
 // (pi may not propagate env to extensions in all modes, so the sentinel is handy).
@@ -210,7 +215,89 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     if (!active.includes("agent-link")) pi.setActiveTools([...active, "agent-link"]);
   }
 
+  // ---- remote reload (see reload.ts) ----------------------------------------
+  const reloads = new ReloadController({
+    isIdle: () => lastCtx?.isIdle?.() ?? true,
+    editorText: () => (lastCtx?.hasUI ? lastCtx.ui.getEditorText?.() ?? "" : ""),
+    // A command, not a chat message: expandPromptTemplates makes pi run the
+    // extension command, so nothing reaches the transcript or the model.
+    dispatch: () => pi.sendUserMessage(`/${RELOAD_COMMAND}`, { expandPromptTemplates: true }),
+    notify: (m, level) => notify(m, level),
+  });
+  // Senders waiting on a reload_result, keyed by request id.
+  const reloadWaiters = new Map<string, (outcome: ReloadOutcome) => void>();
+
+  /**
+   * A peer asks us to reload. Only registered, live peers are answered: the
+   * socket is 0600 in a 0700 directory, so the sender already runs as this
+   * user, and the reply address must belong to a session in the registry, so a
+   * frame can't make us write to an arbitrary socket.
+   */
+  function onReloadRequest(frame: any): void {
+    const fromAddr = typeof frame.from === "string" ? frame.from : "";
+    const sock = fromAddr.startsWith("uds:") ? fromAddr.slice(4) : "";
+    const who = sock && sock !== sockPath ? peerNameBySock(sock) : undefined;
+    if (!who) { dbg(`reload request dropped: sender ${fromAddr || "(none)"} is not a registered peer`); return; }
+    const reqId = typeof frame.req_id === "string" ? frame.req_id : undefined;
+    dbg(`reload requested by ${who} force=${frame.force === true}`);
+    reloads.request({
+      who,
+      force: frame.force === true,
+      reply: (outcome) => sendFrame(sock, {
+        type: "control", action: "reload_result", req_id: reqId, from: ownFrom, name: selfName, ...outcome,
+      }).catch((e) => dbg(`reload reply to ${who} failed: ${(e as Error).message}`)),
+    });
+  }
+
+  /** Ask one peer to reload and wait for its answer. */
+  async function reloadPeer(target: { sock: string; name: string; entrypoint?: string }, force: boolean): Promise<ReloadOutcome> {
+    if (target.entrypoint && target.entrypoint !== "pi") {
+      return { status: "refused", reason: "not a pi session (only pi sessions running agent-link can be reloaded)" };
+    }
+    const reqId = randomUUID();
+    const answer = new Promise<ReloadOutcome>((resolve) => {
+      const timer = setTimeout(() => {
+        reloadWaiters.delete(reqId);
+        resolve({ status: "refused", reason: `no answer within ${RELOAD_REPLY_TIMEOUT_MS / 1000}s (its agent-link may predate reload)` });
+      }, RELOAD_REPLY_TIMEOUT_MS);
+      reloadWaiters.set(reqId, (o) => { clearTimeout(timer); reloadWaiters.delete(reqId); resolve(o); });
+    });
+    try {
+      await sendFrame(target.sock, { type: "control", action: "reload", req_id: reqId, from: ownFrom, fromName: selfName, force });
+    } catch (e) {
+      reloadWaiters.get(reqId)?.({ status: "refused", reason: `could not reach it: ${(e as Error).message}` });
+    }
+    return answer;
+  }
+
+  /** The tool's and /agent-link's reload: one target, or every idle pi session. */
+  async function reloadTargets(to: string, force: boolean): Promise<{ text: string; isError: boolean }> {
+    await starting;
+    if (!started) return { text: "Error: agent-link is not running in this session.", isError: true };
+    if (to === IDLE_TARGETS) {
+      const rows = await listClaudeSessions({ excludeSock: sockPath });
+      const idle = rows.filter((r) => r.entrypoint === "pi" && r.status === "idle");
+      if (!idle.length) return { text: "No other idle pi sessions to reload.", isError: false };
+      const outcomes = await Promise.all(idle.map((r) => reloadPeer(r, force)));
+      const lines = idle.map((r, i) => `- ${peerLabel(r, rows)}: ${describeOutcome(outcomes[i]!)}`);
+      return { text: `Reload of ${idle.length} idle session(s):\n${lines.join("\n")}`, isError: false };
+    }
+    const res = await resolveTarget(to, { excludeSock: sockPath });
+    if (res.error) {
+      const hint = res.candidates?.length ? ` Available: ${res.candidates.join(", ")}.` : "";
+      return { text: `Error: ${res.error}.${hint}`, isError: true };
+    }
+    const outcome = await reloadPeer(res.target!, force);
+    return { text: `"${res.target!.name}": ${describeOutcome(outcome)}`, isError: outcome.status === "refused" };
+  }
+
   function onFrame(frame: any): void {
+    if (frame?.type === "control" && frame.action === "reload") { onReloadRequest(frame); return; }
+    if (frame?.type === "control" && frame.action === "reload_result") {
+      const waiter = typeof frame.req_id === "string" ? reloadWaiters.get(frame.req_id) : undefined;
+      waiter?.(outcomeFromFrame(frame));
+      return;
+    }
     if (frame?.type === "control" && frame.action === "rename" && typeof frame.name === "string") {
       selfName = frame.name;
       updatePeer(pid, { name: frame.name }).catch(() => {});
@@ -322,9 +409,12 @@ export default function piMeshExtension(pi: ExtensionAPI) {
       peerStatus = "idle";
       await registerPeer({ pid, sessionId, name: selfName, cwd, sockPath, status: peerStatus, startedAt, nameSource });
       // session_shutdown cleans up a normal exit; this catches a hard one.
-      if (!exitHooked) {
-        exitHooked = true;
-        process.once("exit", () => deregisterPeerSync(pid, sockPath));
+      // Once per process: a reload builds a new instance, and the path is the same.
+      const g = globalThis as { __piAgentLinkExitHooked?: boolean };
+      if (!g.__piAgentLinkExitHooked) {
+        g.__piAgentLinkExitHooked = true;
+        const exitSock = sockPath;
+        process.once("exit", () => deregisterPeerSync(pid, exitSock));
       }
       syncSummaryFile();
       dbg(`started name=${selfName} pid=${pid} sock=${sockPath} session=${sessionId}`);
@@ -338,8 +428,6 @@ export default function piMeshExtension(pi: ExtensionAPI) {
       notify(`pi-agent-link failed to start: ${(e as Error).message}`, "error");
     }
   }
-
-  let exitHooked = false;
 
   async function stop() {
     try { server?.close(); } catch { /* */ }
@@ -403,6 +491,7 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     lastCtx = ctx;
     activeTools.clear();
     await setPeerStatus("idle");
+    reloads.settled();
   });
   pi.on("session_shutdown", async () => { await starting; await stop(); });
 
@@ -410,10 +499,11 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   const PARAMS = Type.Object({
     action: Type.Union([
       Type.Literal("list"), Type.Literal("send"), Type.Literal("ask"),
-      Type.Literal("reply"), Type.Literal("pending"),
-    ], { description: "list sessions; send fire-and-forget; ask and wait; reply to a pending ask; list pending asks" }),
-    to: Type.Optional(Type.String({ description: "Target name or id; optional to disambiguate reply" })),
+      Type.Literal("reply"), Type.Literal("pending"), Type.Literal("reload"),
+    ], { description: "list sessions; send fire-and-forget; ask and wait; reply to a pending ask; list pending asks; reload a session (pi's /reload)" }),
+    to: Type.Optional(Type.String({ description: `Target name or id; optional to disambiguate reply. For reload: omit to reload this session after the response, or "${IDLE_TARGETS}" for every idle session` })),
     message: Type.Optional(Type.String({ description: "Message text for send, ask, or reply" })),
+    force: Type.Optional(Type.Boolean({ description: "reload only: reload even if the target has unsent text in its editor" })),
   });
 
   const text = (t: string, isError = false) => ({ content: [{ type: "text" as const, text: t }], details: {}, ...(isError && { isError: true }) });
@@ -424,8 +514,10 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     exposure: "deferred",
     description:
       "Talk to agent sessions running on this machine: list, send, ask and wait, " +
-      "reply to a pending ask, or list pending asks. When the user writes @name " +
-      "(for example @foo), that addresses a live session — use this tool, not read.",
+      "reply to a pending ask, list pending asks, or reload a session. When the user writes @name " +
+      "(for example @foo), that addresses a live session — use this tool, not read. " +
+      "To reload a session (pi's /reload, e.g. after extension changes) use action \"reload\": " +
+      "sending the text \"/reload\" does nothing, the receiving model can't run slash commands.",
     promptSnippet: "Message other agent sessions on this machine. @name in the user prompt addresses a live session (use this tool, not read).",
     parameters: PARAMS,
     async execute(_id, params) {
@@ -445,6 +537,16 @@ export default function piMeshExtension(pi: ExtensionAPI) {
         return text(`Pending asks (${lines.length}):\n${lines.join("\n")}`);
       }
       const to = String(params.to || "").trim();
+      if (params.action === "reload") {
+        const force = params.force === true;
+        if (!to) {
+          reloads.requestSelf(force);
+          // terminate ends the run here, so the reload follows this response.
+          return { ...text("Reload requested: this session reloads once this response ends."), terminate: true };
+        }
+        const result = await reloadTargets(to, force);
+        return text(result.text, result.isError);
+      }
       const message = String(params.message ?? "");
       if (!message) return text("Error: 'message' is required.", true);
 
@@ -521,10 +623,32 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ---- reload command ------------------------------------------------------
+  // Remote and self reloads dispatch this (sendUserMessage with
+  // expandPromptTemplates), since only a command context can call ctx.reload().
+  pi.registerCommand(RELOAD_COMMAND, {
+    description: "Reload pi like /reload (agent-link runs this for reload requests from other sessions)",
+    handler: async (_args, ctx) => {
+      // Answer waiting senders first: ctx.reload() shuts this instance down.
+      await reloads.beforeReload();
+      await ctx.reload();
+      return;
+    },
+  });
+
   // ---- convenience command -------------------------------------------------
   pi.registerCommand("agent-link", {
-    description: "List Claude Code sessions you can message; 'dedupe' un-collides their names",
+    description: `List sessions you can message; 'dedupe' un-collides their names; 'reload <name|${IDLE_TARGETS}> [--force]' reloads other sessions`,
     handler: async (args, ctx) => {
+      const [sub, ...rest] = args.trim().split(/\s+/);
+      if (sub === "reload") {
+        const force = rest.includes("--force");
+        const to = rest.filter((a) => a !== "--force").join(" ");
+        if (!to) { ctx.ui.notify("Usage: /agent-link reload <name|*idle> [--force]. Use /reload for this session.", "info"); return; }
+        const result = await reloadTargets(to, force);
+        ctx.ui.notify(result.text, result.isError ? "warning" : "info");
+        return;
+      }
       const rows = await listClaudeSessions({ excludeSock: sockPath });
       if (args.trim() === "dedupe") {
         // Include ourselves: our name is one of the ones that can collide.
