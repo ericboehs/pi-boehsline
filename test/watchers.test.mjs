@@ -665,6 +665,18 @@ const wcfg = (script, over = {}) => ({
 	...over,
 });
 
+test("config: an id of only dots is rejected, since the id names a directory under the state root", () => {
+	for (const id of [".", "..", "..."]) {
+		const cfg = buildConfig(parseToml(`[[watcher]]\nid = "${id}"\ncommand = ["/bin/true"]\nmatch = { cwd = "/" }\n`));
+		assert.equal(cfg.watchers.length, 0, id);
+		assert.ok(cfg.warnings.some((w) => /id must match/.test(w)), id);
+	}
+	for (const id of ["a.b", ".hidden", "v1..2"]) {
+		const cfg = buildConfig(parseToml(`[[watcher]]\nid = "${id}"\ncommand = ["/bin/true"]\nmatch = { cwd = "/" }\n`));
+		assert.equal(cfg.watchers[0]?.id, id);
+	}
+});
+
 test("runner: a stale state.json.next is cleared; commit only on exit 0", async () => {
 	const dir = tmp();
 	const state = tmp();

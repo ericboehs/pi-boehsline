@@ -17,7 +17,8 @@ import { REPO_RE } from "./contract.ts";
 export type TomlValue = string | number | boolean | TomlValue[] | { [key: string]: TomlValue };
 export type TomlTable = { [key: string]: TomlValue };
 
-export const ID_RE = /^[A-Za-z0-9._-]{1,40}$/;
+/** Also used as a directory name under the state root, so `.` and `..` are out. */
+export const ID_RE = /^(?!\.+$)[A-Za-z0-9._-]{1,40}$/;
 /** Passed to every script: gh and GitHub tooling read these. */
 export const ENV_PASS_RE = /^(GH|GITHUB)_[A-Za-z0-9_]{1,60}$/;
 export const INTERVAL_FLOOR_MS = 30_000;
