@@ -6,9 +6,11 @@ import { connect } from "node:net";
 import { bindSocket } from "../claude-protocol.ts";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { unlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, unlinkSync } from "node:fs";
 
-const sock = path.join(tmpdir(), `pi-agent-link-sendclose-${process.pid}.sock`);
+// A private dir of its own: bindSocket refuses a shared one such as /tmp (Linux CI's tmpdir).
+const dir = mkdtempSync(path.join(tmpdir(), "pi-agent-link-sendclose-"));
+const sock = path.join(dir, "s.sock");
 let received = false;
 const server = await bindSocket(sock, () => { received = true; });
 
@@ -35,4 +37,5 @@ try {
 }
 server.close();
 try { unlinkSync(sock); } catch { /* */ }
+rmSync(dir, { recursive: true, force: true });
 process.exit(ok ? 0 : 1);
