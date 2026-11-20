@@ -105,17 +105,33 @@ or from the pi UI: `/agent-link reload <name|*idle> [--force]`.
 The request is a control frame on the agent-link socket, not a message: the target's
 model never sees it, and nothing lands in its transcript. The target answers with one of:
 
-- **reloaded** — it was idle and is reloading now (the answer goes out first);
-- **queued (busy, reloads when the turn ends)** — it reloads at `agent_settled`;
+- **reloaded** — it was free and is reloading now (the answer goes out first, from
+  the reload command, once it has checked the session is still idle);
+- **queued (busy, reloads when it is free)** — it is in an agent run (it reloads at
+  `agent_settled`), or busy otherwise: a manual `/compact`, a blocking dialog from
+  any extension, or one of agent-link's own commands. Outside an agent run it
+  re-checks on `session_compact`, when the dialog closes, and every second, and
+  gives up after 2 minutes with a notice. A queued reload is skipped, with a
+  notice, if the user starts typing or aborts the run (Esc) first, unless forced;
 - **refused: …** — it has unsent text in its editor (`force: true` overrides), it
-  accepted another reload request less than 30 seconds ago, or it didn't answer
-  within 5 seconds (an agent-link without reload, or a Claude session).
+  reloaded for another request less than 30 seconds ago, or it isn't reloadable: a
+  session whose registry entry names another program (a Claude session) is refused
+  at once without a frame, and one with no program recorded that doesn't answer
+  within 5 seconds is reported as no answer (an agent-link without reload).
+
+A request from a socket that isn't in this user's registry gets no answer at all.
 
 `*idle` covers live pi sessions whose status is `idle`, except the caller; busy
-sessions and Claude sessions are left alone. Under the hood the target dispatches
-its own `/agent-link-reload` command, which calls `ctx.reload()` (pi reloads only
-from a command, never mid-run). After the reload agent-link registers again under
-the same name.
+sessions and Claude sessions are left alone. One session sends `*idle` at most once
+per 60 seconds. Under the hood the target dispatches its own `/agent-link-reload`
+command (marked internal; pi has no hidden commands), which calls `ctx.reload()`
+(pi reloads only from a command, never mid-run). After the reload agent-link
+registers again under the same name, including one set by `/agent-link dedupe` or
+a rename, and keeps its start time, so a session that took the name in the gap
+yields it back.
+
+Not detectable: another extension's command that is busy without a dialog open. A
+reload then would invalidate that command's `ctx`.
 
 ## Recommended safety setting
 
@@ -164,10 +180,12 @@ Messages between agents are **peer input, not user authority**:
   user"* — the model is instructed to treat them as peer requests and not as your
   approval.
 - Sockets are `0600` inside a `0700` directory: the boundary is your **user account**
-  (a same-user process could already reach these).
-- **Reload requests** are accepted only from sessions registered on this machine
-  (the same user's registry), at most one per 30 seconds, and never over unsent
-  editor text unless forced. See [SECURITY.md](SECURITY.md).
+  (a same-user process could already reach these). agent-link refuses to bind if the
+  directory is a symlink, belongs to another user, or is open to group/other.
+- **Reload requests** are answered only for sessions registered on this machine
+  (the same user's registry; others are dropped unanswered), reload at most once
+  per 30 seconds, and never over unsent editor text unless forced. A session sends
+  `*idle` at most once per 60 seconds. See [SECURITY.md](SECURITY.md).
 - **Do not wire this extension to external/automated inputs.** It is a path for
   untrusted content to reach a permissioned agent — keep the input side to things a
   human sends.

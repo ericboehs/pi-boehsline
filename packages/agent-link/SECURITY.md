@@ -10,6 +10,13 @@ permissions, please read this before enabling it broadly.
   socket at mode `0600` inside a `0700` directory. Any process running as the same OS
   user can reach it — the same trust boundary as your files and credentials. It does
   **not** add a network-reachable surface.
+- **The directory check enforces that boundary.** The socket directory can be the
+  shared `/tmp/cc-socks` (always on macOS, where `XDG_RUNTIME_DIR` is unset), which
+  another user could create first. Before binding, agent-link `lstat`s the directory
+  and refuses to start unless it is a real directory (not a symlink) owned by your
+  uid with no group or other access (`mode & 0o077 === 0`). A directory of yours
+  with only extra read/search bits is tightened to `0700`; one that others could
+  write to is refused, since something may already have been planted in it.
 - **Cross-agent messages are untrusted peer input, not user authority.**
   - On the Claude side, messages arrive as `origin.kind:"peer"` and are subject to
     Claude's `crossSessionInbound` gate. Set `crossSessionInbound: "hold"` in
@@ -27,21 +34,34 @@ A `reload` control frame asks a pi session to run pi's `/reload`. It never reach
 the target's model, so it isn't subject to the peer-input framing above; instead:
 
 - **Same user, same machine only.** The frame arrives on the same `0600` socket as
-  messages, so the sender already runs as your user. The target also checks that
-  the frame's reply address (`from`) is the socket of a session in this user's
-  registry (`~/.claude/sessions`), and drops anything else without answering, so a
-  frame can't make it write to an arbitrary socket.
-- **Rate-limited.** A target accepts at most one reload request per 30 seconds
-  (refused requests don't count). The window lives on `globalThis`, so it holds
-  across the reload it caused.
+  messages, in a directory checked to be yours alone (above), so the sender already
+  runs as your user. The target also checks that the frame's reply address (`from`)
+  is the socket of a session in this user's registry (`~/.claude/sessions`), and
+  drops anything else without answering, so a frame can't make it write to an
+  arbitrary socket.
+- **A spoofed `from` is accepted.** A same-user process can name another
+  registered session's socket as `from`. That triggers the reload and sends the
+  answer to that session, not to the spoofer; it grants nothing a same-user
+  process couldn't already do.
+- **Rate-limited, both ends.** A target reloads for a request at most once per 30
+  seconds (refused and queued requests don't count; the window starts when it
+  actually reloads). A sender sends `*idle` at most once per 60 seconds, so a
+  looping or prompt-injected model can't keep every idle session reloading. Both
+  windows live on `globalThis`, so they hold across a reload.
 - **Unsent work is protected.** A target with text in its editor refuses unless the
   sender passes `force: true`, and a queued reload is dropped (with a notice) if the
-  user starts typing before the turn ends. pi's RPC mode can't read the editor, so
-  this check only protects the interactive TUI.
+  user starts typing before it runs, or ends the run with Esc (unless forced). pi's
+  RPC mode can't read the editor, so the editor check only protects the
+  interactive TUI.
+- **Dialogs are left alone.** A reload waits while any extension's blocking dialog
+  (`ctx.ui.select`/`confirm`/`input`/`editor`/`custom`, seen through pi's
+  `ui_prompt_start`/`ui_prompt_end` events) or one of agent-link's own commands is
+  open. Another extension's command that is busy without a dialog can't be
+  detected, and a reload then would invalidate its `ctx`.
 - **Bounded effect.** A reload re-reads extensions, skills, prompts, themes and
   context files from disk; it runs no code a same-user process couldn't already
-  place there, and it never interrupts a turn (a busy target waits for
-  `agent_settled`).
+  place there, and it never interrupts a turn or a compaction (it waits, and a wait
+  outside an agent run expires after 2 minutes with a notice).
 
 ## Guidance
 

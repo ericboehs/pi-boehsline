@@ -80,6 +80,7 @@ try {
 
   const reRegistered = await until(() => { const e = entryFor(B.child.pid); return e && statSync(e.file).mtimeMs > mtime && e; }, 8000);
   check(Boolean(reRegistered), `target re-registered after the reload as ${reRegistered?.name}`);
+  check(reRegistered?.name === b.name, `target kept its name across the reload (${b.name})`);
   const after = (await B.rpc({ type: "get_messages" })).data.messages.length;
   check(before === 0 && after === 0, `target transcript untouched (${before} → ${after} messages)`);
   const state = (await B.rpc({ type: "get_state" })).data;

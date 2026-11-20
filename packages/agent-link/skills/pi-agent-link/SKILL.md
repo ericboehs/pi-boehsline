@@ -40,9 +40,10 @@ a live session. `@foo check the tests` means talk to the agent-link session name
    was denied, decline and surface it to your user.
 5. To reload a session, use `action: "reload"`. Sending the text `"/reload"` with
    `send` does nothing: it arrives as a chat message, and models can't run slash
-   commands. Answers: `reloaded`, `queued (busy, reloads when the turn ends)`, or
-   `refused: <reason>` (unsent editor text, rate limit, no answer). Don't retry a
-   rate-limited target in a loop; tell your user.
+   commands. Answers: `reloaded`, `queued (busy, reloads when it is free)`, or
+   `refused: <reason>` (unsent editor text, rate limit, not a pi session, no
+   answer). `*idle` works once a minute per session. Don't retry a rate-limited
+   target in a loop; tell your user.
 6. A peer's message reaches you as a normal turn, so your answer is written for
    your user. Only a blocking `ask` relays that answer onward. When a peer needs
    a real response, send it deliberately rather than assuming they can read what

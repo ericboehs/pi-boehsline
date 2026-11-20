@@ -10,7 +10,7 @@
  * Runs in-process; no daemon, no external transport — Claude's registry is the hub.
  */
 
-import type { AgentEndEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentEndEvent, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   ccSocksDir, bindSocket, registerPeer, updatePeer, deregisterPeer, deregisterPeerSync,
@@ -29,8 +29,8 @@ import { appendFileSync, existsSync, mkdirSync, renameSync, writeFileSync, unlin
 import type { Server } from "node:net";
 import { activateToolSearch } from "../../lib/tool-search.ts";
 import {
-  ReloadController, RELOAD_COMMAND, RELOAD_REPLY_TIMEOUT_MS, IDLE_TARGETS,
-  describeOutcome, outcomeFromFrame, type ReloadOutcome,
+  ReloadController, RELOAD_COMMAND, RELOAD_REPLY_TIMEOUT_MS, IDLE_TARGETS, BULK_COOLDOWN_MS,
+  claimBulkReload, describeOutcome, outcomeFromFrame, parseReloadArgs, sharedReloadState, type ReloadOutcome,
 } from "./reload.ts";
 import { randomUUID } from "node:crypto";
 
@@ -43,6 +43,12 @@ const dbg = (...a: unknown[]) => {
 
 interface AskWaiter { resolve: (body: string) => void; timer: NodeJS.Timeout; }
 interface PendingReply { hops: number; who: string; receivedAt: number; preview: string; }
+/** The peer identity a reload carries over: the new instance would otherwise re-derive it. */
+interface StashedIdentity { selfName: string; nameSource: "user" | "derived"; startedAt: number; }
+const identityStash = (): Map<number, StashedIdentity> => {
+  const g = globalThis as { __piAgentLinkIdentity?: Map<number, StashedIdentity> };
+  return (g.__piAgentLinkIdentity ??= new Map());
+};
 
 export default function piMeshExtension(pi: ExtensionAPI) {
   let started = false;
@@ -51,8 +57,8 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   // ~60ms with a dozen sessions open). Anything that touches the peer record
   // awaits this first.
   let starting: Promise<void> | undefined;
-  const ensureStarted = (ctx: ExtensionContext): Promise<void> => {
-    if (!started) starting = start(ctx);
+  const ensureStarted = (ctx: ExtensionContext, reason?: string): Promise<void> => {
+    if (!started) starting = start(ctx, reason);
     return starting ?? Promise.resolve();
   };
   let server: Server | undefined;
@@ -67,7 +73,7 @@ export default function piMeshExtension(pi: ExtensionAPI) {
 
   // Derived names come from the directory, so every pi in one checkout wants
   // the same one. Claim the first free slot instead of shipping a duplicate.
-  const startedAt = Date.now();
+  let startedAt = Date.now();
   let nameSource: "user" | "derived" = "derived";
   const liveNames = async (): Promise<string[]> =>
     (await listClaudeSessions({ excludeSock: sockPath })).map((r) => r.name);
@@ -216,8 +222,19 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   }
 
   // ---- remote reload (see reload.ts) ----------------------------------------
+  // Between agent_start and agent_settled. A busy session outside a run (a
+  // manual /compact) has no agent_settled to wait for.
+  let runActive = false;
+  // A blocking extension dialog (any extension's ctx.ui.select/confirm/input/
+  // editor/custom, via ui_prompt_start/end) or one of our own commands is open.
+  // Reloading then would tear the dialog down under its handler. Other
+  // extensions' commands that are busy without a dialog can't be seen.
+  let uiPromptOpen = false;
+  let ownCommands = 0;
   const reloads = new ReloadController({
     isIdle: () => lastCtx?.isIdle?.() ?? true,
+    isRunning: () => runActive,
+    uiBusy: () => uiPromptOpen || ownCommands > 0,
     editorText: () => (lastCtx?.hasUI ? lastCtx.ui.getEditorText?.() ?? "" : ""),
     // A command, not a chat message: expandPromptTemplates makes pi run the
     // extension command, so nothing reaches the transcript or the model.
@@ -229,9 +246,11 @@ export default function piMeshExtension(pi: ExtensionAPI) {
 
   /**
    * A peer asks us to reload. Only registered, live peers are answered: the
-   * socket is 0600 in a 0700 directory, so the sender already runs as this
-   * user, and the reply address must belong to a session in the registry, so a
-   * frame can't make us write to an arbitrary socket.
+   * socket is 0600 in a directory bindSocket has checked is ours and 0700, so
+   * the sender already runs as this user, and the reply address must belong to
+   * a session in the registry, so a frame can't make us write to an arbitrary
+   * socket. A same-user process can still name another peer's socket as
+   * `from`; that only sends the answer to that peer (accepted: see SECURITY.md).
    */
   function onReloadRequest(frame: any): void {
     const fromAddr = typeof frame.from === "string" ? frame.from : "";
@@ -278,6 +297,10 @@ export default function piMeshExtension(pi: ExtensionAPI) {
       const rows = await listClaudeSessions({ excludeSock: sockPath });
       const idle = rows.filter((r) => r.entrypoint === "pi" && r.status === "idle");
       if (!idle.length) return { text: "No other idle pi sessions to reload.", isError: false };
+      // A looping or prompt-injected model could otherwise keep every idle
+      // session reloading: the targets' limits are per target, not per sender.
+      const wait = claimBulkReload(sharedReloadState(), Date.now());
+      if (wait) return { text: `Error: ${IDLE_TARGETS} reloads at most once per ${BULK_COOLDOWN_MS / 1000}s from one session; try again in ${wait}s.`, isError: true };
       const outcomes = await Promise.all(idle.map((r) => reloadPeer(r, force)));
       const lines = idle.map((r, i) => `- ${peerLabel(r, rows)}: ${describeOutcome(outcomes[i]!)}`);
       return { text: `Reload of ${idle.length} idle session(s):\n${lines.join("\n")}`, isError: false };
@@ -392,7 +415,7 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   }
 
   // ---- lifecycle -----------------------------------------------------------
-  async function start(ctx: ExtensionContext) {
+  async function start(ctx: ExtensionContext, reason?: string) {
     lastCtx = ctx;
     if (started) return;
     started = true;
@@ -402,8 +425,16 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     sockPath = path.join(ccSocksDir(), `${pid}.sock`);
     ownFrom = `uds:${sockPath}`;
     const chosen = (pi.getSessionName() || "").trim();
-    nameSource = chosen ? "user" : "derived";
-    selfName = chosen || firstFreeName(fallbackName(), await liveNames());
+    // A reload keeps the name it had (one set by dedupe or a rename frame
+    // included) and its age, so a peer that grabbed the name in the gap yields.
+    const stashed = identityStash().get(pid);
+    identityStash().delete(pid);
+    if (reason === "reload" && stashed && (!chosen || chosen === stashed.selfName)) {
+      ({ selfName, nameSource, startedAt } = stashed);
+    } else {
+      nameSource = chosen ? "user" : "derived";
+      selfName = chosen || firstFreeName(fallbackName(), await liveNames());
+    }
     try {
       server = await bindSocket(sockPath, (frame) => onFrame(frame));
       peerStatus = "idle";
@@ -430,17 +461,19 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   }
 
   async function stop() {
+    reloads.dispose();
+    if (started) identityStash().set(pid, { selfName, nameSource, startedAt });
     try { server?.close(); } catch { /* */ }
     clearSummaryFile();
     await deregisterPeer(pid, sockPath).catch(() => {});
   }
 
-  pi.on("session_start", async (_e, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     lastCtx = ctx;
     // Already running (/new, /resume, /fork in the same process): refresh the
     // mirrored sessionFile so psst follows the switch.
     if (started) syncSummaryFile();
-    void ensureStarted(ctx);
+    void ensureStarted(ctx, (event as { reason?: string })?.reason);
     installAutocomplete(ctx);
   });
   // The tool is deferred, so tool_search must be active to find it.
@@ -487,12 +520,19 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     lastCtx = ctx;
     relayReply(event);
   });
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_start", async () => { runActive = true; });
+  pi.on("agent_settled", async (event, ctx) => {
     lastCtx = ctx;
+    runActive = false;
     activeTools.clear();
     await setPeerStatus("idle");
-    reloads.settled();
+    reloads.settled((event as { aborted?: boolean })?.aborted === true);
   });
+  // A queued reload waiting on a compaction or a dialog re-checks when it ends.
+  pi.on("session_compact", async () => { reloads.poll(); });
+  pi.on("session_compact_failed", async () => { reloads.poll(); });
+  pi.on("ui_prompt_start", async () => { uiPromptOpen = true; });
+  pi.on("ui_prompt_end", async () => { uiPromptOpen = false; reloads.poll(); });
   pi.on("session_shutdown", async () => { await starting; await stop(); });
 
   // ---- outbound: the model-facing tool ------------------------------------
@@ -626,55 +666,88 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   // ---- reload command ------------------------------------------------------
   // Remote and self reloads dispatch this (sendUserMessage with
   // expandPromptTemplates), since only a command context can call ctx.reload().
+  // pi has no hidden commands, so the description says it's internal.
   pi.registerCommand(RELOAD_COMMAND, {
-    description: "Reload pi like /reload (agent-link runs this for reload requests from other sessions)",
+    description: "(internal) agent-link runs this for reload requests; use /reload yourself",
     handler: async (_args, ctx) => {
-      // Answer waiting senders first: ctx.reload() shuts this instance down.
-      await reloads.beforeReload();
-      await ctx.reload();
-      return;
+      // pi refuses to reload mid-run or mid-compaction. The user may have
+      // started either since the dispatch: queue again and answer "queued".
+      // Otherwise answer waiting senders first: ctx.reload() shuts this
+      // instance down.
+      if (!(await reloads.beginReload(ctx.isIdle()))) return;
+      try {
+        await ctx.reload();
+      } catch (e) {
+        notify(`agent-link: reload failed: ${(e as Error).message}`, "error");
+      }
     },
   });
 
   // ---- convenience command -------------------------------------------------
   pi.registerCommand("agent-link", {
     description: `List sessions you can message; 'dedupe' un-collides their names; 'reload <name|${IDLE_TARGETS}> [--force]' reloads other sessions`,
+    getArgumentCompletions: async (prefix) => {
+      const parts = prefix.split(/\s+/);
+      if (parts.length <= 1) {
+        const subs = [
+          { value: "dedupe", label: "dedupe", description: "un-collide duplicate session names" },
+          { value: "reload ", label: "reload", description: `reload another pi session, or ${IDLE_TARGETS}` },
+        ];
+        const hits = subs.filter((s) => s.label.startsWith(parts[0] ?? ""));
+        return hits.length ? hits : null;
+      }
+      if (parts[0] !== "reload") return null;
+      const word = parts.at(-1) ?? "";
+      const head = `${parts.slice(0, -1).join(" ")} `;
+      const peers = (await cachedPeers().catch(() => [])).filter((p) => p.entrypoint === "pi");
+      const options = [
+        { name: IDLE_TARGETS, description: "every idle pi session" },
+        ...peers.map((p) => ({ name: p.name, description: p.status })),
+        { name: "--force", description: "even with unsent text in the editor" },
+      ];
+      const hits = options.filter((o) => o.name.startsWith(word) && !parts.slice(1, -1).includes(o.name));
+      return hits.length ? hits.map((o) => ({ value: `${head}${o.name}`, label: o.name, description: o.description })) : null;
+    },
     handler: async (args, ctx) => {
-      const [sub, ...rest] = args.trim().split(/\s+/);
-      if (sub === "reload") {
-        const force = rest.includes("--force");
-        const to = rest.filter((a) => a !== "--force").join(" ");
-        if (!to) { ctx.ui.notify("Usage: /agent-link reload <name|*idle> [--force]. Use /reload for this session.", "info"); return; }
-        const result = await reloadTargets(to, force);
-        ctx.ui.notify(result.text, result.isError ? "warning" : "info");
-        return;
-      }
-      const rows = await listClaudeSessions({ excludeSock: sockPath });
-      if (args.trim() === "dedupe") {
-        // Include ourselves: our name is one of the ones that can collide.
-        const all = [...rows, { pid, name: selfName, cwd: sessionCwd, status: peerStatus, sock: sockPath, startedAt, entrypoint: "pi", nameSource }];
-        const plans = planDedupe(all);
-        if (!plans.length) { ctx.ui.notify("No duplicate names among live sessions.", "info"); return; }
-        const done: string[] = [];
-        const failed: string[] = [];
-        for (const plan of plans) {
-          if (plan.peer.pid === pid) { selfName = plan.to; await updatePeer(pid, { name: selfName, nameSource: "derived" }).catch(() => {}); syncSummaryFile(); done.push(`${plan.from} → ${plan.to} (us)`); continue; }
-          try {
-            await renamePeer(plan.peer.sock, plan.to);
-            done.push(`${plan.from} → ${plan.to} (pid ${plan.peer.pid})`);
-          } catch (e) {
-            failed.push(`${plan.from} (pid ${plan.peer.pid}): ${(e as Error).message}`);
-          }
-        }
-        ctx.ui.notify(
-          [done.length ? `Renamed:\n${done.map((d) => `  ${d}`).join("\n")}` : "", failed.length ? `Failed:\n${failed.map((f) => `  ${f}`).join("\n")}` : ""]
-            .filter(Boolean).join("\n"),
-          failed.length ? "warning" : "info",
-        );
-        return;
-      }
-      if (!rows.length) { ctx.ui.notify("No live Claude sessions found.", "info"); return; }
-      ctx.ui.notify(`Reachable: ${rows.map((r) => `${peerLabel(r, rows)} [${r.status}]`).join(", ")}`, "info");
+      // Ours is in flight (it may open a dialog): a reload waits for it.
+      ownCommands++;
+      try { await agentLinkCommand(args, ctx); } finally { ownCommands--; reloads.poll(); }
     },
   });
+
+  async function agentLinkCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    const { force, to, isReload } = parseReloadArgs(args);
+    if (isReload) {
+      if (!to) { ctx.ui.notify(`Usage: /agent-link reload <name|${IDLE_TARGETS}> [--force]. Use /reload for this session.`, "info"); return; }
+      const result = await reloadTargets(to, force);
+      ctx.ui.notify(result.text, result.isError ? "warning" : "info");
+      return;
+    }
+    const rows = await listClaudeSessions({ excludeSock: sockPath });
+    if (args.trim() === "dedupe") {
+      // Include ourselves: our name is one of the ones that can collide.
+      const all = [...rows, { pid, name: selfName, cwd: sessionCwd, status: peerStatus, sock: sockPath, startedAt, entrypoint: "pi", nameSource }];
+      const plans = planDedupe(all);
+      if (!plans.length) { ctx.ui.notify("No duplicate names among live sessions.", "info"); return; }
+      const done: string[] = [];
+      const failed: string[] = [];
+      for (const plan of plans) {
+        if (plan.peer.pid === pid) { selfName = plan.to; await updatePeer(pid, { name: selfName, nameSource: "derived" }).catch(() => {}); syncSummaryFile(); done.push(`${plan.from} → ${plan.to} (us)`); continue; }
+        try {
+          await renamePeer(plan.peer.sock, plan.to);
+          done.push(`${plan.from} → ${plan.to} (pid ${plan.peer.pid})`);
+        } catch (e) {
+          failed.push(`${plan.from} (pid ${plan.peer.pid}): ${(e as Error).message}`);
+        }
+      }
+      ctx.ui.notify(
+        [done.length ? `Renamed:\n${done.map((d) => `  ${d}`).join("\n")}` : "", failed.length ? `Failed:\n${failed.map((f) => `  ${f}`).join("\n")}` : ""]
+          .filter(Boolean).join("\n"),
+        failed.length ? "warning" : "info",
+      );
+      return;
+    }
+    if (!rows.length) { ctx.ui.notify("No live Claude sessions found.", "info"); return; }
+    ctx.ui.notify(`Reachable: ${rows.map((r) => `${peerLabel(r, rows)} [${r.status}]`).join(", ")}`, "info");
+  }
 }
