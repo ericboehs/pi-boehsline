@@ -424,6 +424,9 @@ export function scriptEnv(
 	return out;
 }
 
+/** How long to wait for `exit` after a timeout kill before giving up on the child. */
+const KILL_FALLBACK_MS = 2000;
+
 const killGroup = (child: ChildProcess) => {
 	if (!child.pid) return;
 	try {
@@ -476,15 +479,31 @@ export function runScript(cfg: WatcherConfig, opts: RunOptions): Promise<RunResu
 		let size = 0;
 		let stderr = "";
 		let error: string | undefined;
+		let fallback: NodeJS.Timeout | undefined;
+		let abandoned = false;
+		// A grandchild that left the group (setsid, double fork) can hold the
+		// pipes open forever, so `close` never comes. After a kill, stop reading,
+		// finish on `exit`, and give up waiting after a short fallback.
+		const abandon = () => {
+			abandoned = true;
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			if (child.exitCode !== null || child.signalCode !== null) finish(child.exitCode, child.signalCode);
+			else if (!fallback) {
+				fallback = setTimeout(() => finish(child.exitCode, child.signalCode ?? "SIGKILL"), KILL_FALLBACK_MS);
+			}
+		};
 		const timer = setTimeout(() => {
 			error = "timed out";
 			killGroup(child);
+			abandon();
 		}, opts.timeoutMs ?? RUN_TIMEOUT_MS);
 		child.stdout?.on("data", (b: Buffer) => {
 			size += b.length;
 			if (size > max) {
 				if (!error) error = "stdout over 1 MB";
 				killGroup(child);
+				abandon();
 				return;
 			}
 			chunks.push(b);
@@ -499,6 +518,7 @@ export function runScript(cfg: WatcherConfig, opts: RunOptions): Promise<RunResu
 			if (done) return;
 			done = true;
 			clearTimeout(timer);
+			if (fallback) clearTimeout(fallback);
 			opts.children?.delete(child);
 			// Anything the script left running in its group goes too.
 			if (child.pid)
@@ -516,6 +536,9 @@ export function runScript(cfg: WatcherConfig, opts: RunOptions): Promise<RunResu
 			finish(null, null);
 		});
 		child.on("close", finish);
+		child.on("exit", (code, signal) => {
+			if (abandoned) finish(code, signal);
+		});
 	});
 }
 

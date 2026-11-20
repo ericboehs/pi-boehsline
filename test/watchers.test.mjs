@@ -712,6 +712,30 @@ test("runner: a timeout SIGKILLs the whole process group", async () => {
 	await waitFor(() => !alive(pid) && !alive(gpid));
 });
 
+test("runner: a timeout still resolves when a grandchild escapes the group and holds stdout open", async () => {
+	const dir = tmp();
+	const state = tmp();
+	// A detached node child is a new session (setsid), outside the script's group, and inherits stdout.
+	const js = `const { spawn } = require("node:child_process"); const fs = require("node:fs"); const c = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { detached: true, stdio: "inherit" }); fs.writeFileSync(${JSON.stringify(join(dir, "escaped"))}, String(c.pid)); c.unref();`;
+	const script = fakeScript(dir, `'${process.execPath}' -e '${js}'`);
+	writeFileSync(join(dir, "sleep"), "30");
+	let escaped;
+	try {
+		const started = Date.now();
+		const r = await runScript(wcfg(script), { cwd: dir, stateDir: state, timeoutMs: 300 });
+		assert.equal(r.error, "timed out");
+		assert.ok(Date.now() - started < 2800, "resolved on exit or the 2 s fallback");
+		escaped = Number(readFileSync(join(dir, "escaped"), "utf8"));
+		assert.ok(alive(escaped), "the escaped grandchild really outlived the group kill");
+	} finally {
+		escaped ??= existsSync(join(dir, "escaped")) ? Number(readFileSync(join(dir, "escaped"), "utf8")) : undefined;
+		if (escaped)
+			try {
+				process.kill(escaped, "SIGKILL");
+			} catch {}
+	}
+});
+
 test("runner: oversized stdout kills the run", async () => {
 	const dir = tmp();
 	const script = fakeScript(dir, `head -c 2000000 /dev/zero | tr '\\0' a`);
