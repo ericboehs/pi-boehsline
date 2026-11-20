@@ -30,6 +30,7 @@ import { Type } from "typebox";
 import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { settingsFor } from "../../lib/config.ts";
 import { readSecret, secretSourceLabel } from "../../lib/secrets.ts";
 import { activateToolSearch } from "../../lib/tool-search.ts";
 import { latestUsage, publishUsage, type ProviderUsageSnapshot, type UsageWindowSnapshot } from "../../lib/usage-snapshot.ts";
@@ -193,6 +194,10 @@ interface Driver {
    *  stretches (observed 9s responses), so it gets a looser leash. */
   timeoutMs?: number;
   command: { name: string; description: string; scopeNote: string };
+  /** May poll in the background (backgroundPollMinutes) while no session uses
+   *  it: pi's own OAuth sign-in, one cache key. Claude is not: its entry is
+   *  per model family. Key- and cookie-based providers never are. */
+  background?: boolean;
   isActive(ctx: ExtensionContext): boolean;
   fetch(ctx: ExtensionContext): Promise<UsageDisplay>;
 }
@@ -2439,6 +2444,7 @@ const DRIVERS: Driver[] = [
       description: "Refresh the compact Codex usage window",
       scopeNote: "Codex usage is only shown for openai-codex models",
     },
+    background: true,
     isActive: (ctx) => isProvider(ctx, "openai-codex"),
     fetch: fetchCodex,
   },
@@ -2468,6 +2474,7 @@ const DRIVERS: Driver[] = [
       description: "Refresh the compact GitHub Copilot premium quota window",
       scopeNote: "Copilot usage is only shown for github-copilot models",
     },
+    background: true,
     isActive: (ctx) => isProvider(ctx, "github-copilot"),
     fetch: fetchCopilot,
   },
@@ -2480,6 +2487,7 @@ const DRIVERS: Driver[] = [
       description: "Refresh the compact SuperGrok usage window",
       scopeNote: "SuperGrok usage is only shown for xAI subscription models",
     },
+    background: true,
     // SuperGrok OAuth only: paid API keys are a different product.
     isActive: (ctx) =>
       ctx.model?.provider === "xai" && ctx.modelRegistry.isUsingOAuth(ctx.model),
@@ -2773,6 +2781,124 @@ async function refreshDriver(
   }
 }
 
+// ---------- background polls ----------
+//
+// A chip refreshes only while a session uses its provider, so a subscription
+// nobody is on goes stale in the cache (pi-usage, botsun) and its OAuth token
+// expires unrefreshed. backgroundPollMinutes polls such a provider anyway,
+// through getProviderAuth so pi refreshes the token itself. One pi on the
+// machine fetches per interval: the shared cache entry's age and a stamp of
+// the last attempt (written under the cache lock, success or not) gate it.
+
+/** `provider-usage` settings in boehsline.json. Minutes; 0 turns one off. */
+export const PROVIDER_USAGE_DEFAULTS = { backgroundPollMinutes: { xai: 30 } };
+/** Floor for a configured interval: background polls must never spam an API. */
+const BACKGROUND_MIN_INTERVAL_MS = 5 * 60 * 1000;
+/** How often a pi checks whether a background poll is due (a file read). */
+const BACKGROUND_TICK_MAX_MS = 5 * 60 * 1000;
+/** First check after session start, off pi's startup path. */
+const BACKGROUND_FIRST_TICK_MS = 15_000;
+const BACKGROUND_STAMP_FILE = "usage-background.json";
+
+export interface BackgroundPoll {
+  driver: Driver;
+  intervalMs: number;
+}
+
+/** Background polls from the settings block: keys are provider names or aliases. */
+export function backgroundPollPlan(settings: unknown): BackgroundPoll[] {
+  const minutes = asRecord(asRecord(settings)?.backgroundPollMinutes) ?? {};
+  const plan: BackgroundPoll[] = [];
+  for (const [name, value] of Object.entries(minutes)) {
+    const driver = resolveUsageDriver(name);
+    if (!driver?.background || plan.some((poll) => poll.driver.id === driver.id)) continue;
+    const n = asNumber(value);
+    if (n === undefined || n <= 0) continue;
+    plan.push({ driver, intervalMs: Math.max(BACKGROUND_MIN_INTERVAL_MS, n * 60_000) });
+  }
+  return plan;
+}
+
+function backgroundStampPath(): string {
+  return join(agentDirectory(), BACKGROUND_STAMP_FILE);
+}
+
+async function readBackgroundStamps(): Promise<Record<string, number>> {
+  try {
+    const parsed = asRecord(JSON.parse(await readFile(backgroundStampPath(), "utf8")));
+    return (parsed ?? {}) as Record<string, number>;
+  } catch {
+    return {};
+  }
+}
+
+async function writeBackgroundStamp(driverId: string, attemptedAt: number): Promise<void> {
+  try {
+    const stamps = await readBackgroundStamps();
+    stamps[driverId] = attemptedAt;
+    const tmp = `${backgroundStampPath()}.tmp.${process.pid}`;
+    await writeFile(tmp, JSON.stringify(stamps));
+    await rename(tmp, backgroundStampPath());
+  } catch {
+    // Best effort: without the stamp a failure retries next interval per pi.
+  }
+}
+
+/** Due when neither a fetch (any session's) nor a background attempt happened within the interval. */
+async function backgroundDue(driver: Driver, intervalMs: number): Promise<boolean> {
+  const now = Date.now();
+  const entry = (await readSharedCache())[driver.id];
+  if (entry && Number.isFinite(entry.fetchedAt) && now - entry.fetchedAt < intervalMs) return false;
+  const attempted = asNumber((await readBackgroundStamps())[driver.id]);
+  return attempted === undefined || now - attempted >= intervalMs;
+}
+
+/** Signed in with pi's OAuth (not an API key, not signed out). Reads no secret. */
+function oauthSignedIn(ctx: ExtensionContext, provider: string): boolean {
+  try {
+    type AnyModel = Parameters<ExtensionContext["modelRegistry"]["isUsingOAuth"]>[0];
+    return ctx.modelRegistry.isUsingOAuth({ provider } as unknown as AnyModel) === true;
+  } catch {
+    return false;
+  }
+}
+
+const backgroundWarned = new Set<string>();
+
+export type BackgroundPollResult = "signed-out" | "fresh" | "locked" | "fetched" | "failed";
+
+/**
+ * One background poll if due. Quiet by design: no UI, failures go to the log
+ * once per streak, and the attempt stamp holds every pi off until the next
+ * interval, so a dead sign-in is tried once per interval machine-wide.
+ */
+export async function backgroundPollOnce(
+  ctx: ExtensionContext,
+  driver: Driver,
+  intervalMs: number,
+): Promise<BackgroundPollResult> {
+  if (!driver.background || !oauthSignedIn(ctx, driver.provider)) return "signed-out";
+  if (!(await backgroundDue(driver, intervalMs))) return "fresh";
+  if (!(await tryAcquireCacheLock())) return "locked";
+  try {
+    // Another pi may have fetched while we took the lock.
+    if (!(await backgroundDue(driver, intervalMs))) return "fresh";
+    await writeBackgroundStamp(driver.id, Date.now());
+    const display = await driver.fetch(ctx);
+    await writeSharedEntry(driver.id, display, Date.now());
+    if (backgroundWarned.delete(driver.id)) logLine(`[${driver.id}] background poll recovered`);
+    return "fetched";
+  } catch (err) {
+    if (!isStaleCtxError(err) && !backgroundWarned.has(driver.id)) {
+      backgroundWarned.add(driver.id);
+      logLine(`[${driver.id}] background poll failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return "failed";
+  } finally {
+    await releaseCacheLock();
+  }
+}
+
 export interface UsageCacheRow {
   id: string;
   provider: string;
@@ -2907,6 +3033,7 @@ function usageToolResult(text: string, rows: UsageCacheRow[]) {
 export default function providerUsage(pi: ExtensionAPI): void {
   let latestCtx: ExtensionContext | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let backgroundTimers: ReturnType<typeof setTimeout>[] = [];
   // Turn activity for the idle gate (pollFetches): set at agent_start,
   // cleared at agent_settled, which also stamps the last turn.
   let running = false;
@@ -2941,12 +3068,43 @@ export default function providerUsage(pi: ExtensionAPI): void {
   function stopPoll(): void {
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = undefined;
+    stopBackgroundPolls();
     latestCtx = undefined;
+  }
+
+  // Background polls for providers no session may be using (backgroundPollMinutes).
+  // Long-lived modes only: a -p or json run exits before a tick matters.
+  function startBackgroundPolls(ctx: ExtensionContext): void {
+    stopBackgroundPolls();
+    let plan: BackgroundPoll[];
+    try {
+      if (ctx.mode === "print" || ctx.mode === "json") return;
+      plan = backgroundPollPlan(settingsFor("provider-usage", PROVIDER_USAGE_DEFAULTS));
+    } catch {
+      return;
+    }
+    for (const { driver, intervalMs } of plan) {
+      const tick = () => {
+        const current = latestCtx;
+        if (current) void backgroundPollOnce(current, driver, intervalMs).catch(dropBackgroundError(driver.id));
+      };
+      const first = setTimeout(tick, BACKGROUND_FIRST_TICK_MS);
+      const every = setInterval(tick, Math.min(intervalMs, BACKGROUND_TICK_MAX_MS));
+      first.unref?.();
+      every.unref?.();
+      backgroundTimers.push(first, every);
+    }
+  }
+
+  function stopBackgroundPolls(): void {
+    for (const timer of backgroundTimers) clearTimeout(timer);
+    backgroundTimers = [];
   }
 
   pi.on("session_start", (_event, ctx) => {
     startPoll();
     refreshAll(ctx);
+    startBackgroundPolls(ctx);
   });
 
   pi.on("model_select", (_event, ctx) => {
