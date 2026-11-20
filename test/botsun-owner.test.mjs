@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, afterEach, beforeEach, test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
 import { stubPi } from "./helpers/stub-pi.mjs";
 
 const home = mkdtempSync(join(tmpdir(), "botsun-owner-"));
@@ -22,7 +22,9 @@ delete process.env.BOTSUN_OWNER_DEBUG;
 delete process.env.TMUX;
 delete process.env.TMUX_PANE;
 process.env.XDG_STATE_HOME = join(home, "state");
-after(() => rmSync(home, { recursive: true, force: true }));
+// At exit, not in a root after(): with --test-name-pattern the root's after
+// can run before tests registered past a top-level await, deleting HOME under them.
+process.on("exit", () => rmSync(home, { recursive: true, force: true }));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(check, ms = 2000) {
