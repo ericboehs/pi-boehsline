@@ -7,6 +7,13 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `reload` action: `agent-link({ action: "reload", to })` asks another pi session to
+  run pi's `/reload` (a control frame, never a chat message), and gets back
+  `reloaded`, `queued (busy, reloads when the turn ends)`, or a refusal with its
+  reason. `to: "*idle"` reloads every idle pi session; no `to` reloads the caller
+  after its response. Targets refuse over unsent editor text (`force: true`
+  overrides), accept one request per 30 s, and answer only registered peers. Also
+  `/agent-link reload <name|*idle> [--force]`.
 - Typing `@` in the pi prompt autocompletes live agent-link session names alongside
   files. `@foo …` is annotated so the model messages that session with the
   `agent-link` tool instead of treating it as a file.

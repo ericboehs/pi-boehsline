@@ -29,6 +29,9 @@ pi-agent-link does pi↔Claude.
   - `agent-link({ action: "ask", to, message })` — send and block until the reply, returned as the tool result
   - `agent-link({ action: "reply", message })` — answer the sole pending inbound ask (`to` disambiguates)
   - `agent-link({ action: "pending" })` — list unanswered inbound asks
+  - `agent-link({ action: "reload", to })` — reload another pi session (pi's `/reload`);
+    `to: "*idle"` reloads every idle one, no `to` reloads this session after the response.
+    See [Remote reload](#remote-reload)
 - **`/agent-link`** command to list sessions from the pi UI, plus a bundled skill so
   natural language ("message the other session…") just works.
 - **`@` mentions in the pi prompt.** Typing `@` autocompletes live agent names
@@ -85,6 +88,35 @@ SendMessage to pi-<dir>: "what's the test status?"
 The message appears in the pi session in real time; pi's answer is relayed back to
 your Claude session.
 
+## Remote reload
+
+After changing extension code, other sessions keep running the old version until
+they `/reload`. Sending them the text `"/reload"` does nothing: it arrives as a chat
+message, and a model can't run slash commands. Use the `reload` action instead:
+
+```
+agent-link({ action: "reload", to: "pi-foo" })    → "pi-foo": reloaded
+agent-link({ action: "reload", to: "*idle" })     → one line per idle pi session
+agent-link({ action: "reload" })                  → this session, once this response ends
+```
+
+or from the pi UI: `/agent-link reload <name|*idle> [--force]`.
+
+The request is a control frame on the agent-link socket, not a message: the target's
+model never sees it, and nothing lands in its transcript. The target answers with one of:
+
+- **reloaded** — it was idle and is reloading now (the answer goes out first);
+- **queued (busy, reloads when the turn ends)** — it reloads at `agent_settled`;
+- **refused: …** — it has unsent text in its editor (`force: true` overrides), it
+  accepted another reload request less than 30 seconds ago, or it didn't answer
+  within 5 seconds (an agent-link without reload, or a Claude session).
+
+`*idle` covers live pi sessions whose status is `idle`, except the caller; busy
+sessions and Claude sessions are left alone. Under the hood the target dispatches
+its own `/agent-link-reload` command, which calls `ctx.reload()` (pi reloads only
+from a command, never mid-run). After the reload agent-link registers again under
+the same name.
+
 ## Recommended safety setting
 
 Cross-agent messages are untrusted peer input. To require explicit approval for each
@@ -110,6 +142,8 @@ No build step — pi runs TypeScript directly.
 - **pi lifecycle events** → keep the registry status current as `idle`, `thinking`,
   or `tool:<name>`.
 - **`agent_end`** → relay pi's reply back to the recorded sender(s).
+- **`control` frame `reload`** → answer `reload_result`, then run `/agent-link-reload`
+  (now if idle, at `agent_settled` if busy). See `reload.ts`.
 - **`session_shutdown`** → unlink the socket, remove the registry entry and the
   name/status cache file.
 - **`agent-link` tool** → `list` reads Claude's registry (live-filtered); `send`/`ask`
@@ -131,6 +165,9 @@ Messages between agents are **peer input, not user authority**:
   approval.
 - Sockets are `0600` inside a `0700` directory: the boundary is your **user account**
   (a same-user process could already reach these).
+- **Reload requests** are accepted only from sessions registered on this machine
+  (the same user's registry), at most one per 30 seconds, and never over unsent
+  editor text unless forced. See [SECURITY.md](SECURITY.md).
 - **Do not wire this extension to external/automated inputs.** It is a path for
   untrusted content to reach a permissioned agent — keep the input side to things a
   human sends.
@@ -145,6 +182,7 @@ a real pi rpc session end-to-end; run them under a pi-compatible Node:
 #   export PI_CMD="/path/to/node22 /path/to/pi/dist/cli.js"
 node --experimental-strip-types test/reg-test.mjs     # registration + cleanup
 node --experimental-strip-types test/roundtrip.mjs    # inbound relay + outbound tool
+node --experimental-strip-types test/reload-live.mjs  # two throwaway pis, one reloads the other
 ```
 
 `dev-run.sh` launches pi with the extension loaded for interactive testing.

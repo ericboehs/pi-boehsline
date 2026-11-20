@@ -21,6 +21,28 @@ permissions, please read this before enabling it broadly.
   and are not authenticated; they are used for routing and display only. Do not rely on
   them for trust decisions.
 
+## Remote reload
+
+A `reload` control frame asks a pi session to run pi's `/reload`. It never reaches
+the target's model, so it isn't subject to the peer-input framing above; instead:
+
+- **Same user, same machine only.** The frame arrives on the same `0600` socket as
+  messages, so the sender already runs as your user. The target also checks that
+  the frame's reply address (`from`) is the socket of a session in this user's
+  registry (`~/.claude/sessions`), and drops anything else without answering, so a
+  frame can't make it write to an arbitrary socket.
+- **Rate-limited.** A target accepts at most one reload request per 30 seconds
+  (refused requests don't count). The window lives on `globalThis`, so it holds
+  across the reload it caused.
+- **Unsent work is protected.** A target with text in its editor refuses unless the
+  sender passes `force: true`, and a queued reload is dropped (with a notice) if the
+  user starts typing before the turn ends. pi's RPC mode can't read the editor, so
+  this check only protects the interactive TUI.
+- **Bounded effect.** A reload re-reads extensions, skills, prompts, themes and
+  context files from disk; it runs no code a same-user process couldn't already
+  place there, and it never interrupts a turn (a busy target waits for
+  `agent_settled`).
+
 ## Guidance
 
 - **Do not wire this extension to external or automated inputs** (webhooks, queues,
