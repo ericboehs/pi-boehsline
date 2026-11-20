@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `reload` action: `agent-link({ action: "reload", to })` asks another pi session to
+  run pi's `/reload` (a control frame, never a chat message), and gets back
+  `reloaded`, `queued (busy, reloads when it is free)`, or a refusal with its
+  reason. `to: "*idle"` reloads every idle pi session (at most once a minute per
+  sender); no `to` reloads the caller after its response. Targets refuse over
+  unsent editor text (`force: true` overrides) and reload at most once per 30 s;
+  frames from a socket outside the registry get no answer. A busy target waits for
+  `agent_settled`, or outside a run (manual `/compact`, an open dialog) re-checks
+  until free and gives up after 2 minutes; an aborted run skips a queued reload.
+  A reload keeps the session's name. Also
+  `/agent-link reload <name|*idle> [--force]`, with completions.
 - Typing `@` in the pi prompt autocompletes live agent-link session names alongside
   files. `@foo …` is annotated so the model messages that session with the
   `agent-link` tool instead of treating it as a file.
@@ -18,6 +29,12 @@ All notable changes to this project are documented here. The format follows
 - Spaced session names ("Chicken Door Tamer") resolve from their lowercase, hyphenated
   handle and its unique prefixes (`@chicken-door-tamer`, `@chicken-door`); autocomplete
   inserts the handle, since a space ends an @mention.
+
+### Security
+- The socket directory is checked before binding: a symlink, one owned by another
+  user, or one open to group/other writes is refused (one of yours with extra
+  read bits is tightened to `0700`). The shared `/tmp/cc-socks` fallback could
+  otherwise be pre-created by another user.
 
 
 ### Removed

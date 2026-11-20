@@ -29,6 +29,9 @@ pi-agent-link does pi↔Claude.
   - `agent-link({ action: "ask", to, message })` — send and block until the reply, returned as the tool result
   - `agent-link({ action: "reply", message })` — answer the sole pending inbound ask (`to` disambiguates)
   - `agent-link({ action: "pending" })` — list unanswered inbound asks
+  - `agent-link({ action: "reload", to })` — reload another pi session (pi's `/reload`);
+    `to: "*idle"` reloads every idle one, no `to` reloads this session after the response.
+    See [Remote reload](#remote-reload)
 - **`/agent-link`** command to list sessions from the pi UI, plus a bundled skill so
   natural language ("message the other session…") just works.
 - **`@` mentions in the pi prompt.** Typing `@` autocompletes live agent names
@@ -85,6 +88,51 @@ SendMessage to pi-<dir>: "what's the test status?"
 The message appears in the pi session in real time; pi's answer is relayed back to
 your Claude session.
 
+## Remote reload
+
+After changing extension code, other sessions keep running the old version until
+they `/reload`. Sending them the text `"/reload"` does nothing: it arrives as a chat
+message, and a model can't run slash commands. Use the `reload` action instead:
+
+```
+agent-link({ action: "reload", to: "pi-foo" })    → "pi-foo": reloaded
+agent-link({ action: "reload", to: "*idle" })     → one line per idle pi session
+agent-link({ action: "reload" })                  → this session, once this response ends
+```
+
+or from the pi UI: `/agent-link reload <name|*idle> [--force]`.
+
+The request is a control frame on the agent-link socket, not a message: the target's
+model never sees it, and nothing lands in its transcript. The target answers with one of:
+
+- **reloaded** — it was free and is reloading now (the answer goes out first, from
+  the reload command, once it has checked the session is still idle);
+- **queued (busy, reloads when it is free)** — it is in an agent run (it reloads at
+  `agent_settled`), or busy otherwise: a manual `/compact`, a blocking dialog from
+  any extension, or one of agent-link's own commands. Outside an agent run it
+  re-checks on `session_compact`, when the dialog closes, and every second, and
+  gives up after 2 minutes with a notice. A queued reload is skipped, with a
+  notice, if the user starts typing or aborts the run (Esc) first, unless forced;
+- **refused: …** — it has unsent text in its editor (`force: true` overrides), it
+  reloaded for another request less than 30 seconds ago, or it isn't reloadable: a
+  session whose registry entry names another program (a Claude session) is refused
+  at once without a frame, and one with no program recorded that doesn't answer
+  within 5 seconds is reported as no answer (an agent-link without reload).
+
+A request from a socket that isn't in this user's registry gets no answer at all.
+
+`*idle` covers live pi sessions whose status is `idle`, except the caller; busy
+sessions and Claude sessions are left alone. One session sends `*idle` at most once
+per 60 seconds. Under the hood the target dispatches its own `/agent-link-reload`
+command (marked internal; pi has no hidden commands), which calls `ctx.reload()`
+(pi reloads only from a command, never mid-run). After the reload agent-link
+registers again under the same name, including one set by `/agent-link dedupe` or
+a rename, and keeps its start time, so a session that took the name in the gap
+yields it back.
+
+Not detectable: another extension's command that is busy without a dialog open. A
+reload then would invalidate that command's `ctx`.
+
 ## Recommended safety setting
 
 Cross-agent messages are untrusted peer input. To require explicit approval for each
@@ -110,6 +158,8 @@ No build step — pi runs TypeScript directly.
 - **pi lifecycle events** → keep the registry status current as `idle`, `thinking`,
   or `tool:<name>`.
 - **`agent_end`** → relay pi's reply back to the recorded sender(s).
+- **`control` frame `reload`** → answer `reload_result`, then run `/agent-link-reload`
+  (now if idle, at `agent_settled` if busy). See `reload.ts`.
 - **`session_shutdown`** → unlink the socket, remove the registry entry and the
   name/status cache file.
 - **`agent-link` tool** → `list` reads Claude's registry (live-filtered); `send`/`ask`
@@ -130,7 +180,12 @@ Messages between agents are **peer input, not user authority**:
   user"* — the model is instructed to treat them as peer requests and not as your
   approval.
 - Sockets are `0600` inside a `0700` directory: the boundary is your **user account**
-  (a same-user process could already reach these).
+  (a same-user process could already reach these). agent-link refuses to bind if the
+  directory is a symlink, belongs to another user, or is open to group/other.
+- **Reload requests** are answered only for sessions registered on this machine
+  (the same user's registry; others are dropped unanswered), reload at most once
+  per 30 seconds, and never over unsent editor text unless forced. A session sends
+  `*idle` at most once per 60 seconds. See [SECURITY.md](SECURITY.md).
 - **Do not wire this extension to external/automated inputs.** It is a path for
   untrusted content to reach a permissioned agent — keep the input side to things a
   human sends.
@@ -145,6 +200,7 @@ a real pi rpc session end-to-end; run them under a pi-compatible Node:
 #   export PI_CMD="/path/to/node22 /path/to/pi/dist/cli.js"
 node --experimental-strip-types test/reg-test.mjs     # registration + cleanup
 node --experimental-strip-types test/roundtrip.mjs    # inbound relay + outbound tool
+node --experimental-strip-types test/reload-live.mjs  # two throwaway pis, one reloads the other
 ```
 
 `dev-run.sh` launches pi with the extension loaded for interactive testing.
