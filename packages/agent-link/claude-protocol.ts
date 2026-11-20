@@ -6,7 +6,7 @@
 // Node built-ins only — no pi/agent deps, so it stays portable and testable.
 // Verified against Claude Code 2.1.224.
 
-import { readdir, readFile, mkdir, chmod, unlink, writeFile } from "node:fs/promises";
+import { readdir, readFile, mkdir, chmod, lstat, unlink, writeFile } from "node:fs/promises";
 import { readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
@@ -367,10 +367,34 @@ export function receiptFrame(o: { status: string; from?: string; origMsgId?: str
  *  after 5s otherwise. If we held the connection half-open, every `SendMessage` to us
  *  would be reported as "Failed to send / Timed out" even though we received it. So we
  *  let the socket close (default allowHalfOpen:false) and also end our side on `end`. */
+/**
+ * Make sure the socket directory is ours alone before binding in it: owned by
+ * this uid, a real directory (not a symlink), with no group or other access.
+ * The fallback is the shared /tmp/cc-socks, so another user could pre-create
+ * it; anyone who can write there could plant or reach our socket and forge
+ * frames. One of ours with looser read/search bits (an older mkdir) is
+ * tightened to 0700; one another user could write to is refused outright,
+ * since something may already have been planted in it.
+ */
+export async function ensurePrivateDir(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true, mode: 0o700 }).catch(() => {});
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  let st = await lstat(dir);
+  if (st.isSymbolicLink()) throw new Error(`refusing to bind: socket dir ${dir} is a symlink`);
+  if (!st.isDirectory()) throw new Error(`refusing to bind: socket dir ${dir} is not a directory`);
+  if (uid === undefined) return; // no POSIX ownership to check (Windows)
+  if (st.uid !== uid) throw new Error(`refusing to bind: socket dir ${dir} is owned by uid ${st.uid}, not ${uid}`);
+  if (st.mode & 0o022) throw new Error(`refusing to bind: socket dir ${dir} is writable by others (mode ${(st.mode & 0o777).toString(8)})`);
+  if (st.mode & 0o077) {
+    await chmod(dir, 0o700);
+    st = await lstat(dir);
+  }
+  if (st.mode & 0o077) throw new Error(`refusing to bind: socket dir ${dir} has mode ${(st.mode & 0o777).toString(8)}, want 700`);
+}
+
 export async function bindSocket(sockPath: string, onFrame: (frame: any, conn: Socket) => void): Promise<Server> {
   const dir = path.dirname(sockPath);
-  await mkdir(dir, { recursive: true, mode: 0o700 }).catch(() => {});
-  await chmod(dir, 0o700).catch(() => {});
+  await ensurePrivateDir(dir);
   await unlink(sockPath).catch(() => {});
   const server = createServer((conn) => {
     conn.setEncoding("utf8");

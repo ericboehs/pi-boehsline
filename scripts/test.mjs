@@ -28,6 +28,7 @@ const SUITE = [
   "packages/agent-link/test/mentions.mjs",
   "packages/agent-link/test/naming.mjs",
   "packages/agent-link/test/relay.mjs",
+  "packages/agent-link/test/reload.mjs",
   "packages/agent-link/test/send-close.mjs",
 ];
 const KEEP = 50;
