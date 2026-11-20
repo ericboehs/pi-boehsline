@@ -468,14 +468,57 @@ test("the phone's Cancel ends the ask as Esc does: User cancelled, the dialog cl
 	assert.equal(prompt.cancel(), "that question was already answered");
 	assert.equal(prompt.answer([{ picks: [0] }]), "that question was already answered");
 
-	// A batch: the same, as "User cancelled" for the whole call.
+	// A batch before any answer: "User cancelled (remaining questions skipped)", as Esc on Q1.
 	const batch = tool.execute("t2", { questions: [{ question: "A?", options: [{ label: "x" }] }, { question: "B?", options: [{ label: "y" }] }] },
 		undefined, undefined, hangingCtx(() => {}));
 	await new Promise((r) => setTimeout(r, 10));
 	openPrompts()[0].cancel();
 	const b = await batch;
 	assert.equal(b.details.cancelled, true);
-	assert.equal(b.content[0].text, "User cancelled");
+	assert.equal(b.content[0].text, "User cancelled (remaining questions skipped)");
+	assert.deepEqual(b.details.byQuestion, []);
+});
+
+test("the phone's Cancel mid-batch keeps the answers given so far, exactly as Esc there would", async () => {
+	const { openPrompts } = await import("../lib/remote-prompts.ts");
+	let tool;
+	await askExtension({ registerTool: (def) => (tool = def) });
+	const hanging = hangingCtx(() => {});
+	let calls = 0;
+	// Q1 picked at the keyboard at once ("0": its first option); Q2's dialog stays open.
+	const ctx = { ...hanging, ui: { ...hanging.ui, custom: (factory) => (++calls === 1 ? Promise.resolve("0") : hanging.ui.custom(factory)) } };
+	const params = { questions: [
+		{ question: "Q1?", options: [{ label: "A" }, { label: "B" }] },
+		{ question: "Q2?", options: [{ label: "C" }, { label: "D" }] },
+		{ question: "Q3?", options: [{ label: "E" }, { label: "F" }] },
+	] };
+	const running = tool.execute("t3", params, undefined, undefined, ctx);
+	await new Promise((r) => setTimeout(r, 10));
+	assert.equal(calls, 2, "on Q2");
+	openPrompts()[0].cancel();
+	const result = await running;
+	assert.equal(result.details.cancelled, true);
+	assert.deepEqual(result.details.byQuestion.map((q) => q.answers), [["A"]]);
+	assert.equal(result.content[0].text, "Q1: Q1?\nUser selected: 1. A\nUser cancelled (remaining questions skipped)");
+	assert.equal(openPrompts().length, 0);
+});
+
+// Subagents (pinned; see botsun-owner's README): a child pi is its own process in print/json
+// mode, so its ask has no UI and offers nothing to the phone; nothing is relayed for it. Within
+// one process every offer shares one registry, so a nested ask (ctx.executeTool from another tool)
+// is that session's card, cancelled under that session's own signature.
+test("a child's ask (no UI) offers nothing to the phone; a nested ask in-process is the session's card", async () => {
+	const { openPrompts } = await import("../lib/remote-prompts.ts");
+	let tool;
+	await askExtension({ registerTool: (def) => (tool = def) });
+	const child = await tool.execute("c1", { question: "Child?", options: [{ label: "A" }] }, undefined, undefined, { hasUI: false, mode: "json", ui: {} });
+	assert.match(child.content[0].text, /UI unavailable/);
+	assert.equal(openPrompts().length, 0, "never offered");
+	const nested = tool.execute("n1", { question: "Nested?", options: [{ label: "A" }] }, undefined, undefined, hangingCtx(() => {}));
+	await new Promise((r) => setTimeout(r, 10));
+	assert.deepEqual(openPrompts().map((p) => p.questions[0].question), ["Nested?"], "one registry per process");
+	openPrompts()[0].cancel();
+	assert.equal((await nested).content[0].text, "User cancelled");
 });
 
 test("a prompt offered without cancellable can't be cancelled from the phone", async () => {

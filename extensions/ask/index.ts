@@ -257,6 +257,9 @@ export default function ask(pi: ExtensionAPI) {
 						});
 					}, options),
 			};
+			// A batch's Esc result for where it is now (the answers given so far), set once the batch
+			// starts: the phone's Cancel returns exactly that, as Esc at the keyboard would.
+			let cancelNow: (() => AgentToolResult<AskDetails>) | undefined;
 			const local = async (): Promise<AgentToolResult<AskDetails>> => {
 				/** Split picked item-values into option answers + optional free text. Null = nothing left. */
 				const resolveCustom = async (
@@ -616,6 +619,7 @@ export default function ask(pi: ExtensionAPI) {
 					};
 				};
 				let i = 0;
+				cancelNow = () => cancelBatch(i);
 				while (i < subs.length) {
 					const sub = subs[i]!;
 					const progress = `Q${i + 1}/${subs.length}`;
@@ -692,6 +696,12 @@ export default function ask(pi: ExtensionAPI) {
 					remote.cancelled.then(() => "cancelled" as const),
 					stopped,
 				]);
+				if (winner === "cancelled" && cancelNow) {
+					// A batch: what Esc returns at this question, the answers given so far kept.
+					const result = cancelNow();
+					abort.abort(); // close the dialog still open in the TUI
+					return result;
+				}
 				if (winner === "stopped" || winner === "cancelled") {
 					abort.abort(); // close the dialog still open in the TUI (a no-op once stopped)
 					const single = subs.length === 1;
