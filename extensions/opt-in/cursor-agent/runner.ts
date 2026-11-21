@@ -52,6 +52,8 @@ export interface BgStartRequest {
 	tailMaxChars: number;
 	/** The job writes `<log>.details.json` (PI_BG_LOG) for its completion message. */
 	details: boolean;
+	/** The caller's own fields for the completion details (bg's cleanJobMeta). */
+	meta?: Record<string, string | number | boolean | null>;
 	accepted: boolean;
 	reply: (result: BgReply) => void;
 }
@@ -70,7 +72,7 @@ const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 export async function startJob(
 	events: { emit(channel: string, data: unknown): void },
 	spec: RunSpec,
-	job: { ctx: unknown; name: string; summary: string },
+	job: { ctx: unknown; name: string; summary: string; meta?: Record<string, string | number | boolean | null> },
 ): Promise<BgReply | null> {
 	const dir = mkdtempSync(join(tmpdir(), "pi-cursor-"));
 	const specPath = join(dir, "spec.json");
@@ -86,6 +88,7 @@ export async function startJob(
 			tailLines: 1000,
 			tailMaxChars: WAKE_CHARS,
 			details: true,
+			...(job.meta ? { meta: job.meta } : {}),
 			accepted: false,
 			reply: done,
 		};

@@ -341,6 +341,82 @@ test("background end to end through the real bg extension: the wake carries the 
 	cursorRuns();
 });
 
+test("background completion details name the tracked child: kind, child_id, agent, task, model", async () => {
+	const { listChildren, resetChildren } = await import("../lib/children.ts");
+	resetChildren();
+	const h = mount();
+	const { default: bg } = await import("../extensions/bg/index.ts");
+	bg(h.pi);
+	await h.fire("session_start", { type: "session_start" }, { ...h.ctx, mode: "print", hasUI: false });
+	fakeEnv({ FAKE_CURSOR_WS: wt, FAKE_CURSOR_ANSWER: "Done." });
+	// Past the list's 200 characters, over two lines: details carry the list's own cleaned string.
+	const long = `Map the repo\n${"and every module in it ".repeat(12)}`;
+	const result = await withPiChild("scout report", () =>
+		h.run({ tasks: [{ agent: "scout", task: long, model: "anthropic/claude-x" }, { agent: "cursor", task: "Fix the bug", model: "composer-2" }], background: true }),
+	);
+	const ids = [...textOf(result).matchAll(/\[(\w+)\] bg (\S+) · log/g)].map((m) => [m[1], m[2]]);
+	assert.equal(ids.length, 2, textOf(result));
+	const kids = listChildren();
+	assert.equal(kids.length, 2);
+
+	const deadline = Date.now() + 20_000;
+	const wakeOf = (id) => h.sent.find((s) => s.message?.customType === "bg" && s.message.details?.id === id);
+	while (!ids.every(([, id]) => wakeOf(id)) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+	const [[, piJob], [, cursorJob]] = ids;
+	const pi = wakeOf(piJob).message.details;
+	const cursor = wakeOf(cursorJob).message.details;
+	const piKid = kids.find((k) => k.kind === "pi");
+	const cursorKid = kids.find((k) => k.kind === "cursor");
+
+	assert.match(piKid.id, /^p-[0-9a-f]{10}$/);
+	assert.deepEqual(
+		{ ...pi, seconds: 0 },
+		{ id: piJob, v: 1, kind: "subagent", name: "sa:scout", named: true, status: "succeeded", exit_code: 0, seconds: 0, cwd: repo, child_id: piKid.id, agent: "scout", task: piKid.task, model: "anthropic/claude-x" },
+	);
+	assert.ok(Number.isInteger(pi.seconds) && pi.seconds >= 0);
+	assert.equal(pi.task.length, 200, "capped as the list caps it");
+	assert.ok(!pi.task.includes("\n"), "one line, as the list shows it");
+	assert.equal(pi.child_id, piKid.id, "the face's id is the tracked child's");
+
+	assert.match(cursorKid.id, /^c-[0-9a-f]{10}$/);
+	assert.equal(cursor.kind, "cursor");
+	assert.equal(cursor.child_id, cursorKid.id);
+	assert.equal(cursor.agent, "cursor");
+	assert.equal(cursor.task, cursorKid.task);
+	assert.equal(cursor.model, "composer-2");
+	assert.equal(cursor.status, "succeeded");
+	assert.equal(cursor.v, 1);
+	assert.equal(cursor.cwd, repo);
+	cursorRuns();
+	resetChildren();
+});
+
+test("a background child whose bg job fails to start is never tracked (no orphan on the list)", async () => {
+	const { listChildren, resetChildren } = await import("../lib/children.ts");
+	resetChildren();
+	const h = mount();
+	const reqs = [];
+	h.pi.events.on("bg:start", (r) => {
+		r.accepted = true;
+		reqs.push(r);
+		queueMicrotask(() => r.reply({ error: "no room" }));
+	});
+	fakeEnv();
+	const result = await h.run({ tasks: [{ agent: "scout", task: "look" }, { agent: "cursor", task: "fix" }], background: true });
+	assert.match(textOf(result), /\[scout\] failed: no room/);
+	assert.match(textOf(result), /\[cursor\] failed: no room/);
+	assert.deepEqual(reqs.map((r) => r.meta?.kind), ["subagent", "cursor"], "each asked with its meta");
+	assert.match(reqs[0].meta.child_id, /^p-[0-9a-f]{10}$/);
+	assert.match(reqs[1].meta.child_id, /^c-[0-9a-f]{10}$/);
+	assert.deepEqual(listChildren(), [], "nothing left running on the phone's list");
+	for (const r of reqs) {
+		const spec = r.command.match(/'([^']+spec\.json)'$/)?.[1];
+		if (spec) rmSync(path.dirname(spec), { recursive: true, force: true });
+	}
+	cursorRuns();
+	resetChildren();
+});
+
 test("cursor-agent not enabled: a clear error for the cursor task only", async (t) => {
 	process.env.BOEHSLINE_ENABLE = "";
 	t.after(() => (process.env.BOEHSLINE_ENABLE = "cursor-agent"));

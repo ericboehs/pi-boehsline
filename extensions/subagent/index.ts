@@ -384,6 +384,15 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 			const kids = await import("../../lib/children.ts");
 			kids.bindChildren(pi.events);
 			const sessionId = kids.sessionOf(ctx);
+			// A background child's bg:start meta: its completion details then name the tracked child
+			// with the agent and task strings the list shows (Botsun draws the same face from them).
+			const childMeta = (kind: "subagent" | "cursor", childId: string, agent: string, task: string, model: string | undefined) => ({
+				kind,
+				child_id: childId,
+				agent: kids.childAgent(agent),
+				task: kids.childTask(task),
+				...(model ? { model: kids.clean(model, 80) } : {}),
+			});
 			// The window the phone draws a pi child's context bar against: its model's, when pi's own
 			// models name it (a child may fail over or be given a model this session can't resolve).
 			const windowOf = (model: string | undefined): number | undefined => {
@@ -490,21 +499,26 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 							continue;
 						}
 						const { startJob } = await import("../opt-in/cursor-agent/runner.ts");
-						const reply = await startJob(pi.events, prep.spec, { ctx, name: `sa:${job.agent}`, summary: `subagent ${job.agent}: ${job.task}` });
+						// Minted before the job, so its completion details name the child (Botsun's card face).
+						// Tracked only once the job started: a failed start leaves no child behind.
+						const cursorId = kids.newChildId("cursor");
+						const meta = childMeta("cursor", cursorId, job.agent, job.task, prep.spec.model);
+						const reply = await startJob(pi.events, prep.spec, { ctx, name: `sa:${job.agent}`, summary: `subagent ${job.agent}: ${job.task}`, meta });
 						if (reply === null) return noBg;
 						const where = prep.spec.worktree ? "new worktree" : prep.spec.cwd;
 						if (!("error" in reply)) {
-							kids.trackChild({ kind: "cursor", agent: job.agent, task: job.task, model: prep.spec.model, sessionId, bg: reply });
+							kids.trackChild({ kind: "cursor", id: cursorId, agent: job.agent, task: job.task, model: prep.spec.model, sessionId, bg: reply });
 						}
 						lines.push("error" in reply ? `[${job.agent}] failed: ${reply.error}` : `[${job.agent}] bg ${reply.id} · log ${reply.logPath} · ${prep.spec.model} · ${where}`);
 						continue;
 					}
 					let model = job.model ?? agent.model ?? defaultModel;
 					let inv: { cmd: string; args: string[] };
-					let childId: string | undefined;
+					// The id comes before the job (its completion details name the child) and, sandboxed,
+					// before the invocation (Botsun's run is that child's Computer). Tracked only once
+					// the job started, so a failed start leaves no child behind.
+					const childId = kids.newChildId("pi");
 					if (sandboxed(job, agent)) {
-						// The id comes before the invocation: Botsun's run is that child's Computer.
-						childId = kids.newChildId("pi");
 						const prep = await sandboxChild(job, agent, childId);
 						if ("error" in prep) {
 							lines.push(`[${job.agent}] ${prep.error}`);
@@ -530,6 +544,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 							ctx,
 							name: `sa:${job.agent}`,
 							summary: `subagent ${job.agent}: ${job.task}`,
+							meta: childMeta("subagent", childId, job.agent, job.task, model),
 							tailLines: 1000,
 							tailMaxChars: BG_WAKE_CHARS,
 							accepted: false,
@@ -539,7 +554,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						if (!req.accepted) resolve(null); // no listener: the bg extension isn't loaded
 					});
 					if (reply === null) return noBg;
-					if (!("error" in reply)) kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, ...(childId ? { id: childId } : {}), bg: { ...reply, callsPath } });
+					if (!("error" in reply)) kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, id: childId, bg: { ...reply, callsPath } });
 					lines.push("error" in reply ? `[${job.agent}] failed: ${reply.error}` : `[${job.agent}] bg ${reply.id} · log ${reply.logPath}`);
 				}
 				return {

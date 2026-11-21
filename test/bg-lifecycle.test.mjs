@@ -293,7 +293,9 @@ test("above-prompt elapsed times refresh without model wakes; completion still w
   assert.equal(h.sent.length, 1);
   assert.equal(h.sent[0].message.customType, "bg");
   assert.equal(h.sent[0].message.display, true);
-  assert.deepEqual(h.sent[0].message.details, { id: task.id });
+  assert.deepEqual(h.sent[0].message.details, {
+    id: task.id, v: 1, kind: "bash", name: "rspec", named: false, status: "succeeded", exit_code: 0, seconds: 60, cwd: dir,
+  }, "a bash job's generic v1 details");
   assert.match(h.sent[0].message.content, /succeeded after 1m00s/);
   assert.match(h.sent[0].message.content, /last 2 lines:\nexample passed\nall green/);
   assert.deepEqual(h.sent[0].options, { deliverAs: "followUp", triggerTurn: true });
@@ -428,6 +430,100 @@ test("bg:start runs another extension's job with its own label, header, and tail
   assert.match(wake, /`subagent scout: count the files` succeeded/);
   assert.doesNotMatch(wake, /PI_SUBAGENT_CHILD/, "summary replaces the raw command");
   assert.match(wake, /last 40 lines:\nline 0\n/);
+});
+
+test("bg:start meta joins the completion details; failed and stopped jobs say so", async (t) => {
+  const h = await mount(t);
+  const start = async (extra) => {
+    const req = { command: "pi child | node -e filter", name: "sa:scout", summary: "subagent scout: x", ...extra };
+    const reply = new Promise((resolve) => (req.reply = resolve));
+    h.emit("bg:start", req);
+    return { ...(await reply), task: h.children.at(-1) };
+  };
+  const meta = { kind: "subagent", child_id: "p-0123456789", agent: "scout", task: "count the files", model: "a/b" };
+  const ok = await start({ meta: { ...meta, id: "forged", status: "succeeded", cwd: "/elsewhere" } });
+  t.mock.timers.tick(4_000);
+  ok.task.exit(3);
+  assert.deepEqual(h.sent[0].message.details, {
+    id: ok.id, v: 1, kind: "subagent", name: "sa:scout", named: true, status: "failed", exit_code: 3, seconds: 4, cwd: dir,
+    child_id: "p-0123456789", agent: "scout", task: "count the files", model: "a/b",
+  }, "meta's own keys join; it never replaces id, status or cwd");
+  assert.match(h.sent[0].message.content, /^\[bg \w+\] `subagent scout: x` exited 3 after 4s\n/, "the message text is unchanged");
+
+  t.mock.method(process, "kill", () => true);
+  const stopped = await start({ meta: { kind: "cursor" }, });
+  const kill = { id: stopped.id, wake: true, reply: () => {} };
+  h.emit("bg:kill", kill);
+  stopped.task.exit(null, "SIGTERM");
+  const details = h.sent[1].message.details;
+  assert.equal(details.kind, "cursor");
+  assert.equal(details.status, "stopped", "a bg:kill stop is stopped");
+  assert.equal(details.signal, "SIGTERM");
+  assert.equal("exit_code" in details, false);
+
+  // Bad meta is dropped whole, and the job still runs.
+  const bad = await start({ meta: Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`k${i}`, i])) });
+  bad.task.exit();
+  assert.equal(h.sent[2].message.details.kind, "bash");
+  assert.equal("k0" in h.sent[2].message.details, false);
+});
+
+test("cleanJobMeta: flat primitives, at most 8 keys and 2KB, reserved keys dropped", async () => {
+  const { cleanJobMeta, JOB_META_BYTES } = await import("../extensions/bg/index.ts");
+  assert.deepEqual(cleanJobMeta({ kind: "subagent", n: 1, ok: true, none: null }), { kind: "subagent", n: 1, ok: true, none: null });
+  assert.deepEqual(cleanJobMeta({ kind: "x", id: "y", v: 2, status: "z", seconds: 1, diff: "d" }), { kind: "x" });
+  for (const bad of [
+    undefined, null, "s", 1, [], ["a"], {}, { id: "only reserved" },
+    Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`k${i}`, i])),
+    { nested: { a: 1 } }, { list: [1] }, { n: Number.NaN }, { "bad key": 1 }, { __proto__x: 1, ["1x"]: 1 },
+    { big: "x".repeat(JOB_META_BYTES) }, new Map([["a", 1]]),
+  ]) {
+    assert.equal(cleanJobMeta(bad), undefined, JSON.stringify(bad) ?? String(bad));
+  }
+  assert.ok(cleanJobMeta({ big: "x".repeat(JOB_META_BYTES - 12) }), "2KB of JSON fits");
+});
+
+test("meta survives the registry: saved with the job, re-adopted, and still in the report", async (t) => {
+  const session = sid("meta");
+  const h = await mount(t, { session });
+  const meta = { kind: "subagent", child_id: "p-abcdef0123", agent: "scout", task: "count the files", model: "m" };
+  const start = async (extra) => {
+    const req = { command: "npm run build", name: "sa:scout", summary: "subagent scout: x", ...extra };
+    const reply = new Promise((resolve) => (req.reply = resolve));
+    h.emit("bg:start", req);
+    return { ...(await reply), task: h.children.at(-1) };
+  };
+  const kept = await start({ meta });
+  const tampered = await start({ meta: { kind: "subagent" } });
+  await settle();
+  const file = path.join(STATE, `${session}.json`);
+  const saved = JSON.parse(readFileSync(file, "utf8"));
+  assert.deepEqual(saved.jobs.find((j) => j.id === kept.id).meta, meta, "saved through toRecord");
+  await h.shutdown("quit");
+  h.goStale();
+  for (const task of h.children) task.ended = true;
+  // A registry edited behind pi's back: parseRecord drops the bad meta, never the job.
+  const onDisk = JSON.parse(readFileSync(file, "utf8"));
+  onDisk.jobs.find((j) => j.id === tampered.id).meta = { nested: { no: 1 } };
+  writeFileSync(file, JSON.stringify(onDisk), { mode: 0o600 });
+  newProcess();
+  mockKill(t);
+
+  const next = await boot(t, h.backgroundTasks, { session, reason: "startup" });
+  assert.deepEqual(next.list().map((j) => j.id).sort(), [kept.id, tampered.id].sort(), "both adopted");
+  t.mock.timers.tick(2000);
+  for (const { task } of [kept, tampered]) {
+    writeExit(task.logPath, 0);
+    touchNow(`${task.logPath}.exit`);
+    procs.delete(task.child.pid);
+  }
+  t.mock.timers.tick(2000);
+  const details = (id) => next.sent.find((s) => s.message.details?.id === id)?.message.details;
+  assert.deepEqual(details(kept.id), {
+    id: kept.id, v: 1, kind: "subagent", name: "sa:scout", named: true, status: "succeeded", exit_code: 0, seconds: 2, cwd: dir, ...meta,
+  });
+  assert.equal(details(tampered.id).kind, "bash", "the tampered meta was dropped");
+  assert.equal(details(tampered.id).status, "succeeded");
 });
 
 test("bg:kill stops one job by id; wake: true still tells the model it was killed", async (t) => {

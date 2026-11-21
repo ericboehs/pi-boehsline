@@ -1000,6 +1000,9 @@ const diffEntry = (entries) => entries.find((e) => e.type === "custom" && e.cust
 const textOf = (result) => result.content.map((p) => p.text ?? "").join("\n");
 
 // One repo, one fake, one process.env: these must not run at the same time.
+/** A completion's identity, and whether any diff field joined it (the generic v1 fields are expected). */
+const diffless = (details) => ({ id: details.id, kind: details.kind, ...Object.fromEntries(["diff", "diffStats", "diffPath"].filter((k) => k in details).map((k) => [k, details[k]])) });
+
 describe("cursor tool details and transcript", { concurrency: 1 }, () => {
 test("the foreground result carries details.diff, diffStats and diffPath", async () => {
 	const h = await mount();
@@ -1111,7 +1114,7 @@ test("only a job the cursor runner started gets PI_BG_LOG and has its sidecar re
 	}
 	assert.ok(wake, "the plain job completed");
 	assert.ok(existsSync(detailsPath(reply.logPath)), "the planted sidecar is there");
-	assert.deepEqual(wake.message.details, { id: reply.id }, "but its completion is just the id");
+	assert.deepEqual(diffless(wake.message.details), { id: reply.id, kind: "bash" }, "but its completion is just the id");
 	assert.match(readFileSync(reply.logPath, "utf8"), /^log=\[\]$/m, "and it had no PI_BG_LOG");
 });
 
@@ -1134,7 +1137,7 @@ test("a plain bg:start with details: true gets no PI_BG_LOG and no sidecar read"
 		await new Promise((r) => setTimeout(r, 50));
 	}
 	assert.ok(wake, "the forged job completed");
-	assert.deepEqual(wake.message.details, { id: reply.id }, "details: true from a plain caller is ignored");
+	assert.deepEqual(diffless(wake.message.details), { id: reply.id, kind: "bash" }, "details: true from a plain caller is ignored");
 	assert.ok(!JSON.stringify(wake.message).includes(SECRET_VALUE));
 	assert.match(readFileSync(reply.logPath, "utf8"), /^log=\[\]$/m, "and it had no PI_BG_LOG");
 });
@@ -1224,7 +1227,7 @@ test("a resumed job reads the sidecar only when its command is this package's ru
 	const kept = wakeOf(runnerId);
 	assert.ok(forged, "the non-runner job was reported");
 	assert.ok(kept, "the runner job was reported");
-	assert.deepEqual(forged.message.details, { id: forgedId }, "a persisted details flag is not trusted");
+	assert.deepEqual(diffless(forged.message.details), { id: forgedId, kind: "bash" }, "a persisted details flag is not trusted");
 	assert.ok(!JSON.stringify(forged.message).includes(forgedMarker));
 	assert.ok(!JSON.stringify(forged.message).includes(SECRET_VALUE));
 	assert.match(kept.message.details.diff, new RegExp(runnerMarker), "completion re-derives the sidecar from the command");

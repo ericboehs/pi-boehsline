@@ -53,7 +53,11 @@
  *   PI_BG_LOG is set only when the command's argv[1] realpaths to runner.ts.
  *   That flag is not saved. At completion the sidecar is read only when the
  *   job command still realpaths there. The diff in `<log>.details.json` joins
- *   the completion message's details.
+ *   the completion message's details. `meta` is the caller's own flat fields
+ *   (at most 8 keys of strings, numbers, booleans or null, 2KB as JSON; saved
+ *   with the job) merged into the completion details, which are
+ *   `{ id, v: 1, kind, name, named, status, exit_code?, signal?, seconds, cwd, ...meta }`
+ *   with status succeeded|failed|stopped (a /bg or bg:kill stop is stopped).
  *   bg.ts emits "bg:jobs" with a snapshot of its jobs (id, name, command, cwd,
  *   logPath, startedAt, endedAt, exitCode, signal, killedByUser; foreground
  *   jobs still racing their budget left out) on every start, adoption and
@@ -377,6 +381,8 @@ interface JobRecord {
 	summary?: string;
 	/** Its name was given (the bash tool's `name`, a bg:start request), not guessed from the command: the wake leads with it. */
 	named?: boolean;
+	/** A bg:start caller's own fields (cleanJobMeta), merged into the completion message's details. */
+	meta?: JobMeta;
 	/** Per-job overrides of TAIL_LINES / TAIL_MAX_CHARS for the wake. */
 	tailLines?: number;
 	tailMaxChars?: number;
@@ -403,10 +409,10 @@ interface Job extends JobRecord {
 
 function toRecord(job: Job): JobRecord {
 	const { id, name, command, cwd, logPath, pid, pidStart, sessionId, startedAt, endedAt, exitCode, signal } = job;
-	const { exitUnknown, killedByUser, wakeOnKill, quiet, summary, named, tailLines, tailMaxChars, reported, adopted } = job;
+	const { exitUnknown, killedByUser, wakeOnKill, quiet, summary, named, meta, tailLines, tailMaxChars, reported, adopted } = job;
 	return {
 		id, name, command, cwd, logPath, pid, pidStart, sessionId, startedAt, endedAt, exitCode, signal,
-		exitUnknown, killedByUser, wakeOnKill, quiet, summary, named, tailLines, tailMaxChars, reported, adopted,
+		exitUnknown, killedByUser, wakeOnKill, quiet, summary, named, meta, tailLines, tailMaxChars, reported, adopted,
 		seenAt: Date.now(),
 	};
 }
@@ -452,6 +458,7 @@ function parseRecord(raw: unknown): JobRecord | undefined {
 		quiet: r.quiet === true,
 		summary: optional(r.summary, (v): v is string => text(v, 10_000)),
 		named: r.named === true ? true : undefined,
+		meta: cleanJobMeta(r.meta),
 		tailLines: optional(r.tailLines, count),
 		tailMaxChars: optional(r.tailMaxChars, count),
 		reported: r.reported === true,
@@ -642,6 +649,41 @@ export function cleanJobName(raw: unknown): string | undefined {
 	const name = raw.replace(/[\p{Cc}\u2028\u2029\u200E\u200F\u202A-\u202E\u2066-\u2069]+/gu, " ").replace(/\s+/g, " ").trim();
 	if (!name) return undefined;
 	return name.length > JOB_NAME_MAX ? `${name.slice(0, JOB_NAME_MAX - 1)}…` : name;
+}
+
+/** A bg:start caller's opaque fields: flat JSON primitives, at most JOB_META_KEYS keys and JOB_META_BYTES of JSON. */
+export type JobMeta = Record<string, string | number | boolean | null>;
+export const JOB_META_KEYS = 8;
+export const JOB_META_BYTES = 2048;
+/** The completion details' own fields: a caller's meta never replaces them (`kind` it may). */
+const META_RESERVED = new Set(["id", "v", "name", "named", "status", "exit_code", "signal", "seconds", "cwd", "diff", "diffStats", "diffPath"]);
+const META_KEY_RE = /^[A-Za-z][A-Za-z0-9_]{0,31}$/;
+
+/**
+ * Validate a bg:start request's (or a saved record's) `meta`. Anything else than a plain
+ * object of at most JOB_META_KEYS primitive values, JOB_META_BYTES as JSON, is dropped
+ * whole; a reserved key (META_RESERVED) is dropped alone. The job runs either way.
+ */
+export function cleanJobMeta(raw: unknown): JobMeta | undefined {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	if (Object.getPrototypeOf(raw) !== Object.prototype && Object.getPrototypeOf(raw) !== null) return undefined;
+	const entries = Object.entries(raw as Record<string, unknown>);
+	if (entries.length === 0 || entries.length > JOB_META_KEYS) return undefined;
+	const meta: JobMeta = {};
+	for (const [key, value] of entries) {
+		if (!META_KEY_RE.test(key)) return undefined;
+		const ok = value === null || typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value));
+		if (!ok) return undefined;
+		if (!META_RESERVED.has(key)) meta[key] = value as JobMeta[string];
+	}
+	let json: string;
+	try {
+		json = JSON.stringify(meta);
+	} catch {
+		return undefined;
+	}
+	if (Buffer.byteLength(json) > JOB_META_BYTES) return undefined;
+	return Object.keys(meta).length > 0 ? meta : undefined;
 }
 
 // Steps that set up rather than do the work: a whole step starting with one is passed over.
@@ -908,6 +950,8 @@ interface BgStartRequest {
 	tailMaxChars?: number;
 	/** Ignored unless the cursor runner authorized this request. Not settable by other callers. */
 	details?: boolean;
+	/** The caller's own fields for the completion details (cleanJobMeta: at most 8 keys, 2KB). */
+	meta?: unknown;
 	accepted?: boolean;
 	reply?: (result: { id: string; logPath: string } | { error: string }) => void;
 }
@@ -1411,6 +1455,7 @@ export default function (pi: ExtensionAPI) {
 			tailLines?: number;
 			tailMaxChars?: number;
 			details?: boolean;
+			meta?: unknown;
 		} = {},
 	): Promise<{ job: Job; exited: Promise<void> }> {
 		if (!bgDirReady()) throw new Error(`${BG_DIR} is not a directory only you can write to; not running jobs in it`);
@@ -1451,6 +1496,7 @@ export default function (pi: ExtensionAPI) {
 			quiet: opts.quiet === true,
 			own: true,
 			summary: opts.summary,
+			meta: cleanJobMeta(opts.meta),
 			tailLines: opts.tailLines,
 			tailMaxChars: opts.tailMaxChars,
 		};
@@ -1765,10 +1811,30 @@ export default function (pi: ExtensionAPI) {
 		persist(job);
 	}
 
-	/** A cursor run's diff sidecar, merged into the completion message. Other jobs stay `{ id }`. Re-derived from the command, never a persisted flag. */
+	/**
+	 * The completion message's details (v1): `{ id, v, kind, name, named, status, exit_code?,
+	 * signal?, seconds, cwd, ...meta }`, plus a cursor run's diff sidecar. `kind` is "cursor"
+	 * for a cursor runner job, else "bash", unless the bg:start caller's meta says otherwise
+	 * (a subagent's "subagent"). Cursor-ness is re-derived from the command, never a persisted flag.
+	 */
 	function completionDetails(job: Job): Record<string, unknown> {
-		const details: Record<string, unknown> = { id: job.id };
-		const extra = commandRunsCursorRunner(job.command) ? readJobDetails(job.logPath) : undefined;
+		const cursor = commandRunsCursorRunner(job.command);
+		const endedAt = job.endedAt ?? Date.now();
+		const status = job.killedByUser ? "stopped" : !job.exitUnknown && (job.signal ?? null) === null && job.exitCode === 0 ? "succeeded" : "failed";
+		const details: Record<string, unknown> = {
+			id: job.id,
+			v: 1,
+			kind: cursor ? "cursor" : "bash",
+			name: job.name,
+			named: job.named === true,
+			status,
+			...(typeof job.exitCode === "number" ? { exit_code: job.exitCode } : {}),
+			...(job.signal ? { signal: job.signal } : {}),
+			seconds: Math.max(0, Math.round((endedAt - job.startedAt) / 1000)),
+			cwd: job.cwd,
+			...job.meta,
+		};
+		const extra = cursor ? readJobDetails(job.logPath) : undefined;
 		if (!extra) return details;
 		// Read again through the trust helper: sensitive bodies reduced, secrets masked, diffPath checked.
 		const trusted = trustJobDetails(extra);
@@ -2175,6 +2241,7 @@ export default function (pi: ExtensionAPI) {
 				tailLines: req.tailLines,
 				tailMaxChars: req.tailMaxChars,
 				details: cursorDetailsRequested(req),
+				meta: req.meta,
 			});
 			if (job.endedAt !== undefined && job.exitCode === 127) {
 				req.reply?.({ error: `failed to start; see ${job.logPath}` });
