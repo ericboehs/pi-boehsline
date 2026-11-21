@@ -215,7 +215,10 @@ test("the invocation is refused, not left to the child, for a missing piece", ()
 	assert.match(sandboxInvocation({ cwd: "", task: "t", prompt: "p", agent: "scout" }).error, /needs a folder/);
 	assert.match(sandboxInvocation({ cwd: "/x", task: " ", prompt: "p", agent: "scout" }).error, /needs a task/);
 	const ok = sandboxInvocation({ cwd: "/x", task: "t", prompt: "p", agent: "scout", model: "anthropic/x", version: "1.5.0" }, {});
-	assert.equal(ok.cmd, DEFAULT_BOTSUN, "no $BOTSUN_BIN: the checkout beside ~/Code");
+	// Whether the checkout exists depends on the machine (CI has none), so the
+	// invocation is checked against sandboxBin and each branch of it separately.
+	assert.equal(ok.cmd, sandboxBin({}), "no $BOTSUN_BIN: whatever sandboxBin resolves");
+	assert.equal(sandboxBin({}, (p) => p === DEFAULT_BOTSUN), DEFAULT_BOTSUN, "no $BOTSUN_BIN: the checkout beside ~/Code");
 	assert.equal(sandboxBin({}, () => false), "botsun", "no $BOTSUN_BIN and no checkout: PATH's botsun");
 	assert.deepEqual(ok.args, ["worker", "exec", "--cwd", "/x", "--agent", "scout", "--task", "t", "--prompt", "p", "--model", "anthropic/x", "--pi-version", "1.5.0"]);
 	assert.equal(sandboxInvocation({ cwd: "/x", task: "t", prompt: "p", agent: "scout" }, { BOTSUN_BIN: "/opt/botsun" }).cmd, "/opt/botsun");
