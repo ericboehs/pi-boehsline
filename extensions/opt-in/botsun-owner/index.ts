@@ -132,8 +132,9 @@ interface Conn {
 	/** The owner socket (T2) and its outstanding nonces (value: expiry ms). */
 	server?: Server;
 	nonces: Map<string, number>;
-	/** Sends a user message through the current extension instance's pi. */
-	inject: (content: string | UserContent[], busy: boolean) => void;
+	/** Sends a user message through the current extension instance's pi. `id`: the phone's client_id
+	 * for it (a say's), which its steer mark carries. */
+	inject: (content: string | UserContent[], busy: boolean, id?: string) => void;
 	/** Runs a slash command from the phone: undefined = not one (send as text), null = ran, string = why not. */
 	command?: (text: string, busy: boolean) => string | null | undefined;
 	/** The commands the phone can run here, for its "/" list; read lazily. */
@@ -142,6 +143,12 @@ interface Conn {
 	deliver?: (text: string, mode: "queue" | "steer" | "stop") => string;
 	/** Stops the running turn as Esc does: "stopped", or "idle" when nothing is running. */
 	stop?: () => string;
+	/** The phone's Stop: as `stop`, with the phone's own steers the abort took out of pi's queue
+	 * (`dropped`, oldest first; taken back out of the TUI editor too), so the phone gets them back. */
+	stopReturning?: () => { stopped: boolean; dropped: string[] };
+	/** The phone's messages on their way into pi (`deliverSay`), each with its client_id when it sent
+	 * one, until pi's input event for it: its steer mark carries the id. Process only. */
+	phoneSays?: PhoneSay[];
 	/** The phone's Close: aborts a running turn ("stopped" / "idle"); the shutdown it returns runs once the reply is sent.
 	 * idleOnly (a locked phone's close_call): null while a turn, Botsun's busy, a compaction or a video reply's
 	 * framing runs, a sent prompt hasn't started yet or pi has queued messages, and nothing is aborted; its
@@ -627,6 +634,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (r.type === "call_end") return dropHeld(c, {});
 	if (r.type === "confirm") return confirmHeld(c, r);
 	if (r.type === "answer") return r.key !== undefined ? answerCall(c, r) : answerAsk(c, r);
+	if (r.type === "cancel_ask") return cancelAsk(c, r);
 	if (r.type === "stash") return stashRequest(c, r);
 	if (r.type === "stop") return stopRequest(c, r);
 	if (r.type === "stop_child") return stopChildRequest(c, r);
@@ -667,7 +675,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	const said = clientId ? saidKey(c, r, clientId) : undefined;
 	const digest = said ? say.digest : "";
 	if (said && saidBefore(c, said, digest)) return { ok: true, delivered: "duplicate" };
-	const outcome = deliverSay(c, text, images, files);
+	const outcome = deliverSay(c, text, images, files, { clientId });
 	return outcome instanceof Promise
 		? outcome.then((reply) => saidDone(c, said, digest, reply))
 		: saidDone(c, said, digest, outcome);
@@ -1038,7 +1046,7 @@ function sayCall(c: Conn, r: Record<string, unknown>): Record<string, unknown> |
 /** What a locked-phone reply may not start with: "/" (commands, skills, templates) or "!" (bash). */
 export const LOCKED_COMMAND = /^[\s\p{Cf}]*[\/!]/u; // spaces and invisible format chars, then / or ! (as Botsun checks)
 
-function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts: { noCommands?: boolean } = {}): Record<string, unknown> | Promise<Record<string, unknown>> {
+function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts: { noCommands?: boolean; clientId?: string } = {}): Record<string, unknown> | Promise<Record<string, unknown>> {
 	let saved: Saved[];
 	try {
 		saved = saveFiles(files);
@@ -1065,16 +1073,71 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 		// they're ready, and queue later replies behind it so they keep their order.
 		const job: Promise<void> = (c.framing ?? Promise.resolve())
 			.then(() => withFrames(saved, runFile))
-			.then(({ notes, frames }) => c.inject(compose(notes, frames), c.busy))
+			.then(({ notes, frames }) => {
+				c.inject(compose(notes, frames), c.busy, opts.clientId);
+			})
 			.catch((e) => debug(`owner say with a video: ${(e as Error).message}`))
 			.finally(() => { if (c.framing === job) c.framing = undefined; });
 		c.framing = job;
 		debug(`owner say accepted (${text.length} chars, ${images.length} photos, ${files.length} files, frames pending)`);
 		return { ok: true, delivered };
 	}
-	c.inject(compose(notes, []), c.busy);
+	c.inject(compose(notes, []), c.busy, opts.clientId);
 	debug(`owner say accepted (${text.length} chars, ${images.length} photos, ${files.length} files)`); // never the text
 	return { ok: true, delivered };
+}
+
+/** A phone message on its way into pi: the text pi's input event will carry, and its client_id. */
+export interface PhoneSay { text: string; id?: string; at: number }
+const PHONE_SAYS_MAX = 20;
+const PHONE_SAY_MS = 10 * 60_000;
+
+/** The text pi queues and its input event carries for a user message (text blocks, joined as pi's contentText does). */
+export function contentTextOf(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.filter((b) => b && typeof b === "object" && (b as { type?: unknown }).type === "text")
+		.map((b) => String((b as { text?: unknown }).text ?? "")).join("");
+}
+
+/** Remembers a phone message until pi's input event for it (takePhoneSay). Newest last, capped. */
+export function notePhoneSay(c: Pick<Conn, "phoneSays">, content: string | UserContent[], id?: string, now = Date.now()): void {
+	const says = (c.phoneSays ??= []);
+	says.push({ text: contentTextOf(content), ...(id ? { id } : {}), at: now });
+	while (says.length > PHONE_SAYS_MAX) says.shift();
+}
+
+/** The phone message pi's input event is for (the oldest with that text, not stale), taken; else undefined. */
+export function takePhoneSay(c: Pick<Conn, "phoneSays"> | undefined, text: string, now = Date.now()): PhoneSay | undefined {
+	const says = c?.phoneSays;
+	if (!says) return undefined;
+	while (says.length && now - says[0]!.at > PHONE_SAY_MS) says.shift();
+	const i = says.findIndex((s) => s.text === text);
+	return i < 0 ? undefined : says.splice(i, 1)[0];
+}
+
+/**
+ * The phone's steers taken back out of the TUI editor after an abort: pi's TUI puts every queued
+ * message there (the queue's texts joined by blank lines, then what was typed), and these are the
+ * phone's, so they go back to the phone instead of waiting for Enter on the Mac. Each is taken once,
+ * with the blank line pi joined it by; what the TUI queued or typed itself stays. `taken` is the
+ * ones found, oldest first.
+ */
+export function takeQueued(editor: string, texts: string[]): { editor: string; taken: string[] } {
+	let rest = editor;
+	const taken: string[] = [];
+	for (const t of texts) {
+		if (!t.trim()) continue;
+		const i = rest.indexOf(t);
+		if (i < 0) continue;
+		let from = i;
+		let to = i + t.length;
+		if (rest.startsWith("\n\n", to)) to += 2;
+		else if (from >= 2 && rest.slice(from - 2, from) === "\n\n") from -= 2;
+		rest = rest.slice(0, from) + rest.slice(to);
+		taken.push(t);
+	}
+	return { editor: rest, taken };
 }
 
 /**
@@ -1307,6 +1370,43 @@ function answerAsk(c: Conn, r: Record<string, unknown>): Record<string, unknown>
 	return error ? { error } : { ok: true };
 }
 
+/** A v1-signed cancel_ask: it takes v2 or newer only. */
+export const CANCEL_ASK_V1_REFUSED = "cancelling a question needs a v2 signature: update Botsun and the app";
+/** A prompt offered without `cancellable` (op-broker's secret approval): only answered. */
+export const CANCEL_ASK_REFUSED = "this question can't be cancelled from the phone; answer it, or press Esc in the session";
+
+/**
+ * Eric's Cancel on the phone's ask card: the tool returns what Esc at the keyboard returns ("User
+ * cancelled") and closes its dialog. Signed with the decision key, v2 or newer, over
+ * "cancel_ask\n<ask id>" (kind session, scope the session id; this session's nonce: single use),
+ * so the signature cancels that question and no other. Only a prompt offered cancellable (the ask
+ * tool's) is taken. Refusals before verifyDevice spend the nonce anyway (one try per nonce).
+ */
+function cancelAsk(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const spend = (error: string) => {
+		if (typeof r.nonce === "string") takeNonce(c, r.nonce);
+		return { error };
+	};
+	if (r.key !== undefined) return spend("bad request");
+	const id = r.ask_id;
+	if (typeof id !== "string" || !validScope(id)) return spend("bad request");
+	if (!atLeastV2(r)) return spend(CANCEL_ASK_V1_REFUSED);
+	const prompt = openPrompts().find((p) => p.id === id);
+	if (!prompt) return spend("that question was already answered");
+	if (!prompt.cancel) return spend(CANCEL_ASK_REFUSED);
+	const payload = `cancel_ask\n${id}`;
+	const denied = verifyDevice(c, r, {
+		decision: "cancel_ask",
+		digest: () => sha256hex(Buffer.from(payload, "utf8")),
+		v2: { kind: "session", decision: "cancel_ask", payload: () => payload },
+	});
+	if (denied) return { error: denied };
+	const error = prompt.cancel();
+	if (error) return { error };
+	debug("owner cancel_ask cancelled an ask");
+	return { ok: true };
+}
+
 /** A sensitive ask (op-broker's secret approval) picked on a locked phone: refused. */
 export const ANSWER_CALL_SENSITIVE = "answer this one on the unlocked phone or the keyboard";
 
@@ -1386,6 +1486,10 @@ function stopRequest(c: Conn, r: Record<string, unknown>): Record<string, unknow
 	const denied = verifyDevice(c, r, { decision: "stop", digest: () => sha256hex(Buffer.from("stop", "utf8")),
 		v2: { kind: "session", decision: "stop", payload: () => "stop" } });
 	if (denied) return { error: denied };
+	if (c.stopReturning) {
+		const { stopped, dropped } = c.stopReturning();
+		return dropped.length ? { ok: true, stopped, dropped } : { ok: true, stopped };
+	}
 	if (!c.stop) return { error: "this session can't stop from the phone yet; run /reload" };
 	return { ok: true, stopped: c.stop() === "stopped" };
 }
@@ -1718,11 +1822,19 @@ export function stashLine(c: Pick<Conn, "sessionId">): { id: string; text: strin
 /**
  * The newest question a tool (ask) has open, as Botsun shows it; null when none. sensitive: a
  * secret's approval, which the call can't confirm (Botsun drops keys it doesn't know).
+ * cancellable: the phone may cancel it (cancel_ask); an older Botsun drops the key.
  */
-function askLine(): { id: string; questions: RemotePrompt["questions"]; sensitive?: true } | null {
+function askLine(): { id: string; questions: RemotePrompt["questions"]; sensitive?: true; cancellable?: true } | null {
 	const open = openPrompts();
 	const p = open[open.length - 1];
-	return p ? { id: p.id, questions: p.questions, ...(p.sensitive ? { sensitive: true as const } : {}) } : null;
+	return p
+		? {
+				id: p.id,
+				questions: p.questions,
+				...(p.sensitive ? { sensitive: true as const } : {}),
+				...(p.cancel ? { cancellable: true as const } : {}),
+			}
+		: null;
 }
 
 const retryBase = (): number => {
@@ -2250,6 +2362,8 @@ function main(pi: ExtensionAPI): void {
 	// Words a stop released: sent once the aborted run has settled, as if typed after Esc.
 	let afterStop: string[] = [];
 	let steerHook = false;
+	// The phone's steers in pi's queue now (not delivered yet), oldest first: what an abort drops.
+	let queuedSteers: string[] = [];
 
 	// pi's reload is only on a command's context, and a command sent with expandPromptTemplates runs
 	// with one, as typed: it reloads only with the one-time token the phone's verified reload sent it
@@ -2386,10 +2500,25 @@ function main(pi: ExtensionAPI): void {
 			pi.on("input", (event) => {
 				inputAt = Date.now();
 				try {
+					const text = typeof event?.text === "string" ? event.text : "";
+					// The phone's message this is (if it is one): its client_id goes on the steer mark,
+					// so Botsun's thread row for it carries the id the phone matches its bubble by.
+					const said = takePhoneSay(conn, text);
 					if (event?.streamingBehavior !== "steer") return;
-					const text = typeof event.text === "string" ? event.text : "";
-					pi.appendEntry("botsun-steer", { text: [...text].slice(0, 200).join(""), at: Date.now() });
+					if (said) {
+						queuedSteers.push(text);
+						if (queuedSteers.length > PHONE_SAYS_MAX) queuedSteers.shift();
+					}
+					pi.appendEntry("botsun-steer", { text: [...text].slice(0, 200).join(""), at: Date.now(), ...(said?.id ? { client_id: said.id } : {}) });
 				} catch {}
+			});
+			// A steer delivered (pi takes it out of its queue as its message starts): no longer the
+			// phone's to get back from a Stop.
+			pi.on("message_start", (event) => {
+				const m = (event as { message?: { role?: unknown; content?: unknown } } | undefined)?.message;
+				if (m?.role !== "user" || !queuedSteers.length) return;
+				const i = queuedSteers.indexOf(contentTextOf(m.content));
+				if (i >= 0) queuedSteers.splice(i, 1);
 			});
 		}
 		const info = sessionInfo(ctx);
@@ -2398,7 +2527,9 @@ function main(pi: ExtensionAPI): void {
 		const sessionName = () => pi.getSessionName();
 		const setSessionName = (name: string) => pi.setSessionName(name);
 		// Eric's own words, as if typed: steer into a running turn, else start one.
-		const inject = (content: string | UserContent[], busy: boolean) => {
+		const inject = (content: string | UserContent[], busy: boolean, id?: string) => {
+			// Remembered until pi's input event for it: its steer mark takes the id, and a Stop gives it back.
+			if (conn) notePhoneSay(conn, content, id);
 			// held still waiting (a compaction just ended, see releaseHeld): stay behind them.
 			if (compacting || held.length > 0) held.push(content);
 			else sendUser(pi, content, busy ? { deliverAs: "steer" } : undefined);
@@ -2419,16 +2550,34 @@ function main(pi: ExtensionAPI): void {
 				sendUser(pi, text, { deliverAs: "followUp" });
 				return "queue";
 			}
-			afterStop.push(text);
-			ctx.abort();
+			// The phone's steers the abort drops go again first (they were sent first), then these words.
+			afterStop.push(...abortTaking(), text);
 			return "stopped";
 		};
-		// The phone's Stop: Esc. A compaction counts as running (Esc stops that too).
-		const stop = (): string => {
-			if (ctx.isIdle() && !compacting) return "idle";
+		// ctx.abort(), taking back the phone's steers it drops: pi's TUI puts every queued message
+		// into its editor on an abort, and the phone's would wait there for Enter at the Mac. They
+		// come back out of the editor (the TUI's own queued and typed text stays) and are returned.
+		const abortTaking = (): string[] => {
+			const phone = ctx.hasPendingMessages?.() === true ? queuedSteers : [];
+			queuedSteers = [];
 			ctx.abort();
-			return "stopped";
+			if (!phone.length || typeof ctx.ui?.getEditorText !== "function" || typeof ctx.ui?.setEditorText !== "function") return [];
+			try {
+				const before = ctx.ui.getEditorText();
+				const { editor, taken } = takeQueued(before, phone);
+				if (taken.length) ctx.ui.setEditorText(editor);
+				return taken;
+			} catch {
+				return [];
+			}
 		};
+		// The phone's Stop: Esc, with the phone's steers it dropped. A compaction counts as running
+		// (Esc stops that too).
+		const stopReturning = (): { stopped: boolean; dropped: string[] } => {
+			if (ctx.isIdle() && !compacting) return { stopped: false, dropped: [] };
+			return { stopped: true, dropped: abortTaking() };
+		};
+		const stop = (): string => (stopReturning().stopped ? "stopped" : "idle");
 		// The phone's Close: stop what's running, then (after the reply) a graceful exit. idleOnly
 		// (close_call): nothing while a turn or compaction runs, a prompt is on its way in (sent,
 		// not started yet) or messages wait in pi's queue, and the same again at shutdown (a typed
@@ -2482,6 +2631,7 @@ function main(pi: ExtensionAPI): void {
 			conn.inject = inject;
 			conn.deliver = deliver;
 			conn.stop = stop;
+			conn.stopReturning = stopReturning;
 			conn.close = close;
 			conn.reload = reload;
 			conn.restart = restart;
@@ -2545,7 +2695,7 @@ function main(pi: ExtensionAPI): void {
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
 			busy: false, prompt: null, promptDepth: 0, sessionName, setSessionName, ...info, launch: g[LAUNCH],
-			nonces: new Map(), inject, deliver, stop, close, reload, restart, command, commands, models, context, confirm, color,
+			nonces: new Map(), inject, deliver, stop, stopReturning, close, reload, restart, command, commands, models, context, confirm, color,
 			model: modelOf(ctx),
 		};
 		store[STORE] = conn;
@@ -2701,6 +2851,9 @@ function main(pi: ExtensionAPI): void {
 
 	pi.on("agent_settled", () => {
 		inputAt = 0;
+		// A settled run has delivered its steers, or an Esc at the keyboard put them in the editor
+		// for Eric there: none is the phone's to take back now.
+		queuedSteers = [];
 		if (afterStop.length) {
 			// As if typed after Esc; through inject, so a compaction starting now still holds them.
 			const text = afterStop.join("\n\n");
