@@ -16,7 +16,7 @@
 //
 // The choice is also exported as PI_SESSION_COLOR (the palette name, "#hex",
 // or xterm index) for tools this session runs: pi's bash tool copies
-// process.env for every command, so eert-bot-feed can post under an avatar
+// process.env for every command, so a chat-posting tool can post under an avatar
 // that matches the border. Process env only, so it's still not persisted.
 //
 // Other extensions read and set it over pi.events, with no import either way
