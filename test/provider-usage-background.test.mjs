@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { mock } from "node:test";
@@ -171,17 +171,52 @@ test("two pi instances polling at once: one fetch", async (t) => {
   assert.equal(env.calls.length, 1);
 });
 
-test("a hung fetch times out, releases the cache lock, and counts as failed", async (t) => {
+test("a hung fetch times out and counts as failed; the cache lock stays held, kept fresh, until the fetch settles", async (t) => {
   const env = setup(t);
   env.writeCache(Date.now() - 2 * INTERVAL);
   const ctx = ctxWith("oauth");
-  // An OAuth refresh that never answers.
-  ctx.modelRegistry.getProviderAuth = () => new Promise(() => {});
+  // An OAuth refresh that hasn't answered yet.
+  let answer;
+  ctx.modelRegistry.getProviderAuth = () => new Promise((resolve) => { answer = resolve; });
+  const lock = path.join(env.dir, "usage-cache.lock");
   const started = Date.now();
-  assert.equal(await backgroundPollOnce(ctx, grok, INTERVAL, 50), "failed");
+  assert.equal(await backgroundPollOnce(ctx, grok, INTERVAL, 50, 20), "failed");
   assert.ok(Date.now() - started < 2_000);
-  assert.equal(existsSync(path.join(env.dir, "usage-cache.lock")), false, "lock released");
-  assert.match(readFileSync(path.join(env.dir, "provider-usage.log"), "utf8"), /background poll failed: timed out/);
+  const log = path.join(env.dir, "provider-usage.log");
+  for (const until = Date.now() + 2_000; !existsSync(log) && Date.now() < until;) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.match(readFileSync(log, "utf8"), /background poll failed: timed out/);
+  assert.equal(existsSync(lock), true, "still held: the refresh is still running");
+  // Kept fresh while it runs: another pi doesn't take it for a crashed fetcher.
+  const old = new Date(Date.now() - 10 * MINUTE);
+  utimesSync(lock, old, old);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.ok(Date.now() - statSync(lock).mtimeMs < MINUTE, "mtime refreshed");
+  // The refresh settles: the lock goes.
+  answer({ auth: { apiKey: "oauth-access-token" } });
+  const deadline = Date.now() + 2_000;
+  while (existsSync(lock) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(existsSync(lock), false, "released once the fetch settled");
+});
+
+test("a fetch hung past the hold cap stops being kept fresh, and its lock is no longer released by it", async (t) => {
+  const env = setup(t);
+  env.writeCache(Date.now() - 2 * INTERVAL);
+  const ctx = ctxWith("oauth");
+  let answer;
+  ctx.modelRegistry.getProviderAuth = () => new Promise((resolve) => { answer = resolve; });
+  const lock = path.join(env.dir, "usage-cache.lock");
+  assert.equal(await backgroundPollOnce(ctx, grok, INTERVAL, 30, 10, 40), "failed");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const old = new Date(Date.now() - 10 * MINUTE);
+  utimesSync(lock, old, old);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(Date.now() - statSync(lock).mtimeMs >= 9 * MINUTE, "no longer touched");
+  // Another pi takes the stale lock; the old fetch settling later must not release that one's.
+  rmSync(lock, { recursive: true });
+  mkdirSync(lock);
+  answer({ auth: { apiKey: "oauth-access-token" } });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(existsSync(lock), true, "the other pi's lock stays");
 });
 
 /**

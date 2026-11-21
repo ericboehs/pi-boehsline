@@ -27,7 +27,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { appendFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { settingsFor } from "../../lib/config.ts";
@@ -146,11 +146,21 @@ async function tryAcquireCacheLock(): Promise<boolean> {
   }
 }
 
-async function releaseCacheLock(): Promise<void> {
+async function releaseCacheLock(lock = cacheLockPath()): Promise<void> {
   try {
-    await rm(cacheLockPath(), { recursive: true, force: true });
+    await rm(lock, { recursive: true, force: true });
   } catch {
     // Best-effort; staleness handling steals it next time.
+  }
+}
+
+/** Marks the lock fresh again (its mtime), so a long-running holder isn't taken for a crashed one. */
+async function touchCacheLock(lock: string): Promise<void> {
+  try {
+    const now = new Date();
+    await utimes(lock, now, now);
+  } catch {
+    // Gone or unreadable: the next acquire sorts it out.
   }
 }
 const STASH_KEY_BASETEN = "__piBasetenUsage";
@@ -2799,12 +2809,22 @@ const BACKGROUND_TICK_MAX_MS = 5 * 60 * 1000;
 /** First check after session start, off pi's startup path. */
 const BACKGROUND_FIRST_TICK_MS = 15_000;
 const BACKGROUND_STAMP_FILE = "usage-background.json";
-/** Cap on one background fetch (auth refresh included), well inside the lock's stale window. */
+/** Cap on how long one background poll waits on its fetch (auth refresh included); the fetch itself runs on. */
 export const BACKGROUND_FETCH_TIMEOUT_MS = 45_000;
-/** Live background-poll timers across every instance, for tests and shutdown checks. */
-let liveBackgroundTimers = 0;
+/** How often a background poll marks the cache lock fresh while its fetch runs (well inside the stale window). */
+export const BACKGROUND_LOCK_TOUCH_MS = 15_000;
+/**
+ * The longest a background poll keeps the cache lock fresh for a fetch that never settles. Past it
+ * the lock goes stale and another pi may take it, so this one no longer releases it.
+ */
+export const BACKGROUND_LOCK_HOLD_MAX_MS = 10 * 60 * 1000;
+/**
+ * Background-poll timers scheduled and not yet cleared by stopBackgroundPolls, across every
+ * instance (a fired one-shot first tick still counts until then), for tests and shutdown checks.
+ */
+let scheduledBackgroundTimers = 0;
 export function backgroundTimerCount(): number {
-  return liveBackgroundTimers;
+  return scheduledBackgroundTimers;
 }
 
 export interface BackgroundPoll {
@@ -2884,23 +2904,48 @@ export async function backgroundPollOnce(
   driver: Driver,
   intervalMs: number,
   fetchTimeoutMs = BACKGROUND_FETCH_TIMEOUT_MS,
+  lockTouchMs = BACKGROUND_LOCK_TOUCH_MS,
+  lockHoldMaxMs = BACKGROUND_LOCK_HOLD_MAX_MS,
 ): Promise<BackgroundPollResult> {
   if (!driver.background || !oauthSignedIn(ctx, driver.provider)) return "signed-out";
   if (!(await backgroundDue(driver, intervalMs))) return "fresh";
   if (!(await tryAcquireCacheLock())) return "locked";
+  // Its path now: the fetch may outlive this call, and the agent dir is read from the environment.
+  const lock = cacheLockPath();
+  // Set once the fetch is under way: the lock is released when it settles, not when we stop waiting.
+  let fetching: Promise<void> | undefined;
+  let held = true;
+  let timedOut = false;
   try {
     // Another pi may have fetched while we took the lock.
     if (!(await backgroundDue(driver, intervalMs))) return "fresh";
     await writeBackgroundStamp(driver.id, Date.now());
-    // The lock goes stale at SHARED_LOCK_STALE_MS; a hung OAuth refresh or fetch
-    // must not hold it past that, or another pi steals it and we release theirs.
+    // We stop waiting after fetchTimeoutMs, but the fetch (and the OAuth refresh in it) can't be
+    // cancelled: the lock stays ours, kept fresh, until it settles, so no other pi refreshes the
+    // same sign-in alongside it (a provider that rotates refresh tokens would sign the user out).
+    const work = driver.fetch(ctx);
+    const startedAt = Date.now();
+    const touch = setInterval(() => {
+      if (Date.now() - startedAt >= lockHoldMaxMs) {
+        // Hung past the cap: let the lock go stale for another pi; it's no longer ours to release.
+        held = false;
+        clearInterval(touch);
+        return;
+      }
+      void touchCacheLock(lock);
+    }, lockTouchMs);
+    touch.unref?.();
+    fetching = work.then(() => {}, () => {}).finally(() => clearInterval(touch));
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`timed out after ${Math.round(fetchTimeoutMs / 1000)}s`)), fetchTimeoutMs);
+      timer = setTimeout(() => {
+        timedOut = true;
+        reject(new Error(`timed out after ${Math.round(fetchTimeoutMs / 1000)}s`));
+      }, fetchTimeoutMs);
     });
     let display: UsageDisplay;
     try {
-      display = await Promise.race([driver.fetch(ctx), timeout]);
+      display = await Promise.race([work, timeout]);
     } finally {
       clearTimeout(timer);
     }
@@ -2914,7 +2959,13 @@ export async function backgroundPollOnce(
     }
     return "failed";
   } finally {
-    await releaseCacheLock();
+    if (!fetching) await releaseCacheLock(lock);
+    else {
+      // Released once the fetch settles (now, unless we stopped waiting on it), unless it hung past the hold cap.
+      const release = fetching.then(() => (held ? releaseCacheLock(lock) : undefined));
+      if (timedOut) void release;
+      else await release;
+    }
   }
 }
 
@@ -3112,13 +3163,13 @@ export default function providerUsage(pi: ExtensionAPI): void {
       first.unref?.();
       every.unref?.();
       backgroundTimers.push(first, every);
-      liveBackgroundTimers += 2;
+      scheduledBackgroundTimers += 2;
     }
   }
 
   function stopBackgroundPolls(): void {
     for (const timer of backgroundTimers) clearTimeout(timer);
-    liveBackgroundTimers -= backgroundTimers.length;
+    scheduledBackgroundTimers -= backgroundTimers.length;
     backgroundTimers = [];
   }
 
