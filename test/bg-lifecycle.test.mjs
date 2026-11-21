@@ -84,9 +84,13 @@ function newProcess() {
   delete globalThis[Symbol.for("pi-boehsline.bg.children")];
 }
 
-/** Let async fs and ps callbacks (the delayed registry prune) run, until `done()` or a bound. */
+/**
+ * Let async fs and ps callbacks (the delayed registry prune) run, until `done()`
+ * or 5 s of real time: a count of ticks ran out on a loaded CI runner before the
+ * thread pool got to the prune. performance.now, since Date is mocked.
+ */
 async function until(done) {
-  for (let i = 0; i < 200 && !done(); i++) await settle();
+  for (const end = performance.now() + 5_000; !done() && performance.now() < end; ) await settle();
 }
 
 /**
