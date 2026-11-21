@@ -183,8 +183,10 @@ test("a hung fetch times out and counts as failed; the cache lock stays held, ke
   assert.equal(await backgroundPollOnce(ctx, grok, INTERVAL, 50, 20), "failed");
   assert.ok(Date.now() - started < 2_000);
   const log = path.join(env.dir, "provider-usage.log");
-  for (const until = Date.now() + 2_000; !existsSync(log) && Date.now() < until;) await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.match(readFileSync(log, "utf8"), /background poll failed: timed out/);
+  // The line, not just the file: logLine's appendFile creates the file before it writes.
+  const logged = () => (existsSync(log) ? readFileSync(log, "utf8") : "");
+  for (const until = Date.now() + 2_000; !/background poll failed/.test(logged()) && Date.now() < until;) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.match(logged(), /background poll failed: timed out/);
   assert.equal(existsSync(lock), true, "still held: the refresh is still running");
   // Kept fresh while it runs: another pi doesn't take it for a crashed fetcher.
   const old = new Date(Date.now() - 10 * MINUTE);

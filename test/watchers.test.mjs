@@ -734,9 +734,11 @@ test("runner: a timeout still resolves when a grandchild escapes the group and h
 	let escaped;
 	try {
 		const started = Date.now();
-		const r = await runScript(wcfg(script), { cwd: dir, stateDir: state, timeoutMs: 300 });
+		// Long enough for two node startups on a loaded machine: the grandchild must
+		// exist (and have written its pid) before the timeout kills the group.
+		const r = await runScript(wcfg(script), { cwd: dir, stateDir: state, timeoutMs: 1500 });
 		assert.equal(r.error, "timed out");
-		assert.ok(Date.now() - started < 2800, "resolved on exit or the 2 s fallback");
+		assert.ok(Date.now() - started < 4000, "resolved on exit or the 2 s fallback");
 		escaped = Number(readFileSync(join(dir, "escaped"), "utf8"));
 		assert.ok(alive(escaped), "the escaped grandchild really outlived the group kill");
 	} finally {
@@ -1739,7 +1741,14 @@ test("git at session start: the budget covers every call together; a hung remote
 	const s = repoSetup('scope = "repo"\nrepos = ["auto"]');
 	const git = {
 		toplevel: async () => (await sleep(60), { path: s.a }),
-		remoteUrl: () => new Promise(() => {}),
+		// Hung the way a real git is: a live handle until the budget aborts it. A bare
+		// never-settling promise leaves only the budget's unref'd timer, so node 22
+		// sees an empty event loop and cancels the test.
+		remoteUrl: (_cwd, signal) =>
+			new Promise(() => {
+				const held = setTimeout(() => {}, 10_000);
+				signal?.addEventListener("abort", () => clearTimeout(held));
+			}),
 	};
 	const h = host(s, { git, gitBudgetMs: 200, complete: async () => okReply() });
 	const t0 = Date.now();
