@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- botsun-owner: a Stop or Close takes back only the phone's own steers. `takeQueued` removes only whole blank-line-separated blocks of the editor equal to a phone text, in queue order from the front, so a phone "ok" no longer cuts "looks ok to me" down to "los ok to me", and a delivered steer that `message_start` didn't match can't cut into Eric's draft. A phone say's `client_id` (and a Stop's `dropped`) attach only to an extension's input (`source: "extension"`), so the same words typed at the keyboard stay his. A non-idle Close now returns the steers its abort took out of the editor as `dropped`, as Stop does, instead of losing them. agent-link's internal `/agent-link-reload` is kept off the phone's "/" list.
 - subagent, children: a background pi subagent's commands show whole on the phone. The progress filter cut each turn's calls to 110 characters for its log line (and split on a " | " inside a command), and the children tracker read only that line, so a long command showed as `git show o…`. The filter now also writes each turn's calls in full (strings capped at 4000 characters) to a sidecar JSONL named by its argument, and the tracker reads that turn from it, falling back to the log line; the sidecar is deleted when the child ends. The log lines (and so the bg completion message) are unchanged.
 
 ### Added

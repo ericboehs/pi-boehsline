@@ -1602,6 +1602,26 @@ test("takeQueued: the phone's steers come back out of the editor; the TUI's own 
 	assert.deepEqual(takeQueued("a\n\na", ["a"]), { editor: "a", taken: ["a"] }, "each once");
 });
 
+test("takeQueued: only whole blocks, in queue order from the front; never part of Eric's own text", async () => {
+	const { takeQueued } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	// A phone text that's a word in what Eric typed: not a block, stays.
+	assert.deepEqual(takeQueued("looks ok to me", ["ok"]), { editor: "looks ok to me", taken: [] }, "substring of a word");
+	assert.deepEqual(takeQueued("okay", ["ok"]), { editor: "okay", taken: [] });
+	// A phone text inside Eric's draft (a line of it, not a block of its own): stays.
+	assert.deepEqual(takeQueued("my draft\nyes\nmore", ["yes"]), { editor: "my draft\nyes\nmore", taken: [] }, "inside his draft");
+	assert.deepEqual(takeQueued("tui queue\n\nsay yes then", ["yes"]), { editor: "tui queue\n\nsay yes then", taken: [] });
+	// Delivered but not matched (message_start's text didn't match): still in queuedSteers, not in the
+	// editor. Nothing of Eric's that merely contains it is cut.
+	assert.deepEqual(takeQueued("tui queued\n\nlooks ok to me", ["ok", "phone two"]), { editor: "tui queued\n\nlooks ok to me", taken: [] }, "delivered, not matched");
+	assert.deepEqual(takeQueued("phone two\n\nlooks ok to me", ["ok", "phone two"]), { editor: "looks ok to me", taken: ["phone two"] });
+	// Queue order from the front: the first match of each, after the one before it.
+	assert.deepEqual(takeQueued("x\n\ny\n\nx", ["x", "y"]), { editor: "x", taken: ["x", "y"] }, "the queued x, not the draft's");
+	assert.deepEqual(takeQueued("y\n\nx", ["x", "y"]), { editor: "y", taken: ["x"] }, "y before x: not in queue order, stays");
+	// A phone text with blank lines of its own is one block.
+	assert.deepEqual(takeQueued("one\n\ntwo\n\ndraft", ["one\n\ntwo"]), { editor: "draft", taken: ["one\n\ntwo"] });
+	assert.deepEqual(takeQueued("tui\n\nphone", ["phone"]), { editor: "tui", taken: ["phone"] }, "last block, with its blank line");
+});
+
 test("the phone's Stop returns the phone's queued steers (out of the TUI editor) as dropped; ids go on steer marks", async () => {
 	const key = phoneKey();
 	writeKeys({ 7: key.raw.toString("base64") });
@@ -1648,6 +1668,57 @@ test("the phone's Stop returns the phone's queued steers (out of the TUI editor)
 	editor = "";
 	assert.deepEqual(await stop(), { ok: true, stopped: true });
 	assert.equal(editor, "one more");
+});
+
+test("a phone say's id and Stop take only an extension's input: the same words typed at the keyboard stay his", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	await m.fire("agent_start");
+	const { nonce } = await ask({ type: "nonce" });
+	const signature = signV2(key, nonce, "session", "say", botsunSayPayload("yes", SAID));
+	assert.equal((await ask({ type: "say", text: "yes", nonce, device_id: 7, sig_v: 2, signature, client_id: SAID })).delivered, "steer");
+	// Eric types the same words before pi's input event for the phone's: his keyboard steer.
+	await m.fire("input", { type: "input", text: "yes", source: "interactive", streamingBehavior: "steer" });
+	assert.equal(m.entries.at(-1).data.client_id, undefined, "not the phone's id on his steer");
+	let editor = "";
+	let queued = ["yes"];
+	m.ctx.isIdle = () => false;
+	m.ctx.hasPendingMessages = () => queued.length > 0;
+	m.ctx.abort = () => { editor = [...queued, editor].filter((t) => t.trim()).join("\n\n"); queued = []; };
+	m.ctx.ui = { getEditorText: () => editor, setEditorText: (t) => (editor = t) };
+	const { nonce: n2 } = await ask({ type: "nonce" });
+	assert.deepEqual(await ask({ type: "stop", nonce: n2, device_id: 7, sig_v: 2, signature: signV2(key, n2, "session", "stop", "stop") }),
+		{ ok: true, stopped: true }, "his typed steer isn't sent to the phone");
+	assert.equal(editor, "yes", "it stays in his editor");
+	// The phone's own input event still finds its say.
+	await m.fire("input", { type: "input", text: "yes", source: "extension", streamingBehavior: "steer" });
+	assert.equal(m.entries.at(-1).data.client_id, SAID);
+});
+
+test("close: the phone's steers a non-idle Close takes out of the editor come back in its reply", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	await m.fire("agent_start");
+	const { nonce } = await ask({ type: "nonce" });
+	const signature = signV2(key, nonce, "session", "say", botsunSayPayload("also check the logs", SAID));
+	assert.equal((await ask({ type: "say", text: "also check the logs", nonce, device_id: 7, sig_v: 2, signature, client_id: SAID })).delivered, "steer");
+	await m.fire("input", { type: "input", text: "also check the logs", source: "extension", streamingBehavior: "steer" });
+	let editor = "draft";
+	let queued = ["also check the logs"];
+	const log = [];
+	m.ctx.isIdle = () => false;
+	m.ctx.hasPendingMessages = () => queued.length > 0;
+	m.ctx.abort = () => { log.push("abort"); editor = [...queued, editor].filter((t) => t.trim()).join("\n\n"); queued = []; };
+	m.ctx.shutdown = () => log.push("shutdown");
+	m.ctx.ui = { getEditorText: () => editor, setEditorText: (t) => (editor = t) };
+	const { nonce: n2 } = await ask({ type: "nonce" });
+	assert.deepEqual(await ask({ type: "close", nonce: n2, device_id: 7, sig_v: 2, signature: signV2(key, n2, "session", "close", "close") }),
+		{ ok: true, dropped: ["also check the logs"] });
+	assert.equal(editor, "draft");
+	await until(() => log.includes("shutdown"));
+	assert.deepEqual(log, ["abort", "shutdown"]);
 });
 
 test("interrupt: the phone's steers the abort dropped go again first, then the words", async () => {
@@ -1819,6 +1890,8 @@ test("reload: v2 only, its own decision; refused while a turn runs (nonce spent)
 	assert.equal(reloads.length, 1, "once");
 	assert.ok(!m.mod.phoneCommands({ getCommands: () => [{ name: RELOAD_COMMAND }, { name: "goal" }] }).some((c) => c.name === RELOAD_COMMAND),
 		"not on the phone's / list");
+	assert.deepEqual(m.mod.phoneCommands({ getCommands: () => [{ name: "agent-link-reload" }, { name: "agent-link" }] }).filter((c) => c.name.startsWith("agent-link")).map((c) => c.name),
+		["agent-link"], "nor agent-link's internal reload command");
 });
 
 test("reload and restart reply first and act after; a turn started in between stops them", async () => {
