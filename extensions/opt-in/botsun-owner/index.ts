@@ -238,6 +238,8 @@ interface Conn {
 	inTurn?: boolean;
 	/** The steers line last sent (JSON): one goes only when it changed. */
 	steersSent?: string;
+	/** Shows the waiting steers in pi's footer (ctx.ui.setStatus), so the keyboard sees what the phone queued. */
+	steerStatus?: (text: string | undefined) => void;
 }
 
 /** What inject is told about a message: see Conn.inject. */
@@ -1555,9 +1557,11 @@ function stopRequest(c: Conn, r: Record<string, unknown>): Record<string, unknow
  * them). Only one the phone can take back starts the wait (words alone, STEER_BYTES_MAX); one it
  * can't (photos, files, bigger words) waits only behind others.
  */
-export function holdsSteer(c: Pick<Conn, "inTurn" | "steers">, withdrawable: boolean): boolean {
+export function holdsSteer(c: Pick<Conn, "inTurn" | "steers" | "hostFeatures">, withdrawable: boolean): boolean {
 	if (c.steers?.length) return true;
-	return withdrawable && c.inTurn === true;
+	// Only for a Botsun that takes them back (its features line lists `unsteer`): an older one drops the
+	// `returned` lines and a stop's `returned` field, so a steer held for it could never come back.
+	return withdrawable && c.inTurn === true && c.hostFeatures?.has("unsteer") === true;
 }
 
 /** Whether these words, alone, can come back from an unsteer: some words, small enough for one reply. */
@@ -1597,8 +1601,14 @@ export function steersLine(c: Pick<Conn, "steers">): Array<{ id: string; chars: 
 		.map((s) => ({ id: s.id, chars: s.text.length, photos: 0, at: new Date(s.at).toISOString() }));
 }
 
-/** A steers line, when the list changed since Botsun was last told (or forced after a hello). */
+/** The footer's status for the waiting steers (every one, photos too), or undefined for none. */
+export function steerStatusText(n: number): string | undefined {
+	return n > 0 ? `📱 ${n} phone steer${n === 1 ? "" : "s"} waiting for the turn's end` : undefined;
+}
+
+/** A steers line, when the list changed since Botsun was last told (or forced after a hello); and pi's footer status. */
 export function reportSteers(c: Conn, force = false): void {
+	try { c.steerStatus?.(steerStatusText(c.steers?.length ?? 0)); } catch {}
 	const steers = steersLine(c);
 	const key = JSON.stringify(steers);
 	if (!force && key === c.steersSent) return;
@@ -2255,9 +2265,20 @@ function sendHello(c: Conn): void {
 	reportSubagents(c);
 	c.steersSent = JSON.stringify(steersLine(c));
 	// The escrow again: a line written while Botsun was away (or before a restart of its own) never
-	// reached it, and one it had is answered with another returned_ack. Only this conversation's:
-	// Botsun takes a line only for the conversation the session is in now.
-	sendReturned(c, (c.returned ?? []).filter((s) => s.sessionId === c.sessionId));
+	// reached it, and one it had is answered with another returned_ack.
+	resendReturned(c);
+}
+
+/**
+ * Every steer still in the escrow, down to Botsun again, named for the conversation pi is in now:
+ * Botsun takes a `returned` line only for that one, and the phone reads the thread by its id. One
+ * handed back by a /new, /resume or /fork was said in the conversation pi just left, so it moves with
+ * pi (Botsun moves its own copies on the `session` line too); one Botsun has is acked again.
+ */
+export function resendReturned(c: Conn): void {
+	const all = c.returned ?? [];
+	for (const s of all) s.sessionId = c.sessionId;
+	sendReturned(c, all);
 }
 
 function scheduleRetry(c: Conn): void {
@@ -2912,6 +2933,10 @@ function main(pi: ExtensionAPI): void {
 		const models = () => phoneModels(ctx);
 		const context = () => phoneContext(ctx);
 		// The keyboard's yes/no, for pinning a changed key or a new device (never answerable remotely).
+		// The waiting steers in pi's footer: the keyboard sees what the phone queued (reportSteers).
+		const steerStatus = (text: string | undefined) => {
+			try { ctx.ui?.setStatus?.("botsun-steers", text); } catch {}
+		};
 		const confirm = typeof ctx.ui?.confirm === "function" ? (title: string, message: string) => ctx.ui.confirm(title, message) : undefined;
 		const prev = store[STORE];
 		if (prev && !prev.closed) {
@@ -2922,6 +2947,7 @@ function main(pi: ExtensionAPI): void {
 			conn.sessionName = sessionName;
 			conn.setSessionName = setSessionName;
 			conn.inject = inject;
+			conn.steerStatus = steerStatus;
 			conn.deliver = deliver;
 			conn.stop = stop;
 			conn.stopReturning = stopReturning;
@@ -2969,6 +2995,9 @@ function main(pi: ExtensionAPI): void {
 			if (changed) {
 				if (conn.boundId !== conn.sessionId) conn.boundId = null;
 				write(conn, "session", { session_file: conn.sessionFile, session_id: conn.sessionId, cwd: conn.cwd, ...colorFields(conn) });
+				// Steers a /new, /resume or /fork handed back (session_shutdown) reach the box of the
+				// conversation the phone follows now, not the one pi left.
+				resendReturned(conn);
 			}
 			// The host clears a session's subagents when its id changes: this conversation's go again.
 			if (changed) conn.subagentsSent = "[]";
@@ -2988,7 +3017,7 @@ function main(pi: ExtensionAPI): void {
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
 			busy: false, prompt: null, promptDepth: 0, sessionName, setSessionName, ...info, launch: g[LAUNCH],
-			nonces: new Map(), inject, deliver, stop, stopReturning, close, reload, restart, command, commands, models, context, confirm, color,
+			nonces: new Map(), inject, steerStatus, deliver, stop, stopReturning, close, reload, restart, command, commands, models, context, confirm, color,
 			model: modelOf(ctx),
 		};
 		store[STORE] = conn;
@@ -3149,7 +3178,10 @@ function main(pi: ExtensionAPI): void {
 	// pi runs this inside finishTurn, before the agent loop reads its steering queue: a waiting steer
 	// handed over here lands at the same read it would have. One per turn, and only while pi holds
 	// none of its own, so the rest stay withdrawable (in pi's default one-at-a-time mode the loop
-	// reads one per turn anyway). Never on an aborted turn: the run is stopping (an Esc, the phone's
+	// reads one per turn anyway). hasPendingMessages counts pi's follow-ups too, and the API can't
+	// tell them apart: with a follow-up queued, a waiting steer waits for the run to settle and goes in
+	// as a prompt then, after that follow-up (accepted: rare, and nothing is lost; it is still
+	// withdrawable until then). Never on an aborted turn: the run is stopping (an Esc, the phone's
 	// Stop, or a /new, /resume, /fork or quit, which reset pi's queue right after), so they go back to
 	// the phone instead (returnSteers).
 	pi.on("turn_end", (event, ctx) => {

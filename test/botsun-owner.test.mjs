@@ -3611,12 +3611,14 @@ const STEER_C = "cccccccc-1111-4222-8333-444444444444";
 /** A session that steers as pi does: sendUserMessage fires pi's input event (a steer only while a
  * run streams, which these tests always are once agent_start fired), so the steer mark lands when
  * pi takes it. */
-async function steering() {
+async function steering({ hostFeatures = ["model_pages", "unsteer"] } = {}) {
 	const key = phoneKey();
 	writeKeys({ 7: key.raw.toString("base64") });
 	const srv = await server();
 	process.env.BOTSUN_OWNER_SOCK = srv.path;
 	const m = await mount();
+	const status = [];
+	m.ctx.ui = { setStatus: (k, t) => { if (k === "botsun-steers") status.push(t); } };
 	m.ctx.isIdle = () => false;
 	m.ctx.abort = () => {};
 	let pending = false;
@@ -3627,6 +3629,9 @@ async function steering() {
 	};
 	await m.fire("session_start", { reason: "startup" });
 	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)) && srv.types().includes("hello"));
+	// Botsun answers the hello with what it takes: steers wait only for one that lists `unsteer`.
+	down(srv, { v: 1, type: "features", features: hostFeatures });
+	await until(() => globalThis[Symbol.for("botsun-owner.v1")]?.hostFeatures?.has(hostFeatures[0]));
 	await m.fire("agent_start");
 	const say = async (text, clientId) => {
 		const { nonce } = await ask({ type: "nonce" });
@@ -3644,7 +3649,7 @@ async function steering() {
 	};
 	const lines = (type) => srv.lines.filter((l) => l.type === type);
 	const setPending = (v) => { pending = v; };
-	return { key, srv, m, say, unsteer, lines, setPending };
+	return { key, srv, m, say, unsteer, lines, setPending, status };
 }
 
 test("unsteer: a steer mid-turn waits for the turn's end, then goes in as a steer, marked only then", async () => {
@@ -3778,14 +3783,51 @@ test("unsteer: an aborted turn, a stopped run or a shutdown hands held steers ba
 	assert.ok(order.lastIndexOf("returned") < order.indexOf("bye"), "returned goes before the bye");
 });
 
-test("unsteer: a steer held over a /new handoff goes back to the phone, and the conversation is named", async () => {
-	const { m, say, lines } = await steering();
+test("unsteer: a steer held over a /new handoff goes back to the phone, in the conversation pi moves to", async () => {
+	const { m, srv, say, lines } = await steering();
 	await m.fire("turn_start", { turnIndex: 0 });
 	await say("keep this", STEER_A);
 	await m.fire("session_shutdown", { reason: "new" });
 	await until(() => lines("returned").length === 1);
-	assert.equal(lines("returned")[0].session_id, "sid-a");
+	assert.equal(lines("returned")[0].session_id, "sid-a", "said while still in the old one");
 	assert.equal(m.sent.length, 0);
+	// The phone follows pi to the new conversation and reads that thread: the escrow goes again,
+	// named for it, right after the session line (Botsun takes a line only for the current one).
+	const b = await mount({ ctx: { sessionManager: { getSessionFile: () => "/tmp/sessions/b.jsonl", getSessionId: () => "sid-b" } } });
+	await b.fire("session_start", { reason: "new" });
+	await until(() => lines("returned").length === 2);
+	const order = srv.lines.map((l) => l.type);
+	assert.ok(order.indexOf("session") < order.lastIndexOf("returned"), "after the session line");
+	assert.deepEqual([lines("returned")[1].session_id, lines("returned")[1].steers[0].id], ["sid-b", STEER_A]);
+	// And after a reconnect's hello, still the new conversation's, until Botsun acks it.
+	for (const c of srv.conns) c.destroy();
+	await until(() => lines("returned").length === 3);
+	assert.equal(lines("returned")[2].session_id, "sid-b");
+	down(srv, { v: 1, type: "returned_ack", ids: [STEER_A] });
+	await until(() => globalThis[Symbol.for("botsun-owner.v1")].returned.length === 0);
+});
+
+test("unsteer: an older Botsun (no `unsteer` in its features line) gets every steer at once, as before", async () => {
+	const { m, say, lines } = await steering({ hostFeatures: ["model_pages"] });
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("go now", STEER_A);
+	assert.deepEqual(m.sent, [{ content: "go now", options: { deliverAs: "steer" } }], "never held: it could never come back");
+	await m.fire("turn_end", { outcome: "aborted" });
+	await sleep(30);
+	assert.equal(lines("returned").length, 0);
+});
+
+test("unsteer: pi's footer shows how many phone steers wait, and clears when none do", async () => {
+	const { m, say, unsteer, status } = await steering();
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("first", STEER_A);
+	await say("second", STEER_B);
+	assert.equal(status.at(-1), "📱 2 phone steers waiting for the turn's end");
+	await m.fire("turn_end", { outcome: "completed" });
+	assert.equal(status.at(-1), "📱 1 phone steer waiting for the turn's end");
+	await unsteer();
+	assert.equal(status.at(-1), undefined);
+	assert.equal(m.mod.steerStatusText(0), undefined);
 });
 
 test("unsteer: a photo steer behind a waiting one waits too (his order), and an unsteer leaves it in place", async () => {
