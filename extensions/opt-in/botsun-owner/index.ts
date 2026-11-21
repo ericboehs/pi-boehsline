@@ -153,7 +153,7 @@ interface Conn {
 	 * idleOnly (a locked phone's close_call): null while a turn, Botsun's busy, a compaction or a video reply's
 	 * framing runs, a sent prompt hasn't started yet or pi has queued messages, and nothing is aborted; its
 	 * shutdown is skipped if one has started since. */
-	close?: (opts?: { idleOnly?: boolean }) => { stopped: boolean; shutdown: () => void } | null;
+	close?: (opts?: { idleOnly?: boolean }) => { stopped: boolean; dropped?: string[]; shutdown: () => void } | null;
 	/** The phone's Reload and Restart: null while anything runs (as close_call's idleOnly); `run` acts once the reply
 	 * is sent, and is skipped if something has started since. */
 	reload?: () => { run: () => void } | null;
@@ -1119,25 +1119,41 @@ export function takePhoneSay(c: Pick<Conn, "phoneSays"> | undefined, text: strin
 /**
  * The phone's steers taken back out of the TUI editor after an abort: pi's TUI puts every queued
  * message there (the queue's texts joined by blank lines, then what was typed), and these are the
- * phone's, so they go back to the phone instead of waiting for Enter on the Mac. Each is taken once,
- * with the blank line pi joined it by; what the TUI queued or typed itself stays. `taken` is the
- * ones found, oldest first.
+ * phone's, so they go back to the phone instead of waiting for Enter on the Mac. Only whole blocks
+ * (between blank lines, or the editor's ends) equal to a phone text are taken, never part of one: a
+ * phone text that's only a word in what Eric typed stays. They're looked for in queue order from the
+ * front (pi puts the queue's texts first, in order), each after the one before it, each once, with
+ * the blank line pi joined it by; one not found (delivered already) is skipped. What the TUI queued
+ * or typed itself stays. `taken` is the ones found, oldest first.
  */
 export function takeQueued(editor: string, texts: string[]): { editor: string; taken: string[] } {
 	let rest = editor;
 	const taken: string[] = [];
+	let at = 0;
 	for (const t of texts) {
 		if (!t.trim()) continue;
-		const i = rest.indexOf(t);
+		const i = wholeBlock(rest, t, at);
 		if (i < 0) continue;
 		let from = i;
 		let to = i + t.length;
 		if (rest.startsWith("\n\n", to)) to += 2;
-		else if (from >= 2 && rest.slice(from - 2, from) === "\n\n") from -= 2;
+		else if (from >= 2) from -= 2;
 		rest = rest.slice(0, from) + rest.slice(to);
+		at = from;
 		taken.push(t);
 	}
 	return { editor: rest, taken };
+}
+
+/** Where `t` is a whole block of `s` (a blank line or an end on each side), at or after `from`; else -1. */
+function wholeBlock(s: string, t: string, from: number): number {
+	for (let i = s.indexOf(t, from); i >= 0; i = s.indexOf(t, i + 1)) {
+		const end = i + t.length;
+		const starts = i === 0 || s.slice(i - 2, i) === "\n\n";
+		const ends = end === s.length || s.startsWith("\n\n", end);
+		if (starts && ends) return i;
+	}
+	return -1;
 }
 
 /**
@@ -1614,8 +1630,8 @@ function closeRequest(c: Conn, r: Record<string, unknown>): Record<string, unkno
 	// refused (checked after verifyDevice, so its nonce is spent and its errors stay alike).
 	if (!atLeastV2(r)) return { error: CLOSE_V1_REFUSED };
 	if (!c.close) return { error: "this session can't close from the phone yet; run /reload" };
-	const { shutdown } = c.close()!;
-	return { ok: true, [AFTER_REPLY]: shutdown };
+	const { shutdown, dropped } = c.close()!;
+	return { ok: true, ...(dropped?.length ? { dropped } : {}), [AFTER_REPLY]: shutdown };
 }
 
 /** A locked phone's close while a turn runs (Botsun refuses it first, naming the session). */
@@ -2122,6 +2138,11 @@ const BUILTINS = new Set(["settings", "model", "tree", "thinking", "scoped-model
 const THINKING = ["off", "minimal", "low", "medium", "high", "xhigh"];
 /** The command the phone's reload runs through (main); not on the phone's "/" list. */
 export const RELOAD_COMMAND = "botsun-reload";
+/**
+ * Other commands kept off the phone's "/" list: internal ones another extension dispatches itself
+ * (agent-link's reload command), and the icon picker, which needs the keyboard.
+ */
+export const PHONE_HIDDEN_COMMANDS: ReadonlySet<string> = new Set([RELOAD_COMMAND, "agent-link-reload", "icon"]);
 
 /** "/name args" as a command; a path like /Users/x is not one. Pure for tests. */
 export function slashCommand(text: string): { name: string; args: string } | null {
@@ -2165,7 +2186,7 @@ const PHONE_BUILTINS: PhoneCommand[] = [
 export function phoneCommands(pi: Pick<ExtensionAPI, "getCommands">): PhoneCommand[] {
 	const seen = new Set(PHONE_BUILTINS.map((c) => c.name));
 	const rest = pi.getCommands()
-		.filter((c) => !seen.has(c.name) && !BUILTINS.has(c.name) && c.name !== RELOAD_COMMAND && c.name !== "icon" && /^[A-Za-z][\w:.-]*$/.test(c.name))
+		.filter((c) => !seen.has(c.name) && !BUILTINS.has(c.name) && !PHONE_HIDDEN_COMMANDS.has(c.name) && /^[A-Za-z][\w:.-]*$/.test(c.name))
 		.map((c) => ({ name: c.name.slice(0, 64), ...(c.description ? { description: c.description.slice(0, 160) } : {}) }));
 	return [...PHONE_BUILTINS, ...rest].slice(0, 300);
 }
@@ -2502,8 +2523,10 @@ function main(pi: ExtensionAPI): void {
 				try {
 					const text = typeof event?.text === "string" ? event.text : "";
 					// The phone's message this is (if it is one): its client_id goes on the steer mark,
-					// so Botsun's thread row for it carries the id the phone matches its bubble by.
-					const said = takePhoneSay(conn, text);
+					// so Botsun's thread row for it carries the id the phone matches its bubble by. Only an
+					// extension's input (sendUserMessage) can be one: the same words typed at the keyboard
+					// stay Eric's own, never the phone's to take back.
+					const said = event?.source === "extension" ? takePhoneSay(conn, text) : undefined;
 					if (event?.streamingBehavior !== "steer") return;
 					if (said) {
 						queuedSteers.push(text);
@@ -2594,7 +2617,9 @@ function main(pi: ExtensionAPI): void {
 				}
 				ctx.shutdown();
 			};
-			return { stopped: stop() === "stopped", shutdown };
+			// The phone's steers the abort takes out of the editor go back in the reply (pi exits next).
+			const { stopped, dropped } = stopReturning();
+			return { stopped, dropped, shutdown };
 		};
 		// The phone's Reload and Restart: never while anything runs or a dialog is open, checked again
 		// once the reply is sent.
