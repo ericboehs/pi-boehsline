@@ -62,7 +62,7 @@ test("returns before the script ends, then delivers its result as one waking mes
 	assert.equal(message.customType, CUSTOM_TYPE);
 	assert.match(message.content, /`answer` succeeded after 2m05s\nScript completed\n42$/);
 	assert.deepEqual(options, { deliverAs: "followUp", triggerTurn: true });
-	assert.deepEqual(message.details, { id: message.details.id, kind: "codemode", name: "answer", status: "succeeded", seconds: 125, failed: false, stopped: false });
+	assert.deepEqual(message.details, { id: message.details.id, v: 1, kind: "codemode", name: "answer", status: "succeeded", seconds: 125, failed: false, stopped: false });
 	assert.match(message.details.id, /^[0-9a-f]{6}$/);
 	assert.equal(api.runs.size, 0);
 });
@@ -84,6 +84,7 @@ test("a failed script and a rejected call both report failed", async () => {
 	assert.equal(sent[0].message.details.status, "failed");
 	assert.equal(sent[1].message.details.status, "failed");
 	assert.equal(sent[1].message.details.kind, "codemode");
+	assert.equal(sent[1].message.details.v, 1, "the same generic v1 shape as a bg job's");
 });
 
 test("stop aborts the run's own signal and reports stopped", async () => {

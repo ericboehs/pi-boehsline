@@ -138,6 +138,7 @@ export function registerBgCodemode(
 				display: true,
 				details: {
 					id: run.id,
+					v: 1,
 					kind: "codemode",
 					name: run.name,
 					status: verb,

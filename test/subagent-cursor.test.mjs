@@ -143,16 +143,16 @@ test("cursor is a built-in agent, with its own params and the safety notes in th
 	assert.match(h.tool().description, /never contain PII, PHI, secrets/);
 
 	// The cursor-agent settings' note and rules (a work seat's) join at session_start.
-	process.env.PI_CURSOR_NOTE = "VA Cursor pilot seat (temporary ATO). Never send PII, PHI, Veteran data or secrets.";
-	process.env.PI_CURSOR_RULES = "The cursor tool's prompt must not contain PII, PHI, Veteran data or secrets; this is a VA pilot.";
+	process.env.PI_CURSOR_NOTE = "Example Corp Cursor pilot seat (temporary approval). Never send PII, PHI, customer data or secrets.";
+	process.env.PI_CURSOR_RULES = "The cursor tool's prompt must not contain PII, PHI, customer data or secrets; this is an Example Corp pilot.";
 	t.after(() => {
 		delete process.env.PI_CURSOR_NOTE;
 		delete process.env.PI_CURSOR_RULES;
 	});
 	await h.fire("session_start", { type: "session_start" }, h.ctx);
 	const d = h.tool().description;
-	assert.ok(d.includes("Cursor rules: VA Cursor pilot seat (temporary ATO). Never send PII, PHI, Veteran data or secrets."), d);
-	assert.ok(d.includes("this is a VA pilot."), d);
+	assert.ok(d.includes("Cursor rules: Example Corp Cursor pilot seat (temporary approval). Never send PII, PHI, customer data or secrets."), d);
+	assert.ok(d.includes("this is an Example Corp pilot."), d);
 	assert.equal(h.tools.filter((x) => x.name === "subagent").length, 2, "re-registered under the same name");
 });
 
@@ -414,6 +414,31 @@ test("a background child whose bg job fails to start is never tracked (no orphan
 		if (spec) rmSync(path.dirname(spec), { recursive: true, force: true });
 	}
 	cursorRuns();
+	resetChildren();
+});
+
+test("through the real bg extension, a child whose spawn fails: untracked, and its wake has start_failed and no child_id", async () => {
+	const { listChildren, resetChildren } = await import("../lib/children.ts");
+	resetChildren();
+	const h = mount();
+	const { default: bg } = await import("../extensions/bg/index.ts");
+	bg(h.pi);
+	await h.fire("session_start", { type: "session_start" }, { ...h.ctx, mode: "print", hasUI: false });
+	fakeEnv();
+	const missing = path.join(repo, "no-such-dir", String(process.pid));
+	const result = await h.run({ agent: "scout", task: "look", cwd: missing, background: true });
+	assert.match(textOf(result), /\[scout\] failed: failed to start; see \S+\.log/);
+	assert.deepEqual(listChildren(), [], "never tracked");
+	const wake = h.sent.find((s) => s.message?.customType === "bg");
+	assert.ok(wake, "the real bg job still reports its failed start");
+	const d = wake.message.details;
+	assert.equal(d.start_failed, true);
+	assert.equal("child_id" in d, false, "no card pointing at an untracked child");
+	assert.equal(d.status, "failed");
+	assert.equal(d.exit_code, 127);
+	assert.equal(d.kind, "subagent");
+	assert.equal(d.agent, "scout");
+	assert.equal(d.cwd, missing);
 	resetChildren();
 });
 
