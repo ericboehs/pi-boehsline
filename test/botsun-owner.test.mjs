@@ -1592,6 +1592,84 @@ test("the phone's Stop ends the running turn as Esc does, signed", async () => {
 	assert.equal(m.sent.length, 0);
 });
 
+test("takeQueued: the phone's steers come back out of the editor; the TUI's own text stays", async () => {
+	const { takeQueued } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	// pi's TUI on an abort: the queue's texts joined by blank lines, then what was typed.
+	assert.deepEqual(takeQueued("phone one\n\ntui typed queue\n\nphone two\n\ndraft", ["phone one", "phone two"]),
+		{ editor: "tui typed queue\n\ndraft", taken: ["phone one", "phone two"] });
+	assert.deepEqual(takeQueued("phone one\n\nphone two", ["phone one", "phone two"]), { editor: "", taken: ["phone one", "phone two"] });
+	assert.deepEqual(takeQueued("draft", ["not there", ""]), { editor: "draft", taken: [] }, "only what's there");
+	assert.deepEqual(takeQueued("a\n\na", ["a"]), { editor: "a", taken: ["a"] }, "each once");
+});
+
+test("the phone's Stop returns the phone's queued steers (out of the TUI editor) as dropped; ids go on steer marks", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	await m.fire("agent_start");
+	const say = async (text, clientId) => {
+		const { nonce } = await ask({ type: "nonce" });
+		const signature = signV2(key, nonce, "session", "say", botsunSayPayload(text, clientId));
+		return ask({ type: "say", text, nonce, device_id: 7, sig_v: 2, signature, ...(clientId ? { client_id: clientId } : {}) });
+	};
+	assert.equal((await say("based on your last question", SAID)).delivered, "steer");
+	assert.equal((await say("I would like that")).delivered, "steer");
+	// pi's input event for each (the stub's sendUserMessage doesn't emit it), and one typed in the TUI.
+	await m.fire("input", { type: "input", text: "based on your last question", source: "extension", streamingBehavior: "steer" });
+	await m.fire("input", { type: "input", text: "I would like that", source: "extension", streamingBehavior: "steer" });
+	await m.fire("input", { type: "input", text: "typed at the Mac", source: "interactive", streamingBehavior: "steer" });
+	assert.deepEqual(m.entries.map((e) => e.data.client_id), [SAID, undefined, undefined], "the phone's id on its own steer's mark only");
+
+	// pi's TUI abort: every queued message into the editor, ahead of what was typed.
+	let editor = "half a thought";
+	let queued = ["based on your last question", "I would like that", "typed at the Mac"];
+	let aborts = 0;
+	m.ctx.isIdle = () => false;
+	m.ctx.hasPendingMessages = () => queued.length > 0;
+	m.ctx.abort = () => {
+		aborts++;
+		editor = [...queued, editor].filter((t) => t.trim()).join("\n\n");
+		queued = [];
+	};
+	m.ctx.ui = { getEditorText: () => editor, setEditorText: (t) => (editor = t) };
+	const stop = async () => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "stop", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "stop", "stop") });
+	};
+	assert.deepEqual(await stop(), { ok: true, stopped: true, dropped: ["based on your last question", "I would like that"] });
+	assert.equal(aborts, 1);
+	assert.equal(editor, "typed at the Mac\n\nhalf a thought", "the Mac's own queued and typed text stays in its editor");
+
+	// Delivered steers aren't the phone's to take back.
+	await say("one more", SAID.replace("0b9e", "1b9e"));
+	await m.fire("input", { type: "input", text: "one more", source: "extension", streamingBehavior: "steer" });
+	await m.fire("message_start", { message: { role: "user", content: [{ type: "text", text: "one more" }] } });
+	queued = ["one more"]; // (as if pi still had a copy queued: only the phone's undelivered ones are taken)
+	editor = "";
+	assert.deepEqual(await stop(), { ok: true, stopped: true });
+	assert.equal(editor, "one more");
+});
+
+test("interrupt: the phone's steers the abort dropped go again first, then the words", async () => {
+	const { m, hold, busy } = await heldCall();
+	busy(true);
+	let editor = "";
+	let queued = [];
+	m.ctx.hasPendingMessages = () => queued.length > 0;
+	m.ctx.abort = () => { editor = [...queued, editor].filter(Boolean).join("\n\n"); queued = []; };
+	m.ctx.ui = { getEditorText: () => editor, setEditorText: (t) => (editor = t) };
+	const steer = await hold("use the staging config");
+	assert.deepEqual(await ask({ type: "release", ids: [steer.held], mode: "steer" }), { ok: true, delivered: "steer" });
+	await m.fire("input", { type: "input", text: "use the staging config", source: "extension", streamingBehavior: "steer" });
+	queued = ["use the staging config"];
+	const stop = await hold("stop, that's the wrong branch");
+	assert.deepEqual(await ask({ type: "release", ids: [stop.held], mode: "interrupt" }), { ok: true, delivered: "stopped" });
+	assert.equal(editor, "", "not left in the Mac's editor");
+	busy(false);
+	await m.fire("agent_settled");
+	assert.deepEqual(m.sent.at(-1), { content: "use the staging config\n\nstop, that's the wrong branch", options: undefined });
+});
+
 test("close: Eric's phone aborts a running turn, gets {ok} at once, then pi shuts down", async () => {
 	const decide = phoneKey();
 	writeFileSync(keysFile, JSON.stringify({ devices: { 7: decide.raw.toString("base64") } }));
@@ -2327,6 +2405,49 @@ test("v2 answer: signed over the prompt's own questions, looked up first", async
 	assert.deepEqual(await send(questions), { ok: true });
 	assert.deepEqual(await offered.answered, answers);
 	assert.equal((await send(questions)).error, "that question was already answered");
+	offered.dispose();
+});
+
+test("cancel_ask: the phone's Cancel, v2 over cancel_ask and the id, only for a cancellable prompt", async () => {
+	const { offerPrompt, openPrompts } = await import("../lib/remote-prompts.ts");
+	const { CANCEL_ASK_REFUSED, CANCEL_ASK_V1_REFUSED } = await import("../extensions/opt-in/botsun-owner/index.ts");
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const { srv } = await ownerWith(undefined);
+	const askFor = (id) => srv.lines.find((l) => l.type === "ask" && l.ask.id === id)?.ask;
+	const questions = [{ question: "Pizza?", options: [{ label: "Pepperoni" }, { label: "Mushrooms" }] }];
+
+	// Not offered cancellable (op-broker's): no flag, and a signed cancel is refused with its nonce spent.
+	const plain = offerPrompt(questions, { sensitive: true });
+	await until(() => askFor(plain.id));
+	assert.equal("cancellable" in askFor(plain.id), false);
+	const { nonce } = await ask({ type: "nonce" });
+	const plainSig = signV2(key, nonce, "session", "cancel_ask", `cancel_ask\n${plain.id}`);
+	assert.equal((await ask({ type: "cancel_ask", ask_id: plain.id, nonce, device_id: 7, sig_v: 2, signature: plainSig })).error, CANCEL_ASK_REFUSED);
+	assert.equal((await ask({ type: "stop", nonce, device_id: 7, sig_v: 2, signature: "AAAA" })).error, "nonce is expired or used", "its nonce was spent");
+	assert.ok(openPrompts().some((p) => p.id === plain.id), "still open");
+	plain.dispose();
+
+	const offered = offerPrompt(questions, { cancellable: true });
+	await until(() => askFor(offered.id));
+	assert.equal(askFor(offered.id).cancellable, true);
+	let cancelled = false;
+	offered.cancelled.then(() => (cancelled = true));
+	const send = async (payload, extra = {}) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "cancel_ask", ask_id: offered.id, nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "cancel_ask", payload), ...extra });
+	};
+	assert.equal((await send(`cancel_ask\nsomething-else`)).error, "signature does not verify", "signed for another question");
+	assert.equal((await send("stop")).error, "signature does not verify", "a stop's payload");
+	assert.equal((await send(`cancel_ask\n${offered.id}`, { sig_v: undefined })).error, CANCEL_ASK_V1_REFUSED);
+	assert.equal((await send(`cancel_ask\n${offered.id}`, { key: "call" })).error, "bad request", "main key only");
+	assert.equal((await send(`cancel_ask\n${offered.id}`, { ask_id: "../x" })).error, "bad request");
+	assert.equal(cancelled, false);
+	assert.deepEqual(await send(`cancel_ask\n${offered.id}`), { ok: true });
+	await offered.cancelled;
+	assert.equal(openPrompts().some((p) => p.id === offered.id), false, "withdrawn");
+	await until(() => srv.types().includes("ask_end"));
+	assert.equal((await send(`cancel_ask\n${offered.id}`)).error, "that question was already answered");
 	offered.dispose();
 });
 

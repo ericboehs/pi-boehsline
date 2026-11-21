@@ -257,6 +257,9 @@ export default function ask(pi: ExtensionAPI) {
 						});
 					}, options),
 			};
+			// A batch's Esc result for where it is now (the answers given so far), set once the batch
+			// starts: the phone's Cancel returns exactly that, as Esc at the keyboard would.
+			let cancelNow: (() => AgentToolResult<AskDetails>) | undefined;
 			const local = async (): Promise<AgentToolResult<AskDetails>> => {
 				/** Split picked item-values into option answers + optional free text. Null = nothing left. */
 				const resolveCustom = async (
@@ -616,6 +619,7 @@ export default function ask(pi: ExtensionAPI) {
 					};
 				};
 				let i = 0;
+				cancelNow = () => cancelBatch(i);
 				while (i < subs.length) {
 					const sub = subs[i]!;
 					const progress = `Q${i + 1}/${subs.length}`;
@@ -670,7 +674,11 @@ export default function ask(pi: ExtensionAPI) {
 				};
 
 			};
-			const remote = offerPrompt(subs.map((q) => ({ question: q.question, options: q.options, multiSelect: q.multiSelect })));
+			// cancellable: the phone's Cancel ends it as Esc here does (and closes the dialog).
+			const remote = offerPrompt(
+				subs.map((q) => ({ question: q.question, options: q.options, multiSelect: q.multiSelect })),
+				{ cancellable: true },
+			);
 			// The run's abort (Esc, or the phone's Stop → ctx.abort()) closes the dialog and the question.
 			let onAbort!: () => void;
 			const stopped = new Promise<"stopped">((resolve) => {
@@ -685,9 +693,17 @@ export default function ask(pi: ExtensionAPI) {
 				const winner = await Promise.race([
 					local().then((result) => ({ result })),
 					remote.answered.then((answers) => ({ answers })),
+					remote.cancelled.then(() => "cancelled" as const),
 					stopped,
 				]);
-				if (winner === "stopped") {
+				if (winner === "cancelled" && cancelNow) {
+					// A batch: what Esc returns at this question, the answers given so far kept.
+					const result = cancelNow();
+					abort.abort(); // close the dialog still open in the TUI
+					return result;
+				}
+				if (winner === "stopped" || winner === "cancelled") {
+					abort.abort(); // close the dialog still open in the TUI (a no-op once stopped)
 					const single = subs.length === 1;
 					return cancelled(single ? subs[0]!.question : `${subs.length} questions`, single ? subs[0]!.options.map((o) => o.label) : []);
 				}
