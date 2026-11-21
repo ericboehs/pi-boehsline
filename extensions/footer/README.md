@@ -84,11 +84,11 @@ count as defaults too (the same id on another provider still shows):
 ```
 
 In a linked git worktree, the Worktree chip after it names the main repository
-(`eert-feature ⎇ eert`); it's hidden in a main checkout. It reads the `.git`
+(`webapp-feature ⎇ webapp`); it's hidden in a main checkout. It reads the `.git`
 file and `commondir` rather than running git, so a submodule doesn't count.
 When the worktree's directory has the branch's name, the directory chip drops
-out so the name shows once: `⎇ eert feature` rather than
-`feature ⎇ eert feature`. The same goes for a session named for its
+out so the name shows once: `⎇ webapp feature` rather than
+`feature ⎇ webapp feature`. The same goes for a session named for its
 directory: the session name says it, so the directory chip drops out (unless
 the name chip is hidden, or the chip shows the full path).
 

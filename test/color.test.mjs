@@ -273,8 +273,8 @@ test("auto derives a palette color from the session name, deterministically", as
     await ui.run("auto");
     return ui.border();
   };
-  const first = await run("eert");
-  assert.equal(first, await run("eert"));
+  const first = await run("webapp");
+  assert.equal(first, await run("webapp"));
   assert.notEqual(await run("dotfiles"), first, "different names should usually differ");
 });
 
