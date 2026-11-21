@@ -61,6 +61,34 @@ test("idle: dispatches now and answers 'reloaded' only from the reload command",
   assert.equal(replies.length, 1, "each answer is paid once");
 });
 
+test("the reload command run by hand (nothing dispatched): only idle, with no dialog and no unsent text", async () => {
+  const host = fakeHost();
+  const c = controller(host);
+  host.ui = true;
+  assert.equal(await c.beginReload(true), false, "a dialog is open");
+  assert.match(host.notes.at(-1), /not reloading: a dialog is open/);
+  host.ui = false;
+  host.draft = "half a thought";
+  assert.equal(await c.beginReload(true), false, "unsent text");
+  assert.match(host.notes.at(-1), /unsent text/);
+  host.draft = "";
+  assert.equal(await c.beginReload(false), false, "busy");
+  assert.match(host.notes.at(-1), /busy/);
+  assert.equal(c.isPending, false, "refused, not queued");
+  assert.equal(host.dispatched, 0);
+  assert.equal(await c.beginReload(true), true, "free: goes ahead");
+});
+
+test("a dispatched reload isn't held to the by-hand checks again (they ran before it was dispatched)", async () => {
+  const host = fakeHost();
+  const c = controller(host);
+  const replies = [];
+  c.request({ who: "peer", reply: (o) => replies.push(o) });
+  host.ui = true; // our own reload command counts as nothing; this is only to show it isn't rechecked
+  assert.equal(await c.beginReload(true), true);
+  assert.deepEqual(replies, [{ status: "reloaded" }]);
+});
+
 test("streaming: answers 'queued', then reloads at agent_settled", () => {
   const host = fakeHost({ idle: false, running: true });
   const c = controller(host);
@@ -291,6 +319,34 @@ test("socket dir: binds only in a private dir of ours", async () => {
   await assert.rejects(P.ensurePrivateDir(link), /is a symlink/);
   const server = P.bindSocket(path.join(link, "x.sock"), () => {});
   await assert.rejects(server, /is a symlink/, "bindSocket refuses too");
+});
+
+test("socket dir: a refused shared dir falls back to a private one of ours, naming the dir it refused", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "al-sockdir-"));
+  const shared = path.join(base, "shared");
+  mkdirSync(shared); chmodSync(shared, 0o777);
+  const own = path.join(base, "own");
+  const bound = await P.bindSocketOrPrivate(path.join(shared, "42.sock"), () => {}, own);
+  try {
+    assert.equal(bound.sockPath, path.join(own, "42.sock"));
+    assert.match(bound.refused, new RegExp(`socket dir ${shared} is writable by others`));
+    assert.equal(statSync(own).mode & 0o777, 0o700);
+    assert.equal(await P.socketLive(bound.sockPath), true);
+  } finally {
+    bound.server.close();
+  }
+  // A safe dir: bound where asked, nothing refused.
+  const ok = await P.bindSocketOrPrivate(path.join(own, "43.sock"), () => {}, path.join(base, "unused"));
+  ok.server.close();
+  assert.deepEqual([ok.sockPath, ok.refused], [path.join(own, "43.sock"), undefined]);
+  // The fallback refused too: one error naming both.
+  const loose = path.join(base, "loose");
+  mkdirSync(loose); chmodSync(loose, 0o777);
+  await assert.rejects(P.bindSocketOrPrivate(path.join(shared, "44.sock"), () => {}, loose), (e) =>
+    e.message.includes(`socket dir ${shared}`) && e.message.includes(`private fallback failed too`) && e.message.includes(loose));
+  // The default fallback: per user, under the temp dir.
+  const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+  assert.equal(P.privateSocksDir(), path.join(tmpdir(), `cc-socks-${uid}`));
 });
 
 // ------------------------------------------------------------- real extension
@@ -600,6 +656,24 @@ test("extension: completions offer reload, *idle, pi peers and --force", async (
   assert.ok(!labels.includes("claude-solo"), "only pi sessions");
   assert.equal(after.find((i) => i.label === R.IDLE_TARGETS).value, `reload ${R.IDLE_TARGETS}`);
   assert.match(stub.commands.get(R.RELOAD_COMMAND).description, /^\(internal\)/);
+});
+
+test("extension: the reload command typed by hand doesn't reload over unsent text", async () => {
+  reset();
+  let reloads = 0;
+  const run = () => stub.commands.get(R.RELOAD_COMMAND).handler("", { ...ctx, reload: async () => { reloads++; }, isIdle: () => state.idle });
+  state.draft = "half a thought";
+  await run();
+  assert.equal(reloads, 0, "refused");
+  assert.ok(notes.some(([, m]) => /not reloading: there is unsent text/.test(m)));
+  state.draft = "";
+  state.idle = false;
+  await run();
+  assert.equal(reloads, 0, "busy: refused");
+  state.idle = true;
+  await run();
+  assert.equal(reloads, 1, "free: reloads");
+  reset();
 });
 
 test("extension: *idle reloads every idle pi session and lists each outcome", async () => {
