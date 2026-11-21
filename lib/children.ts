@@ -700,6 +700,16 @@ function makeId(kind: ChildKind): string {
 	return `${kind === "cursor" ? "c" : "p"}-${randomBytes(5).toString("hex")}`;
 }
 
+/** A child's agent as the list shows it (trackChild): one line, at most 40 characters. */
+export function childAgent(agent: unknown): string {
+	return clean(agent, 40) || "subagent";
+}
+
+/** A child's task as the list shows it (trackChild): one line, masked, at most 200 characters. */
+export function childTask(task: unknown): string {
+	return clean(task, TASK_MAX);
+}
+
 /** An id a child will have, minted ahead of trackChild (Botsun validates the shape). */
 const CHILD_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
@@ -721,8 +731,8 @@ export function trackChild(start: ChildStart): ChildHandle {
 	const rec: Rec = {
 		id: start.id && CHILD_ID.test(start.id) ? start.id : makeId(start.kind),
 		kind: start.kind,
-		agent: clean(start.agent, 40) || "subagent",
-		task: clean(start.task, TASK_MAX),
+		agent: childAgent(start.agent),
+		task: childTask(start.task),
 		...(start.model ? { model: clean(start.model, 80) } : {}),
 		...(start.window ? { window: start.window } : {}),
 		state: "running",

@@ -20,6 +20,8 @@ process.env.PI_BG_TAIL_LINES = "15";
 after(() => rmSync(dir, { recursive: true, force: true }));
 
 const STATE = process.env.PI_BG_STATE_DIR;
+/** A cwd the fake spawn fails for, as a missing directory does. */
+const MISSING_CWD = path.join(dir, "missing-cwd");
 const HOUR = 60 * 60 * 1000;
 /** ps lstart of every fake job's wrapper. */
 const PS_START = "Fri Nov  6 19:00:00 2026";
@@ -130,7 +132,9 @@ async function mount(t, { mode = "tui", wake = "followUp", session } = {}) {
     };
     procs.set(child.pid, { start: PS_START, args: `/bin/sh ${args.join(" ")}` });
     children.push(task);
-    queueMicrotask(() => child.emit("spawn"));
+    // A missing cwd fails as the real spawn does: an error event, never "spawn".
+    if (options.cwd === MISSING_CWD) queueMicrotask(() => child.emit("error", Object.assign(new Error("spawn /bin/sh ENOENT"), { code: "ENOENT" })));
+    else queueMicrotask(() => child.emit("spawn"));
     return child;
   });
   // hold(): async ps answers wait until release(), as a slow ps would.
@@ -293,7 +297,9 @@ test("above-prompt elapsed times refresh without model wakes; completion still w
   assert.equal(h.sent.length, 1);
   assert.equal(h.sent[0].message.customType, "bg");
   assert.equal(h.sent[0].message.display, true);
-  assert.deepEqual(h.sent[0].message.details, { id: task.id });
+  assert.deepEqual(h.sent[0].message.details, {
+    id: task.id, v: 1, kind: "bash", name: "rspec", named: false, status: "succeeded", exit_code: 0, seconds: 60, cwd: dir,
+  }, "a bash job's generic v1 details");
   assert.match(h.sent[0].message.content, /succeeded after 1m00s/);
   assert.match(h.sent[0].message.content, /last 2 lines:\nexample passed\nall green/);
   assert.deepEqual(h.sent[0].options, { deliverAs: "followUp", triggerTurn: true });
@@ -428,6 +434,157 @@ test("bg:start runs another extension's job with its own label, header, and tail
   assert.match(wake, /`subagent scout: count the files` succeeded/);
   assert.doesNotMatch(wake, /PI_SUBAGENT_CHILD/, "summary replaces the raw command");
   assert.match(wake, /last 40 lines:\nline 0\n/);
+});
+
+test("bg:start meta joins the completion details; failed and stopped jobs say so", async (t) => {
+  const h = await mount(t);
+  const start = async (extra) => {
+    const req = { command: "pi child | node -e filter", name: "sa:scout", summary: "subagent scout: x", ...extra };
+    const reply = new Promise((resolve) => (req.reply = resolve));
+    h.emit("bg:start", req);
+    return { ...(await reply), task: h.children.at(-1) };
+  };
+  const meta = { kind: "subagent", child_id: "p-0123456789", agent: "scout", task: "count the files", model: "a/b" };
+  const ok = await start({ meta: { ...meta, id: "forged", status: "succeeded", cwd: "/elsewhere" } });
+  t.mock.timers.tick(4_000);
+  ok.task.exit(3);
+  assert.deepEqual(h.sent[0].message.details, {
+    id: ok.id, v: 1, kind: "subagent", name: "sa:scout", named: true, status: "failed", exit_code: 3, seconds: 4, cwd: dir,
+    child_id: "p-0123456789", agent: "scout", task: "count the files", model: "a/b",
+  }, "meta's own keys join; it never replaces id, status or cwd");
+  assert.match(h.sent[0].message.content, /^\[bg \w+\] `subagent scout: x` exited 3 after 4s\n/, "the message text is unchanged");
+
+  t.mock.method(process, "kill", () => true);
+  const stopped = await start({ meta: { kind: "cursor" }, });
+  const kill = { id: stopped.id, wake: true, reply: () => {} };
+  h.emit("bg:kill", kill);
+  stopped.task.exit(null, "SIGTERM");
+  const details = h.sent[1].message.details;
+  assert.equal(details.kind, "bash", "meta can't make a plain job pass for a cursor run");
+  assert.equal(details.status, "stopped", "a bg:kill stop is stopped");
+  assert.equal(details.signal, "SIGTERM");
+  assert.equal("exit_code" in details, false);
+
+  // Bad meta is dropped whole, and the job still runs.
+  const bad = await start({ meta: Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`k${i}`, i])) });
+  bad.task.exit();
+  assert.equal(h.sent[2].message.details.kind, "bash");
+  assert.equal("k0" in h.sent[2].message.details, false);
+});
+
+test("bg:start meta: kind only replaces a bash job's, and strings are secret-masked and capped", async (t) => {
+  const h = await mount(t);
+  const { JOB_META_STRING_MAX } = await import("../extensions/bg/index.ts");
+  const start = async (extra) => {
+    const req = { command: "npm run build", name: "job", ...extra };
+    const reply = new Promise((resolve) => (req.reply = resolve));
+    h.emit("bg:start", req);
+    return { ...(await reply), task: h.children.at(-1) };
+  };
+  // A cursor runner job (node + runner.ts): its derived kind stands over meta's.
+  const runner = path.resolve(import.meta.dirname, "../extensions/opt-in/cursor-agent/runner.ts");
+  const cursor = await start({ command: `'${process.execPath}' '${runner}' /nonexistent/spec.json`, meta: { kind: "subagent" } });
+  cursor.task.exit(0);
+  assert.equal(h.sent[0].message.details.kind, "cursor", "a cursor job can't pass for a subagent");
+
+  const secret = "ghp_" + "a".repeat(36);
+  const plain = await start({ meta: { kind: "subagent", task: `use token ${secret} now`, long: "y".repeat(JOB_META_STRING_MAX + 50) } });
+  plain.task.exit(0);
+  const d = h.sent[1].message.details;
+  assert.equal(d.kind, "subagent", "a bash job's kind meta may replace");
+  assert.ok(!d.task.includes(secret), d.task);
+  assert.match(d.task, /•••/);
+  assert.equal(d.long.length, JOB_META_STRING_MAX);
+  assert.ok(d.long.endsWith("…"));
+});
+
+test("a bg:start job whose spawn fails: start_failed, no child_id, and the caller gets an error", async (t) => {
+  const h = await mount(t);
+  const req = { command: "pi child", cwd: MISSING_CWD, name: "sa:scout", meta: { kind: "subagent", child_id: "p-0123456789", agent: "scout" } };
+  const reply = new Promise((resolve) => (req.reply = resolve));
+  h.emit("bg:start", req);
+  assert.match((await reply).error, /failed to start/);
+  const d = h.sent[0].message.details;
+  assert.equal(d.start_failed, true);
+  assert.equal("child_id" in d, false, "the caller never tracked that child");
+  assert.equal(d.status, "failed");
+  assert.equal(d.exit_code, 127);
+  assert.equal(d.agent, "scout");
+  assert.equal(d.kind, "subagent");
+});
+
+test("cleanJobMeta: flat primitives, at most 8 keys and 2KB, reserved keys dropped", async () => {
+  const { cleanJobMeta, JOB_META_BYTES, JOB_META_STRING_MAX } = await import("../extensions/bg/index.ts");
+  assert.deepEqual(cleanJobMeta({ kind: "subagent", n: 1, ok: true, none: null }), { kind: "subagent", n: 1, ok: true, none: null });
+  assert.deepEqual(cleanJobMeta({ kind: "x", id: "y", v: 2, status: "z", seconds: 1, diff: "d" }), { kind: "x" });
+  for (const bad of [
+    undefined, null, "s", 1, [], ["a"], {}, { id: "only reserved" },
+    Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`k${i}`, i])),
+    { nested: { a: 1 } }, { list: [1] }, { n: Number.NaN }, { "bad key": 1 }, { __proto__x: 1, ["1x"]: 1 },
+    { big: "x".repeat(JOB_META_BYTES) }, new Map([["a", 1]]),
+  ]) {
+    assert.equal(cleanJobMeta(bad), undefined, JSON.stringify(bad) ?? String(bad));
+  }
+  const fits = cleanJobMeta({ big: "x".repeat(JOB_META_BYTES - 12) });
+  assert.ok(fits, "2KB of JSON fits");
+  assert.equal(fits.big.length, JOB_META_STRING_MAX, "then capped");
+  assert.deepEqual(cleanJobMeta(cleanJobMeta({ s: `${"z".repeat(900)} ghp_${"b".repeat(36)}` })), cleanJobMeta({ s: `${"z".repeat(900)} ghp_${"b".repeat(36)}` }), "masking and capping are idempotent (registry round trips)");
+});
+
+test("meta survives the registry: saved with the job, re-adopted, and still in the report", async (t) => {
+  const session = sid("meta");
+  const h = await mount(t, { session });
+  const meta = { kind: "subagent", child_id: "p-abcdef0123", agent: "scout", task: "count the files", model: "m" };
+  const start = async (extra) => {
+    const req = { command: "npm run build", name: "sa:scout", summary: "subagent scout: x", ...extra };
+    const reply = new Promise((resolve) => (req.reply = resolve));
+    h.emit("bg:start", req);
+    return { ...(await reply), task: h.children.at(-1) };
+  };
+  const kept = await start({ meta });
+  const tampered = await start({ meta: { kind: "subagent" } });
+  const forged = await start({ meta: { kind: "subagent" } });
+  await settle();
+  const file = path.join(STATE, `${session}.json`);
+  const saved = JSON.parse(readFileSync(file, "utf8"));
+  assert.deepEqual(saved.jobs.find((j) => j.id === kept.id).meta, meta, "saved through toRecord");
+  await h.shutdown("quit");
+  h.goStale();
+  for (const task of h.children) task.ended = true;
+  // A registry edited behind pi's back: parseRecord drops the bad meta, never the job.
+  const onDisk = JSON.parse(readFileSync(file, "utf8"));
+  onDisk.jobs.find((j) => j.id === tampered.id).meta = { kind: "subagent", nested: { no: 1 } };
+  // Reserved keys written into the registry never replace the job's own fields.
+  onDisk.jobs.find((j) => j.id === forged.id).meta = { kind: "subagent", status: "succeeded", cwd: "/x", seconds: 999 };
+  writeFileSync(file, JSON.stringify(onDisk), { mode: 0o600 });
+  newProcess();
+  mockKill(t);
+
+  const next = await boot(t, h.backgroundTasks, { session, reason: "startup" });
+  assert.deepEqual(next.list().map((j) => j.id).sort(), [kept.id, tampered.id, forged.id].sort(), "all adopted");
+  t.mock.timers.tick(2000);
+  for (const { task } of [kept, tampered, forged]) {
+    writeExit(task.logPath, task === forged.task ? 4 : 0);
+    touchNow(`${task.logPath}.exit`);
+    procs.delete(task.child.pid);
+  }
+  t.mock.timers.tick(2000);
+  const details = (id) => next.sent.find((s) => s.message.details?.id === id)?.message.details;
+  // The end time is the exit file's whole-second mtime, the start the mocked clock: seconds may round either way.
+  assert.deepEqual({ ...details(kept.id), seconds: 0 }, {
+    id: kept.id, v: 1, kind: "subagent", name: "sa:scout", named: true, status: "succeeded", exit_code: 0, seconds: 0, cwd: dir, ...meta,
+  });
+  assert.ok(Number.isInteger(details(kept.id).seconds) && details(kept.id).seconds >= 0);
+  const bad = details(tampered.id);
+  assert.equal(bad.kind, "bash", "the tampered meta was dropped whole, its kind too");
+  assert.equal("nested" in bad, false);
+  assert.equal(bad.status, "succeeded");
+  const f = details(forged.id);
+  assert.equal(f.kind, "subagent", "its other keys kept");
+  assert.equal(f.status, "failed", "a registry edit can't make a failure succeed");
+  assert.equal(f.exit_code, 4);
+  assert.equal(f.cwd, dir);
+  assert.notEqual(f.seconds, 999);
 });
 
 test("bg:kill stops one job by id; wake: true still tells the model it was killed", async (t) => {
@@ -799,6 +956,11 @@ test("pid reuse: a live pid with another start time, or another program, is neve
   assert.deepEqual(h.list().map((job) => typeof job.endedAt), ["number", "number"]);
   assert.equal(h.sent.length, 2);
   for (const { message } of h.sent) assert.match(message.content, /` ended \(exit unknown\) while the session was closed\n/);
+  for (const { message } of h.sent) {
+    assert.equal(message.details.status, "unknown", "no recorded status: unknown, as the text says");
+    assert.equal("seconds" in message.details, false, "its time is not the job's runtime");
+    assert.equal("exit_code" in message.details, false);
+  }
   for (const job of [reused, stranger]) {
     const req = { id: job.id, reply: (r) => (req.got = r) };
     h.emit("bg:kill", req);

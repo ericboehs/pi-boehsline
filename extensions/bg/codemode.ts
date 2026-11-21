@@ -129,13 +129,23 @@ export function registerBgCodemode(
 		if (disposed) return;
 		const failed = thrown !== undefined || outcome?.isError === true;
 		const verb = run.stopped ? "stopped" : failed ? "failed" : "succeeded";
+		const ms = now() - run.startedAt;
 		const body = thrown !== undefined ? String((thrown as Error)?.message ?? thrown) : textOf(outcome);
 		pi.sendMessage(
 			{
 				customType: CUSTOM_TYPE,
-				content: `[codemode_bg ${run.id}] \`${run.name}\` ${verb} after ${duration(now() - run.startedAt)}\n${cap(body) || "(no output)"}`,
+				content: `[codemode_bg ${run.id}] \`${run.name}\` ${verb} after ${duration(ms)}\n${cap(body) || "(no output)"}`,
 				display: true,
-				details: { id: run.id, name: run.name, failed, stopped: run.stopped === true },
+				details: {
+					id: run.id,
+					v: 1,
+					kind: "codemode",
+					name: run.name,
+					status: verb,
+					seconds: Math.max(0, Math.round(ms / 1000)),
+					failed,
+					stopped: run.stopped === true,
+				},
 			},
 			{ deliverAs: "followUp", triggerTurn: true },
 		);

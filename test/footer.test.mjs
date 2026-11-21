@@ -972,14 +972,14 @@ test("the worktree chip names the main repo in a linked worktree, and nothing el
   const git = (cwd, ...args) => execFileSync("git", args, { cwd, stdio: "ignore", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" } });
 
   // A real worktree, and a folder inside it.
-  const main = path.join(root, "eert");
+  const main = path.join(root, "webapp");
   mkdirSync(main);
   git(main, "init", "-q");
   git(main, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init");
-  git(main, "worktree", "add", "-q", path.join(root, "eert-feature"), "-b", "feature");
-  assert.equal(worktreeRepo(path.join(root, "eert-feature")), "eert");
-  mkdirSync(path.join(root, "eert-feature", "docs"));
-  assert.equal(worktreeRepo(path.join(root, "eert-feature", "docs")), "eert", "from a subfolder too");
+  git(main, "worktree", "add", "-q", path.join(root, "webapp-feature"), "-b", "feature");
+  assert.equal(worktreeRepo(path.join(root, "webapp-feature")), "webapp");
+  mkdirSync(path.join(root, "webapp-feature", "docs"));
+  assert.equal(worktreeRepo(path.join(root, "webapp-feature", "docs")), "webapp", "from a subfolder too");
   assert.equal(worktreeRepo(main), undefined, "the main checkout");
   assert.equal(worktreeRepo(root), undefined, "not a repo");
 
@@ -1001,19 +1001,19 @@ test("a worktree named for its branch says the name once", async () => {
   const { execFileSync } = await import("node:child_process");
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "footer-wtname-")));
   const git = (cwd, ...args) => execFileSync("git", args, { cwd, stdio: "ignore", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" } });
-  const main = path.join(root, "eert");
+  const main = path.join(root, "webapp");
   mkdirSync(main);
   git(main, "init", "-q");
   git(main, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init");
   git(main, "worktree", "add", "-q", path.join(root, "feature"), "-b", "feature");
-  git(main, "worktree", "add", "-q", path.join(root, "eert-other"), "-b", "other");
+  git(main, "worktree", "add", "-q", path.join(root, "webapp-other"), "-b", "other");
 
   const same = await mount({ cwd: path.join(root, "feature"), branch: "feature", porcelain: "" });
-  assert.match((await same.settled())[0], /^⎇ eert feature /, "directory dropped: the branch names it");
-  const differs = await mount({ cwd: path.join(root, "eert-other"), branch: "other", porcelain: "" });
-  assert.match((await differs.settled())[0], /^eert-other ⎇ eert other /, "a different directory stays");
-  const mainCheckout = await mount({ cwd: main, branch: "eert", porcelain: "" });
-  assert.match((await mainCheckout.settled())[0], /^eert eert /, "only in a linked worktree");
+  assert.match((await same.settled())[0], /^⎇ webapp feature /, "directory dropped: the branch names it");
+  const differs = await mount({ cwd: path.join(root, "webapp-other"), branch: "other", porcelain: "" });
+  assert.match((await differs.settled())[0], /^webapp-other ⎇ webapp other /, "a different directory stays");
+  const mainCheckout = await mount({ cwd: main, branch: "webapp", porcelain: "" });
+  assert.match((await mainCheckout.settled())[0], /^webapp webapp /, "only in a linked worktree");
 });
 
 test("a session named for its directory says the name once", async () => {

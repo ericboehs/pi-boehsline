@@ -62,6 +62,8 @@ test("returns before the script ends, then delivers its result as one waking mes
 	assert.equal(message.customType, CUSTOM_TYPE);
 	assert.match(message.content, /`answer` succeeded after 2m05s\nScript completed\n42$/);
 	assert.deepEqual(options, { deliverAs: "followUp", triggerTurn: true });
+	assert.deepEqual(message.details, { id: message.details.id, v: 1, kind: "codemode", name: "answer", status: "succeeded", seconds: 125, failed: false, stopped: false });
+	assert.match(message.details.id, /^[0-9a-f]{6}$/);
 	assert.equal(api.runs.size, 0);
 });
 
@@ -79,6 +81,10 @@ test("a failed script and a rejected call both report failed", async () => {
 	assert.match(sent[0].message.content, /failed after .*\nScript failed/);
 	assert.match(sent[1].message.content, /failed after .*\nboom/);
 	assert.equal(sent[1].message.details.failed, true);
+	assert.equal(sent[0].message.details.status, "failed");
+	assert.equal(sent[1].message.details.status, "failed");
+	assert.equal(sent[1].message.details.kind, "codemode");
+	assert.equal(sent[1].message.details.v, 1, "the same generic v1 shape as a bg job's");
 });
 
 test("stop aborts the run's own signal and reports stopped", async () => {
@@ -92,6 +98,8 @@ test("stop aborts the run's own signal and reports stopped", async () => {
 	calls[0].resolve({ result: { content: [{ type: "text", text: "Script failed: aborted" }] }, isError: true });
 	await flush();
 	assert.match(sent[0].message.content, /stopped after/);
+	assert.equal(sent[0].message.details.status, "stopped");
+	assert.equal(sent[0].message.details.stopped, true);
 	const again = await tool.execute("c3", { stop: id }, undefined, undefined, ctx);
 	assert.equal(again.isError, true);
 });
