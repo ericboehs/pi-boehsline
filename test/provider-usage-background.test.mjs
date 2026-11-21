@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { mock } from "node:test";
@@ -13,6 +13,7 @@ import test, { mock } from "node:test";
 import providerUsage, {
   PROVIDER_USAGE_DEFAULTS,
   backgroundPollOnce,
+  backgroundTimerCount,
   backgroundPollPlan,
   resolveUsageDriver,
 } from "../extensions/provider-usage/index.ts";
@@ -170,7 +171,60 @@ test("two pi instances polling at once: one fetch", async (t) => {
   assert.equal(env.calls.length, 1);
 });
 
-/** Run session_start under fake timers, jump past the first background tick, and count fetches. */
+test("a hung fetch times out and counts as failed; the cache lock stays held, kept fresh, until the fetch settles", async (t) => {
+  const env = setup(t);
+  env.writeCache(Date.now() - 2 * INTERVAL);
+  const ctx = ctxWith("oauth");
+  // An OAuth refresh that hasn't answered yet.
+  let answer;
+  ctx.modelRegistry.getProviderAuth = () => new Promise((resolve) => { answer = resolve; });
+  const lock = path.join(env.dir, "usage-cache.lock");
+  const started = Date.now();
+  assert.equal(await backgroundPollOnce(ctx, grok, INTERVAL, 50, 20), "failed");
+  assert.ok(Date.now() - started < 2_000);
+  const log = path.join(env.dir, "provider-usage.log");
+  // The line, not just the file: logLine's appendFile creates the file before it writes.
+  const logged = () => (existsSync(log) ? readFileSync(log, "utf8") : "");
+  for (const until = Date.now() + 2_000; !/background poll failed/.test(logged()) && Date.now() < until;) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.match(logged(), /background poll failed: timed out/);
+  assert.equal(existsSync(lock), true, "still held: the refresh is still running");
+  // Kept fresh while it runs: another pi doesn't take it for a crashed fetcher.
+  const old = new Date(Date.now() - 10 * MINUTE);
+  utimesSync(lock, old, old);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.ok(Date.now() - statSync(lock).mtimeMs < MINUTE, "mtime refreshed");
+  // The refresh settles: the lock goes.
+  answer({ auth: { apiKey: "oauth-access-token" } });
+  const deadline = Date.now() + 2_000;
+  while (existsSync(lock) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(existsSync(lock), false, "released once the fetch settled");
+});
+
+test("a fetch hung past the hold cap stops being kept fresh, and its lock is no longer released by it", async (t) => {
+  const env = setup(t);
+  env.writeCache(Date.now() - 2 * INTERVAL);
+  const ctx = ctxWith("oauth");
+  let answer;
+  ctx.modelRegistry.getProviderAuth = () => new Promise((resolve) => { answer = resolve; });
+  const lock = path.join(env.dir, "usage-cache.lock");
+  assert.equal(await backgroundPollOnce(ctx, grok, INTERVAL, 30, 10, 40), "failed");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const old = new Date(Date.now() - 10 * MINUTE);
+  utimesSync(lock, old, old);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(Date.now() - statSync(lock).mtimeMs >= 9 * MINUTE, "no longer touched");
+  // Another pi takes the stale lock; the old fetch settling later must not release that one's.
+  rmSync(lock, { recursive: true });
+  mkdirSync(lock);
+  answer({ auth: { apiKey: "oauth-access-token" } });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(existsSync(lock), true, "the other pi's lock stays");
+});
+
+/**
+ * Run session_start under fake timers, jump past the first background tick,
+ * and count fetches plus live background timers (after start, after shutdown).
+ */
 async function fetchesAfterStart(t, ctx) {
   const env = setup(t);
   env.writeCache(Date.now() - 2 * INTERVAL);
@@ -188,23 +242,30 @@ async function fetchesAfterStart(t, ctx) {
     for (const handler of handlers.get(name) ?? []) await handler({}, ctx);
   };
   providerUsage(pi);
+  const baseline = backgroundTimerCount();
+  let timers;
   mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
   try {
     await fire("session_start");
+    timers = backgroundTimerCount() - baseline;
     mock.timers.tick(20_000);
   } finally {
     mock.timers.reset();
   }
-  const deadline = Date.now() + 2_000;
+  const deadline = Date.now() + (timers > 0 ? 2_000 : 200);
   while (env.calls.length === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
   await fire("session_shutdown");
-  return env.calls.length;
+  return { fetches: env.calls.length, timers, afterShutdown: backgroundTimerCount() - baseline };
 }
 
-test("the extension polls xai in the background shortly after session start", async (t) => {
-  assert.equal(await fetchesAfterStart(t, ctxWith("oauth")), 1);
+test("the extension polls xai in the background shortly after session start, and shutdown clears its timers", async (t) => {
+  assert.deepEqual(await fetchesAfterStart(t, ctxWith("oauth")), { fetches: 1, timers: 2, afterShutdown: 0 });
 });
 
 test("print mode never starts the background poll", async (t) => {
-  assert.equal(await fetchesAfterStart(t, ctxWith("oauth", { mode: "print", hasUI: false })), 0);
+  assert.deepEqual(await fetchesAfterStart(t, ctxWith("oauth", { mode: "print", hasUI: false })), { fetches: 0, timers: 0, afterShutdown: 0 });
+});
+
+test("json mode never starts the background poll", async (t) => {
+  assert.deepEqual(await fetchesAfterStart(t, ctxWith("oauth", { mode: "json", hasUI: false })), { fetches: 0, timers: 0, afterShutdown: 0 });
 });

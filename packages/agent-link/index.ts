@@ -13,7 +13,7 @@
 import type { AgentEndEvent, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-  ccSocksDir, bindSocket, registerPeer, updatePeer, deregisterPeer, deregisterPeerSync,
+  ccSocksDir, bindSocketOrPrivate, registerPeer, updatePeer, deregisterPeer, deregisterPeerSync,
   firstFreeName, losesNameRace,
   listClaudeSessions, resolveTarget, sendToClaude, stripEnvelope, receiptFrame, sendFrame,
   peerLabel, planDedupe, renamePeer,
@@ -436,7 +436,15 @@ export default function piMeshExtension(pi: ExtensionAPI) {
       selfName = chosen || firstFreeName(fallbackName(), await liveNames());
     }
     try {
-      server = await bindSocket(sockPath, (frame) => onFrame(frame));
+      // Claude's socket dir, unless it's unsafe to bind in (shared with other users, say): then a
+      // private one of ours, so agent-link still starts (without Claude's receipts).
+      const bound = await bindSocketOrPrivate(sockPath, (frame) => onFrame(frame));
+      server = bound.server;
+      if (bound.refused) {
+        sockPath = bound.sockPath;
+        ownFrom = `uds:${sockPath}`;
+        notify(`pi-agent-link: ${bound.refused}; using ${path.dirname(sockPath)} instead (Claude Code won't send delivery receipts there)`, "warning");
+      }
       peerStatus = "idle";
       await registerPeer({ pid, sessionId, name: selfName, cwd, sockPath, status: peerStatus, startedAt, nameSource });
       // session_shutdown cleans up a normal exit; this catches a hard one.

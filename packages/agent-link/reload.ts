@@ -254,20 +254,41 @@ export class ReloadController {
    * window, pay the "reloaded" answers owed, and return true (go ahead with
    * ctx.reload()). Busy (the user started a turn or a compaction after the
    * dispatch): queue again, tell the waiting senders "queued", and return false.
+   * With no reload dispatched (the command run by hand), it goes ahead only when
+   * idle, with no dialog open and no unsent text, else refuses (nothing queued).
    */
   async beginReload(idle: boolean): Promise<boolean> {
     const inflight = this.inflight;
     this.inflight = undefined;
     const owed = this.owed;
     this.owed = [];
-    if (!idle) {
-      this.queue(inflight?.who ?? "the reload command", inflight?.force ?? false);
+    if (!inflight) {
+      // Nothing dispatched it: typed by hand, or sent by another extension (a phone's "/" list).
+      // The same checks a dispatched reload passed first: idle, no dialog open, nothing typed.
+      const refusal = this.byHandRefusal(idle);
+      if (refusal) {
+        await Promise.allSettled(owed.map(async (send) => send({ status: "refused", reason: refusal })));
+        this.host.notify(`agent-link: not reloading: ${refusal}; use /reload yourself`, "warning");
+        return false;
+      }
+    } else if (!idle) {
+      this.queue(inflight.who, inflight.force);
       await Promise.allSettled(owed.map(async (send) => send({ status: "queued" })));
       return false;
     }
     this.shared.lastAcceptedAt = this.now();
     await Promise.allSettled(owed.map(async (send) => send({ status: "reloaded" })));
     return true;
+  }
+
+  /** Why a reload no request dispatched can't run now, or undefined when it can. */
+  private byHandRefusal(idle: boolean): string | undefined {
+    if (!idle) return "this session is busy";
+    let dialog = false;
+    try { dialog = this.host.uiBusy?.() === true; } catch { dialog = true; }
+    if (dialog) return "a dialog is open";
+    if (this.hasDraft()) return "there is unsent text in the editor";
+    return undefined;
   }
 
   /** Stop the re-check timer (session_shutdown). */

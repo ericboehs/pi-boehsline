@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, test } from "node:test";
+import { test } from "node:test";
 import { iconCompletions, iconLineFields, parseIconArgs, takeCatalog, takeLookNotes } from "../extensions/opt-in/botsun-owner/icon.ts";
 import { namingCatalog, suggestIcon } from "../lib/icon-suggestion.ts";
 import { stubPi } from "./helpers/stub-pi.mjs";
@@ -23,7 +23,9 @@ delete process.env.TMUX;
 delete process.env.TMUX_PANE;
 // This suite may itself run under pi as a subagent's child; botsun-owner registers nothing there.
 delete process.env.PI_SUBAGENT_CHILD;
-after(() => rmSync(home, { recursive: true, force: true }));
+// At exit, not in a root after(): with --test-name-pattern the root's after
+// can run before tests registered past a top-level await, deleting HOME under them.
+process.on("exit", () => rmSync(home, { recursive: true, force: true }));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const CATALOG = {

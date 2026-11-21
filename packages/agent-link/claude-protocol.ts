@@ -11,7 +11,7 @@ import { readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { nameHandle } from "./mentions.ts";
 
@@ -379,17 +379,61 @@ export function receiptFrame(o: { status: string; from?: string; origMsgId?: str
 export async function ensurePrivateDir(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true, mode: 0o700 }).catch(() => {});
   const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const refuse = (why: string) => new SocketDirRefused(dir, why);
   let st = await lstat(dir);
-  if (st.isSymbolicLink()) throw new Error(`refusing to bind: socket dir ${dir} is a symlink`);
-  if (!st.isDirectory()) throw new Error(`refusing to bind: socket dir ${dir} is not a directory`);
+  if (st.isSymbolicLink()) throw refuse("is a symlink");
+  if (!st.isDirectory()) throw refuse("is not a directory");
   if (uid === undefined) return; // no POSIX ownership to check (Windows)
-  if (st.uid !== uid) throw new Error(`refusing to bind: socket dir ${dir} is owned by uid ${st.uid}, not ${uid}`);
-  if (st.mode & 0o022) throw new Error(`refusing to bind: socket dir ${dir} is writable by others (mode ${(st.mode & 0o777).toString(8)})`);
+  if (st.uid !== uid) throw refuse(`is owned by uid ${st.uid}, not ${uid}`);
+  if (st.mode & 0o022) throw refuse(`is writable by others (mode ${(st.mode & 0o777).toString(8)})`);
   if (st.mode & 0o077) {
     await chmod(dir, 0o700);
     st = await lstat(dir);
   }
-  if (st.mode & 0o077) throw new Error(`refusing to bind: socket dir ${dir} has mode ${(st.mode & 0o777).toString(8)}, want 700`);
+  if (st.mode & 0o077) throw refuse(`has mode ${(st.mode & 0o777).toString(8)}, want 700`);
+}
+
+/** ensurePrivateDir's refusal: the directory it refused and why, both in the message. */
+export class SocketDirRefused extends Error {
+  readonly dir: string;
+  constructor(dir: string, why: string) {
+    super(`refusing to bind: socket dir ${dir} ${why}`);
+    this.name = "SocketDirRefused";
+    this.dir = dir;
+  }
+}
+
+/**
+ * This user's own socket directory, for when the shared one is refused: $TMPDIR (else the system
+ * temp dir) /cc-socks-<uid>. Peers still find the socket through the registry entry; Claude only
+ * sends receipts to siblings of its own socket, so those are lost while it's used.
+ */
+export function privateSocksDir(): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+  return path.join(tmpdir(), `cc-socks-${uid}`);
+}
+
+/**
+ * bindSocket at `sockPath`; if its directory is refused (shared with other users, a symlink...),
+ * the same socket name in privateSocksDir() instead. `refused` says which directory was refused
+ * and why; `sockPath` is where it actually bound.
+ */
+export async function bindSocketOrPrivate(
+  sockPath: string,
+  onFrame: (frame: any, conn: Socket) => void,
+  fallbackDir = privateSocksDir(),
+): Promise<{ server: Server; sockPath: string; refused?: string }> {
+  try {
+    return { server: await bindSocket(sockPath, onFrame), sockPath };
+  } catch (e) {
+    if (!(e instanceof SocketDirRefused) || path.resolve(e.dir) === path.resolve(fallbackDir)) throw e;
+    const fallback = path.join(fallbackDir, path.basename(sockPath));
+    try {
+      return { server: await bindSocket(fallback, onFrame), sockPath: fallback, refused: e.message };
+    } catch (e2) {
+      throw new Error(`${e.message}; the private fallback failed too: ${(e2 as Error).message}`);
+    }
+  }
 }
 
 export async function bindSocket(sockPath: string, onFrame: (frame: any, conn: Socket) => void): Promise<Server> {

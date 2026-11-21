@@ -62,6 +62,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [cursor-agent](extensions/opt-in/cursor-agent/README.md) | Delegates tasks to Cursor's agent CLI, with live steps and each run's real cost | `cursor` tool, `/cursor-usage`, `/cursor-worktrees` |
 | [image-prune](extensions/opt-in/image-prune/README.md) | Shrinks big tool result images on arrival, and swaps old images for a note with their path past a size threshold | `/image-prune` |
 | [watch](extensions/opt-in/watch/README.md) | Slack, bot feed and notification watcher with digests and drafts | `/watch`, `watch_items` tool |
+| [watchers](extensions/opt-in/watchers/README.md) | Background scripts (`~/.pi/agent/watchers.toml`) whose events become status lines; titles and excerpts pass a tool-less guardian, and actionable events can wake the agent | `/watchers` |
 | [memory](extensions/opt-in/memory/README.md) | Durable facts about you and your work, shared by every session on the host: markdown files, local git, a secret scanner, optional qmd search | `remember`, `memory_search`, `forget`, `memory_update` tools, `/memory` |
 | [meeting](extensions/opt-in/meeting/README.md) | Live meeting copilot: rolling notes, name and action alerts, slide summaries, and chat answers, from the transcript | `/meeting` |
 | [op-broker](extensions/opt-in/op-broker/README.md) | 1Password for agents: an approval card per item, one shared Touch ID for every session | `/op-broker` |
