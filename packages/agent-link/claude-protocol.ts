@@ -6,7 +6,7 @@
 // Node built-ins only — no pi/agent deps, so it stays portable and testable.
 // Verified against Claude Code 2.1.224.
 
-import { readdir, readFile, mkdir, chmod, lstat, unlink, writeFile } from "node:fs/promises";
+import { readdir, readFile, mkdir, chmod, lstat, rename, unlink, writeFile } from "node:fs/promises";
 import { readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
@@ -476,6 +476,21 @@ function procStart(pid: number): Promise<string | undefined> {
   });
 }
 
+/**
+ * Replace a registry entry in one step: a temp file renamed over it, so a peer
+ * listing (or our own read-modify-write in updatePeer) never reads it half written.
+ */
+async function writeEntry(file: string, entry: unknown): Promise<void> {
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(entry, null, 2));
+    await rename(tmp, file);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
+}
+
 /** Write ~/.claude/sessions/<pid>.json so Claude lists this session as a peer. */
 export async function registerPeer(o: {
   pid: number; sessionId?: string; name: string; cwd: string; sockPath: string; status?: string;
@@ -498,14 +513,14 @@ export async function registerPeer(o: {
     nameSource: o.nameSource || "derived",
     status: o.status || "idle",
   };
-  await writeFile(path.join(CLAUDE_REGISTRY, `${o.pid}.json`), JSON.stringify(entry, null, 2));
+  await writeEntry(path.join(CLAUDE_REGISTRY, `${o.pid}.json`), entry);
 }
 
 export async function updatePeer(pid: number, patch: Record<string, unknown>): Promise<void> {
   const f = path.join(CLAUDE_REGISTRY, `${pid}.json`);
   let cur: any = {};
   try { cur = JSON.parse(await readFile(f, "utf8")); } catch { return; }
-  await writeFile(f, JSON.stringify({ ...cur, ...patch }, null, 2));
+  await writeEntry(f, { ...cur, ...patch });
 }
 
 export async function deregisterPeer(pid: number, sockPath?: string): Promise<void> {
