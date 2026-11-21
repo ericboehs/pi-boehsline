@@ -316,8 +316,28 @@ async function peer({ pid, name, status = "idle", entrypoint = "pi", answer, del
   return { sock, frames, from: `uds:${sock}` };
 }
 
-// Registered before the extension starts, so ccSocksDir() puts its socket in this HOME too.
-const sender = await peer({ pid: 910001, name: "sender", answer: { status: "reloaded" } });
+// Everything below is set up on first use, not by top-level awaits: a test
+// registered after a top-level await can miss the run entirely when the tests
+// above finish first (a slow import on a loaded CI runner), and then the
+// sockets this section opens keep the file's process alive until the job's
+// timeout. So every test is registered synchronously, and the extension tests
+// await setup() themselves.
+let sender, extension, stub, ownJson, target;
+let setupOnce;
+const setup = () => (setupOnce ??= (async () => {
+  // Registered before the extension starts, so ccSocksDir() puts its socket in this HOME too.
+  sender = await peer({ pid: 910001, name: "sender", answer: { status: "reloaded" } });
+  ({ default: extension } = await import("../index.ts"));
+  stub = stubPi();
+  extension(stub.pi);
+  await stub.fire("session_start", { reason: "startup" }, ctx);
+  ownJson = path.join(REG, `${process.pid}.json`);
+  assert.ok(await until(() => existsSync(ownJson)), "the extension registered");
+  target = JSON.parse(readFileSync(ownJson, "utf8")).messagingSocketPath;
+  countAnswerWrites();
+})());
+/** A test of the real extension: it sets the extension up first. */
+const extTest = (name, fn) => test(name, async (t) => { await setup(); return fn(t); });
 
 function stubPi() {
   const handlers = new Map();
@@ -353,14 +373,6 @@ const ctx = {
   },
 };
 
-const { default: extension } = await import("../index.ts");
-const stub = stubPi();
-extension(stub.pi);
-await stub.fire("session_start", { reason: "startup" }, ctx);
-const ownJson = path.join(REG, `${process.pid}.json`);
-assert.ok(await until(() => existsSync(ownJson)), "the extension registered");
-const target = JSON.parse((await import("node:fs")).readFileSync(ownJson, "utf8")).messagingSocketPath;
-
 /** Stand in for pi running the dispatched command: commands bypass the model. */
 async function runDispatched() {
   const cmd = stub.sent.findLast((s) => s.content === `/${R.RELOAD_COMMAND}`);
@@ -389,16 +401,18 @@ function reset() {
 // callback), so the test can tell "sent before ctx.reload()" from "started".
 let answersWritten = 0;
 const realEnd = net.Socket.prototype.end;
-net.Socket.prototype.end = function (data, ...rest) {
-  const cb = typeof rest.at(-1) === "function" ? rest.pop() : undefined;
-  const isAnswer = typeof data === "string" && data.includes('"reload_result"');
-  return realEnd.call(this, data, ...rest, (...a) => { if (isAnswer) answersWritten++; cb?.(...a); });
-};
+function countAnswerWrites() {
+  net.Socket.prototype.end = function (data, ...rest) {
+    const cb = typeof rest.at(-1) === "function" ? rest.pop() : undefined;
+    const isAnswer = typeof data === "string" && data.includes('"reload_result"');
+    return realEnd.call(this, data, ...rest, (...a) => { if (isAnswer) answersWritten++; cb?.(...a); });
+  };
+}
 
 const ask = (extra = {}) => P.sendFrame(target, { type: "control", action: "reload", req_id: `r-${Math.random()}`, from: sender.from, ...extra });
 const answers = () => sender.frames.filter((f) => f.action === "reload_result");
 
-test("extension: a reload frame reaches no chat and answers before reloading", async () => {
+extTest("extension: a reload frame reaches no chat and answers before reloading", async () => {
   reset();
   await ask({ req_id: "one" });
   assert.ok(await until(() => stub.sent.length === 1));
@@ -411,7 +425,7 @@ test("extension: a reload frame reaches no chat and answers before reloading", a
   assert.equal(answers()[0].req_id, "one");
 });
 
-test("extension: busy answers queued and reloads at agent_settled", async () => {
+extTest("extension: busy answers queued and reloads at agent_settled", async () => {
   reset();
   state.idle = false;
   await stub.fire("agent_start", {}, ctx);
@@ -425,7 +439,7 @@ test("extension: busy answers queued and reloads at agent_settled", async () => 
   assert.equal(state.reloads, 1);
 });
 
-test("extension: an aborted run drops the queued reload with a notice", async () => {
+extTest("extension: an aborted run drops the queued reload with a notice", async () => {
   reset();
   state.idle = false;
   await stub.fire("agent_start", {}, ctx);
@@ -437,7 +451,7 @@ test("extension: an aborted run drops the queued reload with a notice", async ()
   assert.ok(notes.some(([, m]) => /the run was aborted/.test(m)));
 });
 
-test("extension: a manual /compact holds the reload until session_compact, not the next turn", async () => {
+extTest("extension: a manual /compact holds the reload until session_compact, not the next turn", async () => {
   reset();
   state.idle = false; // compacting: busy, but no agent run
   await ask();
@@ -450,7 +464,7 @@ test("extension: a manual /compact holds the reload until session_compact, not t
   assert.equal(state.reloads, 1);
 });
 
-test("extension: busy again when the reload command runs: answers queued, no reload, no rate limit", async () => {
+extTest("extension: busy again when the reload command runs: answers queued, no reload, no rate limit", async () => {
   reset();
   await ask({ req_id: "late" });
   assert.ok(await until(() => stub.sent.length === 1));
@@ -468,7 +482,7 @@ test("extension: busy again when the reload command runs: answers queued, no rel
   assert.equal(state.reloads, 1);
 });
 
-test("extension: an open dialog (any extension's) holds the reload", async () => {
+extTest("extension: an open dialog (any extension's) holds the reload", async () => {
   reset();
   await stub.fire("ui_prompt_start", { kind: "select" }, ctx);
   await ask();
@@ -480,7 +494,7 @@ test("extension: an open dialog (any extension's) holds the reload", async () =>
   await runDispatched();
 });
 
-test("extension: unsent editor text refuses, force reloads anyway", async () => {
+extTest("extension: unsent editor text refuses, force reloads anyway", async () => {
   reset();
   state.draft = "draft";
   await ask();
@@ -493,7 +507,7 @@ test("extension: unsent editor text refuses, force reloads anyway", async () => 
   await runDispatched();
 });
 
-test("extension: a request inside 30s of a reload is rate-limited", async () => {
+extTest("extension: a request inside 30s of a reload is rate-limited", async () => {
   reset();
   await ask();
   assert.ok(await until(() => stub.sent.length === 1));
@@ -505,7 +519,7 @@ test("extension: a request inside 30s of a reload is rate-limited", async () => 
   assert.equal(stub.sent.length, 1, "only the first dispatched");
 });
 
-test("extension: a spoofed registered 'from' can only send the answer to that peer", async () => {
+extTest("extension: a spoofed registered 'from' can only send the answer to that peer", async () => {
   reset();
   // Same-user processes can already reach the socket; one naming another
   // peer's socket as 'from' gets no answer itself (accepted, see SECURITY.md).
@@ -520,7 +534,7 @@ test("extension: a spoofed registered 'from' can only send the answer to that pe
   assert.equal(frames.length, 0);
 });
 
-test("extension: frames from an unregistered socket are dropped", async () => {
+extTest("extension: frames from an unregistered socket are dropped", async () => {
   reset();
   const rogue = path.join(home, "rogue.sock");
   const frames = [];
@@ -534,7 +548,7 @@ test("extension: frames from an unregistered socket are dropped", async () => {
 const tool = () => stub.tools.find((t) => t.name === "agent-link");
 let replaced;
 
-test("extension: reload without 'to' reloads this session after the response", async () => {
+extTest("extension: reload without 'to' reloads this session after the response", async () => {
   reset();
   state.idle = false;
   const res = await tool().execute("id", { action: "reload" });
@@ -547,14 +561,14 @@ test("extension: reload without 'to' reloads this session after the response", a
   assert.equal(state.reloads, 1);
 });
 
-test("extension: reload a named peer reports its answer", async () => {
+extTest("extension: reload a named peer reports its answer", async () => {
   reset();
   await peer({ pid: 910010, name: "solo-busy", answer: { status: "queued" } });
   const res = await tool().execute("id", { action: "reload", to: "solo-busy" });
   assert.equal(res.content[0].text, '"solo-busy": queued (busy, reloads when it is free)');
 });
 
-test("extension: a single non-pi target is refused at once, without a frame", async () => {
+extTest("extension: a single non-pi target is refused at once, without a frame", async () => {
   reset();
   const claude = await peer({ pid: 910011, name: "claude-solo", entrypoint: "cli", answer: { status: "reloaded" } });
   const res = await tool().execute("id", { action: "reload", to: "claude-solo" });
@@ -563,7 +577,7 @@ test("extension: a single non-pi target is refused at once, without a frame", as
   assert.equal(claude.frames.length, 0);
 });
 
-test("extension: /agent-link reload parses --force and needs a target", async () => {
+extTest("extension: /agent-link reload parses --force and needs a target", async () => {
   reset();
   const cmd = stub.commands.get("agent-link");
   const forced = await peer({ pid: 910012, name: "solo-force", answer: { status: "reloaded" } });
@@ -576,7 +590,7 @@ test("extension: /agent-link reload parses --force and needs a target", async ()
   assert.match(notes.at(-1)[1], /^Usage: \/agent-link reload/);
 });
 
-test("extension: a reload waits for agent-link's own command to finish", async () => {
+extTest("extension: a reload waits for agent-link's own command to finish", async () => {
   reset();
   // A peer that answers slowly keeps /agent-link reload in flight.
   const slow = await peer({ pid: 910013, name: "solo-slow", answer: { status: "reloaded" }, delay: 300 });
@@ -591,7 +605,7 @@ test("extension: a reload waits for agent-link's own command to finish", async (
   await runDispatched();
 });
 
-test("extension: completions offer reload, *idle, pi peers and --force", async () => {
+extTest("extension: completions offer reload, *idle, pi peers and --force", async () => {
   const complete = stub.commands.get("agent-link").getArgumentCompletions;
   assert.deepEqual((await complete("re")).map((i) => i.label), ["reload"]);
   const after = await complete("reload ");
@@ -602,7 +616,7 @@ test("extension: completions offer reload, *idle, pi peers and --force", async (
   assert.match(stub.commands.get(R.RELOAD_COMMAND).description, /^\(internal\)/);
 });
 
-test("extension: *idle reloads every idle pi session and lists each outcome", async () => {
+extTest("extension: *idle reloads every idle pi session and lists each outcome", async () => {
   reset();
   const a = await peer({ pid: 910020, name: "idle-a", answer: { status: "reloaded" } });
   const b = await peer({ pid: 910021, name: "idle-b", answer: { status: "refused", reason: R.EDITOR_REFUSAL } });
@@ -622,13 +636,16 @@ test("extension: *idle reloads every idle pi session and lists each outcome", as
   assert.equal(a.frames.length, 1, "the cooldown sends nothing");
 });
 
-test("extension: a reload keeps the name a rename frame set", async () => {
+extTest("extension: a reload keeps the name a rename frame set", async () => {
   reset();
   await P.sendFrame(target, { type: "control", action: "rename", name: "renamed-by-dedupe" });
   assert.ok(await until(() => JSON.parse(readFileSync(ownJson, "utf8")).name === "renamed-by-dedupe"));
   // What ctx.reload() does: shut this instance down, start a fresh one.
   await stub.fire("session_shutdown", { reason: "reload" }, ctx);
   const next = stubPi();
+  // Recorded before anything can fail, so test.after shuts this instance down
+  // (and closes its socket) even when an assertion below throws.
+  replaced = next;
   next.pi.getSessionName = () => undefined;
   extension(next.pi);
   await next.fire("session_start", { reason: "reload" }, ctx);
@@ -636,11 +653,10 @@ test("extension: a reload keeps the name a rename frame set", async () => {
   assert.ok(await until(() => JSON.parse(readFileSync(ownJson, "utf8")).name === "renamed-by-dedupe"), "the name survived");
   await sleep(400); // past a name-race settle
   assert.equal(JSON.parse(readFileSync(ownJson, "utf8")).name, "renamed-by-dedupe");
-  replaced = next;
 });
 
 test.after(async () => {
   net.Socket.prototype.end = realEnd;
-  await (replaced ?? stub).fire("session_shutdown", { reason: "quit" }, ctx);
+  await (replaced ?? stub)?.fire("session_shutdown", { reason: "quit" }, ctx);
   for (const s of servers) s.close();
 });

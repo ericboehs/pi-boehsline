@@ -89,6 +89,16 @@ async function until(done) {
   for (let i = 0; i < 200 && !done(); i++) await settle();
 }
 
+/**
+ * Sets a file's mtime to the mocked clock, rounded up to a whole second: a
+ * fractional Date.now() / 1000 can come back a hair early from stat (60s read
+ * as 59.999s, reported "59s"), and a whole second is stored exactly.
+ */
+function touchNow(file) {
+  const at = Math.ceil(Date.now() / 1000);
+  utimesSync(file, at, at);
+}
+
 async function mount(t, { mode = "tui", wake = "followUp", session } = {}) {
   // Each wake policy is read at module load; query imports isolate the constants.
   process.env.PI_BG_WAKE = wake;
@@ -738,7 +748,7 @@ test("restart: the resumed session re-adopts its running job, polls it, and repo
 
   writeFileSync(task.logPath, "built\n");
   writeExit(task.logPath, 7);
-  utimesSync(`${task.logPath}.exit`, Date.now() / 1000, Date.now() / 1000);
+  touchNow(`${task.logPath}.exit`);
   procs.delete(task.child.pid);
   t.mock.timers.tick(2000);
   assert.equal(next.sent.length, 1);
@@ -815,8 +825,8 @@ test("jobs that ended while pi was down are reported once on resume, waking the 
   writeExit(build.logPath, 0);
   writeExit(dev.logPath, 143);
   for (const task of h.children) {
-    utimesSync(task.logPath, Date.now() / 1000, Date.now() / 1000);
-    if (existsSync(`${task.logPath}.exit`)) utimesSync(`${task.logPath}.exit`, Date.now() / 1000, Date.now() / 1000);
+    touchNow(task.logPath);
+    if (existsSync(`${task.logPath}.exit`)) touchNow(`${task.logPath}.exit`);
     task.ended = true;
     procs.delete(task.child.pid);
   }
