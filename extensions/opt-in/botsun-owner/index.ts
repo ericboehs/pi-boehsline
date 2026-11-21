@@ -27,7 +27,7 @@
 // unless BOTSUN_OWNER_DEBUG is set. Every timer and the socket are unref'd,
 // so nothing here keeps pi alive.
 
-import { createHash, createPublicKey, randomBytes, verify as verifySignature } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, randomUUID, verify as verifySignature } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { accessSync, appendFileSync, existsSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
@@ -92,6 +92,19 @@ const SAID_MAX = 64;
 /** Streaming text to Botsun: at most this often, and at most this much (the end is kept). */
 const STREAM_EVERY_MS = 250;
 const STREAM_MAX = 20_000;
+/**
+ * A busy steer from the phone waits here (Conn.steers) for the turn's end instead of going to pi at
+ * once, so the phone's first Stop can take it back (unsteer): pi's extension API can't read or clear
+ * its own steering queue. Only words alone can come back, up to this many bytes of JSON: one must
+ * fit, whole, in the unsteer reply and in a `returned` line under Botsun's 64 KB MAX_LINE. Photos,
+ * files and bigger words wait too when earlier steers do (to keep his order), but never come back
+ * from an unsteer.
+ */
+export const STEER_BYTES_MAX = 16 * 1024;
+/** The unsteer reply's withdrawn steers: at most this many bytes of JSON (Botsun cuts a reply at 64 KB). */
+export const UNSTEER_REPLY_MAX = 48 * 1024;
+/** A v1-signed unsteer: it takes v2 or newer only (a new request, like stop_child). */
+export const UNSTEER_V1_REFUSED = "unsteer needs a v2 signature: v1 is refused (update Botsun and the app)";
 /** DER prefix that turns a 65-byte uncompressed P-256 point into an SPKI key. */
 const P256_SPKI = Buffer.from("3059301306072a8648ce3d020106082a8648ce3d030107034200", "hex");
 
@@ -132,9 +145,11 @@ interface Conn {
 	/** The owner socket (T2) and its outstanding nonces (value: expiry ms). */
 	server?: Server;
 	nonces: Map<string, number>;
-	/** Sends a user message through the current extension instance's pi. `id`: the phone's client_id
-	 * for it (a say's), which its steer mark carries. */
-	inject: (content: string | UserContent[], busy: boolean, id?: string) => void;
+	/** Sends a user message through the current extension instance's pi. A busy steer may wait for the
+	 * turn's end (Conn.steers, holdsSteer): `steer.id` is the phone's client_id for it (a say's, which
+	 * its steer mark carries), `steer.text` his words as typed (what a Stop gives back), and
+	 * `steer.withdrawable` false for one the phone can't take back (photos, files, frames). */
+	inject: (content: string | UserContent[], busy: boolean, steer?: SteerMeta) => void;
 	/** Runs a slash command from the phone: undefined = not one (send as text), null = ran, string = why not. */
 	command?: (text: string, busy: boolean) => string | null | undefined;
 	/** The commands the phone can run here, for its "/" list; read lazily. */
@@ -213,7 +228,39 @@ interface Conn {
 	/** What the host says it takes (its features line: model_pages for a paged catalogue), and so what
 	 * this session may send it. Undefined until that line arrives: until then, only what an older host takes. */
 	hostFeatures?: Set<string>;
+	/** Eric's steers from the phone, waiting for a turn's end (holdsSteer), oldest first: the phone can
+	 * take the withdrawable ones back (unsteer). On the connection, so a handoff never drops one. */
+	steers?: HeldSteer[];
+	/** Steers taken back (unsteer) or handed back by a stopped run, kept until Botsun says the phone has
+	 * them (a returned_ack line): they never go to pi again, and never vanish. Sent again after every hello. */
+	returned?: ReturnedSteer[];
+	/** Between pi's turn_start and turn_end: a steer then is held for that turn's end. */
+	inTurn?: boolean;
+	/** The steers line last sent (JSON): one goes only when it changed. */
+	steersSent?: string;
 }
+
+/** What inject is told about a message: see Conn.inject. */
+export interface SteerMeta { id?: string; text?: string; withdrawable?: boolean; attachments?: number }
+/**
+ * A steer waiting for the turn's end: its id (the phone's client_id, or one made here), his words as
+ * typed (`text`, what goes back), what pi gets (`content`), whether an unsteer may take it, and
+ * whether its phone say is noted already (it came through a compaction's hold).
+ */
+export interface HeldSteer {
+	id: string;
+	clientId?: string;
+	text: string;
+	content: string | UserContent[];
+	withdrawable: boolean;
+	attachments: number;
+	noted?: boolean;
+	at: number;
+}
+/** A steer on its way back to the phone, and the conversation it was said in. */
+export interface ReturnedSteer { id: string; text: string; at: number; sessionId: string | null; why: "withdrawn" | "stopped" }
+/** Steers kept for Botsun at most (the oldest go first): its own escrow takes as many per session. */
+export const RETURNED_MAX = 50;
 
 const store = globalThis as unknown as { [STORE]?: Conn };
 
@@ -637,6 +684,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (r.type === "cancel_ask") return cancelAsk(c, r);
 	if (r.type === "stash") return stashRequest(c, r);
 	if (r.type === "stop") return stopRequest(c, r);
+	if (r.type === "unsteer") return unsteerRequest(c, r);
 	if (r.type === "stop_child") return stopChildRequest(c, r);
 	if (r.type === "close") return r.key !== undefined ? closeCall(c, r) : closeRequest(c, r);
 	if (r.type === "reload" || r.type === "restart") return reloadOrRestart(c, r, r.type);
@@ -746,6 +794,7 @@ export function serverLine(c: Conn, line: string): boolean {
 	if (v === 1 && type === "looks") return applyLookNotes(c, msg as Record<string, unknown>);
 	if (v === 1 && type === "icon") return applyIconReply(c, msg as Record<string, unknown>);
 	if (v === 1 && type === "features") return applyHostFeatures(c, msg as Record<string, unknown>);
+	if (v === 1 && type === "returned_ack") return applyReturnedAck(c, msg as Record<string, unknown>);
 	if (v !== 1 || type !== "sandbox_token") return false;
 	if (typeof token !== "string" || !SANDBOX_TOKEN.test(token)) return false;
 	if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < 1 || ttl > SANDBOX_TOKEN_MAX_S) return false;
@@ -1074,7 +1123,7 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 		const job: Promise<void> = (c.framing ?? Promise.resolve())
 			.then(() => withFrames(saved, runFile))
 			.then(({ notes, frames }) => {
-				c.inject(compose(notes, frames), c.busy, opts.clientId);
+				c.inject(compose(notes, frames), c.busy, { id: opts.clientId, text, withdrawable: false, attachments: images.length + files.length });
 			})
 			.catch((e) => debug(`owner say with a video: ${(e as Error).message}`))
 			.finally(() => { if (c.framing === job) c.framing = undefined; });
@@ -1082,7 +1131,9 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 		debug(`owner say accepted (${text.length} chars, ${images.length} photos, ${files.length} files, frames pending)`);
 		return { ok: true, delivered };
 	}
-	c.inject(compose(notes, []), c.busy, opts.clientId);
+	// Words alone can be taken back from the phone while they wait for the turn's end; a message with
+	// photos or files can't (yet): the reply that brings a steer back has no room for them.
+	c.inject(compose(notes, []), c.busy, { id: opts.clientId, text, withdrawable: !images.length && !files.length, attachments: images.length + files.length });
 	debug(`owner say accepted (${text.length} chars, ${images.length} photos, ${files.length} files)`); // never the text
 	return { ok: true, delivered };
 }
@@ -1487,11 +1538,181 @@ function stopRequest(c: Conn, r: Record<string, unknown>): Record<string, unknow
 		v2: { kind: "session", decision: "stop", payload: () => "stop" } });
 	if (denied) return { error: denied };
 	if (c.stopReturning) {
+		// The steers still waiting for the turn's end go back to the phone first, never to pi (returnSteers):
+		// by id in the reply (what fits it), and through the escrow either way.
+		const returned = replyList(returnSteers(c, "stopped"));
 		const { stopped, dropped } = c.stopReturning();
-		return dropped.length ? { ok: true, stopped, dropped } : { ok: true, stopped };
+		return { ok: true, stopped, ...(dropped.length ? { dropped } : {}), ...(returned.length ? { returned } : {}) };
 	}
 	if (!c.stop) return { error: "this session can't stop from the phone yet; run /reload" };
 	return { ok: true, stopped: c.stop() === "stopped" };
+}
+
+/**
+ * Whether a busy steer waits for the turn's end (Conn.steers) instead of going to pi now: between
+ * pi's turn_start and turn_end (one said after the last turn_end has no turn_end left to go in at,
+ * and goes straight to pi as before), or whenever earlier ones wait (so it never jumps ahead of
+ * them). Only one the phone can take back starts the wait (words alone, STEER_BYTES_MAX); one it
+ * can't (photos, files, bigger words) waits only behind others.
+ */
+export function holdsSteer(c: Pick<Conn, "inTurn" | "steers">, withdrawable: boolean): boolean {
+	if (c.steers?.length) return true;
+	return withdrawable && c.inTurn === true;
+}
+
+/** Whether these words, alone, can come back from an unsteer: some words, small enough for one reply. */
+export function withdrawableText(content: string | UserContent[], meta?: SteerMeta): boolean {
+	if (meta?.withdrawable === false || typeof content !== "string" || !content.trim()) return false;
+	return Buffer.byteLength(JSON.stringify(content), "utf8") <= STEER_BYTES_MAX;
+}
+
+/** A steer id: the phone's client_id (a lowercase UUID), as Botsun checks it. */
+const STEER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** A busy steer, into the wait (holdsSteer said so). Its phone say is noted when it goes to pi. */
+export function holdSteer(c: Conn, content: string | UserContent[], meta: SteerMeta | undefined, opts: { noted?: boolean; now?: number } = {}): HeldSteer {
+	const withdrawable = withdrawableText(content, meta);
+	const clientId = meta?.id && STEER_ID.test(meta.id) ? meta.id : undefined;
+	const steer: HeldSteer = {
+		id: clientId ?? randomUUID(),
+		...(clientId ? { clientId } : {}),
+		text: meta?.text ?? contentTextOf(content),
+		content,
+		withdrawable,
+		attachments: meta?.attachments ?? 0,
+		...(opts.noted ? { noted: true } : {}),
+		at: opts.now ?? Date.now(),
+	};
+	(c.steers ??= []).push(steer);
+	reportSteers(c);
+	return steer;
+}
+
+/**
+ * The waiting steers as Botsun keeps them (its `steers` line): what the phone's next Stop takes
+ * back, by id, size and time, never the words. One it can't take back isn't listed.
+ */
+export function steersLine(c: Pick<Conn, "steers">): Array<{ id: string; chars: number; photos: number; at: string }> {
+	return (c.steers ?? []).filter((s) => s.withdrawable)
+		.map((s) => ({ id: s.id, chars: s.text.length, photos: 0, at: new Date(s.at).toISOString() }));
+}
+
+/** A steers line, when the list changed since Botsun was last told (or forced after a hello). */
+export function reportSteers(c: Conn, force = false): void {
+	const steers = steersLine(c);
+	const key = JSON.stringify(steers);
+	if (!force && key === c.steersSent) return;
+	c.steersSent = key;
+	try { write(c, "steers", { steers }); } catch {}
+}
+
+/** Each steer on its way back to the phone, one `returned` line each (a line stays under MAX_LINE). */
+function sendReturned(c: Conn, items: ReturnedSteer[]): void {
+	for (const s of items) {
+		try {
+			write(c, "returned", { session_id: s.sessionId, steers: [{ id: s.id, text: s.text, at: new Date(s.at).toISOString(), why: s.why }] });
+		} catch {}
+	}
+}
+
+/** Into the escrow (Conn.returned, at most RETURNED_MAX) and down to Botsun. */
+function escrow(c: Conn, out: ReturnedSteer[]): void {
+	if (!out.length) return;
+	const all = (c.returned ??= []);
+	all.push(...out);
+	if (all.length > RETURNED_MAX) all.splice(0, all.length - RETURNED_MAX);
+	reportSteers(c);
+	sendReturned(c, out);
+}
+
+/** The words a steer goes back with: his own, or what it carried when he typed none. */
+function returnedText(s: HeldSteer): string {
+	if (s.text.trim()) return s.text;
+	const n = Math.max(1, s.attachments);
+	return `[${n} attachment${n === 1 ? "" : "s"}]`;
+}
+
+/**
+ * Every waiting steer goes back to the phone (a run stopped, or this session is ending): into the
+ * escrow and down to Botsun, which puts them back in the phone's message box. Never to pi: a
+ * stopped run's steers would start the agent again, or be lost in the reset that follows an abort
+ * on /new, /resume, /fork and quit. One with photos goes back as its words (the phone still has
+ * its photos while its bubble is there, and finds them by id).
+ */
+export function returnSteers(c: Conn, why: ReturnedSteer["why"]): ReturnedSteer[] {
+	const out = (c.steers ?? []).map((s): ReturnedSteer => ({ id: s.id, text: returnedText(s), at: s.at, sessionId: c.sessionId, why }));
+	c.steers = [];
+	escrow(c, out);
+	return out;
+}
+
+/** The returned steers that fit one reply under Botsun's 64 KB line ({id, text}); the rest reach the phone by the thread read. */
+export function replyList(items: ReturnedSteer[], max = UNSTEER_REPLY_MAX): Array<{ id: string; text: string }> {
+	const out: Array<{ id: string; text: string }> = [];
+	let bytes = 64;
+	for (const s of items) {
+		const size = Buffer.byteLength(JSON.stringify({ id: s.id, text: s.text }), "utf8") + 1;
+		if (bytes + size > max) break;
+		out.push({ id: s.id, text: s.text });
+		bytes += size;
+	}
+	return out;
+}
+
+/** Botsun has the phone's word that these came back (its returned_ack line): the escrow lets them go. */
+function applyReturnedAck(c: Conn, msg: Record<string, unknown>): boolean {
+	if (!Array.isArray(msg.ids)) return false;
+	const ids = new Set(msg.ids.filter((id): id is string => typeof id === "string"));
+	if (!c.returned?.length) return true;
+	c.returned = c.returned.filter((s) => !ids.has(s.id));
+	return true;
+}
+
+/**
+ * The phone's first Stop (or Esc) while steers wait: takes back the ones it can, as pi's own Alt+Up
+ * does for typed ones, and never stops the run. Signed with the decision key, v2 or newer, over
+ * "unsteer". Atomic with the turn's end, which hands pi the next one: both run on this one thread,
+ * so a steer pi took is never in the reply, and one in the reply never reaches pi. The reply names
+ * exactly what came back (`withdrawn`, oldest first) and how many it could have taken are still
+ * waiting (`kept`: the rest of a reply over UNSTEER_REPLY_MAX, for the next press); photos, files
+ * and bigger words stay where they are, in order. Nothing to take back is an empty `withdrawn`,
+ * never a stop (the phone stops with its own request). What came back is in the escrow too, so a
+ * reply lost on the way still reaches the phone.
+ */
+function unsteerRequest(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const denied = verifyDevice(c, r, { decision: "unsteer", digest: () => sha256hex(Buffer.from("unsteer", "utf8")),
+		v2: { kind: "session", decision: "unsteer", payload: () => "unsteer" } });
+	if (denied) return { error: denied };
+	if (!atLeastV2(r)) return { error: UNSTEER_V1_REFUSED };
+	const { withdrawn, kept } = takeWithdrawable(c);
+	const back = withdrawn.map((s): ReturnedSteer => ({ id: s.id, text: s.text, at: s.at, sessionId: c.sessionId, why: "withdrawn" }));
+	escrow(c, back);
+	debug(`owner unsteer took back ${withdrawn.length} (${kept} kept)`);
+	return { ok: true, withdrawn: back.map((s) => ({ id: s.id, text: s.text })), kept };
+}
+
+/** The withdrawable waiting steers, oldest first, as many as fit one reply; the rest stay in order. */
+export function takeWithdrawable(c: Pick<Conn, "steers">, max = UNSTEER_REPLY_MAX): { withdrawn: HeldSteer[]; kept: number } {
+	const withdrawn: HeldSteer[] = [];
+	const left: HeldSteer[] = [];
+	let bytes = 64;
+	let full = false;
+	for (const s of c.steers ?? []) {
+		if (!s.withdrawable) {
+			left.push(s);
+			continue;
+		}
+		const size = Buffer.byteLength(JSON.stringify({ id: s.id, text: s.text }), "utf8") + 1;
+		if (full || bytes + size > max) {
+			full = true;
+			left.push(s);
+			continue;
+		}
+		withdrawn.push(s);
+		bytes += size;
+	}
+	c.steers = left;
+	return { withdrawn, kept: left.filter((s) => s.withdrawable).length };
 }
 
 /** A v1-signed stop_child: it takes v2 or newer only. */
@@ -1956,7 +2177,10 @@ function featureList(c: Conn): string[] {
 		// This pi sends a catalogue in pages (sendModels) when the host says it appends them: the host
 		// answers this with its own features line (OwnerSessions' HOST_FEATURES).
 		"model_pages",
-		"subagents", "subagent_chats", ...(hasStash ? ["stash"] : []), ...(c.reload ? ["reload"] : []),
+		"subagents", "subagent_chats",
+		// Phone steers wait here for the turn's end, and the phone can take them back (unsteerRequest).
+		"unsteer",
+		...(hasStash ? ["stash"] : []), ...(c.reload ? ["reload"] : []),
 		...(c.restart && restartTarget() ? ["restart"] : [])];
 }
 
@@ -2018,6 +2242,8 @@ function sendHello(c: Conn): void {
 		usage: usageLine(),
 		compacting,
 		bypass: bypassed,
+		// The steers held for the turn's end (ids and sizes): the phone's first Stop takes them back.
+		steers: steersLine(c),
 		...colorFields(c),
 		context: (() => {
 			try { return c.context?.() ?? null; } catch { return null; }
@@ -2027,6 +2253,11 @@ function sendHello(c: Conn): void {
 	// clears the host's list, so an empty one needs no line.
 	c.subagentsSent = "[]";
 	reportSubagents(c);
+	c.steersSent = JSON.stringify(steersLine(c));
+	// The escrow again: a line written while Botsun was away (or before a restart of its own) never
+	// reached it, and one it had is answered with another returned_ack. Only this conversation's:
+	// Botsun takes a line only for the conversation the session is in now.
+	sendReturned(c, (c.returned ?? []).filter((s) => s.sessionId === c.sessionId));
 }
 
 function scheduleRetry(c: Conn): void {
@@ -2358,7 +2589,10 @@ function main(pi: ExtensionAPI): void {
 	if (process.env.PI_SUBAGENT_CHILD === "1") return;
 
 	let conn: Conn | undefined;
-	let held: Array<string | UserContent[]> = [];
+	let held: Array<{ content: string | UserContent[]; steer?: SteerMeta }> = [];
+	// The waiting steers' turn_end and agent_settled steps (set in session_start, where pi and ctx are).
+	let turnEndSteers: (aborted: boolean, pending: boolean) => void = () => {};
+	let settleSteers: (aborted: boolean) => void = () => {};
 	// Words a stop released: sent once the aborted run has settled, as if typed after Esc.
 	let afterStop: string[] = [];
 	let steerHook = false;
@@ -2526,13 +2760,65 @@ function main(pi: ExtensionAPI): void {
 		if (!(LAUNCH in g)) g[LAUNCH] = (_event as { reason?: string } | undefined)?.reason === "startup" ? launchOf(info) : null;
 		const sessionName = () => pi.getSessionName();
 		const setSessionName = (name: string) => pi.setSessionName(name);
-		// Eric's own words, as if typed: steer into a running turn, else start one.
-		const inject = (content: string | UserContent[], busy: boolean, id?: string) => {
-			// Remembered until pi's input event for it: its steer mark takes the id, and a Stop gives it back.
-			if (conn) notePhoneSay(conn, content, id);
+		// Eric's own words, as if typed: steer into a running turn, else start one. A busy steer waits for
+		// the turn's end (holdsSteer), where turn_end hands it to pi at the point pi would have read it:
+		// until then the phone's first Stop can take it back (unsteer).
+		const inject = (content: string | UserContent[], busy: boolean, steer?: SteerMeta) => {
+			const c = conn;
 			// held still waiting (a compaction just ended, see releaseHeld): stay behind them.
-			if (compacting || held.length > 0) held.push(content);
-			else sendUser(pi, content, busy ? { deliverAs: "steer" } : undefined);
+			if (compacting || held.length > 0) {
+				// Remembered until pi's input event for it: its steer mark takes the id, and a Stop gives it back.
+				if (c) notePhoneSay(c, content, steer?.id);
+				held.push({ content, ...(steer ? { steer } : {}) });
+				return;
+			}
+			if (busy && c && !c.closed && holdsSteer(c, withdrawableText(content, steer))) {
+				holdSteer(c, content, steer);
+				return;
+			}
+			if (c) notePhoneSay(c, content, steer?.id);
+			sendUser(pi, content, busy ? { deliverAs: "steer" } : undefined);
+		};
+		// The oldest waiting steer, to pi now as a steer (turn_end), its phone say noted for its mark.
+		const flushSteer = (c: Conn): void => {
+			const next = c.steers?.shift();
+			if (!next) return;
+			reportSteers(c);
+			if (!next.noted) notePhoneSay(c, next.content, next.clientId);
+			sendUser(pi, next.content, { deliverAs: "steer" });
+		};
+		// A settled run's steers it never read (no turn_end was left, or one skipped its handlers): his
+		// next prompt and follow-ups, as if typed once it settled; held while a compaction runs.
+		const sendLeftSteers = (c: Conn): void => {
+			const left = c.steers ?? [];
+			if (!left.length) return;
+			c.steers = [];
+			reportSteers(c);
+			left.forEach((s, i) => {
+				if (compacting || held.length > 0) {
+					if (!s.noted) notePhoneSay(c, s.content, s.clientId);
+					held.push({ content: s.content });
+					return;
+				}
+				if (!s.noted) notePhoneSay(c, s.content, s.clientId);
+				try { sendUser(pi, s.content, i > 0 ? { deliverAs: "followUp" } : undefined); } catch {}
+			});
+		};
+		settleSteers = (aborted: boolean): void => {
+			const c = conn;
+			if (!c || c.closed) return;
+			c.inTurn = false;
+			if (!c.steers?.length) return;
+			if (aborted) returnSteers(c, "stopped");
+			else sendLeftSteers(c);
+		};
+		turnEndSteers = (aborted: boolean, pending: boolean): void => {
+			const c = conn;
+			if (!c || c.closed) return;
+			c.inTurn = false;
+			if (!c.steers?.length) return;
+			if (aborted) returnSteers(c, "stopped");
+			else if (!pending) flushSteer(c);
 		};
 		// Released call words. queue: a follow-up once the turn ends (a prompt when idle). steer: as a
 		// typed message would. stop: abort the run, like Esc, then send them once pi settles.
@@ -2550,8 +2836,15 @@ function main(pi: ExtensionAPI): void {
 				sendUser(pi, text, { deliverAs: "followUp" });
 				return "queue";
 			}
-			// The phone's steers the abort drops go again first (they were sent first), then these words.
-			afterStop.push(...abortTaking(), text);
+			// The phone's steers the abort drops go again first (they were sent first), then these words:
+			// the waiting ones in words alone too; one with photos goes back to the phone (turn_end).
+			const waiting = conn?.steers ?? [];
+			const words = waiting.filter((s) => typeof s.content === "string");
+			if (conn && words.length) {
+				conn.steers = waiting.filter((s) => typeof s.content !== "string");
+				reportSteers(conn);
+			}
+			afterStop.push(...words.map((s) => s.content as string), ...abortTaking(), text);
 			return "stopped";
 		};
 		// ctx.abort(), taking back the phone's steers it drops: pi's TUI puts every queued message
@@ -2583,7 +2876,7 @@ function main(pi: ExtensionAPI): void {
 		// not started yet) or messages wait in pi's queue, and the same again at shutdown (a typed
 		// prompt, a follow-up or a trigger may have started one since the reply).
 		const running = () =>
-			!ctx.isIdle() || compacting !== null || conn?.busy === true || conn?.framing !== undefined ||
+			!ctx.isIdle() || compacting !== null || conn?.busy === true || conn?.framing !== undefined || (conn?.steers?.length ?? 0) > 0 ||
 			(inputAt > 0 && Date.now() - inputAt < PROMPT_STARTING_MS) || ctx.hasPendingMessages?.() === true;
 		const close = (opts?: { idleOnly?: boolean }) => {
 			if (opts?.idleOnly && running()) return null;
@@ -2849,11 +3142,28 @@ function main(pi: ExtensionAPI): void {
 		write(conn, "busy", { quiet: conn.quietSent });
 	});
 
-	pi.on("agent_settled", () => {
+	// A turn: a busy steer said now waits for its end (holdsSteer), where pi reads its queue.
+	pi.on("turn_start", () => {
+		if (conn && !conn.closed) conn.inTurn = true;
+	});
+	// pi runs this inside finishTurn, before the agent loop reads its steering queue: a waiting steer
+	// handed over here lands at the same read it would have. One per turn, and only while pi holds
+	// none of its own, so the rest stay withdrawable (in pi's default one-at-a-time mode the loop
+	// reads one per turn anyway). Never on an aborted turn: the run is stopping (an Esc, the phone's
+	// Stop, or a /new, /resume, /fork or quit, which reset pi's queue right after), so they go back to
+	// the phone instead (returnSteers).
+	pi.on("turn_end", (event, ctx) => {
+		let pending = false;
+		try { pending = ctx?.hasPendingMessages?.() === true; } catch {}
+		turnEndSteers((event as { outcome?: string } | undefined)?.outcome === "aborted", pending);
+	});
+
+	pi.on("agent_settled", (event) => {
 		inputAt = 0;
 		// A settled run has delivered its steers, or an Esc at the keyboard put them in the editor
 		// for Eric there: none is the phone's to take back now.
 		queuedSteers = [];
+		settleSteers((event as { aborted?: boolean } | undefined)?.aborted === true);
 		if (afterStop.length) {
 			// As if typed after Esc; through inject, so a compaction starting now still holds them.
 			const text = afterStop.join("\n\n");
@@ -2901,7 +3211,13 @@ function main(pi: ExtensionAPI): void {
 		}
 		const out = held;
 		held = [];
-		out.forEach((content, i) => {
+		const c = conn;
+		out.forEach(({ content, steer }, i) => {
+			// A running turn's steer waits for its end like any other (holdsSteer), behind those waiting.
+			if (!idle && c && !c.closed && holdsSteer(c, withdrawableText(content, steer))) {
+				holdSteer(c, content, steer, { noted: true });
+				return;
+			}
 			const options = i > 0 ? { deliverAs: "followUp" as const } : idle ? undefined : { deliverAs: "steer" as const };
 			try { sendUser(pi, content, options); } catch {}
 		});
@@ -2933,6 +3249,9 @@ function main(pi: ExtensionAPI): void {
 		const c = conn;
 		conn = undefined;
 		if (!c || c.closed) return;
+		// Never handed to pi at teardown (it aborts and resets its queue): back to the phone, before a bye.
+		c.inTurn = false;
+		returnSteers(c, "stopped");
 		const reason = (event as { reason?: string }).reason;
 		if (reason === "new" || reason === "resume" || reason === "fork" || reason === "reload") {
 			// The next instance picks this up in session_start; if none does
