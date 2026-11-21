@@ -1602,6 +1602,26 @@ test("takeQueued: the phone's steers come back out of the editor; the TUI's own 
 	assert.deepEqual(takeQueued("a\n\na", ["a"]), { editor: "a", taken: ["a"] }, "each once");
 });
 
+test("takeQueued: only whole blocks, in queue order from the front; never part of Eric's own text", async () => {
+	const { takeQueued } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	// A phone text that's a word in what Eric typed: not a block, stays.
+	assert.deepEqual(takeQueued("looks ok to me", ["ok"]), { editor: "looks ok to me", taken: [] }, "substring of a word");
+	assert.deepEqual(takeQueued("okay", ["ok"]), { editor: "okay", taken: [] });
+	// A phone text inside Eric's draft (a line of it, not a block of its own): stays.
+	assert.deepEqual(takeQueued("my draft\nyes\nmore", ["yes"]), { editor: "my draft\nyes\nmore", taken: [] }, "inside his draft");
+	assert.deepEqual(takeQueued("tui queue\n\nsay yes then", ["yes"]), { editor: "tui queue\n\nsay yes then", taken: [] });
+	// Delivered but not matched (message_start's text didn't match): still in queuedSteers, not in the
+	// editor. Nothing of Eric's that merely contains it is cut.
+	assert.deepEqual(takeQueued("tui queued\n\nlooks ok to me", ["ok", "phone two"]), { editor: "tui queued\n\nlooks ok to me", taken: [] }, "delivered, not matched");
+	assert.deepEqual(takeQueued("phone two\n\nlooks ok to me", ["ok", "phone two"]), { editor: "looks ok to me", taken: ["phone two"] });
+	// Queue order from the front: the first match of each, after the one before it.
+	assert.deepEqual(takeQueued("x\n\ny\n\nx", ["x", "y"]), { editor: "x", taken: ["x", "y"] }, "the queued x, not the draft's");
+	assert.deepEqual(takeQueued("y\n\nx", ["x", "y"]), { editor: "y", taken: ["x"] }, "y before x: not in queue order, stays");
+	// A phone text with blank lines of its own is one block.
+	assert.deepEqual(takeQueued("one\n\ntwo\n\ndraft", ["one\n\ntwo"]), { editor: "draft", taken: ["one\n\ntwo"] });
+	assert.deepEqual(takeQueued("tui\n\nphone", ["phone"]), { editor: "tui", taken: ["phone"] }, "last block, with its blank line");
+});
+
 test("the phone's Stop returns the phone's queued steers (out of the TUI editor) as dropped; ids go on steer marks", async () => {
 	const key = phoneKey();
 	writeKeys({ 7: key.raw.toString("base64") });
@@ -1648,6 +1668,57 @@ test("the phone's Stop returns the phone's queued steers (out of the TUI editor)
 	editor = "";
 	assert.deepEqual(await stop(), { ok: true, stopped: true });
 	assert.equal(editor, "one more");
+});
+
+test("a phone say's id and Stop take only an extension's input: the same words typed at the keyboard stay his", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	await m.fire("agent_start");
+	const { nonce } = await ask({ type: "nonce" });
+	const signature = signV2(key, nonce, "session", "say", botsunSayPayload("yes", SAID));
+	assert.equal((await ask({ type: "say", text: "yes", nonce, device_id: 7, sig_v: 2, signature, client_id: SAID })).delivered, "steer");
+	// Eric types the same words before pi's input event for the phone's: his keyboard steer.
+	await m.fire("input", { type: "input", text: "yes", source: "interactive", streamingBehavior: "steer" });
+	assert.equal(m.entries.at(-1).data.client_id, undefined, "not the phone's id on his steer");
+	let editor = "";
+	let queued = ["yes"];
+	m.ctx.isIdle = () => false;
+	m.ctx.hasPendingMessages = () => queued.length > 0;
+	m.ctx.abort = () => { editor = [...queued, editor].filter((t) => t.trim()).join("\n\n"); queued = []; };
+	m.ctx.ui = { getEditorText: () => editor, setEditorText: (t) => (editor = t) };
+	const { nonce: n2 } = await ask({ type: "nonce" });
+	assert.deepEqual(await ask({ type: "stop", nonce: n2, device_id: 7, sig_v: 2, signature: signV2(key, n2, "session", "stop", "stop") }),
+		{ ok: true, stopped: true }, "his typed steer isn't sent to the phone");
+	assert.equal(editor, "yes", "it stays in his editor");
+	// The phone's own input event still finds its say.
+	await m.fire("input", { type: "input", text: "yes", source: "extension", streamingBehavior: "steer" });
+	assert.equal(m.entries.at(-1).data.client_id, SAID);
+});
+
+test("close: the phone's steers a non-idle Close takes out of the editor come back in its reply", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	await m.fire("agent_start");
+	const { nonce } = await ask({ type: "nonce" });
+	const signature = signV2(key, nonce, "session", "say", botsunSayPayload("also check the logs", SAID));
+	assert.equal((await ask({ type: "say", text: "also check the logs", nonce, device_id: 7, sig_v: 2, signature, client_id: SAID })).delivered, "steer");
+	await m.fire("input", { type: "input", text: "also check the logs", source: "extension", streamingBehavior: "steer" });
+	let editor = "draft";
+	let queued = ["also check the logs"];
+	const log = [];
+	m.ctx.isIdle = () => false;
+	m.ctx.hasPendingMessages = () => queued.length > 0;
+	m.ctx.abort = () => { log.push("abort"); editor = [...queued, editor].filter((t) => t.trim()).join("\n\n"); queued = []; };
+	m.ctx.shutdown = () => log.push("shutdown");
+	m.ctx.ui = { getEditorText: () => editor, setEditorText: (t) => (editor = t) };
+	const { nonce: n2 } = await ask({ type: "nonce" });
+	assert.deepEqual(await ask({ type: "close", nonce: n2, device_id: 7, sig_v: 2, signature: signV2(key, n2, "session", "close", "close") }),
+		{ ok: true, dropped: ["also check the logs"] });
+	assert.equal(editor, "draft");
+	await until(() => log.includes("shutdown"));
+	assert.deepEqual(log, ["abort", "shutdown"]);
 });
 
 test("interrupt: the phone's steers the abort dropped go again first, then the words", async () => {
@@ -1819,6 +1890,8 @@ test("reload: v2 only, its own decision; refused while a turn runs (nonce spent)
 	assert.equal(reloads.length, 1, "once");
 	assert.ok(!m.mod.phoneCommands({ getCommands: () => [{ name: RELOAD_COMMAND }, { name: "goal" }] }).some((c) => c.name === RELOAD_COMMAND),
 		"not on the phone's / list");
+	assert.deepEqual(m.mod.phoneCommands({ getCommands: () => [{ name: "agent-link-reload" }, { name: "agent-link" }] }).filter((c) => c.name.startsWith("agent-link")).map((c) => c.name),
+		["agent-link"], "nor agent-link's internal reload command");
 });
 
 test("reload and restart reply first and act after; a turn started in between stops them", async () => {
@@ -2291,6 +2364,7 @@ test("every signed request type refuses alike: bad request, used nonce, unknown 
 		answer: { type: "answer", ask_id: "nope", answers: [] },
 		stash: { type: "stash", op: "drop", id: "x1" },
 		stop: { type: "stop" },
+		unsteer: { type: "unsteer" },
 		close: { type: "close" },
 	};
 	for (const [name, body] of Object.entries(bodies)) {
@@ -2312,6 +2386,7 @@ test("every signed request type refuses alike: bad request, used nonce, unknown 
 // ---- Signing v2 (sig_v: 2) and device key pinning --------------------------
 
 const sha = (s) => createHash("sha256").update(s).digest("hex");
+const UNSTEER_V1 = "unsteer needs a v2 signature: v1 is refused (update Botsun and the app)";
 /** A v2 signature: "botsun-sign-v2" … kind, scope (the session id), decision, sha256(payload). */
 function signV2(key, nonce, kind, decision, payload, { scope = "sid-a", deviceId = "7" } = {}) {
 	const msg = ["botsun-sign-v2", deviceId, nonce, kind, scope, decision, sha(payload)].join("\n");
@@ -3598,4 +3673,282 @@ test("the prompt names each session the way the phone does, and drops the name w
 	assert.deepEqual(sections, {}, "a subagent child gets no identity section");
 	delete process.env.PI_SUBAGENT_CHILD;
 	await srv.stop();
+});
+
+// ---- Take back a steer (unsteer): held for the turn's end, flushed there, or handed back ----------
+
+const STEER_A = "aaaaaaaa-1111-4222-8333-444444444444";
+const STEER_B = "bbbbbbbb-1111-4222-8333-444444444444";
+const STEER_C = "cccccccc-1111-4222-8333-444444444444";
+
+/** A session that steers as pi does: sendUserMessage fires pi's input event (a steer only while a
+ * run streams, which these tests always are once agent_start fired), so the steer mark lands when
+ * pi takes it. */
+async function steering({ hostFeatures = ["model_pages", "unsteer"] } = {}) {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	const status = [];
+	m.ctx.ui = { setStatus: (k, t) => { if (k === "botsun-steers") status.push(t); } };
+	m.ctx.isIdle = () => false;
+	m.ctx.abort = () => {};
+	let pending = false;
+	m.ctx.hasPendingMessages = () => pending;
+	m.pi.sendUserMessage = async (content, options) => {
+		m.sent.push({ content, options });
+		await m.fire("input", { type: "input", text: typeof content === "string" ? content : "", source: "extension", streamingBehavior: options?.deliverAs });
+	};
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)) && srv.types().includes("hello"));
+	// Botsun answers the hello with what it takes: steers wait only for one that lists `unsteer`.
+	down(srv, { v: 1, type: "features", features: hostFeatures });
+	await until(() => globalThis[Symbol.for("botsun-owner.v1")]?.hostFeatures?.has(hostFeatures[0]));
+	await m.fire("agent_start");
+	const say = async (text, clientId) => {
+		const { nonce } = await ask({ type: "nonce" });
+		const signature = signV2(key, nonce, "session", "say", botsunSayPayload(text, clientId));
+		return ask({ type: "say", text, nonce, device_id: 7, sig_v: 2, signature, ...(clientId ? { client_id: clientId } : {}) });
+	};
+	const unsteer = async ({ v1 = false } = {}) => {
+		const { nonce } = await ask({ type: "nonce" });
+		if (v1) {
+			const msg = ["botsun-decide-v1", "7", nonce, "session", "sid-a", "unsteer", sha("unsteer")].join("\n");
+			const signature = cryptoSign("sha256", Buffer.from(msg), { key: key.privateKey, dsaEncoding: "der" }).toString("base64");
+			return ask({ type: "unsteer", nonce, device_id: 7, signature });
+		}
+		return ask({ type: "unsteer", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "unsteer", "unsteer") });
+	};
+	const lines = (type) => srv.lines.filter((l) => l.type === type);
+	const setPending = (v) => { pending = v; };
+	return { key, srv, m, say, unsteer, lines, setPending, status };
+}
+
+test("unsteer: a steer mid-turn waits for the turn's end, then goes in as a steer, marked only then", async () => {
+	const { m, say, lines } = await steering();
+	assert.ok((await ask({ type: "nonce" })).features.includes("unsteer"));
+	await m.fire("turn_start", { turnIndex: 0 });
+	assert.deepEqual(await say("run the tests first", STEER_A), { ok: true, delivered: "steer" });
+	assert.equal(m.sent.length, 0, "held for the turn's end");
+	assert.equal(m.entries.length, 0, "no steer mark for words pi hasn't taken");
+	await until(() => lines("steers").length >= 1);
+	const held = lines("steers").at(-1).steers;
+	assert.deepEqual(held.map((s) => [s.id, s.chars, s.photos]), [[STEER_A, 19, 0]]);
+	assert.equal(JSON.stringify(lines("steers")).includes("run the tests"), false, "the steers line never carries the words");
+	await m.fire("turn_end", { outcome: "completed" });
+	assert.deepEqual(m.sent, [{ content: "run the tests first", options: { deliverAs: "steer" } }]);
+	assert.deepEqual(m.entries.map((e) => [e.customType, e.data.text]), [["botsun-steer", "run the tests first"]], "marked as pi takes it");
+	await until(() => lines("steers").at(-1).steers.length === 0);
+	// Outside a turn (after its last turn_end) a steer has no turn_end left: straight in, as before.
+	await say("one more thing", STEER_B);
+	assert.deepEqual(m.sent.at(-1), { content: "one more thing", options: { deliverAs: "steer" } });
+});
+
+test("unsteer: one held steer per turn_end, and none while pi holds one of its own", async () => {
+	const { m, say, setPending } = await steering();
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("first", STEER_A);
+	await say("second", STEER_B);
+	setPending(true);
+	await m.fire("turn_end", { outcome: "completed" });
+	assert.equal(m.sent.length, 0, "pi still has a steer queued: the rest stay withdrawable");
+	// Between turns, a new steer waits behind the held ones (never jumps ahead of them).
+	await say("third", STEER_C);
+	assert.equal(m.sent.length, 0);
+	setPending(false);
+	await m.fire("turn_start", { turnIndex: 1 });
+	await m.fire("turn_end", { outcome: "error" }); // an error's retry reads the queue too: as today
+	assert.deepEqual(m.sent.map((s) => s.content), ["first"]);
+	await m.fire("turn_start", { turnIndex: 2 });
+	await m.fire("turn_end", { outcome: "completed" });
+	assert.deepEqual(m.sent.map((s) => s.content), ["first", "second"]);
+	// The run settles with one still held (no turn_end left for it): his next prompt, not lost.
+	await m.fire("agent_settled", { aborted: false });
+	assert.deepEqual(m.sent.at(-1), { content: "third", options: undefined });
+	assert.equal(m.entries.filter((e) => e.data.text === "third").length, 0, "a prompt is no steer: no mark");
+});
+
+test("unsteer: takes back every held steer, oldest first, signed v2; the escrow keeps them until Botsun acks", async () => {
+	const { m, srv, say, unsteer, lines } = await steering();
+	// Before any v2 from this device (whose first v2 would refuse every v1 after it anyway).
+	assert.equal((await unsteer({ v1: true })).error, UNSTEER_V1, "v1 is refused");
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("wait, use the staging db", STEER_A);
+	await say("and skip the slow specs", STEER_B);
+	const res = await unsteer();
+	assert.deepEqual(res, { ok: true, withdrawn: [{ id: STEER_A, text: "wait, use the staging db" }, { id: STEER_B, text: "and skip the slow specs" }], kept: 0 });
+	await m.fire("turn_end", { outcome: "completed" });
+	assert.equal(m.sent.length, 0, "nothing withdrawn reaches pi");
+	assert.equal(m.entries.length, 0, "and leaves no steer mark");
+	assert.deepEqual(await unsteer(), { ok: true, withdrawn: [], kept: 0 }, "nothing held: says so, and never stops");
+	await until(() => lines("returned").length === 2);
+	assert.deepEqual(lines("returned").map((l) => [l.session_id, l.steers[0].id, l.steers[0].why]), [["sid-a", STEER_A, "withdrawn"], ["sid-a", STEER_B, "withdrawn"]]);
+	// Botsun gone and back: the escrow goes again after the hello, until Botsun's returned_ack.
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	assert.equal(conn.returned.length, 2);
+	down(srv, { v: 1, type: "returned_ack", ids: [STEER_A] });
+	await until(() => conn.returned.length === 1);
+	for (const c of srv.conns) c.destroy();
+	await until(() => srv.types().filter((t) => t === "hello").length === 2);
+	await until(() => lines("returned").length === 3);
+	assert.equal(lines("returned").at(-1).steers[0].id, STEER_B, "only what Botsun hasn't acked");
+});
+
+test("unsteer: a reply stays under the cap; the rest stay held for the next press; too big is never held", async () => {
+	const { m, say, unsteer } = await steering();
+	const { STEER_BYTES_MAX, UNSTEER_REPLY_MAX } = m.mod;
+	await m.fire("turn_start", { turnIndex: 0 });
+	const big = (c) => c.repeat(STEER_BYTES_MAX - 100);
+	const ids = ["11111111-0000-4000-8000-000000000001", "11111111-0000-4000-8000-000000000002", "11111111-0000-4000-8000-000000000003", "11111111-0000-4000-8000-000000000004"];
+	for (const [i, id] of ids.entries()) await say(big("abcd"[i]).slice(0, 16_000), id);
+	assert.equal(m.sent.length, 0);
+	const first = await unsteer();
+	assert.ok(Buffer.byteLength(JSON.stringify(first)) <= UNSTEER_REPLY_MAX, "under the cap");
+	assert.ok(first.withdrawn.length >= 1 && first.kept >= 1, "the rest stay held");
+	assert.equal(first.withdrawn.length + first.kept, 4);
+	const second = await unsteer();
+	assert.deepEqual([...first.withdrawn, ...second.withdrawn].map((s) => s.id), ids, "in order, none lost");
+	// Too big for a reply (in UTF-8): straight in, not withdrawable.
+	const wide = "é".repeat(9_000);
+	await say(wide, STEER_C);
+	assert.deepEqual(m.sent.at(-1), { content: wide, options: { deliverAs: "steer" } });
+});
+
+test("unsteer: a photo steer and a compaction's held words go as before, never held", async () => {
+	const { m, key } = await steering();
+	await m.fire("turn_start", { turnIndex: 0 });
+	const images = [{ data: Buffer.from("png").toString("base64"), mime_type: "image/png" }];
+	const { nonce } = await ask({ type: "nonce" });
+	const text = "like this";
+	const signature = signV2(key, nonce, "session", "say_images", botsunSayPayload(text, undefined, images));
+	assert.equal((await ask({ type: "say", text, images, nonce, device_id: 7, sig_v: 2, signature })).delivered, "steer");
+	assert.equal(m.sent.length, 1, "photos aren't withdrawable yet: straight in");
+	assert.equal(m.sent[0].options.deliverAs, "steer");
+});
+
+test("unsteer: an aborted turn, a stopped run or a shutdown hands held steers back, never to pi", async () => {
+	const { m, srv, say, lines } = await steering();
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("held one", STEER_A);
+	// Held steers make a locked phone's close wait: they're on their way in.
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	m.ctx.isIdle = () => true;
+	await m.fire("agent_settled", { aborted: true }); // settles busy off, and hands it back
+	assert.equal(m.sent.length, 0, "an aborted run never restarts the agent");
+	await until(() => lines("returned").length === 1);
+	assert.deepEqual(lines("returned")[0].steers.map((s) => [s.id, s.text, s.why]), [[STEER_A, "held one", "stopped"]]);
+
+	await m.fire("agent_start");
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("held two", STEER_B);
+	assert.equal(conn.close({ idleOnly: true }), null, "a held steer counts as running");
+	await m.fire("turn_end", { outcome: "aborted" });
+	assert.equal(m.sent.length, 0, "an aborted turn never flushes");
+	await until(() => lines("returned").length === 2);
+
+	await m.fire("turn_start", { turnIndex: 1 });
+	await say("held three", STEER_C);
+	await m.fire("session_shutdown", { reason: "quit" });
+	await until(() => lines("returned").length === 3 && lines("bye").length === 1);
+	assert.equal(m.sent.length, 0);
+	const order = srv.lines.map((l) => l.type);
+	assert.ok(order.lastIndexOf("returned") < order.indexOf("bye"), "returned goes before the bye");
+});
+
+test("unsteer: a steer held over a /new handoff goes back to the phone, in the conversation pi moves to", async () => {
+	const { m, srv, say, lines } = await steering();
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("keep this", STEER_A);
+	await m.fire("session_shutdown", { reason: "new" });
+	await until(() => lines("returned").length === 1);
+	assert.equal(lines("returned")[0].session_id, "sid-a", "said while still in the old one");
+	assert.equal(m.sent.length, 0);
+	// The phone follows pi to the new conversation and reads that thread: the escrow goes again,
+	// named for it, right after the session line (Botsun takes a line only for the current one).
+	const b = await mount({ ctx: { sessionManager: { getSessionFile: () => "/tmp/sessions/b.jsonl", getSessionId: () => "sid-b" } } });
+	await b.fire("session_start", { reason: "new" });
+	await until(() => lines("returned").length === 2);
+	const order = srv.lines.map((l) => l.type);
+	assert.ok(order.indexOf("session") < order.lastIndexOf("returned"), "after the session line");
+	assert.deepEqual([lines("returned")[1].session_id, lines("returned")[1].steers[0].id], ["sid-b", STEER_A]);
+	// And after a reconnect's hello, still the new conversation's, until Botsun acks it.
+	for (const c of srv.conns) c.destroy();
+	await until(() => lines("returned").length === 3);
+	assert.equal(lines("returned")[2].session_id, "sid-b");
+	down(srv, { v: 1, type: "returned_ack", ids: [STEER_A] });
+	await until(() => globalThis[Symbol.for("botsun-owner.v1")].returned.length === 0);
+});
+
+test("unsteer: an older Botsun (no `unsteer` in its features line) gets every steer at once, as before", async () => {
+	const { m, say, lines } = await steering({ hostFeatures: ["model_pages"] });
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("go now", STEER_A);
+	assert.deepEqual(m.sent, [{ content: "go now", options: { deliverAs: "steer" } }], "never held: it could never come back");
+	await m.fire("turn_end", { outcome: "aborted" });
+	await sleep(30);
+	assert.equal(lines("returned").length, 0);
+});
+
+test("unsteer: pi's footer shows how many phone steers wait, and clears when none do", async () => {
+	const { m, say, unsteer, status } = await steering();
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("first", STEER_A);
+	await say("second", STEER_B);
+	assert.equal(status.at(-1), "📱 2 phone steers waiting for the turn's end");
+	await m.fire("turn_end", { outcome: "completed" });
+	assert.equal(status.at(-1), "📱 1 phone steer waiting for the turn's end");
+	await unsteer();
+	assert.equal(status.at(-1), undefined);
+	assert.equal(m.mod.steerStatusText(0), undefined);
+});
+
+test("unsteer: a photo steer behind a waiting one waits too (his order), and an unsteer leaves it in place", async () => {
+	const { m, key, say, unsteer, lines } = await steering();
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("first words", STEER_A);
+	const images = [{ data: Buffer.from("png").toString("base64"), mime_type: "image/png" }];
+	const { nonce } = await ask({ type: "nonce" });
+	const signature = signV2(key, nonce, "session", "say_images", botsunSayPayload("this one", undefined, images));
+	assert.equal((await ask({ type: "say", text: "this one", images, nonce, device_id: 7, sig_v: 2, signature })).delivered, "steer");
+	await say("last words", STEER_C);
+	assert.equal(m.sent.length, 0, "the photo waits behind the first words");
+	await until(() => lines("steers").at(-1)?.steers.length === 2);
+	assert.deepEqual(lines("steers").at(-1).steers.map((s) => s.id), [STEER_A, STEER_C], "only what a Stop can take back is listed");
+	const res = await unsteer();
+	assert.deepEqual(res.withdrawn.map((s) => s.id), [STEER_A, STEER_C]);
+	assert.equal(res.kept, 0);
+	await m.fire("turn_end", { outcome: "completed" });
+	assert.equal(m.sent.length, 1, "the photo goes in at the turn's end");
+	assert.equal(m.sent[0].options.deliverAs, "steer");
+	assert.ok(Array.isArray(m.sent[0].content) && m.sent[0].content.some((b) => b.type === "image"));
+});
+
+test("unsteer: the phone's Stop hands the waiting steers back by id in its reply, and they never reach pi", async () => {
+	const { m, key, say, lines } = await steering();
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("not yet read", STEER_A);
+	const { nonce } = await ask({ type: "nonce" });
+	const res = await ask({ type: "stop", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "stop", "stop") });
+	assert.equal(res.ok, true);
+	assert.deepEqual(res.returned, [{ id: STEER_A, text: "not yet read" }]);
+	await m.fire("turn_end", { outcome: "aborted" });
+	await m.fire("agent_settled", { aborted: true });
+	assert.equal(m.sent.length, 0);
+	await until(() => lines("returned").length === 1);
+	assert.equal(lines("returned")[0].steers[0].why, "stopped");
+});
+
+test("unsteer: a steer that came in during a compaction waits behind the waiting ones once it ends", async () => {
+	const { m, say, unsteer } = await steering();
+	await m.fire("turn_start", { turnIndex: 0 });
+	await say("before", STEER_A);
+	await m.fire("session_before_compact", { reason: "threshold" });
+	await say("during", STEER_B);
+	assert.equal(m.sent.length, 0);
+	await m.fire("session_compact", {});
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	await until(() => (conn.steers ?? []).length === 2);
+	assert.equal(m.sent.length, 0, "never ahead of the one waiting");
+	assert.deepEqual((await unsteer()).withdrawn.map((s) => s.id), [STEER_A, STEER_B]);
 });
