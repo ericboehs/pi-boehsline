@@ -177,6 +177,30 @@ function newestMtime(dir) {
 const ACTIVITY_STATES = new Set(["working", "blocked", "done", "error", "idle"]);
 export const WATCH_FILE = ".watch.json";
 
+// Sections written for other readers but not drawn on the page. auto-jobs
+// (the Background jobs card) stays in sections.json with its file, exactly as
+// canvas.ts writes it, because Botsun reads it as its jobs and scheduled-tasks
+// feed (lib/botsun/session_canvas.rb); Botsun's info sheet shows them now, so
+// the page leaves the section out: no card, no Contents entry, no count, no
+// "new" dot, no reload while its body ticks. PI_CANVAS_SHOW_JOBS=1 draws it again.
+export function hiddenSections(env = process.env) {
+  return env.PI_CANVAS_SHOW_JOBS === "1" ? new Set() : new Set(["auto-jobs"]);
+}
+
+/** sections.json as the page gets it: hiddenSections() left out. */
+export function pageSections(list, env = process.env) {
+  if (!Array.isArray(list)) return [];
+  const hidden = hiddenSections(env);
+  return hidden.size ? list.filter((s) => !hidden.has(s?.id)) : list;
+}
+
+/** A change under a session folder that is only a hidden section's body (auto-jobs.jobs rewritten every 2 s). */
+export function hiddenChange(relPath, env = process.env) {
+  const name = String(relPath).split(/[\\/]/).pop() || "";
+  for (const id of hiddenSections(env)) if (name.startsWith(`${id}.`)) return true;
+  return false;
+}
+
 export function sessionState(root, id) {
   const dir = join(root, id);
   const meta = readJson(join(dir, "meta.json"), { id });
@@ -194,7 +218,7 @@ export function sessionState(root, id) {
   // The current or last turn, so the page can mark what it touched.
   const t = readJson(join(dir, "turn.json"), null);
   const turn = typeof t?.started === "string" ? { started: t.started, ...(typeof t.ended === "string" ? { ended: t.ended } : {}) } : undefined;
-  return { meta: { ...pageMeta(meta), id }, live, tmux: live && Boolean(tmuxOf(meta)), activity, activityMessage, activityAt, turn, status, reply: readReply(dir), acks: live ? readAcks(dir) : [], sections: Array.isArray(sections) ? sections : [], watch: readWatch(root), updated: newestMtime(dir) };
+  return { meta: { ...pageMeta(meta), id }, live, tmux: live && Boolean(tmuxOf(meta)), activity, activityMessage, activityAt, turn, status, reply: readReply(dir), acks: live ? readAcks(dir) : [], sections: pageSections(sections), ...(hiddenSections().has("auto-jobs") ? {} : { showJobs: true }), watch: readWatch(root), updated: newestMtime(dir) };
 }
 
 /**
@@ -1174,6 +1198,7 @@ function onChange(relPath) {
   const id = relPath.split(/[\\/]/)[0];
   if (!id || id.startsWith(".") || !SESSION_ID.test(id)) return;
   if (/^[^\\/]+[\\/]inbox([\\/]|$)/.test(relPath)) return; // talk-back queue: its ack file is what the page waits for
+  if (hiddenChange(relPath)) return; // a body the page doesn't draw (auto-jobs); sections.json still publishes
   clearTimeout(pending.get(id));
   pending.set(
     id,

@@ -16,7 +16,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import canvasExtension, { ActivityTracker, daemonVersion, STATUS_PROMPT, checkChart, compareOptions, normalizeSpec, parseDelimited, diffSkipReason, fileId, filesMarkdown, syncCopies, gitDiff, isSensitivePath, jobsSpec, jobsCard, durableViews, readDurableViews, scheduledSpec, sessionViews, MAX_SCHEDULED, logTail, looksLikeDiff, makePatch, isSectionId, parseExtras, shotsMarkdown, agentTraffic, agentsMarkdown, bashExit, runSpec, streamable, tailLines, readPeers, resolvePeerName, tallyFiles, lastReply, sessionInfo, uniichatInfo, lastTurn, mergeOps, normalizeCode, normalizeOptions, normalizeTracker, normalizeTree, parseLineRange, nextSteps, claimInbox, ackInbox, withoutNextSteps, leftHalfBounds, openTodos, parseStatus, tmuxMeta, todoBoard, turnDigest, upsertSection, worthStatus } from "../extensions/canvas/index.ts";
-import { allowedHost, byteRange, clipTarget, latestClient, listSessions, prune, queueMessage, readAcks, readReply, readWatch, replyPreview, sessionForPane, sessionState, tmuxOf, withKit, PLAN_JS, SANDBOXED_SECTION_CSP, scriptableType, parseGitStatus, usageRows, gitInfo, sessionInfoOf } from "../extensions/canvas/daemon.mjs";
+import { allowedHost, byteRange, clipTarget, hiddenChange, latestClient, listSessions, pageSections, prune, queueMessage, readAcks, readReply, readWatch, replyPreview, sessionForPane, sessionState, tmuxOf, withKit, PLAN_JS, SANDBOXED_SECTION_CSP, scriptableType, parseGitStatus, usageRows, gitInfo, sessionInfoOf } from "../extensions/canvas/daemon.mjs";
 
 const msg = (role, content, extra = {}) => ({ type: "message", message: { role, content, ...extra } });
 
@@ -1190,6 +1190,48 @@ test("Scheduled: soonest first, paused last, at most 20; the jobs card keeps tim
   const both = JSON.parse(jobsCard([job], [v("p", null, "paused"), v("soon", "2026-10-31T12:01:00Z")], read));
   assert.deepEqual([both.jobs.map((j) => j.id), both.scheduled.map((x) => x.id)], [["j"], ["soon", "p"]]);
   assert.deepEqual(JSON.parse(jobsCard([job], [], read)).scheduled, [], "jobs only: an empty group");
+});
+
+test("Background jobs: auto-jobs stays on disk for Botsun but the page never gets it (PI_CANVAS_SHOW_JOBS=1 brings it back)", () => {
+  const { root, mk } = tempRoot();
+  const was = process.env.PI_CANVAS_SHOW_JOBS;
+  delete process.env.PI_CANVAS_SHOW_JOBS;
+  try {
+    // As canvas.ts's writeJobs/putMarkdown write it: the body from jobsCard and the list entry Botsun matches on.
+    const v = { id: "t1", name: "nightly", kind: "interval", every: "every 5m", next: "2026-10-31T12:01:00Z", last: null, status: "armed", source: "session" };
+    const body = jobsCard([{ id: "j", name: "vite", command: "vite", logPath: "/t/a.log", startedAt: 0 }], [v], () => null);
+    const jobs = { id: "auto-jobs", title: "Background jobs", kind: "jobs", file: "auto-jobs.jobs", at: "2026-10-31T12:00:00.000Z", by: "auto" };
+    const notes = { id: "notes", title: "Notes", kind: "markdown", file: "notes.md", at: "2026-10-31T12:00:00.000Z" };
+    const list = JSON.stringify([jobs, notes], null, 2);
+    mk("s1", { name: "busy", pid: process.pid }, { "sections.json": list, "auto-jobs.jobs": body, "notes.md": "hi" });
+
+    assert.deepEqual(sessionState(root, "s1").sections.map((s) => s.id), ["notes"], "no card, no Contents entry");
+    assert.equal("showJobs" in sessionState(root, "s1"), false);
+    assert.equal(listSessions(root).find((s) => s.id === "s1").sections, 1, "not counted on the index");
+    assert.equal(hiddenChange("s1/auto-jobs.jobs"), true, "its 2 s rewrites don't reload the page");
+    assert.equal(hiddenChange("s1/auto-jobs.jobs.tmp-1"), true);
+    for (const f of ["s1/sections.json", "s1/notes.md", "s1/auto-jobsx.md", "s1/turn.json"]) assert.equal(hiddenChange(f), false, f);
+
+    // Botsun's feed is untouched: the same file, the same entry and fields (SESSION_ONLY: kind "jobs", file "auto-jobs.jobs").
+    assert.equal(readFileSync(join(root, "s1", "sections.json"), "utf8"), list);
+    assert.equal(readFileSync(join(root, "s1", "auto-jobs.jobs"), "utf8"), body);
+    assert.deepEqual(JSON.parse(list).find((s) => s.id === "auto-jobs"), jobs);
+    assert.deepEqual(Object.keys(JSON.parse(body)).sort(), ["jobs", "scheduled"]);
+    assert.deepEqual(JSON.parse(body).scheduled.map((x) => x.id), ["t1"]);
+
+    // The escape hatch.
+    assert.deepEqual(pageSections([jobs, notes], { PI_CANVAS_SHOW_JOBS: "1" }).map((s) => s.id), ["auto-jobs", "notes"]);
+    assert.equal(hiddenChange("s1/auto-jobs.jobs", { PI_CANVAS_SHOW_JOBS: "1" }), false);
+    process.env.PI_CANVAS_SHOW_JOBS = "1";
+    assert.deepEqual(sessionState(root, "s1").sections.map((s) => s.id), ["auto-jobs", "notes"]);
+    assert.equal(sessionState(root, "s1").showJobs, true, "tells the page to draw it");
+    assert.equal(listSessions(root).find((s) => s.id === "s1").sections, 2);
+    assert.deepEqual(pageSections(null), []);
+  } finally {
+    if (was === undefined) delete process.env.PI_CANVAS_SHOW_JOBS;
+    else process.env.PI_CANVAS_SHOW_JOBS = was;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Running: tail, exit code, secret commands and the spec", () => {

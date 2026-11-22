@@ -2012,7 +2012,10 @@ export default function canvas(pi: ExtensionAPI) {
    * Background jobs: bg.ts's jobs, from its `bg:jobs` events (no import). A
    * running job joins the card; a finished one stays, with its exit, for 10
    * minutes. Log tails are re-read every 2 s while the card shows a job, and
-   * the card is only rewritten when something changed.
+   * the card is only rewritten when something changed. The canvas page no
+   * longer draws it (daemon.mjs hiddenSections; PI_CANVAS_SHOW_JOBS=1 does),
+   * but the section, its list entry and fields stay exactly as written here:
+   * Botsun reads auto-jobs as its jobs and scheduled-tasks feed.
    */
   const JOBS_EVERY_MS = 2000;
   const JOBS_KEEP_MS = 10 * 60_000; // how long a finished job stays on the card

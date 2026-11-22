@@ -76,7 +76,7 @@ const STATE = {
   meeting: { kind: "list", id: "", recent: [], at: "2026-10-28T14:00:00.000Z" },
 };
 
-async function runPage({ url, metas = {}, bridge = false }) {
+async function runPage({ url, metas = {}, bridge = false, state = STATE }) {
   const head = Object.entries(metas)
     .map(([k, v]) => `<meta name="${k}" content="${v}">`)
     .join("");
@@ -89,7 +89,7 @@ async function runPage({ url, metas = {}, bridge = false }) {
   w.fetch = async (u, opts = {}) => {
     fetches.push({ url: String(u), method: opts.method || "GET" });
     const path = String(u);
-    const body = /\/api\/s\/[^/]+$/.test(path) ? STATE : /\/api\/sessions$/.test(path) ? [] : /themes\.json$/.test(path) ? { themes: {} } : {};
+    const body = /\/api\/s\/[^/]+$/.test(path) ? state : /\/api\/sessions$/.test(path) ? [] : /themes\.json$/.test(path) ? { themes: {} } : {};
     return { ok: true, status: 200, json: async () => body, text: async () => (typeof body === "object" ? "# Notes\n\nhello" : "") };
   };
   const streams = [];
@@ -163,6 +163,20 @@ test("page, embedded read-only and polled: host URLs, no POST, no send box, setI
   assert.ok(w.document.documentElement.classList.contains("canvas-ro"), "the review gutter is off");
   assert.ok(doc.querySelector("#sec-notes"), "the section itself shows");
   assert.ok(fetches.every((f) => f.method === "GET"), "never a POST");
+});
+
+test("page: no Background jobs card or Contents entry (Botsun's feed), unless the state says showJobs", async () => {
+  const JOBS = { id: "auto-jobs", title: "Background jobs", kind: "jobs", file: "auto-jobs.jobs", at: new Date(Date.now() + 1000).toISOString(), by: "auto" };
+  for (const metas of [{}, EMBED]) {
+    const { doc, fetches } = await runPage({ url: metas === EMBED ? "https://host.test/index.html" : "http://127.0.0.1:8790/s/s1", metas, state: { ...STATE, sections: [JOBS, FRESH] } });
+    assert.equal(doc.querySelector("#sec-auto-jobs"), null, "no card");
+    assert.equal(doc.querySelector(".card[data-kind=jobs]"), null);
+    assert.ok(![...doc.querySelectorAll(".toc a")].some((a) => /Background jobs/.test(a.textContent)), "no Contents entry");
+    assert.ok(!fetches.some((f) => f.url.includes("auto-jobs")), "its body is never fetched");
+    assert.ok(doc.querySelector("#sec-notes"), "the other section shows");
+  }
+  const { doc } = await runPage({ url: "http://127.0.0.1:8790/s/s1", state: { ...STATE, showJobs: true, sections: [JOBS, FRESH] } });
+  assert.ok(doc.querySelector("#sec-auto-jobs"), "PI_CANVAS_SHOW_JOBS=1: the card again");
 });
 
 test("page, read-only with a host bridge: Next steps post {text} to it, still no POST", async () => {

@@ -1109,6 +1109,17 @@ function sortSections(list) {
   return [...list].sort((a, b) => String(b.at).localeCompare(String(a.at)));
 }
 
+/**
+ * The state's sections less the ones the page doesn't draw: auto-jobs (Background jobs) stays in
+ * sections.json as Botsun's jobs and scheduled-tasks feed, and Botsun's info sheet shows them, so
+ * no card, Contents entry, count or "new" dot here. The daemon drops it already; this covers an
+ * embedding host that passes it through. state.showJobs (the daemon's PI_CANVAS_SHOW_JOBS=1) keeps it.
+ */
+function shownSections(state) {
+  const list = Array.isArray(state?.sections) ? state.sections : [];
+  return state?.showJobs ? list : list.filter((s) => s?.id !== "auto-jobs");
+}
+
 /** The watcher's snapshot as the auto-watch widget, on every session's page while /watch runs. */
 function withWatch(sections, watch) {
   if (!watch || typeof watch !== "object") return sections;
@@ -2016,6 +2027,7 @@ function cardDetail(items, i, { todo, board, moves }) {
 }
 
 // ── Background jobs (auto-jobs): render.mjs's renderJobs draws the rows; the page adds a click that opens the job's log full screen ──
+// Drawn only with PI_CANVAS_SHOW_JOBS=1: otherwise the daemon (hiddenSections) and shownSections leave auto-jobs out.
 let jobsLatest = []; // the newest spec's jobs: the modal follows them as the card is rewritten
 let jobView = null; // { id, refresh(job) } while the modal shows a job
 // The rows tick themselves (render.mjs); the modal's running time ticks here.
@@ -3044,7 +3056,7 @@ async function sessionView(id) {
       if (by && state.status) by.textContent = statusBy(state.status);
     }
 
-    const sections = sortSections(withMeeting(withWatch(state.sections, state.watch), state.meeting));
+    const sections = sortSections(withMeeting(withWatch(shownSections(state), state.watch), state.meeting));
     pageShots = sections.filter((s) => s.kind === "image").map((s) => ({ src: new URL(bodyUrl(id, s), location.href).href, alt: s.title || "Image" }));
     const keep = new Set(sections.map((s) => s.id));
     for (const [sid, c] of cards) if (!keep.has(sid)) (c.el.remove(), cards.delete(sid));

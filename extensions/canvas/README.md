@@ -266,8 +266,18 @@ the review prompt — so a renderer never reaches for a page global.
   find-generic-password`, `printenv`, `env`, `gh auth token` and the like)
   never stream. Haiku neither trims nor sees the Running card.
   While a background job runs (the `bg.ts` extension: a `bash` call sent to
-  the background or adopted after its budget), a **Background jobs** card
-  (`auto-jobs`) sits at the top of the side panel, above Tasks. Each job is
+  the background or adopted after its budget), or a scheduled task is armed,
+  the extension keeps a **Background jobs** section (`auto-jobs`, kind
+  `jobs`, file `auto-jobs.jobs`) in `sections.json`. It is Botsun's feed
+  (`lib/botsun/session_canvas.rb` reads its jobs and `scheduled` tasks for the
+  phone's info sheet), so it is written exactly as before, but the canvas page
+  no longer draws it: no card, no Contents entry, not in the index's section
+  count, no "new" dot, and its 2 s rewrites don't reload the page (the daemon
+  leaves it out of `/api/s/<id>` and ignores changes to its body; the page
+  also drops it if an embedding host passes it through).
+  `PI_CANVAS_SHOW_JOBS=1` in the daemon's environment (it inherits
+  `PI_CANVAS_*` from the pi that starts it; restart the daemon) draws it again,
+  as below. Drawn, it sits at the top of the side panel, above Tasks. Each job is
   a row: a pulsing dot, its name, a ticking elapsed time and the command.
   A click (or Enter) opens the job full screen: the whole command, when it
   started and ended, its newest 200 log lines (colours dropped, a redrawn
@@ -735,7 +745,8 @@ unchanged: the host intercepts navigation.
 
 `PI_CANVAS=0` disables everything, `PI_CANVAS_STATUS=0` keeps the tool without
 status runs, `PI_CANVAS_TMUX=0` turns off tmux follow mode,
-`PI_CANVAS_THEME=system` follows Omarchy until a theme is picked, and
+`PI_CANVAS_THEME=system` follows Omarchy until a theme is picked,
+`PI_CANVAS_SHOW_JOBS=1` draws the Background jobs card again, and
 `PI_CANVAS_MODEL=provider/id` changes the status model.
 Subagent children skip the canvas.
 
