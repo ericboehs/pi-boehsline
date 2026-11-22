@@ -82,9 +82,10 @@ async function resume(t, session) {
   const bus = new Map();
   const sent = [];
   const notices = [];
+  const commands = new Map();
   backgroundTasks({
     registerTool() {},
-    registerCommand() {},
+    registerCommand: (name, options) => commands.set(name, options),
     registerShortcut() {},
     on: (name, handler) => handlers.set(name, handler),
     sendMessage: (message) => sent.push(message.content),
@@ -99,6 +100,7 @@ async function resume(t, session) {
   return {
     sent,
     notices,
+    command: (name, args) => commands.get(name).handler(args, ctx),
     list: () => {
       let jobs;
       bus.get("bg:list")({ reply: (value) => (jobs = value) });
@@ -221,4 +223,24 @@ test("the wrapper never writes its status through a planted temp-file symlink", 
   const pi = await resume(t, session);
   await waitFor("the report", () => pi.sent.length > 0, 2000);
   assert.match(pi.sent[0], / exited 4 after \d+s while the session was closed\n/);
+});
+
+test("/bg --no-wake <id> saves wake:false in the registry, which the wake tick reads; --wake undoes it", async (t) => {
+  const session = sid("no-wake");
+  const go = path.join(dir, `${session}.go`);
+  const job = oldPi(session, waitsFor(go, "done", 0));
+  t.after(() => writeFileSync(go, ""));
+  const pi = await resume(t, session);
+  const entry = () => JSON.parse(readFileSync(registry(session), "utf8")).jobs.find((j) => j.id === job.id);
+  assert.equal(entry().wake, undefined, "absent by default: the tick may wake for it");
+
+  await pi.command("bg", `--no-wake ${job.id}`);
+  assert.equal(entry().wake, false);
+  assert.match(pi.notices.at(-1), /will not reopen this session/);
+
+  await pi.command("bg", `${job.id} --wake`);
+  assert.equal(entry().wake, undefined);
+
+  await pi.command("bg", "--no-wake ffffff");
+  assert.match(pi.notices.at(-1), /No bg job ffffff/);
 });

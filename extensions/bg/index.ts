@@ -91,7 +91,14 @@
  *   PI_BG_STATE_DIR   job registry directory (default
  *                     $XDG_STATE_HOME/pi-bg or ~/.local/state/pi-bg, 0700)
  *   PI_BG_TAIL_LINES  lines injected on completion (default 15, 0 disables)
- *   PI_BG_WAKE        followUp | nextTurn | off  (default followUp)
+ *   PI_BG_WAKE        followUp | nextTurn | off  (default followUp); the
+ *                     pi-scheduler wake tick never reopens a closed session
+ *                     for a job when it is off or nextTurn
+ *
+ * Reopening a crashed session: a running job's registry entry may carry
+ *   `wake: false` (`/bg --no-wake <id>`, or a bg:start `wake: false`), which
+ *   keeps the pi-scheduler tick (packages/scheduler/extensions/lib/wake.ts)
+ *   from reopening its session when the job finishes after a crash.
  *   PI_BG_FG_TIMEOUT  foreground seconds before auto-background (default
  *                     120; 0 disables auto-background)
  *   PI_BG_MAX_TIMEOUT maximum explicit foreground timeout in seconds (default
@@ -360,6 +367,12 @@ interface JobRecord {
 	adopted?: boolean;
 	/** Last time a pi saw it in the registry; ages out not-running entries. */
 	seenAt?: number;
+	/**
+	 * `false`: finishing while its session is closed must not reopen the
+	 * session (`/bg --no-wake <id>`, or a bg:start `wake: false`). Absent means
+	 * the pi-scheduler wake tick may, for a session that crashed.
+	 */
+	wake?: false;
 }
 
 interface Job extends JobRecord {
@@ -375,13 +388,23 @@ interface Job extends JobRecord {
 	unrefChild?: () => void;
 }
 
+/** `--no-wake <id>` or `--wake <id>` (either order), or undefined for anything else. */
+export function parseWakeFlag(args: string): { id: string; wake: boolean } | undefined {
+	const words = args.trim().split(/\s+/).filter(Boolean);
+	if (words.length !== 2) return undefined;
+	const flag = words.find((word) => word === "--no-wake" || word === "--wake");
+	const id = words.find((word) => JOB_ID_RE.test(word));
+	return flag && id ? { id, wake: flag === "--wake" } : undefined;
+}
+
 function toRecord(job: Job): JobRecord {
 	const { id, name, command, cwd, logPath, pid, pidStart, sessionId, startedAt, endedAt, exitCode, signal } = job;
-	const { exitUnknown, startFailed, killedByUser, wakeOnKill, quiet, summary, named, meta, tailLines, tailMaxChars, reported, adopted } = job;
+	const { exitUnknown, startFailed, killedByUser, wakeOnKill, quiet, summary, named, meta, tailLines, tailMaxChars, reported, adopted, wake } = job;
 	return {
 		id, name, command, cwd, logPath, pid, pidStart, sessionId, startedAt, endedAt, exitCode, signal,
 		exitUnknown, startFailed, killedByUser, wakeOnKill, quiet, summary, named, meta, tailLines, tailMaxChars, reported, adopted,
 		seenAt: Date.now(),
+		...(wake === false ? { wake } : {}),
 	};
 }
 
@@ -433,6 +456,7 @@ function parseRecord(raw: unknown): JobRecord | undefined {
 		reported: r.reported === true,
 		adopted: r.adopted === true,
 		seenAt: optional(r.seenAt, time),
+		...(r.wake === false ? { wake: false as const } : {}),
 	};
 }
 
@@ -930,6 +954,8 @@ interface BgStartRequest {
 	details?: boolean;
 	/** The caller's own fields for the completion details (cleanJobMeta: at most 8 keys, 2KB). */
 	meta?: unknown;
+	/** `false`: never reopen a closed session for this job (see JobRecord.wake). */
+	wake?: boolean;
 	accepted?: boolean;
 	reply?: (result: { id: string; logPath: string } | { error: string }) => void;
 }
@@ -1434,6 +1460,7 @@ export default function (pi: ExtensionAPI) {
 			tailMaxChars?: number;
 			details?: boolean;
 			meta?: unknown;
+			wake?: boolean;
 		} = {},
 	): Promise<{ job: Job; exited: Promise<void> }> {
 		if (!bgDirReady()) throw new Error(`${BG_DIR} is not a directory only you can write to; not running jobs in it`);
@@ -1477,6 +1504,7 @@ export default function (pi: ExtensionAPI) {
 			meta: cleanJobMeta(opts.meta),
 			tailLines: opts.tailLines,
 			tailMaxChars: opts.tailMaxChars,
+			...(opts.wake === false ? { wake: false as const } : {}),
 		};
 		jobs.set(id, job);
 		const pid = child.pid;
@@ -2195,11 +2223,37 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("bg", {
-		description: "List, view, or stop background jobs",
-		handler: async (_args, ctx) => {
+		description: "List, view, or stop background jobs; /bg --no-wake <id> keeps a job from reopening a closed session",
+		handler: async (args, ctx) => {
+			const flag = parseWakeFlag(args ?? "");
+			if (flag) {
+				const message = setJobWake(flag.id, flag.wake);
+				if (ctx.hasUI) ctx.ui.notify(message.text, message.level);
+				else process.stderr.write(`${message.text}\n`);
+				return;
+			}
 			await openPanel(ctx);
 		},
 	});
+
+	/**
+	 * `/bg --no-wake <id>` / `/bg --wake <id>`: whether this job finishing while
+	 * its session is closed may have the pi-scheduler tick reopen the session.
+	 * Saved in the job's registry entry, which is what the tick reads.
+	 */
+	function setJobWake(id: string, wake: boolean): { text: string; level: "info" | "warning" } {
+		const job = jobs.get(id);
+		if (!job) return { text: `No bg job ${id} in this session`, level: "warning" };
+		if (wake) delete job.wake;
+		else job.wake = false;
+		persist(job);
+		return {
+			text: wake
+				? `bg job ${id} may reopen this session if it finishes after a crash`
+				: `bg job ${id} will not reopen this session when it finishes`,
+			level: "info",
+		};
+	}
 
 	pi.registerShortcut("ctrl+shift+b", {
 		// Requires CSI-u disambiguation; /bg is the portable fallback.
@@ -2237,6 +2291,7 @@ export default function (pi: ExtensionAPI) {
 				tailMaxChars: req.tailMaxChars,
 				details: cursorDetailsRequested(req),
 				meta: req.meta,
+				...(req.wake === false ? { wake: false } : {}),
 			});
 			if (job.endedAt !== undefined && job.exitCode === 127) {
 				req.reply?.({ error: `failed to start; see ${job.logPath}` });
