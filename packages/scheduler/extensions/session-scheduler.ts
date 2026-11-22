@@ -165,8 +165,8 @@ interface ToolParams {
   when?: string;
   every?: string;
   id?: string;
-  /** "crash" | "always", or `true` for "crash"; only accepted with `allowWake`. */
-  wake?: WakeLevel | boolean | null;
+  /** "crash" | "always", or `true` for "crash"; only accepted with `allowWake`. Matches the tool's literal union. */
+  wake?: WakeLevel | true | null;
   /** skip | always | a duration such as 6h. */
   misfire?: string;
 }
@@ -1764,6 +1764,10 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     const { exposure, allowWake } = settingsFor(TOOL_OPT_IN, { exposure: "deferred", allowWake: false }, config);
     const direct = exposure === "direct";
     if (!direct) activateToolSearch(pi);
+    const wakeParam = Type.Optional(Type.Union([Type.Literal("crash"), Type.Literal("always"), Type.Literal(true)], { description: "once/loop: reopen this session to fire even if it is closed — \"crash\" (unexpected exit only) or \"always\" (even after the user quit); true means \"crash\"" }));
+    // Typed as always present so the static params see the optional literal
+    // union; at runtime the key exists only when allowWake is on.
+    const wakeProps = (allowWake ? { wake: wakeParam } : {}) as { wake: typeof wakeParam };
 
     /** A tool-set wake level, refused when the opt-in does not allow it. */
     const toolWake = (params: ToolParams): WakeLevel | undefined => {
@@ -1870,9 +1874,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
         // Only declared when the user turned it on: a parameter the agent can
         // see is a parameter it will try, and an unattended reopened turn with
         // full tools is not something a model should be able to grant itself.
-        ...(allowWake
-          ? { wake: Type.Optional(Type.Union([Type.Literal("crash"), Type.Literal("always"), Type.Literal(true)], { description: "once/loop: reopen this session to fire even if it is closed — \"crash\" (unexpected exit only) or \"always\" (even after the user quit); true means \"crash\"" })) }
-          : {}),
+        ...wakeProps,
       }),
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         if (!ctx.hasUI && params.action !== "list") {
