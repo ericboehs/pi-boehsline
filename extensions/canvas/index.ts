@@ -2364,29 +2364,43 @@ export default function canvas(pi: ExtensionAPI) {
         try {
           return await makePatchAsync(e.base ? join(d, e.base) : null, abs, displayPath(abs, ctx.cwd));
         } catch {
-          return null; // no stamp: the next settle tries again
+          return null;
         }
       });
-      const updates: Record<string, DiffEntry> = {};
+      // Only what this pass measured: the merge below copies these fields and nothing else.
+      const updates: Record<string, Partial<DiffEntry>> = {};
       stale.forEach((abs, i) => {
         const p = patches[i];
-        if (!p) return;
+        if (!p) {
+          // A diff that failed (over git's buffer cap, a base the prune took) keeps its old patch,
+          // but records the stamp too, so the next settle doesn't spawn git for it again unchanged.
+          updates[abs] = { ...stamps[i] };
+          return;
+        }
         const e = idx[abs]!;
         writeAtomicIfChanged(join(d, e.patch), p.patch);
-        idx[abs] = { ...e, adds: p.adds, dels: p.dels, ...stamps[i] };
-        updates[abs] = idx[abs]!;
+        updates[abs] = { adds: p.adds, dels: p.dels, ...stamps[i] };
       });
+      // The card is built from the freshest read, so an entry snapshotBase added during the
+      // diffs shows now rather than at the next settle.
+      let latest = idx;
       if (Object.keys(updates).length) {
-        // Read it again: a tool_call during the diffs may have added an entry.
-        const merged = readJson<Record<string, DiffEntry>>(idxPath, {});
-        for (const [abs, e] of Object.entries(updates)) merged[abs] = { ...(merged[abs] ?? e), ...e };
-        writeAtomicIfChanged(idxPath, JSON.stringify(merged, null, 2));
+        // Read it again: a tool_call during the diffs may have added an entry, and the prune may
+        // have dropped one. Only the four fields this pass measured go in, and only into entries
+        // still there: never a fresher base/patch/skip, and never one someone deleted (its base is
+        // gone, so its diff would fail from then on).
+        latest = readJson<Record<string, DiffEntry>>(idxPath, {});
+        for (const [abs, u] of Object.entries(updates)) {
+          const cur = latest[abs];
+          if (cur) latest[abs] = { ...cur, ...u };
+        }
+        writeAtomicIfChanged(idxPath, JSON.stringify(latest, null, 2));
       }
       // Every listed file, not just this turn's: files changed before copies existed get one too.
       const copiesPath = join(d, "auto-copies.json");
       const copies = syncCopies(d, Object.keys(files), readJson<Record<string, CopyEntry>>(copiesPath, {}));
       writeAtomicIfChanged(copiesPath, JSON.stringify(copies, null, 2));
-      putMarkdown(d, { id: "auto-files", title: "Files changed", body: filesMarkdown(files, ctx.cwd, 40, { diffs: idx, copies, sessionId }), by: "auto" });
+      putMarkdown(d, { id: "auto-files", title: "Files changed", body: filesMarkdown(files, ctx.cwd, 40, { diffs: latest, copies, sessionId }), by: "auto" });
     }
     if (images.length) {
       const path = join(d, "auto-shots.json");
@@ -2572,15 +2586,19 @@ export default function canvas(pi: ExtensionAPI) {
     const sid = sessionId;
     const live = liveNested;
     liveNested = [];
+    // The turn and its ops, read and merged now, before the timer: a run that starts first
+    // (botsun-owner's afterStop, the scheduler, goal, agent-link) has already put its user entry
+    // on the branch, and lastTurn would hand back that new, empty turn, so this turn's ops never
+    // reached Files changed. getBranch is an in-memory walk; the cost was in the writes below.
+    const settled = autoOn ? lastTurn(ctx.sessionManager.getBranch() || []) : undefined;
+    if (settled) settled.ops = mergeOps(settled.ops ?? [], live);
     setTimeout(() => {
       if (sessionId !== sid) return; // the session switched while we waited
       try {
         writeReply(ctx);
         writeInfo(ctx);
-        if (autoOn) {
-          const turn = lastTurn(ctx.sessionManager.getBranch() || []);
-          turn.ops = mergeOps(turn.ops ?? [], live);
-          void serial(() => updateWidgets(ctx, turn)).catch(() => {});
+        if (settled) {
+          void serial(() => updateWidgets(ctx, settled)).catch(() => {});
           void serial(() => updateAgents(ctx)).catch(() => {});
           void serial(() => updateTasks(ctx)).catch(() => {});
         }

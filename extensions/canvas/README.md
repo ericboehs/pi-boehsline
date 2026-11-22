@@ -681,5 +681,5 @@ status runs, `PI_CANVAS_TMUX=0` turns off tmux follow mode,
 Subagent children skip the canvas.
 
 ```sh
-node --test test/canvas.test.mjs test/canvas-nav.test.mjs test/canvas-render.test.mjs test/canvas-security.test.mjs test/canvas-meeting.test.mjs test/canvas-embed.test.mjs
+node --test test/canvas.test.mjs test/canvas-nav.test.mjs test/canvas-render.test.mjs test/canvas-security.test.mjs test/canvas-meeting.test.mjs test/canvas-embed.test.mjs test/canvas-settle.test.mjs
 ```

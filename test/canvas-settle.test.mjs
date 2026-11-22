@@ -217,3 +217,92 @@ test("agent_settled returns before the deferred widget work starts", async () =>
     rmSync(w.cwd, { recursive: true, force: true });
   }
 });
+
+/** A `git` first on PATH that logs, and on its first call copies `from` over `to` (then never
+ * again): a way to change a tracking JSON at exactly the moment the diffs are in flight. */
+function mutatingGit(log, from, to) {
+  const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  const bin = mkdtempSync(join(tmpdir(), "canvas-settle-bin-"));
+  const once = join(bin, "done");
+  writeFileSync(
+    join(bin, "git"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\n` +
+      `if [ ! -f ${JSON.stringify(once)} ]; then : > ${JSON.stringify(once)}; cp ${JSON.stringify(from)} ${JSON.stringify(to)}; fi\n` +
+      `exec ${JSON.stringify(real)} "$@"\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+test("a run that starts before the deferred settle can't take the settled turn's ops", async () => {
+  const w = workspace("settle-c", 2);
+  try {
+    const { pi, fire } = stubPi();
+    await canvas.default(pi);
+    await fire("session_start", { reason: "new" }, w.ctx);
+    for (const [i, p] of w.paths.entries()) {
+      await fire("tool_call", { toolName: "edit", input: { path: p } }, w.ctx);
+      writeFileSync(p, `one\n${i}\nedited\n`);
+    }
+
+    const settled = fire("agent_settled", { aborted: false }, w.ctx);
+    // Before the timer runs: the next run starts (botsun-owner's afterStop, the scheduler,
+    // goal, agent-link) and its user entry is on the branch.
+    w.state.branch = [...w.state.branch, msg("user", "next run, no edits yet"), msg("assistant", [{ type: "text", text: "on it" }])];
+    await settled;
+
+    // The settled turn's ops still reach Files changed: they were read in the handler, not in the
+    // timer, where lastTurn would have handed back the new, empty turn.
+    await until(() => existsSync(join(w.dir, "auto-files.json")));
+    const files = JSON.parse(readFileSync(join(w.dir, "auto-files.json"), "utf8"));
+    assert.deepEqual(Object.keys(files).sort(), [...w.paths].sort(), "both edited files are tracked");
+    await until(() => Object.values(w.idx()).every((e) => e.adds !== undefined));
+    assert.ok(Object.values(w.idx()).every((e) => e.adds >= 1), "and each got its diff");
+    const card = JSON.parse(readFileSync(join(w.dir, "sections.json"), "utf8")).find((s) => s.id === "auto-files");
+    assert.match(readFileSync(join(w.dir, card.file), "utf8"), /f0\.txt/, "the card lists them too");
+  } finally {
+    rmSync(w.cwd, { recursive: true, force: true });
+  }
+});
+
+test("the diff merge keeps a fresher entry and never resurrects a deleted one", async () => {
+  const w = workspace("settle-d", 2);
+  const [f0, f1] = w.paths;
+  try {
+    const { pi, fire } = stubPi();
+    await canvas.default(pi);
+    await fire("session_start", { reason: "new" }, w.ctx);
+    for (const [i, p] of w.paths.entries()) {
+      await fire("tool_call", { toolName: "edit", input: { path: p } }, w.ctx);
+      writeFileSync(p, `one\n${i}\nedited\n`);
+    }
+    // What the prune does mid-diff: one entry gone, and another rewritten by a fresher read
+    // (snapshotBase only writes when absent, so a base it recorded during the diffs must stand).
+    const fresh = { ...w.idx() };
+    assert.ok(fresh[f0] && fresh[f1], "snapshotBase tracked both before the settle");
+    delete fresh[f1];
+    fresh[f0] = { ...fresh[f0], base: "base-fresh", patch: "diff-fresh.patch" };
+    const freshPath = join(w.cwd, "fresh.json");
+    writeFileSync(freshPath, JSON.stringify(fresh, null, 2));
+    const bin = mutatingGit(w.log, freshPath, join(w.dir, "auto-diffs.json"));
+    const wasPath = process.env.PATH;
+    process.env.PATH = `${bin}:${wasPath}`;
+    try {
+      await fire("agent_settled", { aborted: false }, w.ctx);
+      await until(() => diffs(w.log).length >= 2);
+      await sleep(150); // the merge, the copies and the card are behind the diffs
+
+      const idx = w.idx();
+      assert.equal(idx[f0].base, "base-fresh", "the fresher base was not overwritten by the stale one");
+      assert.equal(idx[f0].patch, "diff-fresh.patch");
+      assert.equal(typeof idx[f0].adds, "number", "but the measured fields did land");
+      assert.equal(typeof idx[f0].mtimeMs, "number");
+      assert.equal(idx[f1], undefined, "an entry deleted during the diffs is not resurrected");
+    } finally {
+      process.env.PATH = wasPath;
+      rmSync(bin, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(w.cwd, { recursive: true, force: true });
+  }
+});
