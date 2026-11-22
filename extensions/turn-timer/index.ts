@@ -289,8 +289,9 @@ export default function (pi: ExtensionAPI) {
 
 /**
  * The spinner line. With a question prompt open it times the wait — "30s
- * Waiting on user..." — because "Working for 5m 48s" over a dialog that is
- * blocking on a human claims the model is busy when it is starving. Steps and
+ * Waiting on user..." — because "5m 48s Working" over a dialog that is
+ * blocking on a human claims the model is busy when it is starving. The time
+ * leads both lines so the words after it don't shift as it grows. Steps and
  * think time drop out too: they describe model work that is paused. The
  * Guardian's blocked count rides along under either line. `now` is injectable
  * so the tests can pin the clock.
@@ -301,7 +302,7 @@ export function workingMessage(run: RunState, now: number = Date.now()): string 
   if (waitOpenAt != null) {
     parts.push(`${fmt(now - waitOpenAt)} Waiting on user`);
   } else {
-    parts.push(`Working for ${fmt(now - run.startedAt)}`);
+    parts.push(`${fmt(now - run.startedAt)} Working`);
     if (run.steps > 0) {
       parts.push(`${run.steps} step${run.steps === 1 ? "" : "s"}`);
     }

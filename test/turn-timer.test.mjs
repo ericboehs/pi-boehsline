@@ -69,7 +69,7 @@ test("a wait over a minute formats like the run clock does", () => {
 test("answering the question flips the spinner back to the run clock", () => {
   const now = 5 * 60_000;
   const run = runState({ startedAt: 0, steps: 15, thinkMs: 45_000 });
-  assert.equal(workingMessage(run, now), "Working for 5m 0s · 15 steps · 45s think...");
+  assert.equal(workingMessage(run, now), "5m 0s Working · 15 steps · 45s think...");
 });
 
 test("the blocked-tool count rides along under the waiting line", () => {
