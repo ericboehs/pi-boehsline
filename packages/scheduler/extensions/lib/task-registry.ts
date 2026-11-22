@@ -25,7 +25,6 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
-  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -34,6 +33,7 @@ import {
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 
+import { withLockedFile } from "./locked-file.ts";
 import {
   MIN_INTERVAL_MS,
   type Schedule,
@@ -54,8 +54,6 @@ export const DEFAULT_TIMEOUT_MS = 900_000;
 
 /** How long a claim may look alive before the runner is presumed dead. */
 export const CLAIM_STALE_MS = 6 * 3_600_000;
-
-const LOCK_STALE_MS = 60_000;
 
 export const RUN_STATUSES = ["ok", "error", "timeout", "skipped"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
@@ -349,61 +347,16 @@ export function writeRegistry(registry: Registry): void {
   );
 }
 
-function lockPath(): string {
-  return `${registryPath()}.lock`;
-}
-
-function lockAgeMs(): number | undefined {
-  try {
-    return Date.now() - statSync(lockPath()).mtimeMs;
-  } catch {
-    return undefined;
-  }
-}
-
 /**
- * Read-modify-write the registry under a mkdir mutex.
+ * Read-modify-write the registry under a mkdir mutex (lib/locked-file.ts).
  *
- * mkdir is the one filesystem primitive that is atomic on every macOS
- * filesystem including network volumes. It is held for the JSON round trip
- * plus whatever the caller does inside `mutate` — `check` also compacts run
- * logs there, which is the longest critical section. The actual agent run
- * happens outside it, guarded instead by the claim fields on the task.
+ * The lock is held for the JSON round trip plus whatever the caller does
+ * inside `mutate` — `check` also compacts run logs there, which is the longest
+ * critical section. The actual agent run happens outside it, guarded instead
+ * by the claim fields on the task.
  */
 export function withRegistry<T>(mutate: (registry: Registry) => T): T {
-  ensureDir(schedulerDir());
-  const path = lockPath();
-
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    try {
-      mkdirSync(path, { mode: 0o700 });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const age = lockAgeMs();
-      if (age !== undefined && age > LOCK_STALE_MS) {
-        // The holder died mid-write. The registry itself is only ever replaced
-        // by rename, so the worst case is a lost concurrent edit, not a torn file.
-        rmSync(path, { recursive: true, force: true });
-        continue;
-      }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-      continue;
-    }
-
-    // A `process.exit` from inside `mutate` would skip the finally below and
-    // strand this lock for the full stale window, blocking every other
-    // invocation. Belt and braces: release it on the way out too.
-    const release = () => rmSync(path, { recursive: true, force: true });
-    process.once("exit", release);
-    try {
-      return mutate(readRegistry());
-    } finally {
-      process.removeListener("exit", release);
-      release();
-    }
-  }
-
-  throw new Error(`Could not lock ${path}; remove it if no scheduler is running`);
+  return withLockedFile(registryPath(), readRegistry, mutate);
 }
 
 export function makeTaskId(existing: DurableTask[]): string {
