@@ -7,6 +7,29 @@ change behaviour; each one says what it breaks.
 
 ### Added
 
+- Session timers survive pi being closed. A `/once` or `/loop` fire that came
+  due while pi was not running is **delivered once** when the session is next
+  resumed (before, it was dropped silently), prefixed with when it was due and
+  how late it is. A recurring timer fires once for a miss and then re-arms to
+  its next future slot from its interval, so a week away is one catch-up, not a
+  week of them. Missed fires are delivered oldest first, one per settle, at most
+  `MAX_CATCHUPS` (5) per restore; the overflow is skipped with a notice.
+- A staleness cap for catch-up: a fire more than 24h late is skipped with a
+  notice instead of delivered. Per task with `/once --misfire=6h …` (also
+  `skip` and `always`), globally with `PI_SCHEDULER_SESSION_MISFIRE`.
+- `wake` on a session timer: `/once --wake` (`crash`: reopen after an
+  unexpected exit), `--wake=always` (reopen even after a deliberate quit), and
+  `--no-wake` to clear it. The `schedule` tool takes `wake` only when the
+  opt-in also sets `"allowWake": true` (default false), because an unattended
+  reopened turn has the user's full tool set. Recorded and published; the tick
+  that reopens a session is a separate change.
+- `~/.pi/agent/scheduler/session-timers.json`: a small, locked, atomically
+  written index saying which sessions have timers, when the earliest is due and
+  when the next `wake` timer is due, plus the pid/lstart/host of the live pi
+  holding it. Metadata only — never a prompt — so an outside process can decide
+  when to wake a session without reading session files. Entries are removed at
+  zero unpaused timers and pruned when their session file is gone and their pi
+  is dead.
 - Opt-in `schedule` tool so the agent can set and manage session timers:
   `once`, `loop`, `list`, `cancel`, `pause`, `resume`. Off unless
   `scheduler-tool` is in Boehsline's `enable` list; deferred by default
@@ -17,11 +40,45 @@ change behaviour; each one says what it breaks.
   `--cwd <dir>` (absolute, an existing directory; quote one with spaces),
   before the id or after it, to move a task's model or folder while keeping
   its id, name, delivery and history. Any other option is refused there.
+- `extensions/lib/locked-file.ts`: the mkdir-mutex read-modify-write pulled out
+  of `task-registry.ts`, now shared with the session index; `withRegistry`
+  wraps it. `extensions/lib/process-identity.ts` holds the `ps` lstart lookup
+  that `extensions/bg` and the index both need, so the two cannot disagree
+  about whether a pid is still that process.
 
 ### Changed
 
+- **Session timers now catch up instead of dropping missed fires.** Deferring
+  to `/schedule` for anything that must happen while pi is closed is still the
+  right advice for work, but a reminder that came due during a reboot is no
+  longer lost. Catch-up happens on `session_start` with reason `startup`,
+  `resume` or `reload` only: `/new`, `/fork` and `/clone` inherit nothing (the
+  snapshot names the session id), tree navigation never replays a slot an
+  older branch already fired, and `/loop resume` still skips what was missed
+  while paused. In print mode (`pi -p --session`) the snapshot is left exactly
+  as it is: no catch-up, no drop, no write.
+- **At most once.** A catch-up one-shot is persisted as delivered before its
+  prompt is sent, and put back if the send throws; a crash in between loses
+  that reminder rather than repeating it. A recurring catch-up is re-armed
+  before it is queued, so a queued fire lost to a quit is the one gap.
+- Live `setTimeout`s are armed in 60s chunks and re-check `Date.now()`, because
+  libuv's clock does not advance during macOS sleep; a live fire more than 2
+  minutes late now takes the catch-up path (prefix and cap) instead of looking
+  on time.
+- Two pi processes on one session no longer both catch up: the restore checks
+  the index for another live holder (pid, `ps` lstart and host) and leaves the
+  missed fires to it.
 - The session status is plain text (`2 timers · 1 paused`) instead of
   `⏰ 2 ⏸1`. Boehsline's footer renders it as a `◷` Timers chip.
+- `list` and the `schedule` tool's output show `wake` / `wake always`, and the
+  `/once` notice now says a missed fire is delivered on the next resume rather
+  than "keep this session open or it will not fire".
+
+### Fixed
+
+- `/once help`, `/loop help` and the bare-command usage now document `--wake`,
+  `--misfire` and the catch-up behaviour they used to deny.
+
 
 ## [0.2.0] — 2026-08-24
 

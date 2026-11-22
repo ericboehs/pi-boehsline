@@ -67,7 +67,7 @@ Each extension is a folder under [`extensions/`](extensions) with its own README
 | [meeting](extensions/opt-in/meeting/README.md) | Live meeting copilot: rolling notes, name and action alerts, slide summaries, and chat answers, from the transcript | `/meeting` |
 | [op-broker](extensions/opt-in/op-broker/README.md) | 1Password for agents: an approval card per item, one shared Touch ID for every session | `/op-broker` |
 | [omlx](extensions/opt-in/omlx/README.md) | Adds models loaded in a local oMLX server to `/model` |  |
-| [scheduler-tool](packages/scheduler/README.md#letting-the-agent-set-timers-schedule-tool) | Lets the agent set and manage `/once` and `/loop` timers | `schedule` tool (deferred) |
+| [scheduler-tool](packages/scheduler/README.md#letting-the-agent-set-timers-schedule-tool) | Lets the agent set and manage `/once` and `/loop` timers, and mark them to wake the session | `schedule` tool (deferred) |
 | [sc](extensions/opt-in/sc/README.md) | Attach the newest screenshot from iCloud Downloads | `/sc` |
 | [skill-modes](extensions/opt-in/skill-modes/README.md) | Sticky skill modes: a `mode: true` skill stays on until `/mode off` | `/mode` |
 | [tmux-attention](extensions/opt-in/tmux-attention/README.md) | Highlights the tmux window when pi needs you |  |
@@ -125,7 +125,7 @@ Everything below goes in `~/.pi/agent/boehsline.json`, or comes from a package t
   "memory": { "root": "~/.local/share/pi-memory", "inject": { "startChars": 2500, "startMax": 25 }, "qmd": "auto", "search": { "collections": [] } },  // see extensions/opt-in/memory
   "failover": { "chain": ["anthropic/claude-opus-5.5", "opencode-go/glm-5.3"], "maxSwitches": 3 },  // see extensions/failover
   "image-prune": { "thresholdMB": 5, "keepTurns": 2, "shrinkMaxPx": 1568, "shrinkMinKB": 512 },  // "enabled": false pauses it; /image-prune now still works
-  "scheduler-tool": { "exposure": "deferred" },  // "direct" puts the schedule tool in every prompt
+  "scheduler-tool": { "exposure": "deferred", "allowWake": false },  // "direct" puts the schedule tool in every prompt; allowWake lets the agent set wake (reopens the session unattended)
   "update": { "dir": "~/Code/github.com/ericboehs/pi", "args": ["--quick-tests", "--push"] },  // no dir: the checkout pi runs from
   "wiki-session-log": { "command": ["~/bin/pi-session-sync"] }
 }

@@ -11,7 +11,7 @@ implementation.
 | Survives quitting pi | no | yes |
 | Model | whatever the session is using | per task |
 | Stored in | a custom session entry | `~/.pi/agent/scheduler/tasks.json` |
-| Missed fires | dropped | caught up once, within a grace window |
+| Missed fires | caught up once on the next resume, within 24h | caught up once, within a grace window |
 
 **By default neither extension registers an LLM tool or adds anything to model
 context.** The one exception is opt-in: enable `scheduler-tool` in Boehsline
@@ -19,8 +19,10 @@ and the agent gets a deferred `schedule` tool for session timers (see
 [below](#letting-the-agent-set-timers-schedule-tool)). The durable half stays out of pi entirely between runs: a launchd/systemd tick
 owns the schedule, so nothing is resident and pi's startup path is untouched.
 Session timers (`/once`, `/loop`) are necessarily in-process — they hold
-`setTimeout`s for the life of the session and read their snapshot back at
-`session_start` — but they still register no tool and no context.
+`setTimeout`s (in one-minute chunks, so a laptop sleep cannot leave one
+looking on time) and read their snapshot back at `session_start` — but they
+still register no tool and no context. They also publish a small index of who
+has timers and when they are next due, for [#the-session-timer-index](#the-session-timer-index).
 
 ## Install
 
@@ -62,6 +64,55 @@ check the build`, with an optional `in`/`at`) or trail (`/once check the build
 in 15m`); the leading form wins when its first token parses as a time, so
 `/once 8p check in on this` keeps the prompt's own "in" intact.
 
+### Catch-up: a fire missed while pi was closed
+
+A timer that came due while pi was not running is **delivered once**, when you
+next resume the session, rather than being dropped:
+
+```text
+[Scheduled task 4a1f (one-shot) that you set with the schedule tool fired; it was due at 8:00:00 AM and is 4h late (1 missed run) because this session was not open]
+```
+
+- A recurring timer fires **once** for a miss, however many slots went by, then
+  re-arms to the next future slot from its interval — one catch-up, never a
+  replay.
+- Missed fires are delivered oldest first, one at a time, waiting for the agent
+  to settle between them, and at most `5` per restore. The rest are skipped
+  with a notice (a recurring timer among them still re-arms).
+- Anything older than the **misfire window is skipped** with a notice: `24h` by
+  default, per task with `/once --misfire=6h …` (or `--misfire=skip` / `=always`),
+  globally with `PI_SCHEDULER_SESSION_MISFIRE`.
+- `paused` timers are untouched. `/loop resume` still skips what was missed
+  while paused, and tree navigation never catches up: an older branch can hold
+  a slot that already fired.
+- **At most once.** A catch-up one-shot is recorded as delivered *before* the
+  prompt is sent, so a crash in between loses that reminder rather than
+  repeating it. A recurring catch-up is re-armed before it is queued, so a
+  queued fire that never gets sent is the one thing catch-up can lose.
+- Timers are restored from the session, so `/new`, `/fork` and `/clone` inherit
+  nothing: the snapshot names the session id that created it.
+
+### `--wake`, for a session that is not open at all
+
+Catch-up needs you to open the session. A timer can also ask pi to open it:
+
+```text
+/once --wake 8a check the backup          # after a crash or reboot
+/once --wake=always 8a check the backup   # even if you quit last night
+/once --no-wake 8a check the backup       # clear the mark again
+```
+
+`--wake` (a `crash`) means "reopen if the session died without being quit";
+`--wake=always` means "reopen even though I closed it on purpose". The flag is
+recorded on the task and published in the index; the tick that actually
+reopens a session is a separate change, so today it changes nothing else.
+
+The `schedule` tool takes `wake` only when the opt-in also says
+`"allowWake": true` — an unattended reopened turn has your full tool set, and
+the agent should not be able to grant itself that. Your own `--wake` flags are
+always allowed. `misfire` and `wake` also survive `/once edit` and `/loop edit`,
+and `--wake`/`--no-wake`/`--misfire=` change them there.
+
 `pause` disarms a timer but keeps it listed, so it survives session resume
 without firing or drifting. `resume` recomputes the next occurrence rather than
 replaying what was missed: a recurring task advances to its next future slot,
@@ -90,9 +141,13 @@ as `/once` and `/loop`:
 | `cancel` | `id` | an id or unique prefix |
 | `pause` / `resume` | `id` | an id, a prefix, or `all` |
 
+`once` and `loop` also take `misfire` (`skip`, `always`, or a duration such as
+`6h`), and `wake` when the settings say `"allowWake": true` — see
+[`--wake`](#--wake-for-a-session-that-is-not-open-at-all).
+
 It is the agent's version of the commands, not a separate scheduler: `/loop
 list` shows what the agent set, the agent can cancel yours, and the same
-limits apply (50 timers, 1m loop floor, nothing survives quitting pi). You
+limits apply (50 timers, 1m loop floor, catch-up on the next resume). You
 see a notice whenever the agent adds, cancels, pauses or resumes a timer.
 
 When an agent-set timer fires, its prompt arrives labelled
@@ -118,6 +173,40 @@ While timers exist the session status reads `2 timers`, `2 timers · 1
 paused`, or `1 paused`, in plain text. Boehsline's footer turns it into a
 `◷` Timers chip you can set to count, detailed or hidden in `/footer`; other
 footers show the text as is.
+
+### The session timer index
+
+Timers live in the session file, which nothing outside pi can cheaply read, so
+every session with timers also publishes a one-line entry to
+`~/.pi/agent/scheduler/session-timers.json` (`PI_SCHEDULER_DIR`, then
+`PI_AGENT_DIR`, as the durable registry does):
+
+```json
+{ "v": 1, "sessions": { "<sessionId>": {
+  "sessionFile": "~/.pi/agent/sessions/…jsonl", "cwd": "/Users/you/Code/x",
+  "pid": 4711, "pidStart": "Sat Nov 22 14:29:49 2026", "host": "laptop",
+  "liveSince": 1763830000000, "closedAt": 1763833600000,
+  "nextDueAt": 1763840000000, "nextWakeDueAt": 1763840000000,
+  "wake": "always", "count": 2, "updatedAt": 1763833000000 } } }
+```
+
+- Metadata only: no prompts ever go in it, so a process that reads it learns
+  when a session is next due and nothing about what you scheduled.
+- `count` is unpaused timers; `nextWakeDueAt` and `wake` cover the tasks asking
+  to be woken, strongest level wins (`always` > `crash`). An entry disappears
+  when the session has nothing unpaused left.
+- `pid` plus `pidStart` (ps `lstart`) and `host` identify the live pi holding
+  the session; both are cleared with `closedAt` on shutdown for any reason, so
+  after `/resume` or `/fork` the old entry no longer claims a live process.
+- Written under a lock, atomically, mode 0600 (directory 0700), and left alone
+  when nothing changed. A session is indexed once its file exists (pi writes
+  the file with the first reply); an entry is pruned only when its file is gone
+  *and* its pi is dead.
+- Two pi processes on one session would each catch up the same missed timer, so
+  a restore checks this index first and leaves the catch-up to the live holder.
+
+This is what a future `pi-scheduler` tick can use to wake a session for a
+`--wake` timer. Nothing reads it to fire timers yet.
 
 ## Durable tasks: `/schedule`
 
@@ -299,9 +388,11 @@ never match (`0 0 30 2 *`) is refused at creation.
 ## Edge cases worth knowing
 
 Session timers live in custom session entries, so they restore when you resume
-that session and are not inherited by `/new`, `/fork` or `/clone`. Pi must be
-running; missed fires are skipped rather than replayed after resume. Recurring
-intervals have a one-minute minimum, in both schedulers.
+that session and are not inherited by `/new`, `/fork` or `/clone`. A fire that
+came due while pi was closed is delivered once on the next resume (see
+[catch-up](#catch-up-a-fire-missed-while-pi-was-closed)); a fire that came due
+while the *session* was paused or replaced is not. Recurring intervals have a
+one-minute minimum, in both schedulers.
 
 From pi's `SessionManager._persist`: pi does not create the session file until
 the session holds at least one assistant message. A timer set before that is
