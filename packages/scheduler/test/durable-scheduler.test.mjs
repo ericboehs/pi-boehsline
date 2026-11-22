@@ -12,13 +12,19 @@ import durableScheduler, {
 import { readRegistry, readRuns, settleRun, writeRegistry } from "../extensions/lib/task-registry.ts";
 import { piArgsFor } from "../extensions/lib/runner.ts";
 
+// A last-resort scratch directory for anything that reaches the registry
+// outside a test's own withTempDir (a queued callback can fire after a test's
+// cleanup restored the environment). Without it those writes land in the
+// developer's real ~/.pi/agent/scheduler.
+const fallbackDir = mkdtempSync(join(tmpdir(), "pi-sched-fallback-"));
+process.env.PI_SCHEDULER_DIR = fallbackDir;
+
 function withTempDir(t) {
   const dir = mkdtempSync(join(tmpdir(), "pi-sched-cmd-"));
   const previous = process.env.PI_SCHEDULER_DIR;
   process.env.PI_SCHEDULER_DIR = dir;
   t.after(() => {
-    if (previous === undefined) delete process.env.PI_SCHEDULER_DIR;
-    else process.env.PI_SCHEDULER_DIR = previous;
+    process.env.PI_SCHEDULER_DIR = previous ?? fallbackDir;
     rmSync(dir, { recursive: true, force: true });
   });
   return dir;

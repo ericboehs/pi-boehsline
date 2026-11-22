@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -11,13 +12,49 @@ const configPath = join(configDir, "boehsline.json");
 process.env.BOEHSLINE_CONFIG = configPath;
 delete process.env.BOEHSLINE_ENABLE;
 
+// Every scheduler file a test produces — the timer index, lock directories —
+// goes here. Without this the tests read and write ~/.pi/agent/scheduler, which
+// is the developer's real one.
+const schedulerDir = mkdtempSync(join(tmpdir(), "session-scheduler-state-"));
+process.env.PI_SCHEDULER_DIR = schedulerDir;
+delete process.env.PI_SCHEDULER_SESSION_MISFIRE;
+process.env.PI_AGENT_DIR = schedulerDir;
+
 import sessionScheduler, {
+  MAX_CATCHUPS,
   TOOL_OPT_IN,
   advanceRecurringTask,
   deliveryText,
-  timerStatusText,
+  latestMissedSlot,
   normalizeTasksForResume,
+  parseTimerFlags,
+  planRestore,
+  sessionMisfireMs,
+  timerStatusText,
 } from "../extensions/session-scheduler.ts";
+import {
+  indexPath,
+  planIndexEntry,
+  readSessionIndex,
+  sessionHeldElsewhere,
+  updateSessionIndex,
+} from "../extensions/lib/session-index.ts";
+import { processStart } from "../extensions/lib/process-identity.ts";
+
+/** The index file for this run. */
+const indexFile = () => indexPath();
+
+function readIndex() {
+  return JSON.parse(readFileSync(indexFile(), "utf8"));
+}
+
+/** A fresh, real session file: the index refuses to record one that is not on disk. */
+function makeSessionFile(name = "session") {
+  const dir = mkdtempSync(join(tmpdir(), `session-scheduler-${name}-`));
+  const file = join(dir, "session.jsonl");
+  writeFileSync(file, "");
+  return file;
+}
 
 function snapshot(sessionId, tasks) {
   return {
@@ -34,6 +71,8 @@ async function mount({
   persisted = true,
   hasUI = true,
   config = {},
+  reason = "startup",
+  sessionFile = makeSessionFile(),
 } = {}) {
   writeFileSync(configPath, JSON.stringify(config));
   const tools = [];
@@ -43,6 +82,12 @@ async function mount({
     ? [{ type: "message", message: { role: "assistant", content: [] } }, ...branch]
     : [...branch];
   const sent = [];
+  /** Each send, with how many tasks the snapshot held at that instant. */
+  const sentOrder = [];
+  const lastSnapshotTasks = () => {
+    const latest = entries.filter((entry) => entry.type === "custom").at(-1);
+    return latest?.data?.tasks?.length;
+  };
   const notices = [];
   const statuses = [];
   let isIdle = idle;
@@ -51,10 +96,12 @@ async function mount({
 
   const ctx = {
     hasUI,
+    cwd: tmpdir(),
     isIdle: () => (idleChecks++, isIdle),
     sessionManager: {
       getSessionId: () => sessionId,
       getBranch: () => entries,
+      ...(sessionFile === null ? {} : { getSessionFile: () => sessionFile }),
     },
     ui: {
       notify: (message, level) => notices.push({ message, level }),
@@ -80,13 +127,17 @@ async function mount({
       entries.push({ type: "custom", customType, data });
     },
     sendUserMessage: (prompt) => {
+      sentOrder.push({ prompt, snapshotTasks: lastSnapshotTasks() });
       sent.push(prompt);
       isIdle = false;
     },
   };
 
   sessionScheduler(pi);
-  await handlers.session_start({ reason: "startup" }, ctx);
+  await handlers.session_start({ reason }, ctx);
+  // Catch-ups are delivered on the tick after session_start, deliberately:
+  // pi is still wiring the session up while the event runs.
+  await new Promise((resolve) => setTimeout(resolve, 20));
 
   return {
     commands,
@@ -97,15 +148,19 @@ async function mount({
     handlers,
     notices,
     sent,
+    sentOrder,
     statuses,
     registeredTools,
     tools,
+    sessionFile,
     tool: (params) => tools[0].execute("call-1", params, undefined, undefined, ctx),
     setIdle: (value) => { isIdle = value; },
     /** How often the scheduler asked whether the session is idle: once per delivery attempt. */
     idleChecks: () => idleChecks,
     run: (name, args = "") => commands[name].handler(args, ctx),
-    shutdown: () => handlers.session_shutdown({ reason: "quit" }, ctx),
+    start: (startReason = "resume") => handlers.session_start({ reason: startReason }, ctx),
+    shutdown: (shutdownReason = "quit") => handlers.session_shutdown({ reason: shutdownReason }, ctx),
+    settle: () => handlers.agent_settled({}, ctx),
   };
 }
 
@@ -182,7 +237,8 @@ test("/once creates a one-shot task and warns that the session must stay open", 
   assert.equal(task.kind, "once");
   assert.equal(task.prompt, "check whether the deploy finished");
   assert.ok(task.nextRunAt > Date.now());
-  assert.match(ui.notices.at(-1).message, /keep this session open/);
+  assert.match(ui.notices.at(-1).message, /fires while this session is open/);
+  assert.match(ui.notices.at(-1).message, /next resume if not more than 1d late/);
   assert.deepEqual(ui.sent, [], "scheduling must not wake the model");
 });
 
@@ -195,10 +251,13 @@ test("/once and /loop share one help that draws the line at /schedule", async (t
     const help = ui.notices.at(-1).message;
     assert.equal(ui.notices.at(-1).level, "info", `${command} help is not an error`);
     assert.match(help, /need pi open/, "the session-scoped caveat is the whole point");
-    assert.match(help, /dropped rather than replayed/);
+    assert.match(help, /delivered once when you next resume/, "catch-up, not replay-of-everything");
+    assert.match(help, /24h late/, "the staleness window is stated");
     assert.match(help, /use \/schedule/, "help names the durable alternative");
     assert.match(help, /may lead or trail/, "the one genuinely surprising parse rule");
     assert.match(help, /1m minimum/);
+    assert.match(help, /--wake=always/);
+    assert.match(help, /--misfire/, "the new flags are documented where they are used");
   }
 
   assert.equal(latestTasks(ui).length, 0, "asking for help does not schedule anything");
@@ -384,8 +443,8 @@ test("a snapshot with an unparseable cron expression is still rejected", async (
 });
 
 test("a due task waits for agent_settled when the session is busy", async (t) => {
-  // Due soon, but not so soon that a slow mount finds it already past due: a
-  // one-shot that is overdue at resume counts as missed and is dropped.
+  // Due in the future, so the mount's own catch-up pass has nothing to do: the
+  // timer fires live, finds the session busy, and waits to be settled.
   const task = { id: "deadbeef", kind: "once", prompt: "wake up", createdAt: Date.now(), nextRunAt: Date.now() + 250 };
   const ui = await mount({ branch: [snapshot("session-a", [task])], idle: false });
   t.after(ui.shutdown);
@@ -403,13 +462,203 @@ test("a due task waits for agent_settled when the session is busy", async (t) =>
   assert.deepEqual(ui.sent, ["wake up"]);
 });
 
-test("an overdue one-shot is discarded on resume instead of catching up", async (t) => {
-  const task = { id: "deadbeef", kind: "once", prompt: "stale", createdAt: Date.now() - 2_000, nextRunAt: Date.now() - 1_000 };
+test("an overdue one-shot is delivered once on resume, with a late prefix", async (t) => {
+  const dueAt = Date.now() - 2 * 3_600_000;
+  const task = { id: "deadbeef", kind: "once", prompt: "check the backup", createdAt: dueAt - 1_000, nextRunAt: dueAt };
   const ui = await mount({ branch: [snapshot("session-a", [task])] });
   t.after(ui.shutdown);
 
-  assert.deepEqual(ui.sent, []);
+  assert.equal(ui.sent.length, 1, "the missed one-shot is delivered");
+  assert.match(ui.sent[0], /^\[Scheduled task deadbeef was due at .+, 2h late \(1 missed run\) because this session was not open\]\ncheck the backup$/);
+  assert.deepEqual(latestTasks(ui), [], "and retired from the snapshot as usual");
+});
+
+test("the snapshot records the removal before the catch-up is sent", async (t) => {
+  const dueAt = Date.now() - 60_000;
+  const task = { id: "0rder1ng", kind: "once", prompt: "persist first", createdAt: dueAt - 1_000, nextRunAt: dueAt };
+  const ui = await mount({ branch: [snapshot("session-a", [task])] });
+  t.after(ui.shutdown);
+
+  assert.equal(ui.sent.length, 1);
+  // The appended snapshot that emptied the list came before the message went
+  // out: at-most-once means a crash between the two loses the prompt, never
+  // delivers it twice.
+  const appended = ui.entries.filter((entry) => entry.type === "custom");
+  assert.deepEqual(appended.at(-1).data.tasks, []);
+  assert.equal(ui.sentOrder[0].snapshotTasks, 0, "snapshot was already empty when the send happened");
+});
+
+test("a missed fire past its cap is dropped with a notice, not delivered", async (t) => {
+  const dueAt = Date.now() - 30 * 3_600_000;
+  const task = { id: "t00late", kind: "once", prompt: "month-old reminder", createdAt: dueAt - 1_000, nextRunAt: dueAt };
+  const ui = await mount({ branch: [snapshot("session-a", [task])] });
+  t.after(ui.shutdown);
+
+  assert.deepEqual(ui.sent, [], "24h is the default staleness window");
   assert.deepEqual(latestTasks(ui), []);
+  assert.match(ui.notices.at(-1).message, /Skipped t00late: its .+ fire was 1d6h late, past its catch-up limit/);
+  assert.equal(ui.notices.at(-1).level, "warning", "a lost reminder is never silent");
+});
+
+test("a per-task misfire window overrides the default cap", async (t) => {
+  const dueAt = Date.now() - 30 * 3_600_000;
+  const task = { id: "always", kind: "once", prompt: "fires however late", createdAt: dueAt - 1_000, nextRunAt: dueAt, misfire: "always" };
+  const kept = { id: "skip", kind: "once", prompt: "never late", createdAt: dueAt - 1_000, nextRunAt: dueAt - 1, misfire: "skip" };
+  const ui = await mount({ branch: [snapshot("session-a", [task, kept])] });
+  t.after(ui.shutdown);
+
+  assert.equal(ui.sent.length, 1, "misfire=always still delivers a month-old fire");
+  assert.match(ui.sent[0], /^\[Scheduled task always was due at/);
+  assert.match(ui.notices.find((n) => /Skipped skip/.test(n.message)).message, /past its catch-up limit/);
+});
+
+test("PI_SCHEDULER_SESSION_MISFIRE sets the default window", () => {
+  const previous = process.env.PI_SCHEDULER_SESSION_MISFIRE;
+  try {
+    delete process.env.PI_SCHEDULER_SESSION_MISFIRE;
+    assert.equal(sessionMisfireMs(), 24 * 3_600_000);
+    process.env.PI_SCHEDULER_SESSION_MISFIRE = "90m";
+    assert.equal(sessionMisfireMs(), 5_400_000);
+    process.env.PI_SCHEDULER_SESSION_MISFIRE = "skip";
+    assert.equal(sessionMisfireMs(), 0);
+    process.env.PI_SCHEDULER_SESSION_MISFIRE = "always";
+    assert.equal(sessionMisfireMs(), Number.POSITIVE_INFINITY);
+    process.env.PI_SCHEDULER_SESSION_MISFIRE = "nonsense";
+    assert.equal(sessionMisfireMs(), 24 * 3_600_000, "an unreadable value falls back, never to zero");
+  } finally {
+    if (previous === undefined) delete process.env.PI_SCHEDULER_SESSION_MISFIRE;
+    else process.env.PI_SCHEDULER_SESSION_MISFIRE = previous;
+  }
+});
+
+test("a recurring task with missed slots fires once and re-arms", async (t) => {
+  const now = Date.now();
+  const task = { id: "l00p1111", kind: "interval", prompt: "check CI", createdAt: now - 600_000, nextRunAt: now - 250_000, intervalMs: 60_000 };
+  const ui = await mount({ branch: [snapshot("session-a", [task])] });
+  t.after(ui.shutdown);
+
+  assert.equal(ui.sent.length, 1, "one fire, not five");
+  // The slots at -250s, -190s, -130s, -70s and -10s all came due; lateness is
+  // measured from the latest of them, not the earliest.
+  assert.match(ui.sent[0], /^\[Scheduled task l00p1111 was due at .+, \d+s late \(5 missed runs\) because this session was not open\]\ncheck CI$/);
+  const [restored] = latestTasks(ui);
+  assert.equal(restored.id, "l00p1111");
+  assert.ok(restored.nextRunAt > Date.now(), "re-armed into the future");
+  assert.equal(restored.nextRunAt % 60_000, task.nextRunAt % 60_000, "and still on its original phase");
+});
+
+test("recurring lateness is measured from the latest missed slot", () => {
+  const now = 1_000_000_000;
+  // Due 25.5h ago every hour: the earliest slot is old, the latest is minutes old.
+  const task = { id: "hourly", kind: "interval", prompt: "x", createdAt: now - 100_000_000, intervalMs: 3_600_000, nextRunAt: now - 25.5 * 3_600_000 };
+  assert.equal(now - latestMissedSlot(task, now), 1_800_000, "30m late, not 25h");
+  const plan = planRestore([task], now, { catchUp: true });
+  assert.equal(plan.catchUps.length, 1, "so a 24h cap still delivers it");
+  assert.equal(plan.catchUps[0].late.missed, 26);
+});
+
+test("only MAX_CATCHUPS missed timers are delivered, oldest first", async (t) => {
+  const now = Date.now();
+  const tasks = Array.from({ length: MAX_CATCHUPS + 2 }, (_, index) => ({
+    id: `catch${index}`,
+    kind: "once",
+    prompt: `reminder ${index}`,
+    createdAt: now - 600_000,
+    nextRunAt: now - 300_000 + index * 1_000,
+  }));
+  const ui = await mount({ branch: [snapshot("session-a", tasks)] });
+  t.after(ui.shutdown);
+  // Deliver them one at a time, as a real session would.
+  for (let index = 0; index < MAX_CATCHUPS + 2; index += 1) {
+    ui.setIdle(true);
+    await ui.settle();
+  }
+
+  assert.equal(ui.sent.length, MAX_CATCHUPS);
+  assert.match(ui.sent[0], /reminder 0/, "oldest first");
+  const overflow = ui.notices.filter((n) => /only 5 missed timers are caught up at a time/.test(n.message));
+  assert.equal(overflow.length, 2, "the rest are named, not silently binned");
+  assert.match(overflow[0].message, /Skipped catch5/);
+});
+
+test("paused tasks are untouched by a catch-up", async (t) => {
+  const now = Date.now();
+  const paused = { id: "pau5ed00", kind: "once", prompt: "held", createdAt: now - 600_000, nextRunAt: now - 300_000, paused: true };
+  const ui = await mount({ branch: [snapshot("session-a", [paused])] });
+  t.after(ui.shutdown);
+
+  assert.deepEqual(ui.sent, [], "a paused task does not fire");
+  assert.deepEqual(latestTasks(ui).map((task) => task.id), ["pau5ed00"], "and is not dropped");
+});
+
+test("reload delivers a never-delivered one-shot exactly once", async (t) => {
+  const now = Date.now();
+  const task = { id: "re10ad00", kind: "once", prompt: "check the deploy", createdAt: now - 600_000, nextRunAt: now - 300_000 };
+  const ui = await mount({ branch: [snapshot("session-a", [task])], reason: "reload" });
+  t.after(ui.shutdown);
+
+  assert.equal(ui.sent.length, 1);
+  assert.deepEqual(latestTasks(ui), [], "the snapshot now says it is gone");
+
+  // /reload again: the runtime is rebuilt from that snapshot, so there is
+  // nothing left to fire.
+  ui.setIdle(true);
+  await ui.start("reload");
+  ui.setIdle(true);
+  await ui.settle();
+  assert.equal(ui.sent.length, 1, "a second reload does not re-fire");
+});
+
+test("a crash after delivery does not re-fire the catch-up", async (t) => {
+  const now = Date.now();
+  const task = { id: "cra5h000", kind: "once", prompt: "only once", createdAt: now - 600_000, nextRunAt: now - 300_000 };
+  const ui = await mount({ branch: [snapshot("session-a", [task])] });
+  t.after(ui.shutdown);
+  assert.equal(ui.sent.length, 1);
+
+  // Kill the process without a shutdown: the appended snapshot is the only
+  // thing that survives, which is why it is written before the send.
+  const entries = ui.entries.map((entry) => ({ ...entry }));
+  const restarted = await mount({ branch: entries, reason: "resume" });
+  t.after(restarted.shutdown);
+  assert.equal(restarted.sent.length, 0, "at most once, even across a crash");
+});
+
+test("tree navigation never catches up", async (t) => {
+  const now = Date.now();
+  const future = { id: "future00", kind: "interval", prompt: "future", createdAt: now, nextRunAt: now + 3_600_000, intervalMs: 3_600_000 };
+  const ui = await mount({ branch: [snapshot("session-a", [future])] });
+  t.after(ui.shutdown);
+  // Moving to a branch whose snapshot holds a slot that already fired.
+  ui.entries.push(snapshot("session-a", [
+    future,
+    { id: "tree0000", kind: "once", prompt: "older branch", createdAt: now - 600_000, nextRunAt: now - 300_000 },
+  ]));
+
+  await ui.handlers.session_tree({}, ui.ctx);
+  ui.setIdle(true);
+  await ui.settle();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(ui.sent.filter((text) => text.includes("older branch")).length, 0, "session_tree must not replay");
+  assert.deepEqual(latestTasks(ui).map((task) => task.id), ["future00"], "the missed one-shot is dropped, as before");
+});
+
+test("print mode leaves the snapshot alone and still writes the index", async (t) => {
+  const now = Date.now();
+  const task = { id: "pr1nt000", kind: "once", prompt: "never into a print run", createdAt: now - 600_000, nextRunAt: now - 300_000 };
+  const sessionFile = makeSessionFile("print");
+  const ui = await mount({ branch: [snapshot("session-a", [task])], hasUI: false, sessionFile });
+  t.after(ui.shutdown);
+  const customs = () => ui.entries.filter((entry) => entry.type === "custom");
+
+  assert.deepEqual(ui.sent, [], "no catch-up is injected into an unattended answer");
+  assert.equal(customs().length, 1, "and nothing is persisted: only the snapshot it found");
+  assert.deepEqual(customs()[0].data.tasks.map((entry) => entry.id), ["pr1nt000"], "not even a drop");
+  assert.equal(ui.notices.length, 0, "nor is a missing watch reported as a drop");
+  const entry = readIndex().sessions["session-a"];
+  assert.equal(entry.sessionFile, sessionFile, "the index still says the session has timers");
+  assert.ok(entry.nextDueAt <= Date.now());
 });
 
 test("/loop pause stops a task firing but keeps it listed", async (t) => {
@@ -849,4 +1098,393 @@ test("emits scheduler:tasks with a display-safe view on start, every change and 
 
   await ui.shutdown();
   assert.deepEqual(events().at(-1), [], "shutdown clears them");
+});
+
+// ── wake flag and misfire flags ──
+
+test("flags are parsed as whole tokens and the rest of the line is untouched", () => {
+  const parsed = parseTimerFlags("--wake=always 15m :: check CI\nand the deploy");
+  assert.equal(parsed.wake, "always");
+  assert.equal(parsed.rest, "15m :: check CI\nand the deploy", "the prompt keeps its newline");
+
+  assert.equal(parseTimerFlags("--wake 15m x").wake, "crash");
+  assert.equal(parseTimerFlags("15m x --no-wake").clearWake, true);
+  assert.equal(parseTimerFlags("--misfire=6h 15m x").misfire, 21_600_000);
+  assert.equal(parseTimerFlags("--misfire=skip 15m x").misfire, "skip");
+  assert.equal(parseTimerFlags("--misfire=always 15m x").misfire, "always");
+  assert.equal(parseTimerFlags("15m explain --frobnicate").rest, "15m explain --frobnicate", "unknown flags stay in the prompt");
+  assert.throws(() => parseTimerFlags("--wake=sometimes 15m x"), /--wake wants/);
+  assert.throws(() => parseTimerFlags("--misfire=soon 15m x"), /--misfire wants/);
+});
+
+test("/once --wake sets crash, --wake=always sets always, and /loop takes both", async (t) => {
+  const ui = await mount();
+  t.after(ui.shutdown);
+
+  await ui.run("once", "--wake 15m ping");
+  await ui.run("loop", "--wake=always 5m tick");
+  await ui.run("once", "30m plain");
+  assert.deepEqual(latestTasks(ui).map((task) => [task.wake, task.prompt]), [
+    ["crash", "ping"],
+    ["always", "tick"],
+    [undefined, "plain"],
+  ]);
+  assert.match(ui.notices.find((entry) => /Looping .* wake always/.test(entry.message)).message, /wake always/);
+
+  await ui.run("loop", "list");
+  const listed = ui.notices.at(-1).message;
+  assert.match(listed, /· wake ·/, "wake crash reads as 'wake'");
+  assert.match(listed, /· wake always ·/);
+});
+
+test("edit keeps the wake level, and --no-wake clears it", async (t) => {
+  const ui = await mount();
+  t.after(ui.shutdown);
+
+  await ui.run("once", "--wake=always 15m ping");
+  const id = latestTasks(ui)[0].id;
+
+  await ui.run("once", `edit ${id} 30m ping again`);
+  assert.equal(latestTasks(ui)[0].wake, "always", "an edit that says nothing keeps the level");
+  assert.equal(latestTasks(ui)[0].misfire, undefined);
+
+  await ui.run("once", `edit ${id} --no-wake 45m ping once more`);
+  assert.equal(latestTasks(ui)[0].wake, undefined);
+  assert.equal(latestTasks(ui)[0].prompt, "ping once more");
+});
+
+test("--misfire per task is stored and overrides the env window", async (t) => {
+  const ui = await mount();
+  t.after(ui.shutdown);
+  await ui.run("once", "--misfire=6h 15m ping");
+  assert.equal(latestTasks(ui)[0].misfire, 21_600_000);
+});
+
+test("a snapshot with an invalid wake level or misfire is rejected", async (t) => {
+  const now = Date.now();
+  const ui = await mount({
+    branch: [snapshot("session-a", [
+      { id: "badwake0", kind: "once", prompt: "x", createdAt: now, nextRunAt: now + 60_000, wake: "sometimes" },
+      { id: "badmisf1", kind: "once", prompt: "y", createdAt: now, nextRunAt: now + 60_000, misfire: -5 },
+      { id: "good0001", kind: "once", prompt: "z", createdAt: now, nextRunAt: now + 60_000, wake: "always", misfire: "skip" },
+    ])],
+  });
+  t.after(ui.shutdown);
+
+  await ui.run("once", "list");
+  const listed = ui.notices.at(-1).message;
+  assert.match(listed, /good0001/);
+  assert.doesNotMatch(listed, /badwake0|badmisf1/);
+});
+
+// ── the due index ──
+
+test("the index follows create, edit, pause, resume and cancel", async (t) => {
+  const sessionId = "index-life";
+  const sessionFile = makeSessionFile("index-life");
+  const ui = await mount({ sessionId, sessionFile });
+  t.after(ui.shutdown);
+  const entry = () => readSessionIndex().index.sessions[sessionId];
+
+  assert.equal(entry(), undefined, "no timers, no entry");
+
+  await ui.run("loop", "1h check CI");
+  const first = latestTasks(ui)[0];
+  const created = entry();
+  assert.equal(created.count, 1);
+  assert.equal(created.sessionFile, sessionFile);
+  assert.equal(created.pid, process.pid);
+  assert.equal(created.host, hostname());
+  assert.ok(created.pidStart, "pid identity carries the start stamp");
+  assert.equal(created.wake, undefined);
+  assert.equal(created.nextWakeDueAt, undefined);
+  assert.ok(created.liveSince <= created.updatedAt);
+  assert.equal(created.nextDueAt, first.nextRunAt);
+  assert.equal(statSync(indexFile()).mode & 0o777, 0o600, "private: mode 0600");
+  assert.equal(statSync(schedulerDir).mode & 0o777, 0o700, "and its directory 0700");
+
+  const before = entry().nextDueAt;
+  await ui.run("loop", `edit ${first.id} 2h check CI again`);
+  assert.ok(entry().nextDueAt > before, "an edit moves nextDueAt");
+
+  await ui.run("once", "--wake=always 3h wake me");
+  assert.equal(entry().count, 2);
+  assert.equal(entry().wake, "always", "the strongest level wins");
+  const wakeTask = latestTasks(ui).find((task) => task.wake === "always");
+  assert.equal(entry().nextWakeDueAt, wakeTask.nextRunAt, "the earliest wake timer, not the earliest timer");
+
+  await ui.run("loop", "pause all");
+  assert.equal(entry(), undefined, "no unpaused timers: the entry is removed");
+
+  await ui.run("loop", "resume all");
+  assert.equal(entry().count, 2, "and comes back when they are resumed");
+
+  await ui.run("loop", "clear yes");
+  assert.equal(entry(), undefined, "cleared timers leave no entry");
+});
+
+test("the index never contains a prompt", async (t) => {
+  const sessionId = "index-secret";
+  const ui = await mount({ sessionId, sessionFile: makeSessionFile("index-secret") });
+  t.after(ui.shutdown);
+  const secret = "rotate the PRIVATE token";
+  await ui.run("loop", `5m ${secret}`);
+  await ui.run("once", `2h ${secret} again`);
+
+  const raw = readFileSync(indexFile(), "utf8");
+  assert.match(raw, new RegExp(sessionId));
+  assert.equal(raw.includes("PRIVATE"), false, "the index is metadata only");
+});
+
+test("an ephemeral session is not indexed", async (t) => {
+  const sessionId = "index-ephemeral";
+  const ui = await mount({ sessionId, sessionFile: null });
+  t.after(ui.shutdown);
+
+  await ui.run("loop", "1h check CI");
+  assert.equal(readSessionIndex().index.sessions[sessionId], undefined);
+});
+
+test("a session is indexed once its file exists, retried on the first reply", async (t) => {
+  const sessionId = "index-unflushed";
+  const dir = mkdtempSync(join(tmpdir(), "session-scheduler-unflushed-"));
+  const notYet = join(dir, "session.jsonl");
+  const ui = await mount({ sessionId, sessionFile: notYet });
+  t.after(ui.shutdown);
+
+  await ui.run("loop", "1h check CI");
+  assert.equal(readSessionIndex().index.sessions[sessionId], undefined, "pi has not written the file yet");
+
+  writeFileSync(notYet, "");
+  await ui.settle();
+  assert.equal(readSessionIndex().index.sessions[sessionId]?.sessionFile, notYet, "the first reply flushes it, and then it is indexed");
+});
+
+test("shutdown for any reason clears the pid and records when", async () => {
+  for (const reason of ["quit", "resume", "fork", "new", "reload"]) {
+    const sessionId = `index-shutdown-${reason}`;
+    const ui = await mount({ sessionId, sessionFile: makeSessionFile(reason) });
+    await ui.run("loop", "1h check CI");
+    assert.ok(readSessionIndex().index.sessions[sessionId].pid, `${reason}: live before shutdown`);
+    await ui.shutdown(reason);
+    const entry = readSessionIndex().index.sessions[sessionId];
+    assert.equal(entry.pid, undefined, `${reason} must not keep claiming the session`);
+    assert.equal(entry.pidStart, undefined);
+    assert.ok(entry.closedAt > 0, `${reason} records closedAt`);
+  }
+});
+
+test("an entry is pruned only when its file is gone and its pi is dead", () => {
+  const alive = makeSessionFile("prune-alive");
+  const gone = join(mkdtempSync(join(tmpdir(), "session-scheduler-gone-")), "missing.jsonl");
+  const base = { cwd: "/tmp", host: hostname(), liveSince: 1, count: 1, updatedAt: 1, nextDueAt: 1 };
+
+  updateSessionIndex("prune-alive", { ...base, sessionFile: alive, pid: process.pid, pidStart: processStart(process.pid) });
+  updateSessionIndex("prune-gone", { ...base, sessionFile: gone, pid: 999_999, pidStart: "Thu Jan  1 00:00:00 1970" });
+  // Something else writes: the dead entry goes, the live one stays.
+  updateSessionIndex("prune-writer", { ...base, sessionFile: makeSessionFile("prune-writer"), pid: process.pid });
+
+  const sessions = readSessionIndex().index.sessions;
+  assert.ok(sessions["prune-alive"], "a live session is never pruned");
+  assert.equal(sessions["prune-gone"], undefined, "a missing file plus a dead pid is pruned");
+  assert.ok(sessions["prune-writer"]);
+});
+
+test("a session held by another live pi is not caught up here", async (t) => {
+  // A real live process on this host, but not us.
+  const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+  t.after(() => other.kill());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const otherStart = processStart(other.pid);
+  assert.ok(otherStart, "ps found the other process");
+
+  const sessionId = "index-held-elsewhere";
+  const sessionFile = makeSessionFile("held");
+  const now = Date.now();
+  updateSessionIndex(sessionId, {
+    sessionFile, cwd: "/tmp", host: hostname(), liveSince: now, count: 1, updatedAt: now,
+    pid: other.pid, pidStart: otherStart, nextDueAt: now - 300_000,
+  });
+  assert.equal(sessionHeldElsewhere(sessionId), true);
+
+  const ui = await mount({
+    sessionId,
+    sessionFile,
+    branch: [snapshot(sessionId, [{ id: "held0000", kind: "once", prompt: "the other pi's business", createdAt: now - 600_000, nextRunAt: now - 300_000 }])],
+  });
+  t.after(ui.shutdown);
+  assert.deepEqual(ui.sent, [], "two live pis must not both deliver it");
+
+  other.kill();
+  assert.equal(sessionHeldElsewhere(sessionId), false, "a dead holder does not count");
+});
+
+test("a corrupt index is moved aside and rebuilt", () => {
+  mkdirSync(schedulerDir, { recursive: true });
+  writeFileSync(indexFile(), "{ this is not json");
+  const result = updateSessionIndex("corrupt-1", {
+    sessionFile: makeSessionFile("corrupt"), cwd: "/tmp", host: hostname(), liveSince: 1, count: 1, updatedAt: 1, nextDueAt: 1,
+  });
+
+  assert.equal(result.error, undefined);
+  assert.ok(readSessionIndex().index.sessions["corrupt-1"], "starts empty and writes this entry");
+  const quarantined = readdirSync(schedulerDir).filter((name) => name.startsWith("session-timers.json.corrupt-"));
+  assert.equal(quarantined.length, 1, "the unreadable file is kept, not deleted");
+});
+
+test("concurrent writers lose no entries", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "session-scheduler-race-"));
+  const script = join(dir, "writer.mjs");
+  writeFileSync(script, [
+    "import { updateSessionIndex } from " + JSON.stringify(new URL("../extensions/lib/session-index.ts", import.meta.url).href) + ";",
+    "const [id, file] = process.argv.slice(2);",
+    "const now = Date.now();",
+    "updateSessionIndex(id, { sessionFile: file, cwd: '/tmp', host: 'concurrency-test', liveSince: now, count: 1, updatedAt: now, nextDueAt: now });",
+  ].join("\n"));
+
+  const writers = Array.from({ length: 8 }, (_, index) => index);
+  await Promise.all(writers.map((index) => {
+    const file = makeSessionFile(`race-${index}`);
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [script, `race-${index}`, file], {
+        stdio: "inherit",
+        env: { ...process.env, PI_SCHEDULER_DIR: schedulerDir },
+      });
+      child.on("error", reject);
+      child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`writer ${index} exited ${code}`))));
+    });
+  }));
+
+  const sessions = readSessionIndex().index.sessions;
+  for (const index of writers) {
+    assert.ok(sessions[`race-${index}`], `writer ${index} kept its entry`);
+  }
+});
+
+test("the index builder refuses an empty entry", () => {
+  assert.equal(
+    planIndexEntry({ sessionFile: "/tmp/x", cwd: "/tmp", liveSince: 1, count: 0 }, 1_000),
+    undefined,
+    "no unpaused tasks, no entry",
+  );
+  assert.equal(
+    planIndexEntry({ sessionFile: "", cwd: "/tmp", liveSince: 1, count: 1 }, 1_000),
+    undefined,
+    "no session file, no entry",
+  );
+  const entry = planIndexEntry({ sessionFile: "/tmp/x", cwd: "/tmp", liveSince: 1, count: 1, wake: "crash", nextDueAt: 7, nextWakeDueAt: 7 }, 1_000);
+  assert.deepEqual(
+    { count: entry.count, wake: entry.wake, nextDueAt: entry.nextDueAt, updatedAt: entry.updatedAt, pid: entry.pid },
+    { count: 1, wake: "crash", nextDueAt: 7, updatedAt: 1_000, pid: undefined },
+  );
+});
+
+// ── live timers across a sleep ──
+
+/** Swap in a setTimeout that records instead of arming; returns the undo. */
+function captureTimers() {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const realNow = Date.now;
+  const scheduled = [];
+  globalThis.setTimeout = (fn, delay) => {
+    // Anything short is the scheduler's own plumbing (the deferred first drain,
+    // the test's own sleeps): run it for real so mounting still works.
+    if (delay <= 100) return realSetTimeout(fn, delay);
+    const handle = { fn, delay, unref() {} };
+    scheduled.push(handle);
+    return handle;
+  };
+  globalThis.clearTimeout = () => {};
+  return {
+    scheduled,
+    jump(ms) { Date.now = () => realNow() + ms; },
+    undo() {
+      Date.now = realNow;
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    },
+  };
+}
+
+test("a live timer waits in 60s chunks and re-checks the clock", async (t) => {
+  const task = { id: "chunk000", kind: "interval", prompt: "tick", createdAt: Date.now(), nextRunAt: Date.now() + 3_600_000, intervalMs: 3_600_000 };
+  const ui = await mount({ branch: [snapshot("session-a", [task])] });
+  t.after(ui.shutdown);
+
+  const fake = captureTimers();
+  t.after(fake.undo);
+  await ui.run("loop", "1h other");
+  assert.equal(fake.scheduled.at(-1).delay, 60_000, "an hour is armed in one-minute chunks");
+
+  fake.scheduled.at(-1).fn();
+  assert.equal(fake.scheduled.at(-1).delay, 60_000, "an early chunk re-arms instead of firing");
+  assert.deepEqual(ui.sent, []);
+});
+
+test("a live fire after a long sleep carries the late prefix", async (t) => {
+  const now = Date.now();
+  const task = { id: "sl33p000", kind: "once", prompt: "wake up", createdAt: now, nextRunAt: now + 600_000 };
+  const fake = captureTimers();
+  t.after(fake.undo);
+  const ui = await mount({ branch: [snapshot("session-a", [task])] });
+  t.after(ui.shutdown);
+
+  fake.jump(2 * 3_600_000);
+  fake.scheduled.filter((handle) => handle.fn).at(-1).fn();
+
+  assert.equal(ui.sent.length, 1);
+  assert.match(ui.sent[0], /^\[Scheduled task sl33p000 was due at .+, 1h\d+m late \(1 missed run\) because this session was not open\]\nwake up$/);
+});
+
+test("a live fire past the cap is skipped with a notice", async (t) => {
+  const now = Date.now();
+  const task = { id: "s10ppped", kind: "once", prompt: "too old", createdAt: now, nextRunAt: now + 600_000 };
+  const fake = captureTimers();
+  t.after(fake.undo);
+  const ui = await mount({ branch: [snapshot("session-a", [task])] });
+  t.after(ui.shutdown);
+
+  fake.jump(30 * 3_600_000);
+  fake.scheduled.filter((handle) => handle.fn).at(-1).fn();
+
+  assert.deepEqual(ui.sent, [], "a 30h-late fire is past the 24h cap");
+  assert.match(ui.notices.at(-1).message, /Skipped s10ppped/);
+  assert.deepEqual(latestTasks(ui), [], "and the one-shot is gone rather than left overdue");
+});
+
+// ── the tool's wake parameter ──
+
+test("the tool refuses wake unless the opt-in allows it", async (t) => {
+  const ui = await mount(withTool);
+  t.after(ui.shutdown);
+  assert.equal("wake" in ui.tools[0].parameters.properties, false, "the parameter is not even declared");
+
+  await assert.rejects(
+    ui.tool({ action: "once", when: "15m", prompt: "x", wake: "always" }),
+    /not allowed to set wake/,
+  );
+  assert.deepEqual(latestTasks(ui), []);
+});
+
+test("allowWake exposes the parameter, and true means crash", async (t) => {
+  const ui = await mount({ config: { enable: [TOOL_OPT_IN], [TOOL_OPT_IN]: { allowWake: true } } });
+  t.after(ui.shutdown);
+  assert.ok("wake" in ui.tools[0].parameters.properties, "declared when the user allowed it");
+
+  await ui.tool({ action: "once", when: "15m", prompt: "remind me", wake: true });
+  await ui.tool({ action: "loop", every: "5m", prompt: "poll", wake: "always" });
+  assert.deepEqual(latestTasks(ui).map((task) => task.wake), ["crash", "always"]);
+
+  await assert.rejects(ui.tool({ action: "once", when: "15m", prompt: "x", wake: "sometimes" }), /wake wants/);
+});
+
+test("the tool's misfire parameter accepts skip, always or a duration", async (t) => {
+  const ui = await mount(withTool);
+  t.after(ui.shutdown);
+
+  await ui.tool({ action: "once", when: "15m", prompt: "a", misfire: "6h" });
+  await ui.tool({ action: "once", when: "15m", prompt: "b", misfire: "skip" });
+  assert.deepEqual(latestTasks(ui).map((task) => task.misfire), [21_600_000, "skip"]);
+  await assert.rejects(ui.tool({ action: "once", when: "15m", prompt: "c", misfire: "soon" }), /Could not read misfire/);
 });
