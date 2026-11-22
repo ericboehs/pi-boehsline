@@ -148,8 +148,11 @@ interface Conn {
 	/** Sends a user message through the current extension instance's pi. A busy steer may wait for the
 	 * turn's end (Conn.steers, holdsSteer): `steer.id` is the phone's client_id for it (a say's, which
 	 * its steer mark carries), `steer.text` his words as typed (what a Stop gives back), and
-	 * `steer.withdrawable` false for one the phone can't take back (photos, files, frames). */
-	inject: (content: string | UserContent[], busy: boolean, steer?: SteerMeta) => void;
+	 * `steer.withdrawable` false for one the phone can't take back (photos, files, frames).
+	 * "held" when a compaction (announced or not, see pendingCompact) made them wait instead. */
+	inject: (content: string | UserContent[], busy: boolean, steer?: SteerMeta) => "held" | undefined;
+	/** Whether words sent now would wait for a compaction pi hasn't finished: deliverSay says "held". */
+	pendingCompact?: () => boolean;
 	/** Runs a slash command from the phone: undefined = not one (send as text), null = ran, string = why not. */
 	command?: (text: string, busy: boolean) => string | null | undefined;
 	/** The commands the phone can run here, for its "/" list; read lazily. */
@@ -1118,7 +1121,8 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 			return { ok: true, delivered: "command" };
 		}
 	}
-	const delivered = c.busy ? "steer" : "prompt";
+	// Words a compaction holds are "held": pi would refuse them as a prompt (2026-11-10).
+	const delivered = c.pendingCompact?.() ? "held" : c.busy ? "steer" : "prompt";
 	if (saved.some((s) => s.video) || c.framing) {
 		// Frames take ffmpeg a few seconds: reply now (the socket and Botsun don't wait), deliver when
 		// they're ready, and queue later replies behind it so they keep their order.
@@ -1135,9 +1139,11 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 	}
 	// Words alone can be taken back from the phone while they wait for the turn's end; a message with
 	// photos or files can't (yet): the reply that brings a steer back has no room for them.
-	c.inject(compose(notes, []), c.busy, { id: opts.clientId, text, withdrawable: !images.length && !files.length, attachments: images.length + files.length });
+	const kept = c.inject(compose(notes, []), c.busy, { id: opts.clientId, text, withdrawable: !images.length && !files.length, attachments: images.length + files.length });
 	debug(`owner say accepted (${text.length} chars, ${images.length} photos, ${files.length} files)`); // never the text
-	return { ok: true, delivered };
+	// The inject knows what happened just now (`delivered` was guessed before it): a compaction it
+	// held them for, or a send pi refused, and the phone hears "held" rather than a prompt it lost.
+	return { ok: true, delivered: kept === "held" ? "held" : delivered };
 }
 
 /** A phone message on its way into pi: the text pi's input event will carry, and its client_id. */
@@ -2132,6 +2138,9 @@ let compacting: string | null = null;
 // running for a while.
 let inputAt = 0;
 const PROMPT_STARTING_MS = 10_000;
+// How long a compaction may hold the phone's words before they go back to it, unsent (dropHeld):
+// a compaction that never ends mustn't swallow them.
+const HELD_MAX_MS = 10 * 60_000;
 // Every prompt this extension sends: marked before pi's input event fires for it.
 // The quiet extension consumes this mark, so a phone message starts a run of
 // Eric's, not a quiet background run.
@@ -2807,21 +2816,22 @@ function main(pi: ExtensionAPI): void {
 		// Eric's own words, as if typed: steer into a running turn, else start one. A busy steer waits for
 		// the turn's end (holdsSteer), where turn_end hands it to pi at the point pi would have read it:
 		// until then the phone's first Stop can take it back (unsteer).
-		const inject = (content: string | UserContent[], busy: boolean, steer?: SteerMeta) => {
+		const inject = (content: string | UserContent[], busy: boolean, steer?: SteerMeta): "held" | undefined => {
 			const c = conn;
-			// held still waiting (a compaction just ended, see releaseHeld): stay behind them.
-			if (compacting || held.length > 0) {
+			// Words still waiting (a compaction just ended, see releaseHeld) or a compaction pi hasn't
+			// announced yet (pendingCompact): stay behind them, in order.
+			if (pendingCompact(ctx) || held.length > 0) {
 				// Remembered until pi's input event for it: its steer mark takes the id, and a Stop gives it back.
 				if (c) notePhoneSay(c, content, steer?.id);
-				held.push({ content, ...(steer ? { steer } : {}) });
-				return;
+				holdWords(ctx, content, steer);
+				return "held";
 			}
 			if (busy && c && !c.closed && holdsSteer(c, withdrawableText(content, steer))) {
 				holdSteer(c, content, steer);
-				return;
+				return undefined;
 			}
 			if (c) notePhoneSay(c, content, steer?.id);
-			sendUser(pi, content, busy ? { deliverAs: "steer" } : undefined);
+			return sendOrHold(ctx, content, busy ? { deliverAs: "steer" } : undefined, steer) ? undefined : "held";
 		};
 		// The oldest waiting steer, to pi now as a steer (turn_end), its phone say noted for its mark.
 		const flushSteer = (c: Conn): void => {
@@ -2832,20 +2842,16 @@ function main(pi: ExtensionAPI): void {
 			sendUser(pi, next.content, { deliverAs: "steer" });
 		};
 		// A settled run's steers it never read (no turn_end was left, or one skipped its handlers): his
-		// next prompt and follow-ups, as if typed once it settled; held while a compaction runs.
+		// next prompt and follow-ups, as if typed once it settled; held while a compaction runs (or one
+		// pi hasn't announced yet), behind the words already waiting.
 		const sendLeftSteers = (c: Conn): void => {
 			const left = c.steers ?? [];
 			if (!left.length) return;
 			c.steers = [];
 			reportSteers(c);
 			left.forEach((s, i) => {
-				if (compacting || held.length > 0) {
-					if (!s.noted) notePhoneSay(c, s.content, s.clientId);
-					held.push({ content: s.content });
-					return;
-				}
 				if (!s.noted) notePhoneSay(c, s.content, s.clientId);
-				try { sendUser(pi, s.content, i > 0 ? { deliverAs: "followUp" } : undefined); } catch {}
+				sendOrHold(ctx, s.content, i > 0 ? { deliverAs: "followUp" } : undefined);
 			});
 		};
 		settleSteers = (aborted: boolean): void => {
@@ -2868,18 +2874,10 @@ function main(pi: ExtensionAPI): void {
 		// typed message would. stop: abort the run, like Esc, then send them once pi settles.
 		const deliver = (text: string, mode: "queue" | "steer" | "stop"): string => {
 			const idle = ctx.isIdle();
-			if (mode === "steer" || compacting) {
-				inject(text, !idle);
-				return compacting ? "held" : idle ? "prompt" : "steer";
-			}
-			if (idle) {
-				sendUser(pi, text);
-				return "prompt";
-			}
-			if (mode === "queue") {
-				sendUser(pi, text, { deliverAs: "followUp" });
-				return "queue";
-			}
+			// A compaction, announced or not, holds these (pendingCompact): the phone hears "held".
+			if (mode === "steer" || pendingCompact(ctx)) return inject(text, !idle) ?? (idle ? "prompt" : "steer");
+			if (idle) return sendOrHold(ctx, text) ? "prompt" : "held";
+			if (mode === "queue") return sendOrHold(ctx, text, { deliverAs: "followUp" }) ? "queue" : "held";
 			// The phone's steers the abort drops go again first (they were sent first), then these words:
 			// the waiting ones in words alone too; one with photos goes back to the phone (turn_end).
 			const waiting = conn?.steers ?? [];
@@ -2921,7 +2919,7 @@ function main(pi: ExtensionAPI): void {
 		// prompt, a follow-up or a trigger may have started one since the reply).
 		const running = () =>
 			!ctx.isIdle() || compacting !== null || conn?.busy === true || conn?.framing !== undefined || (conn?.steers?.length ?? 0) > 0 ||
-			(inputAt > 0 && Date.now() - inputAt < PROMPT_STARTING_MS) || ctx.hasPendingMessages?.() === true;
+			promptStarting() || ctx.hasPendingMessages?.() === true;
 		const close = (opts?: { idleOnly?: boolean }) => {
 			if (opts?.idleOnly && running()) return null;
 			const shutdown = () => {
@@ -2972,6 +2970,7 @@ function main(pi: ExtensionAPI): void {
 			conn.sessionName = sessionName;
 			conn.setSessionName = setSessionName;
 			conn.inject = inject;
+			conn.pendingCompact = () => pendingCompact(ctx);
 			conn.steerStatus = steerStatus;
 			conn.deliver = deliver;
 			conn.stop = stop;
@@ -3042,7 +3041,7 @@ function main(pi: ExtensionAPI): void {
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
 			busy: false, prompt: null, promptDepth: 0, sessionName, setSessionName, ...info, launch: g[LAUNCH],
-			nonces: new Map(), inject, steerStatus, deliver, stop, stopReturning, close, reload, restart, command, commands, models, context, confirm, color,
+			nonces: new Map(), inject, pendingCompact: () => pendingCompact(ctx), steerStatus, deliver, stop, stopReturning, close, reload, restart, command, commands, models, context, confirm, color,
 			model: modelOf(ctx),
 		};
 		store[STORE] = conn;
@@ -3215,19 +3214,19 @@ function main(pi: ExtensionAPI): void {
 		turnEndSteers((event as { outcome?: string } | undefined)?.outcome === "aborted", pending);
 	});
 
-	pi.on("agent_settled", (event) => {
+	pi.on("agent_settled", (event, ctx) => {
 		inputAt = 0;
 		// A settled run has delivered its steers, or an Esc at the keyboard put them in the editor
 		// for Eric there: none is the phone's to take back now.
 		queuedSteers = [];
 		settleSteers((event as { aborted?: boolean } | undefined)?.aborted === true);
 		if (afterStop.length) {
-			// As if typed after Esc; through inject, so a compaction starting now still holds them.
+			// As if typed after Esc; through the hold guard, so a compaction starting now waits with them.
 			const text = afterStop.join("\n\n");
 			afterStop = [];
 			try {
 				if (conn && !conn.closed) conn.inject(text, false);
-				else sendUser(pi, text);
+				else sendOrHold(ctx, text);
 			} catch {}
 		}
 		if (!conn || conn.closed || !conn.busy) return;
@@ -3252,20 +3251,80 @@ function main(pi: ExtensionAPI): void {
 		if (!compacting) return;
 		compacting = null;
 		if (conn && !conn.closed) try { write(conn, "compacting", { reason: null }); } catch {}
-		setTimeout(() => releaseHeld(ctx), 0);
+		startRelease(ctx);
 	};
-	// pi emits session_compact while the compaction still counts as running, and a prompt sent then
-	// is refused ("Cannot submit a prompt while compaction is in progress") asynchronously, past any
-	// try/catch: the phone's words were lost (2026-11-10). Release them once the session takes them:
-	// idle (a prompt) or in a running turn (a steer). After a minute, send anyway.
-	const releaseHeld = (ctx: ExtensionContext, waitedMs = 0) => {
-		if (compacting || held.length === 0) return;
-		const idle = ctx.isIdle();
-		const running = conn?.busy === true;
-		if (!idle && !running && waitedMs < 60_000) {
-			setTimeout(() => releaseHeld(ctx, waitedMs + 250), 250);
+	/** A prompt sent, not started yet: pi's input and before_agent_start handlers are still running. */
+	const promptStarting = (): boolean => inputAt > 0 && Date.now() - inputAt < PROMPT_STARTING_MS;
+	/**
+	 * A compaction pi hasn't announced yet. pi refuses a prompt from the moment it starts one, but its
+	 * `session_before_compact` handlers run in load order and another extension's can run for a minute
+	 * first (extensions/compaction writes the whole summary inside its own), so `compacting` is still
+	 * null when the phone's words arrive (2026-11-10). A session that isn't idle with no turn running
+	 * and no prompt on its way in is one of those: the API has neither `compaction_start` nor
+	 * `isCompacting`, and that is the only other thing that leaves pi neither idle nor running.
+	 */
+	const pendingCompact = (ctx: ExtensionContext): boolean =>
+		compacting !== null || (!ctx.isIdle() && conn?.busy !== true && !promptStarting());
+	// The phone's words a compaction holds: they wait in `held`, in order, until pi takes a prompt
+	// again (releaseHeld). Never sent blind, and never dropped without going back to the phone.
+	const holdWords = (ctx: ExtensionContext, content: string | UserContent[], steer?: SteerMeta): void => {
+		if (!held.length) heldAt = Date.now(); // the wait's clock starts with the first word
+		held.push({ content, ...(steer ? { steer } : {}) });
+		startRelease(ctx);
+	};
+	/**
+	 * pi's words now, or held when it can't take them: false when they were held. pi's own refusal ("Cannot
+	 * submit a prompt while compaction is in progress") goes to the runner's error listeners
+	 * (`send_user_message`), which no extension can hear, so the check before the send is the guard; a
+	 * send that throws anyway (an older pi that refuses first) re-holds them rather than losing them.
+	 */
+	const sendOrHold = (ctx: ExtensionContext, content: string | UserContent[], options?: Parameters<ExtensionAPI["sendUserMessage"]>[1], steer?: SteerMeta): boolean => {
+		if (pendingCompact(ctx)) {
+			holdWords(ctx, content, steer);
+			return false;
+		}
+		try {
+			sendUser(pi, content, options);
+			return true;
+		} catch {
+			holdWords(ctx, content, steer);
+			return false;
+		}
+	};
+	// One release poll at a time: a hold while one waits joins it, and a compaction's end starts one.
+	let releasing = false;
+	// When the waiting words' clock started (Date.now: wall time, so a test can move it).
+	let heldAt = 0;
+	const startRelease = (ctx: ExtensionContext): void => {
+		if (releasing) return;
+		releasing = true;
+		releaseHeld(ctx);
+	};
+	/**
+	 * pi emits session_compact while the compaction still counts as running, and a prompt sent then is
+	 * refused asynchronously, past any try/catch: the phone's words were lost (2026-11-10). Release them
+	 * only once pi takes them: idle (a prompt) or in a running turn (a steer). A compaction pi never
+	 * announced reads the same way (pendingCompact) and is waited out; after HELD_MAX_MS the words go
+	 * back to the phone (dropHeld) instead, so nothing waits forever and nothing vanishes.
+	 */
+	const releaseHeld = (ctx: ExtensionContext): void => {
+		// An announced compaction ends with session_compact, which starts this again (endCompaction).
+		if (compacting || held.length === 0) {
+			releasing = false;
+			if (!held.length) heldAt = 0;
 			return;
 		}
+		if (pendingCompact(ctx)) {
+			if (Date.now() - heldAt >= HELD_MAX_MS) {
+				releasing = false;
+				dropHeld();
+				return;
+			}
+			setTimeout(() => releaseHeld(ctx), 250).unref();
+			return; // still releasing: one poll at a time
+		}
+		releasing = false;
+		const idle = ctx.isIdle();
 		const out = held;
 		held = [];
 		const c = conn;
@@ -3276,8 +3335,37 @@ function main(pi: ExtensionAPI): void {
 				return;
 			}
 			const options = i > 0 ? { deliverAs: "followUp" as const } : idle ? undefined : { deliverAs: "steer" as const };
-			try { sendUser(pi, content, options); } catch {}
+			// One pi still won't take stays held, for the next hold or compaction's end.
+			try { sendUser(pi, content, options); } catch { held.push({ content, ...(steer ? { steer } : {}) }); }
 		});
+		// Nothing left: the next hold starts the wait's clock again.
+		if (!held.length) heldAt = 0;
+	};
+	/**
+	 * Words held past HELD_MAX_MS, back to the phone's message box: the channel a returned steer uses
+	 * (Botsun's `returned` line, which puts it in the phone's box), so the phone hears they weren't
+	 * delivered. Never silently dropped; why "withdrawn" is the only one Botsun knows that fits.
+	 */
+	const dropHeld = (): void => {
+		const c = conn;
+		const out = held;
+		held = [];
+		heldAt = 0;
+		if (!out.length) return;
+		debug(`held words dropped after ${HELD_MAX_MS / 60_000} minutes`); // never the text
+		if (!c || c.closed) return;
+		const now = Date.now();
+		escrow(c, out.map(({ content, steer }) => {
+			const text = (steer?.text ?? contentTextOf(content)).trim();
+			const n = Math.max(1, steer?.attachments ?? 0);
+			return {
+				id: steer?.id && STEER_ID.test(steer.id) ? steer.id : randomUUID(),
+				text: text || `[${n} attachment${n === 1 ? "" : "s"}]`,
+				at: now,
+				sessionId: c.sessionId,
+				why: "withdrawn" as const,
+			};
+		}));
 	};
 	pi.on("session_compact", (_event, ctx) => {
 		endCompaction(ctx);

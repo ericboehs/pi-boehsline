@@ -82,6 +82,8 @@ async function mount({ ctx: over = {}, sessionName } = {}) {
 		cwd: "/tmp/work/proj",
 		hasUI: true,
 		mode: "tui",
+		// pi is idle unless a test says otherwise (its compaction controller is set, a turn runs).
+		isIdle: () => true,
 		sessionManager: { getSessionFile: () => "/tmp/sessions/a.jsonl", getSessionId: () => "sid-a" },
 		...over,
 	};
@@ -1466,7 +1468,7 @@ test("compaction: held words wait until pi stops counting the compaction as runn
 	await m.fire("session_before_compact", { reason: "manual" });
 	const { nonce } = await ask({ type: "nonce" });
 	const text = "the share sheet one";
-	await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) });
+	assert.deepEqual(await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) }), { ok: true, delivered: "held" });
 	await m.fire("session_compact", { reason: "manual" });
 	await settle(20);
 	assert.equal(m.sent.length, 0, "not while pi still counts the compaction");
@@ -1483,10 +1485,117 @@ test("compaction: the phone hears of it, and a reply meanwhile waits for it to e
 	await m.fire("session_before_compact", { reason: "threshold" });
 	const { nonce } = await ask({ type: "nonce" });
 	const text = "and then the docs";
-	assert.deepEqual(await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) }), { ok: true, delivered: "prompt" });
+	assert.deepEqual(await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) }), { ok: true, delivered: "held" });
 	assert.equal(m.sent.length, 0, "pi refuses a prompt mid-compaction");
 	await m.fire("session_compact", { reason: "threshold" }); await settle();
 	assert.deepEqual(m.sent.at(-1), { content: text, options: undefined });
+});
+
+test("compaction: a say that arrives before this extension hears of it is held, then goes in once as a prompt", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	// pi set its compaction controller, so it refuses prompts; another extension's session_before_compact
+	// is still running, so this one's `compacting` is still null.
+	let idle = false;
+	m.ctx.isIdle = () => idle;
+	const { nonce } = await ask({ type: "nonce" });
+	const text = "the share sheet one";
+	assert.deepEqual(await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) }), { ok: true, delivered: "held" });
+	assert.equal(m.sent.length, 0, "never a prompt pi would refuse");
+	await m.fire("session_before_compact", { reason: "manual" });
+	await m.fire("session_compact", { reason: "manual" });
+	await settle(20);
+	assert.equal(m.sent.length, 0, "not while pi still counts the compaction");
+	idle = true;
+	await settle(400);
+	assert.deepEqual(m.sent, [{ content: text, options: undefined }], "once, as a prompt");
+});
+
+test("compaction: words held for one pi never announced go in when it turns idle (a poll, no events)", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	let idle = false;
+	m.ctx.isIdle = () => idle;
+	const { nonce } = await ask({ type: "nonce" });
+	const text = "after the summary";
+	assert.equal((await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) })).delivered, "held");
+	assert.equal(m.sent.length, 0);
+	// The compaction finished inside another extension's handler: no session_before_compact, no
+	// session_compact, nothing to start a release but the poll its hold started.
+	idle = true;
+	await settle(400);
+	assert.deepEqual(m.sent, [{ content: text, options: undefined }]);
+});
+
+test("compaction: a send pi refuses goes back to held, and the phone hears held, not prompt", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	m.ctx.isIdle = () => true;
+	// pi's own refusal is async and only reaches the runner's error listeners (send_user_message),
+	// which no extension can hear: a pi that throws instead must not lose the words either.
+	let refusals = 2; // the send, and the release's retry
+	m.pi.sendUserMessage = (content, options) => {
+		if (refusals-- > 0) throw new Error("Cannot submit a prompt while compaction is in progress");
+		m.sent.push({ content, options });
+	};
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const { nonce } = await ask({ type: "nonce" });
+	const text = "sent while it compacts";
+	assert.deepEqual(await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) }), { ok: true, delivered: "held" });
+	assert.equal(m.sent.length, 0, "held, not lost");
+	// The compaction ends and its handlers run: the release sends what was held.
+	await m.fire("session_before_compact", { reason: "manual" });
+	await m.fire("session_compact", { reason: "manual" });
+	await settle(20);
+	assert.deepEqual(m.sent, [{ content: text, options: undefined }], "in once, as a prompt");
+});
+
+test("compaction: a running turn's steer and a prompt on its way in are not held", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	m.ctx.isIdle = () => false;
+	await m.fire("agent_start"); // a turn runs: not idle, but Botsun's busy explains it
+	const say = async (text) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) });
+	};
+	assert.equal((await say("steer this")).delivered, "steer");
+	assert.deepEqual(m.sent.at(-1).options, { deliverAs: "steer" });
+	await m.fire("agent_settled");
+	// A prompt sent, its turn not started: pi's input handler marks the moment (inputAt).
+	await m.fire("input", { type: "input", text: "typed at the Mac", source: "interactive" });
+	assert.equal((await say("right after your prompt")).delivered, "prompt");
+	assert.deepEqual(m.sent.at(-1), { content: "right after your prompt", options: undefined });
+});
+
+test("compaction: words held for ten minutes go back to the phone, not into the void", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	m.ctx.isIdle = () => false; // a compaction that never ends: pi never takes a prompt again
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const realNow = Date.now;
+	try {
+		const { nonce } = await ask({ type: "nonce" });
+		const text = "are you stuck?";
+		assert.equal((await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) })).delivered, "held");
+		Date.now = () => realNow() + 11 * 60_000; // past the hold's cap (HELD_MAX_MS)
+		await settle(400); // the poll its hold started sees the cap
+		assert.deepEqual(srv.lines.find((l) => l.type === "returned").steers.map((s) => [s.text, s.why]), [[text, "withdrawn"]]);
+		assert.equal(m.sent.length, 0, "never into a compaction");
+	} finally {
+		Date.now = realNow;
+	}
 });
 
 test("bypass: the phone hears the guardian's state, and a signed /bypass flips it", async () => {
@@ -1528,7 +1637,13 @@ async function heldCall() {
 		return ask({ type: "say_audio", text, nonce, device_id: 7, wav_sha256: wav, signature, hold: true,
 			...(proposal ? { proposal_sha256: proposal } : {}) });
 	};
-	return { m, hold, busy: (b) => (idle = !b), aborts: () => aborts };
+	// A turn is running only when pi says so (agent_start): not idle and not busy is a compaction's
+	// shape, which the extension holds for (pendingCompact).
+	const busy = async (b) => {
+		idle = !b;
+		await m.fire(b ? "agent_start" : "agent_settled");
+	};
+	return { m, hold, busy, aborts: () => aborts };
 }
 
 test("held call words go in only when released: queued after the turn, or steered in", async () => {
@@ -1538,7 +1653,7 @@ test("held call words go in only when released: queued after the turn, or steere
 	const b = await hold("and then lint");
 	assert.match(a.held, /^[0-9a-f]{12}$/);
 	assert.equal(m.sent.length, 0, "held, not put in");
-	busy(true);
+	await busy(true);
 	assert.deepEqual(await ask({ type: "release", ids: [a.held, b.held], mode: "queue" }), { ok: true, delivered: "queue" });
 	assert.deepEqual(m.sent.at(-1), { content: "run the tests\n\nand then lint", options: { deliverAs: "followUp" } });
 	assert.equal((await ask({ type: "release", ids: [a.held], mode: "queue" })).error, `not waiting: ${a.held}`, "each goes in once");
@@ -1550,7 +1665,7 @@ test("held call words go in only when released: queued after the turn, or steere
 
 test("interrupt stops the run only when Eric's own words say stop", async () => {
 	const { m, hold, busy, aborts } = await heldCall();
-	busy(true);
+	await busy(true);
 	const look = await hold("look at the failing spec instead");
 	assert.deepEqual(await ask({ type: "release", ids: [look.held], mode: "interrupt" }), { ok: true, delivered: "steer" });
 	assert.equal(aborts(), 0, "the helper's judgment alone never aborts");
@@ -1561,8 +1676,7 @@ test("interrupt stops the run only when Eric's own words say stop", async () => 
 	assert.deepEqual(await ask({ type: "release", ids: [stop.held], mode: "interrupt" }), { ok: true, delivered: "stopped" });
 	assert.equal(aborts(), 1);
 	const before = m.sent.length;
-	busy(false);
-	await m.fire("agent_settled");
+	await busy(false);
 	assert.equal(m.sent.length, before + 1, "sent once the aborted run settled");
 	assert.deepEqual(m.sent.at(-1), { content: "stop, that's the wrong branch", options: undefined });
 });
@@ -1725,7 +1839,7 @@ test("close: the phone's steers a non-idle Close takes out of the editor come ba
 
 test("interrupt: the phone's steers the abort dropped go again first, then the words", async () => {
 	const { m, hold, busy } = await heldCall();
-	busy(true);
+	await busy(true);
 	let editor = "";
 	let queued = [];
 	m.ctx.hasPendingMessages = () => queued.length > 0;
@@ -1738,8 +1852,7 @@ test("interrupt: the phone's steers the abort dropped go again first, then the w
 	const stop = await hold("stop, that's the wrong branch");
 	assert.deepEqual(await ask({ type: "release", ids: [stop.held], mode: "interrupt" }), { ok: true, delivered: "stopped" });
 	assert.equal(editor, "", "not left in the Mac's editor");
-	busy(false);
-	await m.fire("agent_settled");
+	await busy(false);
 	assert.deepEqual(m.sent.at(-1), { content: "use the staging config\n\nstop, that's the wrong branch", options: undefined });
 });
 
@@ -2149,6 +2262,8 @@ test("a locked phone's close counts words this extension released after a stop o
 	const realNow = Date.now;
 	const later = (ms) => { Date.now = () => realNow() + ms; };
 	try {
+		// A turn running (not just !isIdle: that alone is a compaction's shape now).
+		await m.fire("agent_start");
 		// Stop, then the words once pi settles: sent by this extension, pi's input event not yet run.
 		assert.equal(conn.deliver("try the other fix", "stop"), "stopped");
 		idle = true;
@@ -2257,7 +2372,7 @@ test("a reworded message goes in only with his signed yes to that exact text", a
 	const long = "x".repeat(601);
 	assert.equal((await confirm((await hold("sure", proposalTextHash(long))).held, long)).error, "bad request", "no longer than Botsun reads back");
 	assert.equal(m.sent.length, 0);
-	busy(true);
+	await busy(true);
 	const yes = await hold("yeah send it", sha);
 	assert.deepEqual(await confirm(yes.held), { ok: true, delivered: "steer" });
 	assert.deepEqual(m.sent.at(-1), { content: text, options: { deliverAs: "steer" } });
@@ -2408,7 +2523,10 @@ test("v2: the nonce reply advertises sign_v2 and ask_v2; say, stash and stop ver
 	const key = phoneKey();
 	writeKeys({ 7: key.raw.toString("base64") });
 	const m = await owner();
-	m.ctx.isIdle = () => false;
+	// Idle for the says below (a session that isn't idle and isn't running is a compaction's shape),
+	// then busy for the stop.
+	let idle = true;
+	m.ctx.isIdle = () => idle;
 	m.ctx.abort = () => {};
 	const { features } = await ask({ type: "nonce" });
 	assert.ok(features.includes("sign_v2") && features.includes("ask_v2"));
@@ -2441,6 +2559,7 @@ test("v2: the nonce reply advertises sign_v2 and ask_v2; say, stash and stop ver
 	assert.match(res.error ?? "", /^this phone signs v2/, "v1 is refused once the device signed v2");
 
 	({ nonce } = await ask({ type: "nonce" }));
+	idle = false;
 	assert.deepEqual(await ask({ type: "stop", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "stop", "stop") }), { ok: true, stopped: true });
 	({ nonce } = await ask({ type: "nonce" }));
 	assert.equal((await ask({ type: "close", nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "stop", "stop") })).error,
@@ -3183,7 +3302,10 @@ test("v3: verifies against owner-keys.json's host; a signature for another host,
 	const key = phoneKey();
 	writeKeysWithHost({ 7: key.raw.toString("base64") });
 	const m = await owner();
-	m.ctx.isIdle = () => false;
+	// Idle for the says below (a session that isn't idle and isn't running is a compaction's shape),
+	// then busy for the stop.
+	let idle = true;
+	m.ctx.isIdle = () => idle;
 	m.ctx.abort = () => {};
 	const { features } = await ask({ type: "nonce" });
 	assert.ok(features.includes("sign_v3"));
@@ -3199,6 +3321,7 @@ test("v3: verifies against owner-keys.json's host; a signature for another host,
 	assert.equal(m.sent.at(-1).content, "here");
 	assert.equal((await readSignVersions())["7"].sign_version, 3);
 	({ nonce } = await ask({ type: "nonce" }));
+	idle = false;
 	assert.deepEqual(await ask({ type: "stop", nonce, device_id: 7, sig_v: 3, signature: signV3(key, nonce, "session", "stop", "stop") }), { ok: true, stopped: true });
 	({ nonce } = await ask({ type: "nonce" }));
 	assert.equal((await ask({ type: "stop", nonce, device_id: 7, sig_v: 3, signature: signV3(key, nonce, "session", "stop", "stop", { scope: "sid-b" }) })).error,
