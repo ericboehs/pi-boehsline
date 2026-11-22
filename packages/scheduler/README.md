@@ -22,7 +22,8 @@ Session timers (`/once`, `/loop`) are necessarily in-process — they hold
 `setTimeout`s (in one-minute chunks, so a laptop sleep cannot leave one
 looking on time) and read their snapshot back at `session_start` — but they
 still register no tool and no context. They also publish a small index of who
-has timers and when they are next due, for [#the-session-timer-index](#the-session-timer-index).
+has timers and when they are next due, for [the session timer
+index](#the-session-timer-index).
 
 ## Install
 
@@ -85,10 +86,17 @@ next resume the session, rather than being dropped:
 - `paused` timers are untouched. `/loop resume` still skips what was missed
   while paused, and tree navigation never catches up: an older branch can hold
   a slot that already fired.
-- **At most once.** A catch-up one-shot is recorded as delivered *before* the
-  prompt is sent, so a crash in between loses that reminder rather than
-  repeating it. A recurring catch-up is re-armed before it is queued, so a
-  queued fire that never gets sent is the one thing catch-up can lose.
+- **At most once, and never abandoned.** A one-shot — catch-up or live — is
+  removed from the snapshot and saved *before* its prompt is sent, and put back
+  if the send fails, so a crash between the two loses that prompt rather than
+  repeating it. Until it is actually delivered a catch-up one-shot stays in the
+  snapshot (unarmed), so quitting, crashing or `/reload`-ing first retries it on
+  the next resume. A recurring catch-up is re-armed before it is queued, so a
+  queued recurring fire that never gets sent is the one thing catch-up can lose.
+- Nothing is armed or caught up in print mode (`pi -p --session`), or when
+  another live pi holds the session: the list is restored, no timer is armed and
+  nothing is written, so a second pi cannot double-fire or advance the first
+  one's timers. The second case says which pid holds it.
 - Timers are restored from the session, so `/new`, `/fork` and `/clone` inherit
   nothing: the snapshot names the session id that created it.
 
@@ -197,7 +205,10 @@ every session with timers also publishes a one-line entry to
   when the session has nothing unpaused left.
 - `pid` plus `pidStart` (ps `lstart`) and `host` identify the live pi holding
   the session; both are cleared with `closedAt` on shutdown for any reason, so
-  after `/resume` or `/fork` the old entry no longer claims a live process.
+  after `/resume` or `/fork` the old entry no longer claims a live process. A
+  print-mode run, or a restore that found another holder, updates the timing
+  fields only and leaves that pid alone on the way out, so `pi -p --session X`
+  cannot mark a live `X` closed.
 - Written under a lock, atomically, mode 0600 (directory 0700), and left alone
   when nothing changed. A session is indexed once its file exists (pi writes
   the file with the first reply); an entry is pruned only when its file is gone

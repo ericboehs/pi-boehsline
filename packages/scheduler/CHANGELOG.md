@@ -57,14 +57,33 @@ change behaviour; each one says what it breaks.
   older branch already fired, and `/loop resume` still skips what was missed
   while paused. In print mode (`pi -p --session`) the snapshot is left exactly
   as it is: no catch-up, no drop, no write.
-- **At most once.** A catch-up one-shot is persisted as delivered before its
-  prompt is sent, and put back if the send throws; a crash in between loses
-  that reminder rather than repeating it. A recurring catch-up is re-armed
-  before it is queued, so a queued fire lost to a quit is the one gap.
+- **At most once, and never abandoned.** A one-shot — catch-up or live — is
+  removed from the snapshot and persisted before its prompt is sent, and put
+  back (and persisted again) if the send throws; a crash between the two loses
+  that prompt rather than repeating it. Until it is delivered, a catch-up
+  one-shot stays in the snapshot unarmed, so a quit, crash or `/reload` before
+  delivery leaves it there and the next resume retries it. A recurring catch-up
+  is re-armed before it is queued, so a queued recurring fire lost to a quit is
+  the one gap.
+- A restore that finds another live pi holding the session (pid, `ps` lstart and
+  host in the index) now leaves the session to it: the list is restored, but
+  nothing is armed, caught up, dropped or persisted, and a notice names the
+  holder's pid. Before, it still ran the resume normalization, which advanced
+  recurring timers and dropped due one-shots the holder owned, and persisted
+  that over its view.
+- The index knows who is writing. A claim puts this pi's pid in; a release
+  clears it only when it is ours (or its holder is dead); a passive write (print
+  mode, held elsewhere) updates the timing fields and never takes the pid from a
+  live holder. `pi -p --session X` can no longer mark a live `X` closed on exit.
+- A missing `pidStart` no longer counts as a match, so a reused pid cannot
+  masquerade as the holder. The index is quarantined only for a parse or shape
+  error; an index from a newer pi (or one that cannot be read at all) is
+  reported and never rewritten.
 - Live `setTimeout`s are armed in 60s chunks and re-check `Date.now()`, because
   libuv's clock does not advance during macOS sleep; a live fire more than 2
   minutes late now takes the catch-up path (prefix and cap) instead of looking
-  on time.
+  on time, and its prefix says "because the computer was asleep" rather than
+  claiming the session was not open.
 - Two pi processes on one session no longer both catch up: the restore checks
   the index for another live holder (pid, `ps` lstart and host) and leaves the
   missed fires to it.
@@ -78,6 +97,20 @@ change behaviour; each one says what it breaks.
 
 - `/once help`, `/loop help` and the bare-command usage now document `--wake`,
   `--misfire` and the catch-up behaviour they used to deny.
+- `--wake` / `--no-wake` / `--misfire=` are only read as flags in the positions
+  they belong in — leading, right after the time, or trailing (and after the id
+  or time on an `edit`) — so a prompt that mentions `--no-wake` keeps it, and
+  `--misfire 6h` says to write `--misfire=6h`.
+- The index `count` is the unpaused timers, as documented: a queued fire moves
+  `nextDueAt` earlier but is not a timer of its own.
+- The missed-slot walk starts at the cap window instead of at the stored slot,
+  so a minute-granularity cron missed for weeks is measured at its newest slot
+  (a minute ago) rather than 1000 steps in and hours out of date.
+- The index lock is tried for ~200ms, not ~2s, before giving up: a lock left
+  behind by a crashed holder used to freeze the TUI for two seconds on every
+  persist and every fire. Taking a stale lock is a rename now, so two waiters
+  cannot both decide it is stale and one delete the other's fresh lock. Pruning
+  makes at most four `ps` calls per write.
 
 
 ## [0.2.0] — 2026-08-24
