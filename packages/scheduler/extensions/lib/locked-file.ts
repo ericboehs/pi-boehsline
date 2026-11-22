@@ -14,7 +14,7 @@
  * for long inside it.
  */
 
-import { mkdirSync, rmSync, statSync } from "node:fs";
+import { mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 
 const LOCK_STALE_MS = 60_000;
@@ -22,6 +22,16 @@ const LOCK_STALE_MS = 60_000;
 /** How long to wait between attempts, and how many: ~2s of contention. */
 const LOCK_RETRY_MS = 20;
 const LOCK_ATTEMPTS = 100;
+
+export interface LockOptions {
+  /**
+   * How many times to try for the lock: about `attempts × 20ms`. Callers that
+   * run inside the UI (the session-timer index, from persist() and every timer
+   * fire) want a short one, so a stranded lock from a crashed holder cannot
+   * freeze the TUI for two seconds.
+   */
+  attempts?: number;
+}
 
 function ensureDir(path: string): void {
   mkdirSync(path, { recursive: true, mode: 0o700 });
@@ -53,11 +63,12 @@ export function withLockedFile<V, R>(
   path: string,
   read: () => V,
   mutate: (value: V) => R,
+  { attempts = LOCK_ATTEMPTS }: LockOptions = {},
 ): R {
   ensureDir(dirname(path));
   const lockPath = lockPathOf(path);
 
-  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt += 1) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       mkdirSync(lockPath, { mode: 0o700 });
     } catch (error) {
@@ -66,7 +77,18 @@ export function withLockedFile<V, R>(
       if (age !== undefined && age > LOCK_STALE_MS) {
         // The holder died mid-write. Files here are only ever replaced by
         // rename, so the worst case is a lost concurrent edit, not a torn file.
-        rmSync(lockPath, { recursive: true, force: true });
+        // Taking it by rename, not rm, makes the steal atomic: exactly one of
+        // several waiters renames the directory, and only that one goes on to
+        // take the lock, so two cannot both decide it is stale and one delete
+        // the other's fresh lock.
+        const stalePath = `${lockPath}.stale-${process.pid}-${Date.now()}`;
+        try {
+          renameSync(lockPath, stalePath);
+        } catch {
+          // Someone else stole it first; try again from the top.
+          continue;
+        }
+        rmSync(stalePath, { recursive: true, force: true });
         continue;
       }
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_RETRY_MS);

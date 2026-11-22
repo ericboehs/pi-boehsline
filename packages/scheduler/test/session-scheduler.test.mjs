@@ -1,24 +1,13 @@
+// The test environment first: it has to be in place before the scheduler (or
+// anything else) is loaded. See helpers/env.mjs.
+import { configPath, schedulerDir } from "./helpers/env.mjs";
+
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-
-// The schedule tool is a Boehsline opt-in. Point the config at a scratch file
-// so the developer's own boehsline.json cannot turn it on under the tests.
-const configDir = mkdtempSync(join(tmpdir(), "session-scheduler-"));
-const configPath = join(configDir, "boehsline.json");
-process.env.BOEHSLINE_CONFIG = configPath;
-delete process.env.BOEHSLINE_ENABLE;
-
-// Every scheduler file a test produces — the timer index, lock directories —
-// goes here. Without this the tests read and write ~/.pi/agent/scheduler, which
-// is the developer's real one.
-const schedulerDir = mkdtempSync(join(tmpdir(), "session-scheduler-state-"));
-process.env.PI_SCHEDULER_DIR = schedulerDir;
-delete process.env.PI_SCHEDULER_SESSION_MISFIRE;
-process.env.PI_AGENT_DIR = schedulerDir;
 
 import sessionScheduler, {
   MAX_CATCHUPS,
@@ -29,6 +18,7 @@ import sessionScheduler, {
   normalizeTasksForResume,
   parseTimerFlags,
   planRestore,
+  rearmRecurringTask,
   sessionMisfireMs,
   timerStatusText,
 } from "../extensions/session-scheduler.ts";
@@ -252,7 +242,7 @@ test("/once and /loop share one help that draws the line at /schedule", async (t
     assert.equal(ui.notices.at(-1).level, "info", `${command} help is not an error`);
     assert.match(help, /need pi open/, "the session-scoped caveat is the whole point");
     assert.match(help, /delivered once when you next resume/, "catch-up, not replay-of-everything");
-    assert.match(help, /24h late/, "the staleness window is stated");
+    assert.match(help, /1d late/, "the staleness window is stated");
     assert.match(help, /use \/schedule/, "help names the durable alternative");
     assert.match(help, /may lead or trail/, "the one genuinely surprising parse rule");
     assert.match(help, /1m minimum/);
@@ -557,6 +547,38 @@ test("recurring lateness is measured from the latest missed slot", () => {
   assert.equal(plan.catchUps[0].late.missed, 26);
 });
 
+test("the missed-slot walk starts at the cap, so a long absence is measured at its newest slot", () => {
+  const now = 1_000_000_000;
+  // A minute-granularity cron missed for a month. Walking from the stored slot
+  // stops 1000 steps in and calls the latest fire days old.
+  const task = { id: "minutely", kind: "cron", prompt: "x", createdAt: now - 40 * 86_400_000, nextRunAt: now - 30 * 86_400_000, cronExpr: "* * * * *" };
+  const lateMs = now - latestMissedSlot(task, now, 86_400_000);
+  assert.ok(lateMs >= 0 && lateMs <= 60_000, `a minute late, not days: ${lateMs}`);
+  // A window that ends before the next occurrence says nothing is inside it.
+  const yearly = { id: "yearly", kind: "cron", prompt: "x", createdAt: 0, nextRunAt: now - 30 * 86_400_000, cronExpr: "0 0 1 1 *" };
+  assert.equal(latestMissedSlot(yearly, now, 3_600_000), yearly.nextRunAt, "nothing in an hour, so nothing to measure from");
+  // A minutely cron, on the other hand, always has a slot inside the window.
+  const plan = planRestore([task], now, { catchUp: true, misfireMs: 86_400_000 });
+  assert.equal(plan.catchUps.length, 1, "and the fire is delivered, not skipped as late");
+  assert.equal(plan.skipped.length, 0);
+  assert.ok(now - plan.catchUps[0].late.dueAt <= 60_000, "measured at the newest slot");
+});
+
+test("a re-arm less than a quarter interval away is skipped, intervals only", () => {
+  const now = 1_000_000;
+  const due = (agoMs) => ({ id: "tick", kind: "interval", prompt: "x", createdAt: 0, intervalMs: 60_000, nextRunAt: now - agoMs });
+  // 55s late, so the next slot lands 5s from now: two turns back to back.
+  assert.equal(rearmRecurringTask(due(55_000), now).nextRunAt, now + 65_000, "one interval is skipped");
+  assert.equal(rearmRecurringTask(due(30_000), now).nextRunAt, now + 30_000, "a comfortable slot is kept");
+  // A daily task's slot is the user's clock time, so it is never moved.
+  const daily = { id: "daily", kind: "daily", prompt: "x", createdAt: 0, dailyAt: "09:00", nextRunAt: now - 24 * 3_600_000 };
+  assert.equal(
+    rearmRecurringTask(daily, now).nextRunAt,
+    advanceRecurringTask(daily, now).nextRunAt,
+    "unchanged for daily",
+  );
+});
+
 test("only MAX_CATCHUPS missed timers are delivered, oldest first", async (t) => {
   const now = Date.now();
   const tasks = Array.from({ length: MAX_CATCHUPS + 2 }, (_, index) => ({
@@ -607,6 +629,45 @@ test("reload delivers a never-delivered one-shot exactly once", async (t) => {
   ui.setIdle(true);
   await ui.settle();
   assert.equal(ui.sent.length, 1, "a second reload does not re-fire");
+});
+
+test("a catch-up queued behind a busy turn survives a quit and is retried once", async (t) => {
+  const now = Date.now();
+  const tasks = [
+    { id: "backup01", kind: "once", prompt: "check the backup", createdAt: now - 600_000, nextRunAt: now - 300_000 },
+    { id: "build002", kind: "once", prompt: "check the build", createdAt: now - 500_000, nextRunAt: now - 200_000 },
+  ];
+  const busy = await mount({ branch: [snapshot("session-a", tasks)], idle: false });
+  // Wait for the scheduler to try to deliver and find the turn busy.
+  const deadline = Date.now() + 5_000;
+  while (busy.idleChecks() === 0 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(busy.idleChecks() > 0, "the scheduler tried to deliver");
+  assert.deepEqual(busy.sent, [], "nothing goes into a busy turn");
+  assert.deepEqual(
+    latestTasks(busy).map((task) => task.id).sort(),
+    ["backup01", "build002"],
+    "both stay in the snapshot, unarmed, until they are delivered",
+  );
+
+  // Quitting drops the queue. A removal persisted at restore would lose both.
+  await busy.shutdown();
+
+  const resumed = await mount({ branch: busy.entries, reason: "resume" });
+  t.after(resumed.shutdown);
+  assert.equal(resumed.sent.length, 1, "the first is delivered on the tick after resume");
+  resumed.setIdle(true);
+  await resumed.settle();
+  assert.equal(resumed.sent.length, 2, "the second once the agent settles");
+  const delivered = [...busy.sent, ...resumed.sent];
+  for (const prompt of ["check the backup", "check the build"]) {
+    assert.equal(delivered.filter((text) => text.endsWith(`\n${prompt}`)).length, 1, `${prompt} exactly once`);
+  }
+  assert.deepEqual(latestTasks(resumed), [], "and both are now recorded as delivered");
+
+  // A further restart finds nothing to retry.
+  const again = await mount({ branch: resumed.entries, reason: "resume" });
+  t.after(again.shutdown);
+  assert.deepEqual(again.sent, [], "at most once, across the quit and the retry");
 });
 
 test("a crash after delivery does not re-fire the catch-up", async (t) => {
@@ -1114,7 +1175,26 @@ test("flags are parsed as whole tokens and the rest of the line is untouched", (
   assert.equal(parseTimerFlags("--misfire=always 15m x").misfire, "always");
   assert.equal(parseTimerFlags("15m explain --frobnicate").rest, "15m explain --frobnicate", "unknown flags stay in the prompt");
   assert.throws(() => parseTimerFlags("--wake=sometimes 15m x"), /--wake wants/);
-  assert.throws(() => parseTimerFlags("--misfire=soon 15m x"), /--misfire wants/);
+  assert.throws(() => parseTimerFlags("--misfire=soon 15m x"), /--misfire needs a value/);
+  assert.throws(() => parseTimerFlags("--misfire 6h 15m x"), /--misfire=6h/, "the error says how to write it");
+});
+
+test("a flag word inside the prompt is prompt text, not a flag", async (t) => {
+  const parsed = parseTimerFlags("1h explain the --no-wake flag");
+  assert.equal(parsed.clearWake, undefined);
+  assert.equal(parsed.rest, "1h explain the --no-wake flag");
+  assert.equal(parseTimerFlags("1h grep --wake=a --verbose").rest, "1h grep --wake=a --verbose");
+  // After the time and trailing, the flag positions, they are still flags.
+  assert.equal(parseTimerFlags("8p --wake check the backup").wake, "crash");
+  assert.equal(parseTimerFlags("8p --wake check the backup").rest, "8p check the backup");
+
+  const ui = await mount();
+  t.after(ui.shutdown);
+  await ui.run("once", "1h explain the --no-wake flag");
+  assert.equal(latestTasks(ui)[0].prompt, "explain the --no-wake flag");
+  assert.equal(latestTasks(ui)[0].wake, undefined);
+  await ui.run("once", "8p --wake check the backup");
+  assert.deepEqual([latestTasks(ui)[1].wake, latestTasks(ui)[1].prompt], ["crash", "check the backup"]);
 });
 
 test("/once --wake sets crash, --wake=always sets always, and /loop takes both", async (t) => {
@@ -1316,6 +1396,7 @@ test("a session held by another live pi is not caught up here", async (t) => {
   assert.deepEqual(ui.sent, [], "two live pis must not both deliver it");
 
   other.kill();
+  await new Promise((resolve) => other.once("close", resolve));
   assert.equal(sessionHeldElsewhere(sessionId), false, "a dead holder does not count");
 });
 
@@ -1330,6 +1411,71 @@ test("a corrupt index is moved aside and rebuilt", () => {
   assert.ok(readSessionIndex().index.sessions["corrupt-1"], "starts empty and writes this entry");
   const quarantined = readdirSync(schedulerDir).filter((name) => name.startsWith("session-timers.json.corrupt-"));
   assert.equal(quarantined.length, 1, "the unreadable file is kept, not deleted");
+});
+
+test("an index from a newer pi is left alone, not quarantined", () => {
+  mkdirSync(schedulerDir, { recursive: true });
+  const future = `${JSON.stringify({ v: 2, sessions: { newer: { sessionFile: "/tmp/x" } } }, undefined, 2)}\n`;
+  writeFileSync(indexFile(), future);
+  const before = readdirSync(schedulerDir).filter((name) => name.startsWith("session-timers.json.corrupt-")).length;
+  const now = Date.now();
+
+  const result = updateSessionIndex("mine", {
+    sessionFile: makeSessionFile("newer"), cwd: "/tmp", host: hostname(), liveSince: now, count: 1, updatedAt: now,
+  });
+
+  assert.match(result.error ?? "", /version 2/, "the caller is told, once");
+  assert.equal(readFileSync(indexFile(), "utf8"), future, "a newer pi's index is never rewritten");
+  assert.equal(
+    readdirSync(schedulerDir).filter((name) => name.startsWith("session-timers.json.corrupt-")).length,
+    before,
+    "and not moved aside as corrupt",
+  );
+  // Put the long-standing index back for the tests that follow.
+  rmSync(indexFile(), { force: true });
+});
+
+test("a print-mode run leaves the live holder's pid alone, and so does its exit", async (t) => {
+  const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+  t.after(() => other.kill());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const otherStart = processStart(other.pid);
+  assert.ok(otherStart, "ps found the other process");
+
+  const sessionId = "index-passive-holder";
+  const sessionFile = makeSessionFile("passive");
+  const now = Date.now();
+  updateSessionIndex(sessionId, {
+    sessionFile, cwd: "/tmp", host: hostname(), liveSince: now, count: 1, updatedAt: now,
+    pid: other.pid, pidStart: otherStart, nextDueAt: now - 300_000,
+  });
+
+  const task = { id: "pa551ve0", kind: "once", prompt: "not mine", createdAt: now - 600_000, nextRunAt: now + 3_600_000 };
+  const ui = await mount({ sessionId, sessionFile, hasUI: false, branch: [snapshot(sessionId, [task])] });
+  t.after(ui.shutdown);
+  assert.equal(readSessionIndex().index.sessions[sessionId].pid, other.pid, "a passive write keeps the holder");
+
+  await ui.shutdown();
+  const after = readSessionIndex().index.sessions[sessionId];
+  assert.equal(after.pid, other.pid, "and an exit does not unseat it");
+  assert.equal(after.closedAt, undefined, "nor call a live session closed");
+});
+
+test("shutdown releases only its own pid", () => {
+  const now = Date.now();
+  const mine = { sessionFile: makeSessionFile("release-mine"), cwd: "/tmp", host: hostname(), liveSince: now, count: 1, updatedAt: now };
+  updateSessionIndex("release-mine", { ...mine, pid: process.pid, pidStart: processStart(process.pid) });
+  const { written } = updateSessionIndex("release-mine", { ...mine, pid: process.pid, closedAt: now + 1 }, { owner: "release" });
+  assert.equal(written, true);
+  const released = readSessionIndex().index.sessions["release-mine"];
+  assert.deepEqual([released.pid, released.pidStart, released.closedAt], [undefined, undefined, now + 1]);
+
+  // A dead foreign holder is released too; a live one is not (above).
+  updateSessionIndex("release-dead", { ...mine, sessionFile: makeSessionFile("release-dead"), pid: 999_999, pidStart: "Thu Jan  1 00:00:00 1970" });
+  updateSessionIndex("release-dead", { ...mine, sessionFile: mine.sessionFile }, { owner: "release" });
+  const dead = readSessionIndex().index.sessions["release-dead"];
+  assert.equal(dead.pid, undefined, "a dead holder's session can be released");
+  assert.ok(dead.closedAt > 0);
 });
 
 test("concurrent writers lose no entries", async () => {
@@ -1434,7 +1580,9 @@ test("a live fire after a long sleep carries the late prefix", async (t) => {
   fake.scheduled.filter((handle) => handle.fn).at(-1).fn();
 
   assert.equal(ui.sent.length, 1);
-  assert.match(ui.sent[0], /^\[Scheduled task sl33p000 was due at .+, 1h\d+m late \(1 missed run\) because this session was not open\]\nwake up$/);
+  // pi was open the whole time: the laptop slept, which is a different story
+  // from a session that was closed, and the prefix has to say so.
+  assert.match(ui.sent[0], /^\[Scheduled task sl33p000 was due at .+, 1h\d+m late \(1 missed run\) because the computer was asleep\]\nwake up$/);
 });
 
 test("a live fire past the cap is skipped with a notice", async (t) => {

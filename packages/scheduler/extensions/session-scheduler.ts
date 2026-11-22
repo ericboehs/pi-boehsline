@@ -28,9 +28,10 @@ import {
   taskLabel,
 } from "./lib/schedule-core.ts";
 import {
+  type IndexOwner,
   type WakeLevel,
   planIndexEntry,
-  sessionHeldElsewhere,
+  sessionHolder,
   updateSessionIndex,
 } from "./lib/session-index.ts";
 import type { MisfirePolicy } from "./lib/task-registry.ts";
@@ -74,11 +75,6 @@ interface QueuedFire {
   task: ScheduledTask;
   /** Set when the fire is late: it carries the "was due at" prefix. */
   late?: LateFire;
-  /**
-   * Already persisted as removed, because a catch-up one-shot is retired in
-   * the snapshot before it is sent (at most once). A failed send puts it back.
-   */
-  retired?: boolean;
 }
 
 export interface ScheduledTask extends Schedule {
@@ -175,6 +171,26 @@ export function advanceRecurringTask(task: ScheduledTask, now: number): Schedule
   return next === undefined ? task : { ...task, nextRunAt: next };
 }
 
+/**
+ * A recurring task re-armed past `now`, or nothing when its schedule cannot be
+ * advanced.
+ *
+ * An interval slot that lands less than a quarter interval away is skipped: a
+ * catch-up or a sleep-delayed fire would otherwise be followed by the next
+ * slot almost immediately, which is two model turns back to back for one loop.
+ * The phase is unchanged either way. Interval tasks only — a daily or cron slot
+ * is the user's clock time, not ours to move.
+ */
+export function rearmRecurringTask(task: ScheduledTask, now: number): ScheduledTask | undefined {
+  const advanced = advanceRecurringTask(task, now);
+  if (!(advanced.nextRunAt > now)) return undefined;
+  if (task.kind === "interval" && task.intervalMs && advanced.nextRunAt - now < task.intervalMs / 4) {
+    const again = advanceRecurringTask(advanced, now);
+    if (again.nextRunAt > now) return again;
+  }
+  return advanced;
+}
+
 export function normalizeTasksForResume(
   tasks: ScheduledTask[],
   now = Date.now(),
@@ -215,6 +231,13 @@ export interface LateFire {
   /** Slots that came due while nothing was running. Only arithmetic schedules know. */
   missed?: number;
   lateMs: number;
+  /**
+   * Why it is late: pi was not running, or the computer was asleep with pi
+   * open (libuv's clock stops, so the timer fires at wake, however much later
+   * that is). The two read very differently in a prompt, and only one of them
+   * is a catch-up.
+   */
+  cause: "closed" | "asleep";
 }
 
 /** A fire the restore decided not to deliver. */
@@ -273,17 +296,36 @@ export function taskMisfireMs(task: ScheduledTask, fallback = sessionMisfireMs()
  * A daily task missed for a fortnight is a minute late, not two weeks late:
  * measuring from its first missed slot would make every long absence look
  * past any cap and silently lose the timer for good.
+ *
+ * `capMs` bounds the walk. A minute-granularity cron left for a month has
+ * tens of thousands of slots, and walking them one at a time cost 1000
+ * `parseCron` calls only to report a slot hours out of date. With a finite
+ * cap the walk starts at the first slot inside the window; when that is
+ * already past `now`, every slot is older than the cap, so the original (and
+ * certainly-too-late) due time is returned.
  */
-export function latestMissedSlot(task: ScheduledTask, now: number): number {
+export function latestMissedSlot(task: ScheduledTask, now: number, capMs?: number): number {
   if (task.kind === "interval" && task.intervalMs) {
     const slots = Math.floor((now - task.nextRunAt) / task.intervalMs) + 1;
     return task.nextRunAt + (slots - 1) * task.intervalMs;
   }
-  // daily and cron: step forward. Bounded, because a task left for a year must
-  // not spin here; 1000 steps is still days of daily slots and hours of a
-  // minute-granularity cron.
   let slot = task.nextRunAt;
-  for (let step = 0; step < 1_000; step += 1) {
+  if (capMs !== undefined && Number.isFinite(capMs)) {
+    const floor = now - Math.max(0, capMs);
+    const bounded = advanceSchedule(task, floor, floor);
+    if (bounded === undefined) return slot;
+    if (bounded > now) return slot;
+    if (bounded > slot) slot = bounded;
+  }
+  // daily and cron: step forward. Bounded, because a task left for a year must
+  // not spin here. When the walk starts at the cap floor it can always reach
+  // `now` within one step per minute of the window (cron's granularity is a
+  // minute), so the bound scales with the cap; uncapped, 1000 steps is still
+  // days of daily slots and hours of a minute-granularity cron.
+  const steps = capMs !== undefined && Number.isFinite(capMs)
+    ? Math.ceil(Math.max(0, capMs) / 60_000) + 2
+    : 1_000;
+  for (let step = 0; step < steps; step += 1) {
     const next = advanceSchedule(task, slot, slot);
     if (next === undefined || next > now) break;
     slot = next;
@@ -292,8 +334,12 @@ export function latestMissedSlot(task: ScheduledTask, now: number): number {
 }
 
 /** Everything a late fire needs to describe itself. */
-export function lateFire(task: ScheduledTask, now: number): LateFire {
-  const dueAt = latestMissedSlot(task, now);
+export function lateFire(
+  task: ScheduledTask,
+  now: number,
+  { capMs, cause = "closed" }: { capMs?: number; cause?: LateFire["cause"] } = {},
+): LateFire {
+  const dueAt = latestMissedSlot(task, now, capMs);
   // A one-shot has exactly one run, so its count is always arithmetic; daily
   // and cron would each need a calendar walk, and say "one or more" instead.
   const missed = task.kind === "once"
@@ -301,7 +347,7 @@ export function lateFire(task: ScheduledTask, now: number): LateFire {
     : task.kind === "interval" && task.intervalMs
       ? Math.floor((now - task.nextRunAt) / task.intervalMs) + 1
       : undefined;
-  return { dueAt, missed, lateMs: now - dueAt };
+  return { dueAt, missed, lateMs: now - dueAt, cause };
 }
 
 /**
@@ -312,8 +358,8 @@ export function lateFire(task: ScheduledTask, now: number): LateFire {
  * navigation and `/loop resume` still want: neither may fire anything.
  *
  * With `catchUp` on, a fire missed while pi was not running is delivered once:
- * a one-shot leaves the list (the caller persists that before sending), and a
- * recurring task is re-armed to its next future slot so its phase survives.
+ * a one-shot is left for the caller to keep (unarmed) until it is delivered, and
+ * a recurring task is re-armed to its next future slot so its phase survives.
  * Fires older than the window, and everything past `MAX_CATCHUPS`, are skipped
  * with a visible reason — the overflow oldest-first, because five model turns
  * is already a lot to come back to.
@@ -338,20 +384,20 @@ export function planRestore(
       kept.push(task);
       continue;
     }
-    changed = true;
 
-    const late = lateFire(task, now);
+    const capMs = misfireMs ?? taskMisfireMs(task);
+    const late = lateFire(task, now, { capMs, cause: "closed" });
     // A recurring task is re-armed whether or not its missed fire is delivered:
     // losing the fire is a lost reminder, losing the loop is a lost timer.
     let rearmed: ScheduledTask | undefined;
     if (task.kind !== "once") {
-      const advanced = advanceRecurringTask(task, now);
-      rearmed = advanced.nextRunAt > now ? advanced : undefined;
+      rearmed = rearmRecurringTask(task, now);
       if (rearmed) kept.push(rearmed);
     }
 
-    const capMs = misfireMs ?? taskMisfireMs(task);
     if (late.lateMs > capMs) {
+      // Dropped: a one-shot leaves the list, a recurring task kept its re-arm.
+      changed = true;
       skipped.push({
         id: task.id,
         dueAt: late.dueAt,
@@ -361,6 +407,9 @@ export function planRestore(
       });
       continue;
     }
+    // A catch-up one-shot stays in the list until drainPending persists its
+    // removal before the send, so its restore alone changes nothing.
+    if (task.kind !== "once") changed = true;
     due.push({ task, late });
   }
 
@@ -368,6 +417,9 @@ export function planRestore(
   const catchUps = due.slice(0, MAX_CATCHUPS);
   for (const extra of due.slice(MAX_CATCHUPS)) {
     const keptTask = kept.find((candidate) => candidate.id === extra.task.id);
+    // An overflowed fire is lost either way: the one-shot leaves the list, and
+    // a recurring task keeps only its re-arm.
+    changed = true;
     skipped.push({
       id: extra.task.id,
       dueAt: extra.late.dueAt,
@@ -536,7 +588,11 @@ export function lateText(late: LateFire): string {
  */
 export function deliveryText(task: ScheduledTask, late?: LateFire): string {
   const when = late ? new Date(late.dueAt).toLocaleString() : "";
-  const because = late ? ` because this session was not open` : "";
+  const because = late
+    ? late.cause === "asleep"
+      ? ` because the computer was asleep`
+      : ` because this session was not open`
+    : "";
   if (task.source !== "agent") {
     return late
       ? `[Scheduled task ${task.id} was due at ${when}, ${lateText(late)}${because}]\n${task.prompt}`
@@ -551,11 +607,13 @@ export function deliveryText(task: ScheduledTask, late?: LateFire): string {
  * The optional flags a timer can carry, and whatever text is left once they are
  * stripped out.
  *
- * They are recognized anywhere on the line but only as whole tokens, so a
- * prompt that happens to contain the words "--wake" is not silently eaten:
- * `--wake` and `--no-wake` stand alone, `--wake=` and `--misfire=` take a
- * value. The rest of the line is left byte-for-byte alone (no re-joining), so
- * a multi-line prompt survives.
+ * They are only recognized as a whole-token *run* in one of the positions a
+ * flag actually belongs in — leading, right after the time, or trailing (and,
+ * for the edit form, after its id or time). Anywhere else `--wake` is part of
+ * the prompt: `/once 1h explain the --no-wake flag` is a prompt about the flag,
+ * not a flag on the timer. `--wake` and `--no-wake` stand alone, `--wake=` and
+ * `--misfire=` take a value. The rest of the line is left byte-for-byte alone
+ * (no re-joining), so a multi-line prompt survives.
  */
 export interface TimerFlags {
   wake?: WakeLevel;
@@ -565,11 +623,85 @@ export interface TimerFlags {
   rest: string;
 }
 
+/** A whitespace-delimited token and where it sits in the line. */
+interface TimerToken {
+  text: string;
+  start: number;
+  end: number;
+}
+
+function timerTokens(input: string): TimerToken[] {
+  return [...input.matchAll(/\S+/g)].map((match) => ({
+    text: match[0],
+    start: match.index ?? 0,
+    end: (match.index ?? 0) + match[0].length,
+  }));
+}
+
+function isFlagToken(text: string): boolean {
+  return /^--[a-z][a-z-]*(?:=\S*)?$/i.test(text);
+}
+
+/** Whether this token parses as a time or a duration (so flags may follow it). */
+function isTimeToken(text: string | undefined): boolean {
+  if (text === undefined) return false;
+  return parseOnceTime(text) !== undefined || parseDuration(text) !== undefined;
+}
+
+/** The index where a flag run may start right after the command's time argument. */
+function afterTimeIndex(tokens: TimerToken[]): number | undefined {
+  const first = tokens[0]?.text;
+  const second = tokens[1]?.text;
+  // `/once at 8p …` and `/once in 15m …` take the time as their second token.
+  if (first !== undefined && /^(at|in)$/i.test(first) && isTimeToken(second)) return 2;
+  if (isTimeToken(first)) return 1;
+  return undefined;
+}
+
 export function parseTimerFlags(input: string): TimerFlags {
+  const tokens = timerTokens(input);
+  const consumed = new Set<number>();
+
+  /** Consume the run of flags starting at `start`, walking in `step` direction. */
+  const takeRun = (start: number, step: 1 | -1) => {
+    for (let index = start; index >= 0 && index < tokens.length; index += step) {
+      const token = tokens[index]?.text;
+      if (token === undefined || !isFlagToken(token)) break;
+      // An unknown flag is prompt text; stopping here keeps the flags after it
+      // in the prompt too, rather than half-consuming a phrase.
+      if (!/^--(wake|no-wake|misfire)(=|$)/i.test(token)) break;
+      consumed.add(index);
+    }
+  };
+
+  takeRun(0, 1);
+  const afterTime = afterTimeIndex(tokens);
+  if (afterTime !== undefined) takeRun(afterTime, 1);
+  // The edit verbs put the id (and its time) before any flags.
+  if (/^edit$/i.test(tokens[0]?.text ?? "")) {
+    takeRun(2, 1);
+    if (isTimeToken(tokens[2]?.text)) takeRun(3, 1);
+  }
+  takeRun(tokens.length - 1, -1);
+
   const flags: TimerFlags = { rest: input };
-  const tokenRe = /(^|\s)(--[a-z][a-z-]*(?:=\S*)?)(?=\s|$)/gi;
-  flags.rest = input.replace(tokenRe, (whole, lead: string, token: string) => {
-    const [name, ...valueParts] = token.toLowerCase().split("=");
+  let rest = "";
+  let cursor = 0;
+  for (const index of [...consumed].sort((left, right) => left - right)) {
+    const token = tokens[index];
+    if (!token) continue;
+    // Drop the token and the whitespace that joined it to the text before it,
+    // so removing a flag never leaves a double space behind.
+    let start = token.start;
+    while (start > cursor && /\s/.test(input[start - 1] ?? "")) start -= 1;
+    let end = token.end;
+    if (start === cursor) {
+      // A leading flag: take the whitespace that followed it instead.
+      while (end < input.length && /\s/.test(input[end] ?? "")) end += 1;
+    }
+    rest += input.slice(cursor, start);
+    cursor = end;
+    const [name, ...valueParts] = token.text.toLowerCase().split("=");
     const value = valueParts.join("=");
     switch (name) {
       case "--wake":
@@ -577,22 +709,25 @@ export function parseTimerFlags(input: string): TimerFlags {
         else if (value === "crash" || value === "") flags.wake = "crash";
         else throw new Error(`--wake wants nothing (a crash counts) or =always, not "${value}"`);
         flags.clearWake = false;
-        return lead;
+        break;
       case "--no-wake":
         flags.wake = undefined;
         flags.clearWake = true;
-        return lead;
+        break;
       case "--misfire": {
         const parsed = value === "skip" || value === "always" ? value : parseDuration(value);
-        if (parsed === undefined) throw new Error("--misfire wants skip, always, or a duration such as 6h");
+        if (parsed === undefined) {
+          throw new Error("--misfire needs a value: use --misfire=6h, with skip, always or a duration such as 6h");
+        }
         flags.misfire = parsed;
-        return lead;
+        break;
       }
       default:
-        // Not ours: leave it in the text so it can be part of a prompt.
-        return whole;
+        break;
     }
-  }).trim();
+  }
+  rest += input.slice(cursor);
+  flags.rest = rest.trim();
   return flags;
 }
 
@@ -620,8 +755,10 @@ function makeTaskId(existing: ScheduledTask[]): string {
  * These live and die with the pi process and the conversation that created
  * them — they fire into the current session, using its model and context. A
  * fire while the agent is busy is queued and delivered when it goes idle; a
- * fire while pi is not running is lost, never replayed. Anything that must run
- * whether or not pi is open belongs to `/schedule` (durable-scheduler.ts).
+ * fire missed while pi was not running is caught up once on the next real
+ * resume (up to the misfire window), and one older than that is dropped with a
+ * notice rather than replayed. Anything that must run whether or not pi is
+ * open belongs to `/schedule` (durable-scheduler.ts).
  */
 export default function sessionScheduler(pi: ExtensionAPI): void {
   let tasks: ScheduledTask[] = [];
@@ -705,7 +842,10 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     return armed;
   };
 
-  const writeIndex = (ctx: ExtensionContext | undefined, { closed = false } = {}) => {
+  const writeIndex = (
+    ctx: ExtensionContext | undefined,
+    { closed = false, owner }: { closed?: boolean; owner?: IndexOwner } = {},
+  ) => {
     if (!sessionId) return;
     const target = ctx ?? activeCtx;
     const file = sessionFilePath(target);
@@ -714,6 +854,9 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     // process at a file that is not there; the first agent_settled retries.
     if (!file || !existsSync(file)) return;
 
+    // `count` is the unpaused tasks, as the README says: a queued fire may move
+    // nextDueAt earlier (it is due now) but is never a timer of its own.
+    const unpaused = tasks.filter((task) => !task.paused);
     const armed = armedTasks();
     const wakeTasks = armed.filter((task) => task.wake !== undefined);
     const wake: WakeLevel | undefined = wakeTasks.some((task) => task.wake === "always")
@@ -723,16 +866,19 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
       sessionFile: file,
       cwd: target?.cwd ?? process.cwd(),
       liveSince,
-      count: armed.length,
-      ...(closed
-        ? { closedAt: Date.now() }
-        : { pid: process.pid, pidStart: pidStart ??= processStart(process.pid) }),
+      count: unpaused.length,
+      pid: process.pid,
+      // ps lstart cannot change while we run, so it is looked up once per process.
+      pidStart: pidStart ??= processStart(process.pid),
+      ...(closed ? { closedAt: Date.now() } : {}),
       ...(armed.length > 0 ? { nextDueAt: Math.min(...armed.map((task) => task.nextRunAt)) } : {}),
       ...(wakeTasks.length > 0 ? { nextWakeDueAt: Math.min(...wakeTasks.map((task) => task.nextRunAt)) } : {}),
       ...(wake ? { wake } : {}),
     });
 
-    const { error } = updateSessionIndex(sessionId, entry);
+    const { error } = updateSessionIndex(sessionId, entry, {
+      owner: owner ?? (closed ? "release" : "claim"),
+    });
     if (error && !indexWarned) {
       // Once, not once per persist: a broken index is a housekeeping problem
       // and repeating it would bury every real notice. Never thrown, because
@@ -772,18 +918,37 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
         late ? "warning" : "info",
       );
     }
+
+    // A one-shot is removed and persisted BEFORE the send, live or catch-up
+    // alike: at-most-once means the snapshot has to say "delivered" before the
+    // model can see the prompt. A failed send puts it back below.
+    const oneShot = task.kind === "once";
+    if (oneShot) {
+      const before = tasks;
+      tasks = tasks.filter((candidate) => candidate.id !== task.id);
+      try {
+        persist();
+      } catch (error) {
+        // Not delivered, so not removed: a snapshot that dropped it here would
+        // lose the reminder from both the session and the queue.
+        tasks = before;
+        deliveryInFlight = false;
+        pending.set(id, fire);
+        notice(ctx, `Could not record scheduled task ${id} as delivered, so it was not sent: ${error instanceof Error ? error.message : String(error)}`, "warning");
+        return;
+      }
+      // No longer queued and no longer listed: the chip counts neither.
+      updateStatus(ctx);
+    }
+
     try {
       pi.sendUserMessage(deliveryText(task, late));
     } catch (error) {
-      // Put it back before persisting anything: a one-shot removed from the
-      // snapshot and then failing to deliver would be gone from both the
-      // session and the queue, and the user would simply never be reminded.
       deliveryInFlight = false;
       pending.set(id, fire);
-      if (fire.retired) {
-        // A catch-up one-shot was already persisted as delivered-once before
-        // the send (see restoreRuntime), so the snapshot has to learn about the
-        // failure too or the reminder is gone from both places.
+      if (oneShot) {
+        // The removal was already persisted, so the snapshot has to learn about
+        // the failure too or the reminder is gone from both places.
         tasks = [...tasks, task];
         try {
           persist();
@@ -793,19 +958,6 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
       }
       notice(ctx, `Could not deliver scheduled task ${id}: ${error instanceof Error ? error.message : String(error)}`, "error");
       return;
-    }
-
-    // Delivered. Only now is a one-shot really finished — unless it was a
-    // catch-up, whose removal was already persisted before this send.
-    if (task.kind === "once" && !fire.retired) {
-      tasks = tasks.filter((candidate) => candidate.id !== task.id);
-      try {
-        persist();
-      } catch (error) {
-        // The snapshot is stale, not the timers. Say so rather than throwing
-        // out of a timer callback, which nothing above here would catch.
-        notice(ctx, `Delivered ${id}, but could not record it: ${error instanceof Error ? error.message : String(error)}`, "warning");
-      }
     }
   };
 
@@ -841,14 +993,16 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
 
       // Longer than any scheduler hiccup: the machine slept, and libuv's clock
       // stopped with it. Treat it as a missed fire (prefix, and subject to the
-      // same staleness cap) rather than an on-time one.
-      const late = now - current.nextRunAt > LIVE_LATE_MS ? lateFire(current, now) : undefined;
-      if (late && late.lateMs > taskMisfireMs(current)) {
+      // same staleness cap) rather than an on-time one. The prefix says
+      // "asleep", not "not open": pi was open the whole time.
+      const capMs = taskMisfireMs(current);
+      const late = now - current.nextRunAt > LIVE_LATE_MS ? lateFire(current, now, { capMs, cause: "asleep" }) : undefined;
+      if (late && late.lateMs > capMs) {
         if (current.kind !== "once") {
-          const advanced = advanceRecurringTask(current, now);
-          if (advanced.nextRunAt > now) {
-            tasks[index] = advanced;
-            armTask(advanced, ctx, runtimeGeneration);
+          const rearmed = rearmRecurringTask(current, now);
+          if (rearmed) {
+            tasks[index] = rearmed;
+            armTask(rearmed, ctx, runtimeGeneration);
           } else {
             tasks.splice(index, 1);
           }
@@ -869,10 +1023,10 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
         pending.set(current.id, { task: { ...current }, ...(late ? { late } : {}) });
       }
       if (current.kind !== "once") {
-        const advanced = advanceRecurringTask(current, now);
-        if (advanced.nextRunAt > now) {
-          tasks[index] = advanced;
-          armTask(advanced, ctx, runtimeGeneration);
+        const rearmed = rearmRecurringTask(current, now);
+        if (rearmed) {
+          tasks[index] = rearmed;
+          armTask(rearmed, ctx, runtimeGeneration);
         } else {
           tasks.splice(index, 1);
         }
@@ -892,14 +1046,14 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
    * startup, resume or reload. Tree navigation and pause-resume go through
    * planRestore without it, because neither may fire anything: an older branch
    * can hold a slot that already fired, and `/loop resume` promises to skip
-   * what was missed.
+   * what was missed. `opened` is only true for `session_start`: moving between
+   * branches does not reopen the session, so it must not move `liveSince`.
    */
-  const restoreRuntime = (ctx: ExtensionContext, { catchUp = false } = {}) => {
+  const restoreRuntime = (ctx: ExtensionContext, { catchUp = false, opened = false } = {}) => {
     clearRuntime();
     activeCtx = ctx;
     sessionId = ctx.sessionManager.getSessionId();
-    liveSince = Date.now();
-    pidStart = undefined;
+    if (opened) liveSince = Date.now();
     const raw = readSnapshot(ctx);
 
     // Print mode (`pi -p --session`): a fire would inject a message into an
@@ -910,28 +1064,45 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     // by another name.
     if (!ctx.hasUI) {
       tasks = raw;
-      writeIndex(ctx);
+      writeIndex(ctx, { owner: "passive" });
       return;
     }
 
     // Two pi processes on one session (the same file resumed in a second
     // terminal) would each catch up the same missed timers. The index says
-    // whether another live one holds it; if it does, let that one deliver.
-    const heldElsewhere = sessionId !== undefined && sessionHeldElsewhere(sessionId);
-    const plan = planRestore(raw, Date.now(), { catchUp: catchUp && !heldElsewhere });
-    tasks = plan.tasks;
-    const runtimeGeneration = generation;
-    for (const task of tasks) {
-      if (!task.paused) armTask(task, ctx, runtimeGeneration);
+    // whether another live one holds it; if it does, leave the session to that
+    // one: restore the list, but arm nothing, catch nothing up and persist
+    // nothing, so this pi cannot advance or drop the holder's timers either.
+    const holder = sessionId === undefined ? undefined : sessionHolder(sessionId);
+    if (holder !== undefined) {
+      tasks = raw;
+      notice(
+        ctx,
+        `Timers are held by pi pid ${holder}; this session will not fire or catch them up here.`,
+        "warning",
+      );
+      writeIndex(ctx, { owner: "passive" });
+      updateStatus(ctx);
+      return;
     }
-    // Persist before delivering: a catch-up one-shot is retired here, and
-    // "at most once" means the snapshot has to say so before the model sees
-    // the prompt. If the send then fails, drainPending puts the task back.
+
+    const plan = planRestore(raw, Date.now(), { catchUp });
+    const runtimeGeneration = generation;
+    // A catch-up one-shot stays in the list, unarmed, until drainPending has
+    // persisted its removal and sent it: quitting, crashing or reloading before
+    // then leaves it in the snapshot, so the next resume retries it.
+    const catchUpOneShots = plan.catchUps
+      .filter((fire) => fire.task.kind === "once")
+      .map((fire) => fire.task);
+    tasks = [...plan.tasks, ...catchUpOneShots];
+    for (const { task, late } of plan.catchUps) pending.set(task.id, { task, late });
+    for (const task of tasks) {
+      if (!task.paused && !pending.has(task.id)) armTask(task, ctx, runtimeGeneration);
+    }
+    // A recurring catch-up is re-armed here, so its snapshot has to say so.
+    // A one-shot's removal is persisted by drainPending, just before the send.
     if (plan.changed) persist();
     for (const fire of plan.skipped) notice(ctx, describeSkipped(fire), "warning");
-    for (const { task, late } of plan.catchUps) {
-      pending.set(task.id, { task, late, retired: task.kind === "once" });
-    }
     updateStatus(ctx);
     writeIndex(ctx);
     if (pending.size > 0) {
@@ -1143,6 +1314,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
   };
 
   const showHelp = (ctx: ExtensionContext) => {
+    const misfire = formatDuration(sessionMisfireMs());
     notice(
       ctx,
       [
@@ -1150,7 +1322,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
         "",
         "They live in this session: they need pi open to fire. A fire that came due",
         "while pi was closed is delivered once when you next resume the session, up",
-        "to 24h late; older ones are skipped with a notice. For work that must happen",
+        `to ${misfire} late; older ones are skipped with a notice. For work that must happen`,
         "whether or not you are here, use /schedule.",
         "",
         "/once \u2014 fire one time",
@@ -1167,14 +1339,14 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
         "TIMES   /once takes 30s 15m 2h 1d, or 9a 8p 15:30, or an ISO timestamp",
         "        /loop takes a duration only, 1m or longer",
         "",
-        "OPTIONS (before or after the time, never inside the prompt)",
+        "OPTIONS (leading, after the time, or trailing \u2014 never inside the prompt)",
         "  --wake          mark it to be woken for after a crash (kept for the tick)",
         "  --wake=always   mark it to be woken for even after a deliberate quit",
         "  --no-wake       clear that mark",
         "  --misfire=X     how late a missed fire may still be delivered:",
         "                    skip     never catch up",
         "                    always   catch up however late",
-        "                    <dur>    catch up within this window (default 24h,",
+        `                    <dur>    catch up within this window (default ${misfire},`,
         "                             or PI_SCHEDULER_SESSION_MISFIRE)",
         "",
         "MANAGING",
@@ -1483,7 +1655,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
         "Set timers that send a prompt back into this conversation later, the same timers as the user's /once and /loop. " +
         "Use it to check back on something slow (a deploy, CI, a long build) instead of polling, or when the user asks to be reminded. " +
         "Actions: once (needs when + prompt), loop (needs every + prompt, 1m minimum), list, cancel (id), pause/resume (id or \"all\"). " +
-        "Timers live in this session: they fire while pi is open, and a fire that came due while it was closed is delivered once when the user next resumes it (up to 24h late, or the task's misfire). " +
+        "Timers live in this session: they fire while pi is open, and a fire that came due while it was closed is delivered once when the user next resumes it (up to " + formatDuration(sessionMisfireMs()) + " late, or the task's misfire). " +
         "Set misfire to change how late a missed fire may still be delivered." +
         (allowWake
           ? " Set wake so the session is reopened for it: \"crash\" after an unexpected exit, \"always\" even after a deliberate quit."
@@ -1495,7 +1667,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
         when: Type.Optional(Type.String({ description: "once: 30s, 15m, 2h, 1d; or a clock time 15:30, 9a, 8p; or an ISO timestamp" })),
         every: Type.Optional(Type.String({ description: "loop: interval such as 5m, 1h, 1h30m (at least 1m)" })),
         id: Type.Optional(Type.String({ description: "cancel/pause/resume: task id or a unique prefix; pause/resume also take \"all\"" })),
-        misfire: Type.Optional(Type.String({ description: "once/loop: how late a missed fire may still be delivered — skip, always, or a duration such as 6h (default 24h)" })),
+        misfire: Type.Optional(Type.String({ description: `once/loop: how late a missed fire may still be delivered — skip, always, or a duration such as 6h (default ${formatDuration(sessionMisfireMs())})` })),
         // Only declared when the user turned it on: a parameter the agent can
         // see is a parameter it will try, and an unattended reopened turn with
         // full tools is not something a model should be able to grant itself.
@@ -1520,7 +1692,10 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
   // the snapshot names a session id that no longer exists — and `session_tree`
   // must not replay a slot another branch already fired.
   pi.on("session_start", (event, ctx) =>
-    restoreRuntime(ctx, { catchUp: event?.reason === "startup" || event?.reason === "resume" || event?.reason === "reload" }));
+    restoreRuntime(ctx, {
+      catchUp: event?.reason === "startup" || event?.reason === "resume" || event?.reason === "reload",
+      opened: true,
+    }));
   pi.on("session_tree", (_event, ctx) => restoreRuntime(ctx));
   pi.on("agent_settled", (_event, ctx) => {
     deliveryInFlight = false;

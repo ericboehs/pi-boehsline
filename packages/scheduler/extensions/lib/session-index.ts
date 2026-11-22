@@ -94,15 +94,35 @@ function isEntry(value: unknown): value is SessionIndexEntry {
 /** True when this process started the pid that wrote the entry, so it is still that pi. */
 function sameProcess(entry: SessionIndexEntry, pid: number): boolean {
   if (entry.pid !== pid) return false;
-  // No recorded start means it predates the field; the pid alone is as good as it gets.
-  if (entry.pidStart === undefined) return true;
+  // No recorded start means we cannot prove it is the same process: a reused
+  // pid is exactly what the field is for, and guessing "still alive" there
+  // would skip a catch-up and then silently drop the fire.
+  if (entry.pidStart === undefined) return false;
   return processStart(pid) === entry.pidStart;
+}
+
+/** A live pi on this host holding the session that is not us (`pid`). */
+function liveOtherHolder(entry: SessionIndexEntry | undefined, pid = process.pid): boolean {
+  if (!entry || entry.pid === undefined || entry.pid === pid) return false;
+  // Another host cannot be probed from here; assume it is alive rather than
+  // unseat a session we cannot see.
+  if (entry.host !== hostname()) return true;
+  return sameProcess(entry, entry.pid);
 }
 
 export interface ReadIndexResult {
   index: SessionIndex;
-  /** Present when the file existed but could not be trusted. */
+  /**
+   * Present when the file exists but is malformed: the next writer moves it
+   * aside and starts empty.
+   */
   corrupt?: string;
+  /**
+   * Present when the index must not be rewritten at all — a newer pi's format,
+   * or a file we could not even read. Rewriting either would lose entries this
+   * version cannot represent.
+   */
+  error?: string;
 }
 
 /**
@@ -110,7 +130,9 @@ export interface ReadIndexResult {
  *
  * A corrupt file is reported, not repaired: the next writer moves it aside and
  * starts empty, and a reader that silently treated it as empty would tell the
- * caller "nothing is due" when the truth is "unknown".
+ * caller "nothing is due" when the truth is "unknown". A file from a newer pi,
+ * or one we lack permission to read, is reported as an error instead: it is not
+ * corrupt, and clobbering it would lose entries the newer version understands.
  */
 export function readSessionIndex(): ReadIndexResult {
   let raw: string;
@@ -118,7 +140,7 @@ export function readSessionIndex(): ReadIndexResult {
     raw = readFileSync(indexPath(), "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { index: emptyIndex() };
-    return { index: emptyIndex(), corrupt: String(error) };
+    return { index: emptyIndex(), error: String(error) };
   }
   let parsed: unknown;
   try {
@@ -126,9 +148,18 @@ export function readSessionIndex(): ReadIndexResult {
   } catch (error) {
     return { index: emptyIndex(), corrupt: error instanceof Error ? error.message : "invalid JSON" };
   }
-  const candidate = parsed as Partial<SessionIndex>;
-  if (candidate?.v !== INDEX_VERSION || !candidate.sessions || typeof candidate.sessions !== "object") {
-    return { index: emptyIndex(), corrupt: `unsupported version ${String(candidate?.v)}` };
+  const candidate = parsed as Partial<SessionIndex> | null;
+  if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return { index: emptyIndex(), corrupt: "not a JSON object" };
+  }
+  if (typeof candidate.v === "number" && candidate.v > INDEX_VERSION) {
+    return {
+      index: emptyIndex(),
+      error: `the session-timer index is version ${candidate.v}; this pi writes version ${INDEX_VERSION}`,
+    };
+  }
+  if (candidate.v !== INDEX_VERSION || !candidate.sessions || typeof candidate.sessions !== "object") {
+    return { index: emptyIndex(), corrupt: `unexpected shape (v ${String(candidate.v)})` };
   }
   const sessions: Record<string, SessionIndexEntry> = {};
   for (const [id, entry] of Object.entries(candidate.sessions)) {
@@ -196,8 +227,6 @@ export function planIndexEntry(input: IndexPlanInput, now = Date.now()): Session
   if (input.pid !== undefined) entry.pid = input.pid;
   if (input.pidStart !== undefined) entry.pidStart = input.pidStart;
   if (input.closedAt !== undefined) entry.closedAt = input.closedAt;
-  // Paused-only: keep the entry (it still says "this session has timers"), but
-  // with nothing due, so a reader never wakes it.
   if (input.nextDueAt !== undefined) entry.nextDueAt = input.nextDueAt;
   if (input.nextWakeDueAt !== undefined) entry.nextWakeDueAt = input.nextWakeDueAt;
   if (input.wake !== undefined) entry.wake = input.wake;
@@ -212,19 +241,22 @@ function sameEntry(a: SessionIndexEntry | undefined, b: SessionIndexEntry | unde
 }
 
 /**
- * Is the session held by a different live pi?
+ * The pid of a different live pi holding this session, if there is one.
  *
  * Two pi processes on one session (the same file opened twice, or a resume in
  * a second terminal) would each catch up the same missed timer and each fire
  * it. The pid plus its lstart is the identity: a matching pid on this host
  * whose start time also matches is that process, still running.
  */
-export function sessionHeldElsewhere(sessionId: string, pid = process.pid): boolean {
+export function sessionHolder(sessionId: string, pid = process.pid): number | undefined {
   const { index } = readSessionIndex();
   const entry = index.sessions[sessionId];
-  if (!entry || entry.pid === undefined || entry.pid === pid) return false;
-  if (entry.host !== hostname()) return false;
-  return sameProcess(entry, entry.pid);
+  if (!liveOtherHolder(entry, pid)) return undefined;
+  return entry?.pid;
+}
+
+export function sessionHeldElsewhere(sessionId: string, pid = process.pid): boolean {
+  return sessionHolder(sessionId, pid) !== undefined;
 }
 
 export interface IndexWriteResult {
@@ -233,10 +265,54 @@ export interface IndexWriteResult {
   error?: string;
 }
 
+/**
+ * Who is writing this entry:
+ *  - `claim`: this pi now holds the session, so its pid goes in.
+ *  - `release`: this pi is letting go. The pid is cleared only when it is ours
+ *    (or its holder is dead), so a `pi -p --session X` that runs while a TUI
+ *    holds X cannot mark X closed on its way out.
+ *  - `passive`: print mode, or a restore that found another live holder. The
+ *    timing fields are updated; the pid is left alone while someone else holds
+ *    the session.
+ */
+export type IndexOwner = "claim" | "release" | "passive";
+
 export interface UpdateIndexOptions {
   /** Prune an entry only when its session file is gone *and* its pi is not running. */
   fileExists?: (path: string) => boolean;
   now?: number;
+  owner?: IndexOwner;
+}
+
+/** How many `ps` probes one write may make while pruning. */
+export const MAX_PRUNE_PROBES = 4;
+
+/**
+ * The entry as this writer is allowed to leave it: a live holder we are not
+ * keeps its pid identity, and only a release that owns the entry marks it
+ * closed.
+ */
+function entryForOwner(
+  current: SessionIndexEntry | undefined,
+  entry: SessionIndexEntry,
+  owner: IndexOwner,
+  now: number,
+): SessionIndexEntry {
+  const next: SessionIndexEntry = { ...entry };
+  if (owner === "claim") return next;
+  if (liveOtherHolder(current)) {
+    next.pid = current?.pid;
+    if (current?.pidStart !== undefined) next.pidStart = current.pidStart;
+    else delete next.pidStart;
+    delete next.closedAt;
+    return next;
+  }
+  if (owner === "release") {
+    delete next.pid;
+    delete next.pidStart;
+    next.closedAt = entry.closedAt ?? now;
+  }
+  return next;
 }
 
 /**
@@ -255,9 +331,16 @@ export function updateSessionIndex(
 ): IndexWriteResult {
   const now = options.now ?? Date.now();
   const fileExists = options.fileExists ?? existsByStat;
+  const owner = options.owner ?? "claim";
 
   try {
-    const written = withLockedFile(indexPath(), readSessionIndex, ({ index, corrupt }) => {
+    const written = withLockedFile(indexPath(), readSessionIndex, (result) => {
+      if (result.error !== undefined) {
+        // Refuse to write: a newer pi's format (or a file we cannot read) is
+        // not ours to replace. The caller reports it and carries on.
+        throw new Error(result.error);
+      }
+      const { index, corrupt } = result;
       let dirty = false;
       if (corrupt !== undefined) {
         quarantineIndex();
@@ -269,31 +352,42 @@ export function updateSessionIndex(
       // write by anyone. Both conditions are required: the file can be missing
       // because pi has not flushed a brand-new session yet, and the pid can be
       // absent because that pi simply finished with it.
+      let probes = 0;
       for (const [id, candidate] of Object.entries(index.sessions)) {
         if (id === sessionId) continue;
         // Check the cheap condition first: resolving a pid is a `ps` call, and
-        // this runs under the lock every other session is waiting on.
+        // this runs under the lock every other session is waiting on. At most
+        // four per write; the rest wait for a later one.
         if (fileExists(candidate.sessionFile)) continue;
-        if (candidate.pid !== undefined && candidate.host === hostname() && sameProcess(candidate, candidate.pid)) continue;
+        if (candidate.pid !== undefined && candidate.host === hostname()) {
+          if (probes >= MAX_PRUNE_PROBES) continue;
+          probes += 1;
+          if (sameProcess(candidate, candidate.pid)) continue;
+        }
         delete index.sessions[id];
         dirty = true;
       }
 
       const current = index.sessions[sessionId];
       if (entry === undefined) {
-        if (current !== undefined) {
+        // Removing is this session's own business: a passive writer (or a
+        // release) must not delete an entry a live holder still owns.
+        if (current !== undefined && !(owner !== "claim" && liveOtherHolder(current))) {
           delete index.sessions[sessionId];
           dirty = true;
         }
-      } else if (!sameEntry(current, entry)) {
-        index.sessions[sessionId] = entry;
-        dirty = true;
+      } else {
+        const next = entryForOwner(current, entry, owner, now);
+        if (!sameEntry(current, next)) {
+          index.sessions[sessionId] = next;
+          dirty = true;
+        }
       }
 
       if (!dirty) return false;
       writeIndex(index);
       return true;
-    });
+    }, { attempts: 10 });
     return { written };
   } catch (error) {
     // The index is an optimization for an outside process; losing an update is
