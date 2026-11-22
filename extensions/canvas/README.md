@@ -228,6 +228,11 @@ the review prompt — so a renderer never reaches for a page global.
   the session folder (the newest four show, the rest behind "Show N more";
   captions use the same relative times). On startup and `/reload` these cards
   and Agents are redrawn at once, so new markup shows without waiting a turn.
+  Everything a settle does (`reply.json`, `info.json`, these cards) waits for a
+  macrotask after pi reports the run settled, so the extensions whose
+  `agent_settled` handlers come after canvas's (botsun-owner's `idle`, say)
+  run first, on their own, instead of behind a branch read and a git diff per
+  tracked file.
   When the project has a `.pi/TODO.md` (the todo tool's shared checklist)
   with a task in it, a **Tasks** card at the top of the side panel shows it
   as a kanban with a progress bar: Open, Claimed (with the owner, linked to
@@ -425,7 +430,11 @@ the review prompt — so a renderer never reaches for a page global.
 - **Diffs and lightbox.** Before the agent's first `edit` or `write` to a file,
   the extension copies what the file held (`base-<id>`, never served). After
   each turn, `git diff --no-index` writes `diff-<id>.patch`, the change since
-  then, and `cur-<id>.txt` copies the file as it is now (same skips). Files
+  then, and `cur-<id>.txt` copies the file as it is now (same skips). Only the
+  files this turn edited, or whose size or mtime moved since their last diff
+  (both recorded in `auto-diffs.json`), are diffed again — at most four git at
+  a time, off the event loop — and a patch whose text is unchanged is not
+  rewritten, so a settle over hundreds of tracked files is a stats pass. Files
   changed shows +/− counts, and clicking a path opens it in the modal with
   Diff and File tabs; markdown files get Diff, Preview (rendered, frontmatter
   as a code block) and Source. The tab you pick holds as you step through files.
@@ -672,5 +681,5 @@ status runs, `PI_CANVAS_TMUX=0` turns off tmux follow mode,
 Subagent children skip the canvas.
 
 ```sh
-node --test test/canvas.test.mjs test/canvas-nav.test.mjs test/canvas-render.test.mjs test/canvas-security.test.mjs test/canvas-meeting.test.mjs test/canvas-embed.test.mjs
+node --test test/canvas.test.mjs test/canvas-nav.test.mjs test/canvas-render.test.mjs test/canvas-security.test.mjs test/canvas-meeting.test.mjs test/canvas-embed.test.mjs test/canvas-settle.test.mjs
 ```

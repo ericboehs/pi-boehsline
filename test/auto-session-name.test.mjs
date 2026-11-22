@@ -279,6 +279,14 @@ test("generateTitle reports every model's failure when none work", async () => {
 
 // #21: with Botsun connected, the same call picks a look and a color for the session's Home row,
 // and each is checked against the catalog Botsun sent.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** agent_settled no longer waits for the naming call (it is a model round trip): let it run. */
+async function settle(stub, ctx) {
+  await stub.fire("agent_settled", {}, ctx);
+  await new Promise((r) => setTimeout(r, 0));
+}
+
 const CATALOG = {
   looks: [
     { id: "drop", about: "a water drop" },
@@ -380,14 +388,14 @@ test("a named session hands Botsun's owner its look and color, and only when the
   });
   try {
     autoSessionName(s.pi);
-    await s.fire("agent_settled", {}, ctx('{"name":"Cactus Winter Keeper","look":"nature.cactus","color":"green"}'));
+    await settle(s, ctx('{"name":"Cactus Winter Keeper","look":"nature.cactus","color":"green"}'));
     assert.equal(name, "Cactus Winter Keeper");
     assert.deepEqual(suggestions, [{ look: "nature.cactus", color: "green" }], "handed over once, after the name");
 
     name = undefined;
     s.handlers.get("agent_settled").length = 0;
     autoSessionName(s.pi);
-    await s.fire("agent_settled", {}, ctx("Cactus Winter Keeper"));
+    await settle(s, ctx("Cactus Winter Keeper"));
     assert.equal(name, "Cactus Winter Keeper", "no look in the reply: the name still lands");
     assert.equal(suggestions.length, 1, "and nothing is suggested");
 
@@ -396,7 +404,7 @@ test("a named session hands Botsun's owner its look and color, and only when the
     provideIconCatalog(null);
     s.handlers.get("agent_settled").length = 0;
     autoSessionName(s.pi);
-    await s.fire("agent_settled", {}, ctx('{"name":"Cactus Winter Keeper","look":"nature.cactus"}'));
+    await settle(s, ctx('{"name":"Cactus Winter Keeper","look":"nature.cactus"}'));
     assert.equal(name, "Cactus Winter Keeper");
     assert.equal(suggestions.length, 1, "nothing to check a look against, so none goes");
   } finally {
@@ -429,9 +437,9 @@ test("a quiet miss (no naming model) tries again on a later turn, up to the cap,
     modelRegistry: fakeRegistry(models, { "opencode-go/deepseek-v4.1-flash": { stopReason: "stop", content: [{ type: "text", text: "Cactus Winter Keeper" }] } }),
   });
   autoSessionName(s.pi);
-  await s.fire("agent_settled", {}, ctx([]));
+  await settle(s, ctx([]));
   assert.equal(name, undefined, "no model with credentials: no name yet");
-  await s.fire("agent_settled", {}, ctx([{ provider: "opencode-go", id: "deepseek-v4.1-flash" }]));
+  await settle(s, ctx([{ provider: "opencode-go", id: "deepseek-v4.1-flash" }]));
   assert.equal(name, "Cactus Winter Keeper", "the next settle, with credentials, names it");
   assert.deepEqual(notes, [], "quiet misses never warn");
 
@@ -443,8 +451,8 @@ test("a quiet miss (no naming model) tries again on a later turn, up to the cap,
     other = next;
   };
   autoSessionName(t.pi);
-  for (let i = 0; i < 3; i++) await t.fire("agent_settled", {}, ctx([]));
-  await t.fire("agent_settled", {}, ctx([{ provider: "opencode-go", id: "deepseek-v4.1-flash" }]));
+  for (let i = 0; i < 3; i++) await settle(t, ctx([]));
+  await settle(t, ctx([{ provider: "opencode-go", id: "deepseek-v4.1-flash" }]));
   assert.equal(other, undefined, "gave up after MAX_AUTO_FAILURES quiet misses");
 });
 
@@ -473,6 +481,44 @@ test("the name is asked for at the first assistant reply with text, not only at 
   await s.fire("message_end", { message: { role: "assistant", content: [{ type: "text", text: "Let me look." }] } }, ctx);
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(name, "Cactus Winter Keeper");
-  await s.fire("agent_settled", {}, ctx);
+  await settle(s, ctx);
   assert.equal(asked, 1, "asked once: settle doesn't ask again");
+});
+
+test("a settle doesn't hold the handlers after it for the naming call", async () => {
+  // pi awaits each agent_settled handler in load order and botsun-owner's idle comes after this
+  // one, so awaiting a model round trip here left the phone's done signal seconds late.
+  const s = stubPi();
+  let name;
+  s.pi.getSessionName = () => name;
+  s.pi.setSessionName = (next) => {
+    name = next;
+  };
+  let release = () => {};
+  const gate = new Promise((r) => {
+    release = r;
+  });
+  const ctx = {
+    hasUI: true,
+    ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+    sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", content: "my cactus keeps dying" } }] },
+    modelRegistry: {
+      ...fakeRegistry([{ provider: "opencode-go", id: "deepseek-v4.1-flash" }], {}),
+      complete: async () => (
+        await gate,
+        { stopReason: "stop", content: [{ type: "text", text: "Cactus Winter Keeper" }] }
+      ),
+    },
+  };
+  autoSessionName(s.pi);
+  const fired = s.fire("agent_settled", {}, ctx);
+  // Awaited (the old handler), this never comes back until the model does.
+  const how = await Promise.race([fired.then(() => "returned"), sleep(200).then(() => "still asking")]);
+  const during = name;
+  release();
+  await fired;
+  assert.equal(how, "returned", "the handler returned while the name was still being asked for");
+  assert.equal(during, undefined, "so no name had landed yet");
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(name, "Cactus Winter Keeper", "the name still lands");
 });

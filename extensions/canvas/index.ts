@@ -470,7 +470,12 @@ export function displayPath(abs: string, cwd: string): string {
 // base-<id> (none for a new file). After each turn, diff-<id>.patch holds the
 // change from that base to the file as it is now.
 
-export type DiffEntry = { base: string | null; patch: string; skip?: string; adds?: number; dels?: number };
+/**
+ * One tracked file's diff. mtimeMs/size are the file's stamp at its last diff,
+ * so a settle only re-diffs what changed since (an old entry has neither and is
+ * re-diffed once); mtimeMs is null when the file was gone at that diff.
+ */
+export type DiffEntry = { base: string | null; patch: string; skip?: string; adds?: number; dels?: number; mtimeMs?: number | null; size?: number | null };
 const MAX_BASE = 1024 * 1024;
 const MAX_PATCH = 512 * 1024;
 
@@ -496,14 +501,11 @@ export function diffSkipReason(p: string): string {
   return "";
 }
 
-/** A unified diff from base (null: nothing) to the file now, under the display path. */
-export function makePatch(basePath: string | null, cur: string, label: string): { patch: string; adds: number; dels: number } {
-  const a = basePath ?? "/dev/null";
-  const b = existsSync(cur) ? cur : "/dev/null";
-  if (a === "/dev/null" && b === "/dev/null") return { patch: "", adds: 0, dels: 0 };
-  const r = spawnSync("git", ["diff", "--no-index", "--no-color", "--no-ext-diff", "--no-textconv", "-U3", "--", a, b], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
-  if (r.status !== 0 && r.status !== 1) throw new Error(r.stderr || "git diff failed");
-  const out = r.stdout || "";
+const DIFF_ARGS = (a: string, b: string) => ["diff", "--no-index", "--no-color", "--no-ext-diff", "--no-textconv", "-U3", "--", a, b];
+const MAX_DIFF = 32 * 1024 * 1024;
+
+/** git diff's output as the page's patch: from the first hunk, under the display path. */
+function patchText(out: string, a: string, b: string, label: string): { patch: string; adds: number; dels: number } {
   const at = out.search(/^@@/m);
   const body = at < 0 ? "" : out.slice(at);
   let adds = 0;
@@ -515,6 +517,51 @@ export function makePatch(basePath: string | null, cur: string, label: string): 
   let patch = body ? `--- ${a === "/dev/null" ? a : `a/${label}`}\n+++ ${b === "/dev/null" ? b : `b/${label}`}\n${body}` : "";
   if (patch.length > MAX_PATCH) patch = `${patch.slice(0, MAX_PATCH)}\n\\ diff cut at ${MAX_PATCH / 1024} KB\n`;
   return { patch, adds, dels };
+}
+
+/**
+ * A unified diff from base (null: nothing) to the file now, under the display
+ * path. Blocks until git is done: updateWidgets uses makePatchAsync instead.
+ */
+export function makePatch(basePath: string | null, cur: string, label: string): { patch: string; adds: number; dels: number } {
+  const a = basePath ?? "/dev/null";
+  const b = existsSync(cur) ? cur : "/dev/null";
+  if (a === "/dev/null" && b === "/dev/null") return { patch: "", adds: 0, dels: 0 };
+  const r = spawnSync("git", DIFF_ARGS(a, b), { encoding: "utf8", maxBuffer: MAX_DIFF });
+  if (r.status !== 0 && r.status !== 1) throw new Error(r.stderr || "git diff failed");
+  return patchText(r.stdout || "", a, b, label);
+}
+
+/** The same patch off the event loop (execFile), so a settle never blocks it. */
+function makePatchAsync(basePath: string | null, cur: string, label: string): Promise<{ patch: string; adds: number; dels: number }> {
+  const a = basePath ?? "/dev/null";
+  const b = existsSync(cur) ? cur : "/dev/null";
+  if (a === "/dev/null" && b === "/dev/null") return Promise.resolve({ patch: "", adds: 0, dels: 0 });
+  return new Promise((done, fail) => {
+    execFile("git", DIFF_ARGS(a, b), { encoding: "utf8", maxBuffer: MAX_DIFF }, (err, stdout) => {
+      // git diff --no-index exits 1 when the two files differ, which is the usual case.
+      if (err && (err as { code?: unknown }).code !== 1) return fail(err);
+      try {
+        done(patchText(String(stdout ?? ""), a, b, label));
+      } catch (error) {
+        fail(error);
+      }
+    });
+  });
+}
+
+/** git diff spawns in flight at once while re-diffing tracked files. */
+const PATCH_POOL = 4;
+
+/** At most n at a time, results in input order. */
+async function mapPool<T, R>(items: T[], n: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    for (let i = next++; i < items.length; i = next++) out[i] = await fn(items[i]!);
+  };
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+  return out;
 }
 
 // ── the diff kind ────────────────────────────────────────────────────────────
@@ -1076,6 +1123,14 @@ function writeAtomic(path: string, data: string | Buffer) {
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, data);
   renameSync(tmp, path);
+}
+
+/** writeAtomic only when the text differs: an identical rewrite still moves the folder's mtime. */
+function writeAtomicIfChanged(path: string, text: string) {
+  try {
+    if (readFileSync(path, "utf8") === text) return;
+  } catch {}
+  writeAtomic(path, text);
 }
 
 function readJson<T>(path: string, fallback: T): T {
@@ -2259,7 +2314,7 @@ export default function canvas(pi: ExtensionAPI) {
   }
 
   /** Files changed and Screenshots: plain bookkeeping from the turn's tool calls. */
-  function updateWidgets(ctx: ExtensionContext, turn: Turn) {
+  async function updateWidgets(ctx: ExtensionContext, turn: Turn) {
     const ops = turn.ops ?? [];
     const images = (turn.images ?? []).map((p) => (isAbsolute(p) ? p : resolve(ctx.cwd, p))).filter((p) => {
       try {
@@ -2281,21 +2336,71 @@ export default function canvas(pi: ExtensionAPI) {
       if (ops.length) writeAtomic(path, JSON.stringify(files, null, 2));
       const idxPath = join(d, "auto-diffs.json");
       const idx = readJson<Record<string, DiffEntry>>(idxPath, {});
-      for (const abs of Object.keys(files)) {
+      // A file is re-diffed when this turn touched it or its (mtimeMs, size) moved.
+      // Everything else keeps the patch it already has: the old cost was a git
+      // spawn per tracked file on every settle, and a rewrite of every patch.
+      const touched = new Set(ops.map((op) => (isAbsolute(op.path) ? op.path : resolve(ctx.cwd, op.path))));
+      const stale = Object.keys(files).filter((abs) => {
         const e = idx[abs];
-        if (!e || e.skip) continue;
+        if (!e || e.skip) return false;
+        if (touched.has(abs) || e.mtimeMs === undefined) return true;
+        let st;
         try {
-          const { patch, adds, dels } = makePatch(e.base ? join(d, e.base) : null, abs, displayPath(abs, ctx.cwd));
-          writeAtomic(join(d, e.patch), patch);
-          idx[abs] = { ...e, adds, dels };
+          st = statSync(abs);
         } catch {}
+        return e.mtimeMs !== (st ? st.mtimeMs : null) || e.size !== (st ? st.size : null);
+      });
+      // Stat before diffing: a file that changes mid-diff gets caught next time.
+      const stamps = stale.map((abs) => {
+        try {
+          const st = statSync(abs);
+          return { mtimeMs: st.mtimeMs as number | null, size: st.size as number | null };
+        } catch {
+          return { mtimeMs: null, size: null };
+        }
+      });
+      const patches = await mapPool(stale, PATCH_POOL, async (abs) => {
+        const e = idx[abs]!;
+        try {
+          return await makePatchAsync(e.base ? join(d, e.base) : null, abs, displayPath(abs, ctx.cwd));
+        } catch {
+          return null;
+        }
+      });
+      // Only what this pass measured: the merge below copies these fields and nothing else.
+      const updates: Record<string, Partial<DiffEntry>> = {};
+      stale.forEach((abs, i) => {
+        const p = patches[i];
+        if (!p) {
+          // A diff that failed (over git's buffer cap, a base the prune took) keeps its old patch,
+          // but records the stamp too, so the next settle doesn't spawn git for it again unchanged.
+          updates[abs] = { ...stamps[i] };
+          return;
+        }
+        const e = idx[abs]!;
+        writeAtomicIfChanged(join(d, e.patch), p.patch);
+        updates[abs] = { adds: p.adds, dels: p.dels, ...stamps[i] };
+      });
+      // The card is built from the freshest read, so an entry snapshotBase added during the
+      // diffs shows now rather than at the next settle.
+      let latest = idx;
+      if (Object.keys(updates).length) {
+        // Read it again: a tool_call during the diffs may have added an entry, and the prune may
+        // have dropped one. Only the four fields this pass measured go in, and only into entries
+        // still there: never a fresher base/patch/skip, and never one someone deleted (its base is
+        // gone, so its diff would fail from then on).
+        latest = readJson<Record<string, DiffEntry>>(idxPath, {});
+        for (const [abs, u] of Object.entries(updates)) {
+          const cur = latest[abs];
+          if (cur) latest[abs] = { ...cur, ...u };
+        }
+        writeAtomicIfChanged(idxPath, JSON.stringify(latest, null, 2));
       }
-      if (Object.keys(idx).length) writeAtomic(idxPath, JSON.stringify(idx, null, 2));
       // Every listed file, not just this turn's: files changed before copies existed get one too.
       const copiesPath = join(d, "auto-copies.json");
       const copies = syncCopies(d, Object.keys(files), readJson<Record<string, CopyEntry>>(copiesPath, {}));
-      writeAtomic(copiesPath, JSON.stringify(copies, null, 2));
-      putMarkdown(d, { id: "auto-files", title: "Files changed", body: filesMarkdown(files, ctx.cwd, 40, { diffs: idx, copies, sessionId }), by: "auto" });
+      writeAtomicIfChanged(copiesPath, JSON.stringify(copies, null, 2));
+      putMarkdown(d, { id: "auto-files", title: "Files changed", body: filesMarkdown(files, ctx.cwd, 40, { diffs: latest, copies, sessionId }), by: "auto" });
     }
     if (images.length) {
       const path = join(d, "auto-shots.json");
@@ -2474,18 +2579,32 @@ export default function canvas(pi: ExtensionAPI) {
       writeTurn();
     }
     if (!ctx.hasUI || !sessionId) return;
-    writeReply(ctx);
-    writeInfo(ctx);
-    if (autoOn) {
-      const turn = lastTurn(ctx.sessionManager.getBranch() || []);
-      turn.ops = mergeOps(turn.ops ?? [], liveNested);
-      liveNested = [];
-      void serial(() => updateWidgets(ctx, turn)).catch(() => {});
-      void serial(() => updateAgents(ctx)).catch(() => {});
-      void serial(() => updateTasks(ctx)).catch(() => {});
-    }
-    if (event.aborted || !statusOn) return;
-    void refreshStatus(ctx);
+    // pi awaits each agent_settled handler in load order, and botsun-owner's
+    // idle comes after this one: reply/info read the whole branch, and the
+    // widgets spawn a git diff per tracked file. A macrotask, so every other
+    // extension's settled handler (and its idle write) runs first.
+    const sid = sessionId;
+    const live = liveNested;
+    liveNested = [];
+    // The turn and its ops, read and merged now, before the timer: a run that starts first
+    // (botsun-owner's afterStop, the scheduler, goal, agent-link) has already put its user entry
+    // on the branch, and lastTurn would hand back that new, empty turn, so this turn's ops never
+    // reached Files changed. getBranch is an in-memory walk; the cost was in the writes below.
+    const settled = autoOn ? lastTurn(ctx.sessionManager.getBranch() || []) : undefined;
+    if (settled) settled.ops = mergeOps(settled.ops ?? [], live);
+    setTimeout(() => {
+      if (sessionId !== sid) return; // the session switched while we waited
+      try {
+        writeReply(ctx);
+        writeInfo(ctx);
+        if (settled) {
+          void serial(() => updateWidgets(ctx, settled)).catch(() => {});
+          void serial(() => updateAgents(ctx)).catch(() => {});
+          void serial(() => updateTasks(ctx)).catch(() => {});
+        }
+        if (!event.aborted && statusOn) void refreshStatus(ctx);
+      } catch {}
+    }, 0);
   });
 
   // Running: a bash command still going after 5 s gets a live card.
