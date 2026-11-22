@@ -349,13 +349,85 @@ export function listSessions(root) {
   return out.sort((a, b) => Number(b.live) - Number(a.live) || b.updated - a.updated);
 }
 
+/** pi's session storage: <agent dir>/sessions/--<encoded cwd>--/<stamp>_<id>.jsonl. */
+export function sessionsDir() {
+  const custom = process.env.PI_CODING_AGENT_SESSION_DIR;
+  if (custom) return resolve(custom.startsWith("~") ? join(homedir(), custom.slice(1)) : custom);
+  const agent = process.env.PI_CODING_AGENT_DIR;
+  const base = agent ? resolve(agent.startsWith("~") ? join(homedir(), agent.slice(1)) : agent) : join(homedir(), ".pi", "agent");
+  return join(base, "sessions");
+}
+
+/**
+ * Session transcripts by session id: the newest time of every `<stamp>_<id>.jsonl`
+ * under pi's sessions folder. Built once per prune run (the walk is the expensive
+ * part); prune.mjs imports it too, so both whole-folder rules read one map.
+ */
+export function sessionFileTimes(dir = sessionsDir()) {
+  const out = new Map();
+  const put = (path, name) => {
+    const stem = name.replace(/\.jsonl$/, "");
+    // A session id could itself hold an underscore, so register every tail.
+    const parts = stem.split("_");
+    for (let i = 1; i < parts.length; i++) {
+      const id = parts.slice(i).join("_");
+      if (!SESSION_ID.test(id)) continue;
+      let at;
+      try {
+        const st = statSync(path);
+        at = Math.max(st.mtimeMs, st.ctimeMs);
+      } catch {
+        continue;
+      }
+      if (!(out.get(id) >= at)) out.set(id, at);
+    }
+  };
+  let dirs = [];
+  try {
+    dirs = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of dirs) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    const sub = join(dir, entry.name);
+    let files = [];
+    try {
+      files = readdirSync(sub, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const f of files) if (f.isFile() && f.name.endsWith(".jsonl")) put(join(sub, f.name), f.name);
+  }
+  // Older layouts kept transcripts straight in the sessions folder.
+  for (const f of dirs) if (f.isFile() && f.name.endsWith(".jsonl")) put(join(dir, f.name), f.name);
+  return out;
+}
+
+/**
+ * Whether a session folder may go: its pi is gone, nothing in it has moved in
+ * `days`, and its transcript hasn't either. One rule, used by the 6-hourly
+ * prune() below and by prune.mjs's nightly one, so neither can delete what the
+ * other keeps (a folder /resume'd back into still says `ended` in its meta).
+ */
+export function folderDead(root, id, opts = {}) {
+  const days = opts.days ?? RETAIN_DAYS;
+  const now = opts.now ?? Date.now();
+  if (!(days > 0)) return false;
+  const at = opts.updated ?? newestMtime(join(root, id));
+  if (now - at < days * 86_400_000) return false;
+  const fileAt = (opts.sessionFiles ?? sessionFileTimes()).get(id);
+  return fileAt === undefined || now - fileAt >= days * 86_400_000;
+}
+
 /** Delete session folders idle for `days` whose pi process is gone. */
-export function prune(root, days = RETAIN_DAYS, now = Date.now()) {
+export function prune(root, days = RETAIN_DAYS, now = Date.now(), opts = {}) {
   const removed = [];
   if (!(days > 0)) return removed;
+  const sessionFiles = opts.sessionFiles ?? sessionFileTimes();
   for (const s of listSessions(root)) {
     if (s.live) continue;
-    if (now - s.updated < days * 86_400_000) continue;
+    if (!folderDead(root, s.id, { days, now, sessionFiles, updated: s.updated })) continue;
     try {
       rmSync(join(root, s.id), { recursive: true, force: true });
       removed.push(s.id);

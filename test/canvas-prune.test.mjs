@@ -8,18 +8,24 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { BOOKKEEPING, isArtifactName, LOG_NAME, nextRunDelay, pruneCanvas, pruneSession, schedulePrune, sessionFileTimes, summaryLine } from "../extensions/canvas/prune.mjs";
+import { BOOKKEEPING, fileTime, isArtifactName, LOG_NAME, nextRunDelay, pruneCanvas, pruneSession, schedulePrune, sectionsAfterRemovals, sessionFileTimes, summaryLine, trackingAfterRemovals } from "../extensions/canvas/prune.mjs";
 
 const HERE = fileURLToPath(new URL("..", import.meta.url));
 const DAY = 86_400_000;
-/** Every test prunes as of now, and stamps fixture times against it. */
-const NOW = Date.now();
+/**
+ * Every test prunes as of NOW, which is a little in the future: file ages are
+ * max(mtime, ctime), and ctime (set when a file is created or renamed) cannot
+ * be backdated, so the only way to make a file old is to judge it from later.
+ * Every fixture's times are stamped from NOW too (age() below), so a fresh file
+ * is `now - 0` and an old one is exactly as old as its test says.
+ */
+const NOW = Date.now() + 40 * DAY;
 const daysAgo = (days) => new Date(NOW - days * DAY).toISOString();
 
 function makeRoot() {
@@ -30,8 +36,8 @@ function write(dir, name, body) {
   writeFileSync(join(dir, name), typeof body === "string" ? body : JSON.stringify(body, null, 2));
 }
 
-/** Backdate a path (a file's mtime, or a folder's when the folder is passed). */
-function age(path, days) {
+/** Stamp a path (a file's mtime, or a folder's when the folder is passed) at NOW - days. */
+function age(path, days = 0) {
   const t = new Date(NOW - days * DAY);
   utimesSync(path, t, t);
 }
@@ -47,12 +53,14 @@ function session(root, id, files = [], { meta = deadMeta(id), age: dirAge = 0 } 
   const dir = join(root, id);
   mkdirSync(dir, { recursive: true });
   write(dir, "meta.json", meta);
-  if (dirAge) age(join(dir, "meta.json"), dirAge);
+  age(join(dir, "meta.json"), dirAge);
   for (const [name, body, days] of files) {
     write(dir, name, body);
-    if (days) age(join(dir, name), days);
+    // Always: a file left unstamped would keep its creation ctime, which is
+    // NOW - 40 days, and read as old.
+    age(join(dir, name), days ?? 0);
   }
-  if (dirAge) age(dir, dirAge);
+  age(dir, dirAge);
   return dir;
 }
 
@@ -232,7 +240,7 @@ test("--days moves the folder cutoff", () => {
   assert.equal(existsSync(dir), false);
 });
 
-test("an active turn only gets its sections pruned", () => {
+test("a mid-turn session is left alone entirely", () => {
   const root = makeRoot();
   const dir = session(
     root,
@@ -257,13 +265,75 @@ test("an active turn only gets its sections pruned", () => {
   const summary = pruneSession(root, "turn", { now: NOW });
 
   assert.equal(summary.activeTurn, true);
-  assert.deepEqual(summary.sections, ["old"]);
-  assert.equal(existsSync(join(dir, "old.md")), false);
-  // The tracking and the orphan wait for the turn to end.
+  assert.equal(summary.busy, true);
+  // Nothing at all: the section the agent may be reading, the tracking it writes, the media it put
+  // there a minute ago. Its own settle work runs for seconds after turn.ended, so sections are not
+  // safe to age mid-turn either (a posting copies its file in, then writes the section).
+  assert.deepEqual(summary.sections, []);
   assert.deepEqual(summary.tracked, []);
   assert.deepEqual(summary.orphans, []);
-  assert.equal(existsSync(join(dir, "diff-0123456789ab.patch")), true);
+  assert.match(summary.kept, /active turn/);
+  for (const kept of ["old.md", "diff-0123456789ab.patch", "orphan.png", "auto-files.json"]) {
+    assert.equal(existsSync(join(dir, kept)), true, `${kept} should stay`);
+  }
+  assert.deepEqual(json(join(dir, "sections.json")).map((s) => s.id), ["old", "auto-files"]);
+});
+
+test("a live session that moved something in the last 10 minutes is left alone", () => {
+  const root = makeRoot();
+  // The extension's settle work runs after turn.ended: the turn is over, but the folder moved a
+  // minute ago, so the tracking JSONs are still being written.
+  const dir = session(root, "settling", [["turn.json", JSON.stringify({ started: daysAgo(0), ended: daysAgo(0) }), 0], ["base-0123456789ab", "base", 9]], {
+    meta: { id: "settling", pid: process.pid },
+  });
+  age(join(dir, "turn.json"), 1 / 24 / 60); // a minute ago
+  write(dir, "auto-files.json", { "/repo/a.rb": { edits: 1, writes: 0, at: daysAgo(9) } });
+  age(join(dir, "auto-files.json"), 0);
+  write(dir, "auto-diffs.json", { "/repo/a.rb": { base: "base-0123456789ab", patch: "diff-0123456789ab.patch" } });
+  age(join(dir, "auto-diffs.json"), 0);
+  age(join(dir, "turn.json"), 1 / 24 / 60); // a minute ago
+
+  const summary = pruneSession(root, "settling", { now: NOW });
+  assert.equal(summary.activeTurn, false);
+  assert.equal(summary.busy, true, "live and written to a minute ago");
+  assert.deepEqual(summary.tracked, []);
+  assert.equal(existsSync(join(dir, "base-0123456789ab")), true);
+});
+
+test("a live idle session only loses stale Files changed tracking, never sections or orphans", () => {
+  const root = makeRoot();
+  const dir = session(
+    root,
+    "idle",
+    [
+      ["old.md", "old", 20],
+      ["orphan.png", "png", 20],
+      ["auto-files.md", "| File |", 20],
+      ["base-0123456789ab", "base", 9],
+      ["diff-0123456789ab.patch", "patch", 9],
+      ["turn.json", JSON.stringify({ started: daysAgo(1), ended: daysAgo(1) }), 1],
+    ],
+    { meta: { id: "idle", pid: process.pid }, age: 1 },
+  );
+  write(dir, "sections.json", [
+    { id: "old", title: "Old", kind: "markdown", file: "old.md", at: daysAgo(20) },
+    { id: "auto-files", title: "Files changed", kind: "markdown", file: "auto-files.md", at: daysAgo(20), by: "auto" },
+  ]);
+  write(dir, "auto-files.json", { "/repo/a.rb": { edits: 1, writes: 0, at: daysAgo(9) } });
+  write(dir, "auto-diffs.json", { "/repo/a.rb": { base: "base-0123456789ab", patch: "diff-0123456789ab.patch" } });
+
+  const summary = pruneSession(root, "idle", { now: NOW });
+
+  assert.equal(summary.busy, false);
+  assert.match(summary.kept, /live, Files changed tracking only/);
+  assert.deepEqual(summary.tracked, ["/repo/a.rb"], "the stale tracking entry still goes");
+  assert.equal(existsSync(join(dir, "base-0123456789ab")), false);
+  // Its page still shows these: a live session's sections are never aged out, and an unreferenced
+  // file may be a media a section still needs.
+  assert.deepEqual(summary.sections, []);
+  assert.equal(existsSync(join(dir, "old.md")), true);
   assert.equal(existsSync(join(dir, "orphan.png")), true);
+  assert.deepEqual(json(join(dir, "sections.json")).map((s) => s.id), ["old", "auto-files"]);
 });
 
 test("an unreadable sections.json or tracking file leaves the folder alone", () => {
@@ -286,14 +356,14 @@ test("an unreadable sections.json or tracking file leaves the folder alone", () 
   }
 });
 
-test("sessions are told apart from the root's other folders", () => {
+test("sessions are told apart from the root's other folders", async () => {
   const root = makeRoot();
   session(root, "one", [["status.json", "{}", 1]]);
   mkdirSync(join(root, "meetings"));
   writeFileSync(join(root, ".watch.json"), "{}");
   mkdirSync(join(root, ".vendor"));
 
-  const { sessions } = pruneCanvas({ root, now: NOW });
+  const { sessions } = await pruneCanvas({ root, now: NOW });
   assert.deepEqual(sessions.map((s) => s.id), ["one"]);
   assert.equal(existsSync(join(root, "meetings")), true);
 });
@@ -368,7 +438,9 @@ test("the CLI prunes, logs one line per session, does nothing twice, and --dry-r
 
   const env = { ...process.env, PI_CANVAS_ROOT: canvas, PI_CODING_AGENT_DIR: agent };
   delete env.PI_CANVAS;
-  const cli = (...args) => spawnSync(process.execPath, [join(HERE, "extensions/canvas/prune.mjs"), ...args], { encoding: "utf8", env });
+  // --now: the fixtures' ages are stamped from NOW, which is ahead of the wall clock (a file's ctime
+  // cannot be backdated), so the CLI is asked to judge them as of NOW.
+  const cli = (...args) => spawnSync(process.execPath, [join(HERE, "extensions/canvas/prune.mjs"), "--now", String(NOW), ...args], { encoding: "utf8", env });
 
   const snapshot = () => {
     const out = [];
@@ -409,5 +481,135 @@ test("the CLI prunes, logs one line per session, does nothing twice, and --dry-r
   // Two lines on the first run (both sessions), one on the second ("gone" is gone).
   assert.equal(readFileSync(join(canvas, LOG_NAME), "utf8").trim().split("\n").length, 3);
 
-  assert.match(summaryLine({ id: "x", removedDir: true, bytes: 2048, sections: [], tracked: [], trackedFiles: 0, orphans: [], live: false, activeTurn: false, kept: "" }), /removed the folder \(2\.0 KB\)/);
+  assert.match(summaryLine({ id: "x", removedDir: true, bytes: 2048, sections: [], tracked: [], trackedFiles: 0, orphans: [], live: false, busy: false, activeTurn: false, kept: "" }), /removed the folder \(2\.0 KB\)/);
+});
+
+test("a file's age is when it arrived (ctime) as well as when it was written", () => {
+  const root = makeRoot();
+  const src = join(root, "source.png");
+  writeFileSync(src, "png bytes");
+  // Further back than the test clock's own displacement, so the mtime is really in the past and
+  // ctime (which utimes cannot set) is really newer.
+  age(src, 50);
+  // What a copying tool that keeps times (`cp -p`, rsync -t, mv) hands the canvas: the source's
+  // old mtime on a file that arrived a moment ago. The canvas tool's own copies go through
+  // copyFileSync, whose mtime depends on the filesystem; either way ctime is the arrival.
+  copyFileSync(src, join(root, "posted.png"));
+  age(join(root, "posted.png"), 50);
+  const st = statSync(join(root, "posted.png"));
+  assert.ok(statSync(src).mtimeMs === st.mtimeMs, "the copy carries the source's mtime");
+  assert.ok(st.ctimeMs > st.mtimeMs, "but its ctime is when it arrived");
+  assert.equal(fileTime(join(root, "posted.png")), Math.max(st.mtimeMs, st.ctimeMs));
+  assert.equal(fileTime(join(root, "posted.png")), st.ctimeMs, "so it is aged from the arrival, not the source");
+  assert.equal(fileTime(join(root, "nope.png")), undefined);
+});
+
+test("a section whose file is old but whose `at` is today stays", () => {
+  const root = makeRoot();
+  // The section a canvas tool posted today from a source last edited 20 days ago: an old file
+  // time, a fresh `at`. Aging by the file alone deleted it minutes after it was posted.
+  const dir = session(root, "copy", [
+    ["posted.md", "hi", 20],
+    ["old.md", "old", 20],
+  ]);
+  write(dir, "sections.json", [
+    { id: "posted", title: "Posted", kind: "markdown", file: "posted.md", at: daysAgo(0) },
+  ]);
+  age(join(dir, "sections.json"), 0);
+  // The file really is 20 days old by mtime: only `at` says it was posted today.
+  assert.ok(NOW - statSync(join(dir, "posted.md")).mtimeMs > 19 * DAY);
+
+  assert.deepEqual(pruneSession(root, "copy", { now: NOW }).sections, []);
+  assert.equal(existsSync(join(dir, "posted.md")), true, "posted today, so kept");
+
+  // With the `at` as old as the file, the 14-day rule is what it is for. (A file backdated with
+  // utimes only: ctime is fresh, so a dead-session test can only age it through the clock.)
+  write(dir, "sections.json", [{ id: "posted", title: "Posted", kind: "markdown", file: "posted.md", at: daysAgo(20) }]);
+  const old = pruneSession(root, "copy", { now: NOW });
+  assert.deepEqual(old.sections, ["posted"]);
+  assert.equal(existsSync(join(dir, "posted.md")), false);
+});
+
+test("an unreadable section body leaves the orphans alone", () => {
+  const root = makeRoot();
+  // A body over MAX_BODY is skipped, and a media name may be the only reference in it.
+  const big = `![chart](chart-0123456789ab.png)\n${"x".repeat(1_200_000)}`;
+  const dir = session(root, "big", [
+    ["big.md", big, 1],
+    ["chart-0123456789ab.png", "png", 8],
+    ["shot-0123456789ab.png", "png", 8],
+  ]);
+  write(dir, "sections.json", [{ id: "big", title: "Big", kind: "markdown", file: "big.md", at: daysAgo(1) }]);
+  age(join(dir, "sections.json"), 1);
+
+  const summary = pruneSession(root, "big", { now: NOW });
+  assert.match(summary.kept, /body could not be read, orphans left alone/);
+  assert.deepEqual(summary.orphans, []);
+  for (const kept of ["big.md", "chart-0123456789ab.png", "shot-0123456789ab.png"]) {
+    assert.equal(existsSync(join(dir, kept)), true, `${kept} should stay`);
+  }
+
+  // Bodies that aren't text (an image section's own file, a patch, a copy) are never read, so they
+  // can't exhaust the budget: the md section is still scanned and its media kept.
+  const root2 = makeRoot();
+  const dir2 = session(root2, "media", [
+    ["shot.png", "png", 1],
+    ["notes.md", "![d](inline.png)", 1],
+    ["inline.png", "png", 1],
+    ["orphan.png", "png", 8],
+  ]);
+  write(dir2, "sections.json", [
+    { id: "shot", title: "Shot", kind: "image", file: "shot.png", at: daysAgo(1) },
+    { id: "notes", title: "Notes", kind: "markdown", file: "notes.md", at: daysAgo(1) },
+  ]);
+  age(join(dir2, "sections.json"), 1);
+  const clean = pruneSession(root2, "media", { now: NOW });
+  assert.equal(clean.kept.includes("orphans left alone"), false, "every text body was read");
+  assert.deepEqual(clean.orphans, ["orphan.png"]);
+  assert.equal(existsSync(join(dir2, "inline.png")), true, "named in the body, so kept");
+});
+
+test("removals apply to the fresh copy, so a section or entry added meanwhile survives", () => {
+  // The scan reads sections.json, decides, and writes much later (its own media reads and the
+  // tracking pass run in between). What it writes is the fresh copy minus the dropped ids, never
+  // the list it graded: a section posted in that window would otherwise vanish, and the next run
+  // would delete its file as an orphan.
+  const graded = [
+    { id: "old", title: "Old", kind: "markdown", file: "old.md", at: daysAgo(20) },
+    { id: "auto-files", title: "Files changed", kind: "markdown", file: "auto-files.md", at: daysAgo(1), by: "auto" },
+  ];
+  const fresh = [...graded, { id: "posted", title: "Posted", kind: "markdown", file: "posted.md", at: daysAgo(0) }];
+  const kept = sectionsAfterRemovals(fresh, { droppedIds: new Set(["old"]) });
+  assert.deepEqual(kept.map((s) => s.id), ["auto-files", "posted"], "the new one is kept, the old one gone");
+  // And the Files changed card goes only with an emptied tracking state.
+  assert.deepEqual(sectionsAfterRemovals(fresh, { droppedIds: new Set(["old"]), dropTracking: true }).map((s) => s.id), ["posted"]);
+  // A section without an id is matched by its file.
+  const noId = [{ file: "x.md", title: "X" }, { file: "y.md", title: "Y" }];
+  assert.deepEqual(sectionsAfterRemovals(noId, { droppedFiles: new Set(["x.md"]) }).map((s) => s.title), ["Y"]);
+
+  // The tracking JSONs: only the stale keys go, so an entry the extension added while the prune
+  // ran (a file edited a second ago) survives, and one it refreshed keeps its fresh value.
+  const freshDiffs = {
+    "/repo/a.rb": { base: "base-aaaaaaaaaaaa", patch: "diff-aaaaaaaaaaaa.patch", adds: 9 },
+    "/repo/new.rb": { base: null, patch: "diff-bbbbbbbbbbbb.patch" },
+    "/repo/c.rb": { base: null, patch: "diff-cccccccccccc.patch" },
+  };
+  assert.equal(trackingAfterRemovals(freshDiffs, new Set(["/repo/a.rb", "/repo/gone.rb"])), 1);
+  assert.deepEqual(Object.keys(freshDiffs), ["/repo/new.rb", "/repo/c.rb"]);
+  assert.equal(trackingAfterRemovals(freshDiffs, new Set(["/repo/zzz.rb"])), 0, "nothing to drop, nothing to write");
+});
+
+test("a diffed file's own mtime (branch 1's DiffEntry.mtimeMs) keeps its entry", () => {
+  const root = makeRoot();
+  const dir = session(root, "mtime", [["diff-0123456789ab.patch", "patch", 30]]);
+  write(dir, "auto-files.json", { "/repo/a.rb": { edits: 1, writes: 0, at: daysAgo(30) } });
+  // The patch is old (branch 1 stops rewriting unchanged patches), but the file was diffed a
+  // minute ago, so the entry is not stale.
+  write(dir, "auto-diffs.json", { "/repo/a.rb": { base: null, patch: "diff-0123456789ab.patch", adds: 1, dels: 0, mtimeMs: NOW - 60_000, size: 10 } });
+  age(join(dir, "auto-files.json"), 30);
+  age(join(dir, "auto-diffs.json"), 30);
+
+  const summary = pruneSession(root, "mtime", { now: NOW });
+  assert.deepEqual(summary.tracked, []);
+  assert.equal(existsSync(join(dir, "diff-0123456789ab.patch")), true);
 });
