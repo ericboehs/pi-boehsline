@@ -585,6 +585,44 @@ Files live in `~/.pi/canvas/<session-id>/` (`meta.json`, `status.json`,
 on its first status or section. The daemon deletes folders idle for 30 days
 whose pi process is gone (`PI_CANVAS_RETAIN_DAYS`).
 
+**Cleanup.** [`prune.mjs`](prune.mjs) keeps a long-running session's folder from
+piling up thousands of files. The daemon runs it once 10 minutes after it
+starts, then daily at 04:00 local (unref'd `setTimeout`s, no launchd job), and
+it can be run by hand:
+
+```sh
+node extensions/canvas/prune.mjs --dry-run         # say what would go, change nothing
+node extensions/canvas/prune.mjs --days 60         # a longer folder retention
+```
+
+Per session folder:
+
+- **The folder itself** goes when its pi is not running (the daemon's own
+  liveness: `meta.json`'s `ended` and pid) and nothing in it has moved in 30
+  days (`--days`, else `PI_CANVAS_RETAIN_DAYS`), and its pi session transcript
+  in `~/.pi/agent/sessions/**/<stamp>_<id>.jsonl` has not either. A transcript
+  that no longer exists counts as stale.
+- **Sections** the agent made go after 14 days without a change (the section
+  file's mtime, else its `at`), with their `extra` media: from `sections.json`
+  (written to a temp file and renamed, like every canvas write) and from disk.
+  `auto-*` sections, `by: "auto"` sections and `tracker` sections are never
+  aged out.
+- **Files changed tracking**: an entry in `auto-files.json`, `auto-diffs.json`
+  or `auto-copies.json` goes after 7 days untouched (its own `at`/`mtimeMs` if
+  it has one, else its `diff-*`/`cur-*` file's mtime), with its `base-*`,
+  `cur-*` and `diff-*` files. Emptied tracking files are removed; when
+  `auto-files.json` ends empty, the Files changed card goes too.
+- **Orphans**: a file no section, tracking entry or `auto-shots.json` entry
+  names, and whose name the canvas writes (a section file, `base-*`, `cur-*`,
+  `diff-*`, `shot-*`, or a `*.tmp` over an hour old), is deleted. Anything
+  unrecognized, and everything in a folder whose `sections.json` or tracking
+  JSON doesn't parse, stays.
+
+A session in the middle of a turn gets only the section cleanup: the extension
+writes its tracking and media mid-turn. One line per session goes to
+`~/.pi/canvas/.daemon.log` (`canvas prune: <id>: …`); `--dry-run` writes
+nothing, not even the log.
+
 The daemon is spawned detached on `session_start` when none answers
 `/health`. Its version is a hash of `daemon.mjs` and `page.mjs` on disk, so
 after an edit the next pi to start replaces it. Logs go to
@@ -672,5 +710,5 @@ status runs, `PI_CANVAS_TMUX=0` turns off tmux follow mode,
 Subagent children skip the canvas.
 
 ```sh
-node --test test/canvas.test.mjs test/canvas-nav.test.mjs test/canvas-render.test.mjs test/canvas-security.test.mjs test/canvas-meeting.test.mjs test/canvas-embed.test.mjs
+node --test test/canvas.test.mjs test/canvas-nav.test.mjs test/canvas-render.test.mjs test/canvas-security.test.mjs test/canvas-meeting.test.mjs test/canvas-embed.test.mjs test/canvas-prune.test.mjs
 ```
