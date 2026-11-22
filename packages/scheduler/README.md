@@ -112,8 +112,9 @@ Catch-up needs you to open the session. A timer can also ask pi to open it:
 
 `--wake` (a `crash`) means "reopen if the session died without being quit";
 `--wake=always` means "reopen even though I closed it on purpose". The flag is
-recorded on the task and published in the index; the tick that actually
-reopens a session is a separate change, so today it changes nothing else.
+recorded on the task and published in the index, and the `pi-scheduler` tick
+reopens the session when it comes due: see
+[Waking closed sessions](#waking-closed-sessions).
 
 The `schedule` tool takes `wake` only when the opt-in also says
 `"allowWake": true` — an unattended reopened turn has your full tool set, and
@@ -195,13 +196,16 @@ every session with timers also publishes a one-line entry to
   "pid": 4711, "pidStart": "Sat Nov 22 14:29:49 2026", "host": "laptop",
   "liveSince": 1763830000000, "closedAt": 1763833600000,
   "nextDueAt": 1763840000000, "nextWakeDueAt": 1763840000000,
+  "nextAlwaysDueAt": 1763840000000,
   "wake": "always", "count": 2, "updatedAt": 1763833000000 } } }
 ```
 
 - Metadata only: no prompts ever go in it, so a process that reads it learns
   when a session is next due and nothing about what you scheduled.
 - `count` is unpaused timers; `nextWakeDueAt` and `wake` cover the tasks asking
-  to be woken, strongest level wins (`always` > `crash`). An entry disappears
+  to be woken, strongest level wins (`always` > `crash`); `nextAlwaysDueAt` is
+  the earliest `always` one alone, the only one that may reopen a session you
+  quit on purpose. An entry disappears
   when the session has nothing unpaused left.
 - `pid` plus `pidStart` (ps `lstart`) and `host` identify the live pi holding
   the session; both are cleared with `closedAt` on shutdown for any reason, so
@@ -216,8 +220,148 @@ every session with timers also publishes a one-line entry to
 - Two pi processes on one session would each catch up the same missed timer, so
   a restore checks this index first and leaves the catch-up to the live holder.
 
-This is what a future `pi-scheduler` tick can use to wake a session for a
-`--wake` timer. Nothing reads it to fire timers yet.
+This is what the `pi-scheduler` tick reads to wake a session for a `--wake`
+timer.
+
+## Waking closed sessions
+
+When a session is closed and one of its `--wake` timers comes due, or a
+background job it started has finished since it closed, the per-minute
+`pi-scheduler check` reopens it in a tmux window. The tick only spawns; pi's own
+restore does the rest: the timer's catch-up fires, and bg re-adopts and reports
+the job. No model runs in the tick.
+
+> **A woken session runs the model unattended.** The catch-up or bg report
+> starts a turn with your full tool set and nobody watching. Anything that
+> blocks on you (project trust, approval-guardian, a 1Password prompt) leaves
+> the window waiting; the tick counts that as `stuck` and never kills it.
+
+### Which closes are woken
+
+Every interactive (TUI) session writes a small lifecycle record,
+`~/.pi/agent/scheduler/sessions/<id>.json` (dir 0700, file 0600): `live` at
+start, `closed` plus *how* at shutdown, and `crash` from a synchronous exit hook
+when pi exits without a shutdown. `pi -p`, `--no-session` and subagent children
+never write one, and **no record means never woken**.
+
+| how it closed | `crash` timers, bg jobs | `always` timers |
+|---|---|---|
+| `/quit`, Ctrl+C, Ctrl+D (`user`) | no | yes |
+| `/new`, `/resume`, `/fork` away (`switched`) | no | yes |
+| SIGHUP/SIGTERM, tmux server still alive, no reboot since | no (someone closed the window) | yes |
+| SIGHUP/SIGTERM, and the machine rebooted since or the tmux server is gone | yes | yes |
+| `crash`: exited without a shutdown (uncaught error, dead terminal) | yes | yes |
+| the record says live but its pid is dead (SIGKILL, OOM, power loss) | yes | yes |
+
+A `crash` timer never reopens a session you closed on purpose; `always` does,
+which is the "remind me at 8 AM even though I closed it" case. Every catch-up
+that is due fires on restore, whichever timer woke it. A wake whose due time is
+more than 24 h old does nothing (the catch-up would drop it), so it is skipped.
+
+Liveness is pid + `ps` lstart + host, so a reused pid is not mistaken for pi,
+and a `ps` that cannot answer means "unknown", which is never woken.
+
+**Botsun:** closing a session from the phone, by `tmux kill-window` (a SIGHUP
+with the server still alive) or by sending `/quit`, reads as `user` either way.
+`always` timers still reopen it; `crash` timers and bg jobs don't.
+
+### bg jobs
+
+On by default, for crash-class closes only. A job wakes its session when its
+registry entry (`~/.local/state/pi-bg/<id>.json`) still says running and
+unreported, and its `<log>.exit` is newer than the session's close and less than
+24 h old. The session file and cwd come from the lifecycle record, never the
+job's cwd. Off per job with `/bg --no-wake <id>` (`/bg --wake <id>` undoes it),
+globally with `pi-scheduler wake bg off` or `PI_SCHEDULER_WAKE_BG=0` in the
+service environment, and implicitly when the service's `PI_BG_WAKE` is `off` or
+`nextTurn`, since the reopened session would then report the job without a turn.
+
+### How a wake runs
+
+The wake phase runs at the start of `check`, before any durable task (those are
+sequential agent runs that can take minutes), under the `wake-state.json` lock.
+It opens at most `perTick` windows a tick, oldest due first:
+
+```text
+tmux new-window -d -t pi-wake: -n wake:<id8> -c <cwd> -e PATH=<service PATH> \
+  -e PI_WAKE_ID=<wakeId> -- <abs node> <abs pi-scheduler> wake-exec <wakeId>
+tmux set-option -w -t <window> @pi-session <session id>
+```
+
+Argv form only, never a shell string, and never a session id. `wake-exec`
+checks again under the per-session lock, right before starting pi, that the
+session is not live, the file exists, its header names this session, its cwd
+exists and the host matches; then it runs `<abs pi> --session <abs file>` (pi
+on a missing path would silently start a new empty session). A nonzero exit
+goes to `wake.log` with the last 20 lines of stderr. The woken pi stamps its
+lifecycle record with the wake id and `opener: "wake"`.
+
+Skipped before spawning, each logged at most once an hour per session and
+reason: no record, another host, live, `ps` unknown, session file missing,
+header mismatch, header cwd missing, tmux missing or older than 3.0, pi not
+found, a window already tagged `@pi-session=<id>`, the hourly caps, a backoff.
+
+### Failures and backoff
+
+- **Success:** a lifecycle record with the wake's id goes live and is still
+  live 10 minutes later (or closed normally by then).
+- **Failure:** no such record and no live pane after 3 minutes (a gap between
+  ticks longer than 3 minutes is a sleep, and does not count); a pane alive but
+  never live after 10 minutes (`stuck`, never killed); a crash or vanish within
+  10 minutes of going live.
+- Two failures in a row back the session off until you open it by hand
+  (`opener: "manual"`) or run `pi-scheduler wake reset <id>`.
+- Caps: 3 wakes per session and 10 in all per hour, 1 per tick, keyed by host;
+  the tick acts only on records from its own host.
+
+### Commands and config
+
+```text
+pi-scheduler wake status          # switch, paths under the service env, in-flight wakes,
+                                  # backoffs, caps, next candidates, wake.log tail
+pi-scheduler wake run --dry-run   # what the next tick would wake, and why the rest wait
+pi-scheduler wake on|off          # the global switch
+pi-scheduler wake bg on|off       # bg-job wakes
+pi-scheduler wake reset <id>      # clear a backoff
+```
+
+`~/.pi/agent/scheduler/wake.json`, all optional:
+
+```json
+{ "enabled": true, "bg": true, "tmuxTarget": "pi-wake",
+  "perSessionHourly": 3, "globalHourly": 10, "perTick": 1,
+  "tmux": "/opt/homebrew/bin/tmux", "pi": "/Users/you/.pi/agent/bin/pi" }
+```
+
+`tmuxTarget` is `pi-wake` (a dedicated session, created if missing), `attached`
+(the first attached session, else `pi-wake`) or a session name. `pi` defaults to
+`~/.pi/agent/bin/pi`, then `pi` on the service PATH; the window's PATH puts the
+tick's node first, so the wrapper's `exec node` resolves. Config lives in a file
+because shell environment never reaches launchd or systemd.
+
+`wake-state.json` (in-flight wakes, failures, the hourly ledger) and `wake.log`
+(one line per wake, skip and failure, rotated at 1 MB keeping one `.1`) are both
+0600. Like the lifecycle records they hold ids, paths, reasons and times only:
+never a prompt, or a bg job's command, name, summary or meta.
+
+### Platform notes
+
+- **macOS (launchd):** the tick's job is `ProcessType Background` with
+  `LowPriorityIO`, and everything it forks inherits that throttling. When no
+  tmux server is running, the tick starts one through `launchctl asuser <uid>
+  taskpolicy -d default -g default tmux new-session -d -s pi-wake`, then moves
+  the server out of the background band with `taskpolicy -B -p <pid>` (logged as
+  `tmux-throttled` if that fails). A server you started yourself is never
+  affected. Windows inherit the tmux **server's** environment, not the tick's,
+  hence the explicit `-e PATH`.
+- **Linux (systemd --user):** the `Type=oneshot` unit's default
+  `KillMode=control-group` would kill a tmux server the tick starts, so it is
+  started in its own scope with `systemd-run --user --scope`. Without linger
+  (`sudo loginctl enable-linger $USER`) there is no tick until you log in, and
+  logging out ends the tmux server.
+- `install` captures `TMUX_TMPDIR`, `XDG_STATE_HOME`, the `PI_BG_*` dirs,
+  `PI_BG_WAKE` and `PI_SCHEDULER_WAKE_BG` along with PATH, so the tick talks to
+  your tmux server and reads your bg registry. Reinstall after changing them.
 
 ## Durable tasks: `/schedule`
 
@@ -269,7 +413,8 @@ pi-scheduler list
 pi-scheduler add daily 15:30 :: check grades --name grades
 pi-scheduler run grades       # ignore the schedule and run now
 pi-scheduler runs grades      # recent history
-pi-scheduler check            # what the timer calls
+pi-scheduler check            # what the timer calls (session wakes first, then due tasks)
+pi-scheduler wake status      # see Waking closed sessions
 pi-scheduler uninstall
 ```
 
@@ -279,8 +424,9 @@ expanded into filenames before the scheduler ever sees it.
 ### Nothing stays resident
 
 A launchd job (or systemd `--user` timer on Linux) runs `pi-scheduler check`
-every 60s; it reads one JSON file and exits when nothing is due. pi is only
-spawned when a task is actually due.
+every 60s; it reads a few small JSON files and exits when nothing is due. pi is
+only spawned when a task is actually due, or a closed session is woken (in tmux,
+not by the tick itself).
 
 The launchd label is `com.ericboehs.pi-scheduler`; the systemd unit is
 `pi-scheduler.timer`. Neither tick catches up on its own after a suspend —

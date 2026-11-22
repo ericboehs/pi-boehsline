@@ -82,6 +82,18 @@ dropped without a report. Other sessions' files untouched for 24 h keep only
 jobs that are still running. Sessions without a file (`--no-session`) and
 Windows keep the in-process `/reload` hand-off but no registry.
 
+## Reopening a crashed session
+
+When a session crashed (or its pi was killed, or the machine rebooted) and one
+of its jobs finishes afterwards, the `pi-scheduler` tick reopens the session in
+tmux, and bg re-adopts and reports the job as above. See the scheduler's
+[Waking closed sessions](../../packages/scheduler/README.md#waking-closed-sessions).
+It never happens after a deliberate quit. `/bg --no-wake <id>` keeps one job from
+doing it (`/bg --wake <id>` undoes that), as does a `bg:start` request with
+`wake: false`; the flag is saved as `wake: false` in the job's registry entry,
+which is what the tick reads. With `PI_BG_WAKE=off` or `nextTurn` the tick
+never wakes a session for a job, since the report would start no turn.
+
 
 The `background` flag costs about 55 tokens of context. Logs are plain files the model reads with `read`
 (in `/tmp/pi-bg-<uid>/`, or `PI_BG_DIR`; pruned after 7 days). That directory must be yours and not

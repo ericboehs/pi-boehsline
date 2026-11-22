@@ -7,6 +7,36 @@ change behaviour; each one says what it breaks.
 
 ### Added
 
+- **Waking closed sessions.** `pi-scheduler check` now reopens a closed
+  session in tmux when one of its `--wake` timers is due, or when a bg job it
+  started finished after it closed; pi's own restore then fires the catch-up
+  or reports the job. The wake phase runs before the durable tasks, under the
+  `wake-state.json` lock, at most one spawn per tick (oldest due first), 3 per
+  session and 10 in all per hour. Windows open in a dedicated `pi-wake` tmux
+  session via `tmux new-window … -- <abs node> <abs pi-scheduler> wake-exec
+  <wakeId>` (argv form, `-e PATH`, `-e PI_WAKE_ID`, tagged `@pi-session`);
+  `wake-exec` re-checks liveness, the session file, its header id and cwd and
+  the host under a per-session lock, then runs `<abs pi> --session <abs
+  file>`. When the tick has to start the tmux server, Linux uses
+  `systemd-run --user --scope` and macOS `launchctl asuser` + `taskpolicy`.
+- Session lifecycle records, `sessions/<id>.json`, written by the session
+  scheduler in TUI mode: `live` at start, `closed` with `how`
+  (`user`, `switched`, `signal:SIGHUP|SIGTERM`, `crash`) at shutdown or from a
+  synchronous exit hook. `crash` timers and bg jobs wake only crash-class closes
+  (a crash, a vanished pid, or a signal after a reboot or with the tmux server
+  gone); `always` timers also wake a deliberate quit. No record, never woken.
+- The index gains `nextAlwaysDueAt`, the earliest `always` timer alone.
+- Grace (3 min, stretched over sleep), `stuck` (10 min, never killed), crash
+  within 10 minutes as a failure, and a backoff after two failures in a row
+  until a manual open or `wake reset`.
+- `pi-scheduler wake status | on | off | bg on|off | reset <id> | run
+  --dry-run`, and `wake.json` (`enabled`, `bg`, `tmuxTarget`,
+  `perSessionHourly`, `globalHourly`, `perTick`, `tmux`, `pi`). `wake.log`
+  (0600, rotated at 1 MB) holds ids, paths, reasons and times only.
+- `install` also captures `TMUX_TMPDIR`, `XDG_STATE_HOME`, `PI_BG_STATE_DIR`,
+  `PI_BG_DIR`, `PI_BG_WAKE` and `PI_SCHEDULER_WAKE_BG` into the service
+  environment. Reinstall to pick them up.
+
 - Session timers survive pi being closed. A `/once` or `/loop` fire that came
   due while pi was not running is **delivered once** when the session is next
   resumed (before, it was dropped silently), prefixed with when it was due and
@@ -21,8 +51,8 @@ change behaviour; each one says what it breaks.
   unexpected exit), `--wake=always` (reopen even after a deliberate quit), and
   `--no-wake` to clear it. The `schedule` tool takes `wake` only when the
   opt-in also sets `"allowWake": true` (default false), because an unattended
-  reopened turn has the user's full tool set. Recorded and published; the tick
-  that reopens a session is a separate change.
+  reopened turn has the user's full tool set. The tick reopens the session
+  (see "Waking closed sessions" above).
 - `~/.pi/agent/scheduler/session-timers.json`: a small, locked, atomically
   written index saying which sessions have timers, when the earliest is due and
   when the next `wake` timer is due, plus the pid/lstart/host of the live pi
