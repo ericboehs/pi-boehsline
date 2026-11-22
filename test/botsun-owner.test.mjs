@@ -171,6 +171,39 @@ test("busy, stream_end and idle are stamped in ms; idle carries the settle gap",
 	await m.fire("agent_settled");
 	await until(() => srv.lines.filter((l) => l.type === "idle").length >= 2);
 	assert.equal(srv.lines.filter((l) => l.type === "idle")[1].settle_ms, null);
+	// Nor does a gap from an earlier run leak into a later one that ends without an agent_end (agent
+	// start clears it).
+	await m.fire("agent_end");
+	await m.fire("agent_start");
+	await m.fire("agent_settled");
+	await until(() => srv.lines.filter((l) => l.type === "idle").length >= 3);
+	assert.equal(srv.lines.filter((l) => l.type === "idle")[2].settle_ms, null, "agent_start cleared the stale gap");
+	await m.fire("session_shutdown", { reason: "quit" });
+	await srv.stop();
+});
+
+// The quiet split settles his part of a run and starts a quiet one: its idle and busy are the
+// phone's done signal too, so they carry the same epoch-ms at (an ISO string would give
+// owner_lag_ms nil).
+test("a quiet split's idle and busy are stamped in ms too", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	await m.fire("agent_start");
+	const before = Date.now();
+	m.pi.events.emit("quiet:split", { quiet: true });
+	await until(() => srv.lines.filter((l) => l.type === "busy").length >= 2);
+	const [first, split] = srv.lines.filter((l) => l.type === "busy");
+	const idle = srv.lines.find((l) => l.type === "idle");
+	assert.equal(typeof first.at, "number");
+	assert.equal(typeof idle.at, "number", "the split's idle: epoch ms");
+	assert.equal(typeof split.at, "number", "the split's quiet busy: epoch ms");
+	assert.ok(idle.at >= before && split.at >= idle.at);
+	assert.equal(split.quiet, true);
+	assert.equal(split.split, true);
+	assert.equal(idle.settle_ms, null, "no agent_end yet, so no gap to report");
 	await m.fire("session_shutdown", { reason: "quit" });
 	await srv.stop();
 });

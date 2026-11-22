@@ -2644,6 +2644,14 @@ function main(pi: ExtensionAPI): void {
 	// When pi's agent_end last ran (0: none since the last idle): the phone's idle says how long the
 	// run took to settle after it ended (settle_ms).
 	let agentEndAt = 0;
+	// Every idle this extension writes, stamped the same way: at (ms) is when it was written, settle_ms
+	// how long after agent_end that was. Botsun logs both against its own clock (lag_ms), so at must
+	// be epoch ms here even though write() defaults it to ISO. Clears the gap, so it is reported once.
+	const writeIdle = (c: Conn, extra: Record<string, unknown> = {}): void => {
+		const now = Date.now();
+		write(c, "idle", { ...extra, at: now, settle_ms: agentEndAt ? now - agentEndAt : null });
+		agentEndAt = 0;
+	};
 	let held: Array<{ content: string | UserContent[]; steer?: SteerMeta }> = [];
 	// The waiting steers' turn_end and agent_settled steps (set in session_start, where pi and ctx are).
 	let turnEndSteers: (aborted: boolean, pending: boolean) => void = () => {};
@@ -2758,7 +2766,7 @@ function main(pi: ExtensionAPI): void {
 		const quiet = (state as { quiet?: unknown } | undefined)?.quiet === true;
 		if (conn.quietSent === quiet) return;
 		conn.quietSent = quiet;
-		try { write(conn, "busy", { quiet }); } catch {}
+		try { write(conn, "busy", { quiet, at: Date.now() }); } catch {}
 	});
 	// A background message joined his run after its final reply (the quiet extension's split):
 	// his part ends here, so Botsun settles it (its finished push brings his answer), and a quiet
@@ -2766,9 +2774,9 @@ function main(pi: ExtensionAPI): void {
 	pi.events?.on?.(QUIET_SPLIT_EVENT, () => {
 		if (!conn || conn.closed || !conn.busy || conn.quietSent === true) return;
 		try {
-			write(conn, "idle");
+			writeIdle(conn);
 			conn.quietSent = true;
-			write(conn, "busy", { quiet: true, split: true });
+			write(conn, "busy", { quiet: true, split: true, at: Date.now() });
 		} catch {}
 	});
 	// A quiet run's attention (notify_user or the classifier): the phone shows it.
@@ -3046,7 +3054,7 @@ function main(pi: ExtensionAPI): void {
 			write(conn, "context", { context: (() => { try { return context(); } catch { return null; } })() });
 			write(conn, "stash", { stash: stashLine(conn) });
 			// A replaced session isn't running or waiting on anything.
-			if (conn.busy) { conn.busy = false; write(conn, "idle"); }
+			if (conn.busy) { conn.busy = false; writeIdle(conn); }
 			if (conn.prompt) { conn.prompt = null; conn.promptDepth = 0; write(conn, "prompt_end"); }
 			return;
 		}
@@ -3201,6 +3209,9 @@ function main(pi: ExtensionAPI): void {
 	});
 	pi.on("agent_start", () => {
 		inputAt = 0; // pi's turn counts as running from here
+		// Before the early return too: a run that ends without an agent_end (or one whose idle never
+		// went out) must not hand a stale gap to the next idle's settle_ms.
+		agentEndAt = 0;
 		if (!conn || conn.closed || conn.busy) return;
 		conn.busy = true;
 		conn.quietSent = runIsQuiet();
@@ -3244,11 +3255,8 @@ function main(pi: ExtensionAPI): void {
 		if (!conn || conn.closed || !conn.busy) return;
 		conn.busy = false;
 		conn.quietSent = undefined;
-		// at (ms) is when idle was written; settle_ms, how long after agent_end that was. Botsun logs
-		// both against its own clock (lag_ms) for the done signal's delay.
-		const now = Date.now();
-		write(conn, "idle", { at: now, settle_ms: agentEndAt ? now - agentEndAt : null });
-		agentEndAt = 0;
+		// The run's done signal, with settle_ms: how long the settle handlers ahead of this one held it.
+		writeIdle(conn);
 		reportContext();
 	});
 
