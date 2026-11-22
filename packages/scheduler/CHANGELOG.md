@@ -7,7 +7,9 @@ change behaviour; each one says what it breaks.
 
 ### Added
 
-- **Waking closed sessions.** `pi-scheduler check` now reopens a closed
+- **Waking closed sessions**, **off by default**: turn it on per machine with
+  `pi-scheduler wake on` after the device test passes there (`wake status`
+  says `off (default)` until then). Once on, `pi-scheduler check` reopens a closed
   session in tmux when one of its `--wake` timers is due, or when a bg job it
   started finished after it closed; pi's own restore then fires the catch-up
   or reports the job. The wake phase runs before the durable tasks, under the
@@ -18,7 +20,22 @@ change behaviour; each one says what it breaks.
   `wake-exec` re-checks liveness, the session file, its header id and cwd and
   the host under a per-session lock, then runs `<abs pi> --session <abs
   file>`. When the tick has to start the tmux server, Linux uses
-  `systemd-run --user --scope` and macOS `launchctl asuser` + `taskpolicy`.
+  `systemd-run --user --scope` (no plain fallback; the unit also gets
+  `KillMode=process`) and macOS `launchctl asuser` + `taskpolicy`, with
+  `taskpolicy -B` on the server however it was created; `wake status` shows the
+  server's pid, `pri` and `nice`.
+- A due time past 24 h is dropped on its own, so it no longer blocks a fresher
+  `always` timer or bg exit. `stale` and `user-closed` skips are logged once
+  per due time, `no-record` not at all. A `wake-exec` refusal is not a failure
+  except `pi-missing`, and a lock timeout is logged as `refuse lock-timeout`. A
+  manual open after one failure resets the count; other hosts' in-flight wakes
+  are dropped after 24 h.
+- The live record is written synchronously at `session_start` (no `pidStart`
+  until `ps` fills it in), pi warns when another live pi already holds the
+  session, and a `/reload` keeps the record held so an exit before the next
+  start is a crash. Lifecycle pruning (7 days after a close) skips sessions
+  with a pending wake or `always` timer, and also drops `live` records not seen
+  for 7 days whose pid is dead.
 - Session lifecycle records, `sessions/<id>.json`, written by the session
   scheduler in TUI mode: `live` at start, `closed` with `how`
   (`user`, `switched`, `signal:SIGHUP|SIGTERM`, `crash`) at shutdown or from a

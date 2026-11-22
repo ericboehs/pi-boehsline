@@ -86,7 +86,8 @@ Windows keep the in-process `/reload` hand-off but no registry.
 
 When a session crashed (or its pi was killed, or the machine rebooted) and one
 of its jobs finishes afterwards, the `pi-scheduler` tick reopens the session in
-tmux, and bg re-adopts and reports the job as above. See the scheduler's
+tmux, and bg re-adopts and reports the job as above. Session wake is off until
+`pi-scheduler wake on`. See the scheduler's
 [Waking closed sessions](../../packages/scheduler/README.md#waking-closed-sessions).
 It never happens after a deliberate quit. `/bg --no-wake <id>` keeps one job from
 doing it (`/bg --wake <id>` undoes that), as does a `bg:start` request with
