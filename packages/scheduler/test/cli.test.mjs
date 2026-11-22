@@ -294,6 +294,8 @@ test("the installed unit recovers a registry path containing a space", { skip: p
   // is the form systemd.exec(5) documents.
   assert.equal(line, `Environment="PI_SCHEDULER_DIR=${spaced}"`);
   assert.doesNotMatch(unit, /Persistent=/, "OnUnitActiveSec= timers ignore it");
+  // A tmux server the wake phase starts must not die with the oneshot's cgroup.
+  assert.match(unit, /^KillMode=process$/m);
 });
 
 test("runs still finds the history of a one-shot that has already retired", async (t) => {
@@ -499,7 +501,12 @@ test("a history line with the wrong type for error does not take down runs", asy
 
 test("wake on|off|bg on|off edit wake.json; status and run --dry-run report without changing anything", async (t) => {
   const dir = withTempDir(t);
+  const fresh = (await cli(dir, ["wake", "status"])).stdout;
+  assert.match(fresh, /^wake\s+off \(default\) — run `pi-scheduler wake on` after the device test/m, "ships off");
+  assert.match(fresh, /^tmux server /m);
+  assert.match((await cli(dir, ["wake", "run", "--dry-run"])).stdout, /Session wake is off/);
   assert.match((await cli(dir, ["wake", "off"])).stdout, /Session wake is off/);
+  assert.match((await cli(dir, ["wake", "status"])).stdout, /^wake\s+off$/m, "explicitly off: no default note");
   assert.equal(JSON.parse(readFileSync(join(dir, "wake.json"), "utf8")).enabled, false);
   assert.match((await cli(dir, ["wake", "run", "--dry-run"])).stdout, /Session wake is off/);
   assert.match((await cli(dir, ["wake", "on"])).stdout, /Session wake is on/);
@@ -549,7 +556,7 @@ test("check reopens a crashed session through tmux, argv form, before the durabl
   const dir = withTempDir(t);
   const tmux = fakeTmux(dir);
   const pi = fakePi(dir, { lingerSeconds: 0 });
-  writeFileSync(join(dir, "wake.json"), JSON.stringify({ tmux: tmux.bin, pi: pi.bin }));
+  writeFileSync(join(dir, "wake.json"), JSON.stringify({ enabled: true, tmux: tmux.bin, pi: pi.bin }));
   const id = "0193abcd-0000-7000-8000-000000000001";
   const cwd = join(dir, "project");
   mkdirSync(cwd);

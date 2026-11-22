@@ -144,15 +144,26 @@ export function listLifecycleIds(): string[] {
 
 /**
  * Drop closed records older than `maxAgeMs`. A closed session that old has
- * nothing left to wake for: timer catch-ups and bg exits both stop at 24h.
+ * nothing left to wake for (timer catch-ups and bg exits both stop at 24h),
+ * unless a timer still pending in the index will want it: those ids come in
+ * `keep` and are never pruned. A `live` record not seen for `maxAgeMs` goes
+ * too, when `isDead` says its pi is gone (a SIGKILL or power loss leaves no
+ * close behind).
  */
-export function pruneLifecycle(now: number, maxAgeMs: number): number {
+export function pruneLifecycle(
+  now: number,
+  maxAgeMs: number,
+  { keep, isDead }: { keep?: Set<string>; isDead?: (record: LifecycleRecord) => boolean } = {},
+): number {
   let removed = 0;
   for (const id of listLifecycleIds()) {
+    if (keep?.has(id)) continue;
     const record = readLifecycle(id);
     let stale: boolean;
-    if (record) {
-      stale = record.state === "closed" && now - (record.closedAt ?? record.lastSeen) > maxAgeMs;
+    if (record?.state === "closed") {
+      stale = now - (record.closedAt ?? record.lastSeen) > maxAgeMs;
+    } else if (record) {
+      stale = now - record.lastSeen > maxAgeMs && isDead?.(record) === true;
     } else {
       // Unreadable: age it by mtime so a torn or foreign file does not live forever.
       try {

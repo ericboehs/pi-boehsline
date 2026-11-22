@@ -60,7 +60,7 @@ const PI = fakeExecutable("pi");
 function fresh(config = {}) {
   for (const name of readdirSync(schedulerDir)) rmSync(join(schedulerDir, name), { recursive: true, force: true });
   for (const name of readdirSync(BG_STATE)) rmSync(join(BG_STATE, name), { force: true });
-  writeFileSync(join(schedulerDir, "wake.json"), JSON.stringify({ tmux: TMUX, pi: PI, ...config }));
+  writeFileSync(join(schedulerDir, "wake.json"), JSON.stringify({ enabled: true, tmux: TMUX, pi: PI, ...config }));
 }
 
 let sessionCounter = 0;
@@ -305,6 +305,7 @@ test("no lifecycle record means no wake", () => {
   const result = runWakePhase(m.deps);
   assert.equal(m.newWindows().length, 0);
   assert.equal(result.decisions[0].reason, "no-record");
+  assert.doesNotMatch(log(), /skip/, "no-record is quiet: print-mode and subagent sessions never have one");
 });
 
 test("a record from another host is never acted on", () => {
@@ -503,20 +504,49 @@ test("pre-spawn skips: file missing, header mismatch, cwd missing, tmux missing 
   assert.equal(old.newWindows().length, 0);
 });
 
-test("each skip is logged at most once an hour per session and reason", () => {
+test("user-closed and stale skips are logged once per due time; others at most once an hour", () => {
   fresh();
   const { session, entry } = crashedWithTimer({ how: "user" });
   writeIndex({ [session.id]: entry });
   const m = machine();
+  const skips = () => log().split("\n").filter((line) => line.includes(" skip ")).length;
   runWakePhase(m.deps);
   m.clock.now += MIN;
   runWakePhase(m.deps);
-  m.clock.now += 30 * MIN;
+  m.clock.now += 3 * 60 * MIN;
   runWakePhase(m.deps);
-  assert.equal(log().split("\n").filter((line) => line.includes("skip")).length, 1);
-  m.clock.now += 31 * MIN;
+  assert.equal(skips(), 1, "the same due time is never logged again");
+  writeIndex({ [session.id]: { ...entry, nextWakeDueAt: m.clock.now - MIN } });
   runWakePhase(m.deps);
-  assert.equal(log().split("\n").filter((line) => line.includes("skip")).length, 2);
+  assert.equal(skips(), 2, "a new due time is");
+
+  // ps-unknown is not tied to a due time: hourly.
+  fresh();
+  const other = crashedWithTimer({ state: "live", how: undefined, closedAt: undefined });
+  writeIndex({ [other.session.id]: other.entry });
+  const u = machine({ procs: { [5000 + sessionCounter]: "unknown" } });
+  runWakePhase(u.deps);
+  u.clock.now += 30 * MIN;
+  runWakePhase(u.deps);
+  assert.equal(skips(), 1);
+  u.clock.now += 31 * MIN;
+  runWakePhase(u.deps);
+  assert.equal(skips(), 2);
+});
+
+test("a stale due time is dropped on its own: a fresher always timer still wakes", () => {
+  fresh();
+  const { session, entry } = crashedWithTimer({}, {
+    wake: "always",
+    nextWakeDueAt: NOW - 25 * 60 * MIN,
+    nextAlwaysDueAt: NOW - 2 * MIN,
+  });
+  writeIndex({ [session.id]: entry });
+  const m = machine();
+  const result = runWakePhase(m.deps);
+  assert.equal(m.newWindows().length, 1);
+  assert.equal(result.spawned[0].reason, "always");
+  assert.equal(result.spawned[0].dueAt, NOW - 2 * MIN);
 });
 
 // ── grace, stuck, failures, backoff ──
@@ -912,4 +942,134 @@ test("wake-exec with an unknown wake id does nothing", async () => {
   const spawned = [];
   assert.notEqual(await wakeExec("feedfacefeedface", execDeps(machine(), spawned)), 0);
   assert.equal(spawned.length, 0);
+});
+
+// ── review round: pruning, failures, lock timeouts, server creation ──
+
+/** A wake-state.json with nothing in it but what is given: enough to make the tick take its lock. */
+function seedState(fields = {}) {
+  writeFileSync(wakeStatePath(), JSON.stringify({ v: 1, wakes: {}, failures: {}, ledger: [], logged: {}, ...fields }));
+}
+
+test("lifecycle pruning keeps records a pending timer needs, and drops long-dead live ones", () => {
+  fresh();
+  const DAY = 24 * 60 * MIN;
+  const needed = makeSession();
+  lifecycle(needed, { how: "user", closedAt: NOW - 8 * DAY, lastSeen: NOW - 8 * DAY });
+  const old = makeSession();
+  lifecycle(old, { how: "user", closedAt: NOW - 8 * DAY, lastSeen: NOW - 8 * DAY });
+  const deadLive = makeSession();
+  const deadRecord = lifecycle(deadLive, { state: "live", how: undefined, closedAt: undefined, lastSeen: NOW - 8 * DAY });
+  const aliveLive = makeSession();
+  const aliveRecord = lifecycle(aliveLive, { state: "live", how: undefined, closedAt: undefined, lastSeen: NOW - 8 * DAY });
+  const recentLive = makeSession();
+  lifecycle(recentLive, { state: "live", how: undefined, closedAt: undefined, lastSeen: NOW - DAY });
+  // A 30-day always timer after a /quit: not due yet, but it will need the record.
+  writeIndex({ [needed.id]: indexEntry(needed, { wake: "always", nextWakeDueAt: NOW + 22 * DAY, nextAlwaysDueAt: NOW + 22 * DAY }) });
+  seedState();
+  const m = machine({ procs: { [aliveRecord.pid]: aliveRecord.pidStart } });
+  runWakePhase(m.deps);
+  assert.ok(readLifecycle(needed.id), "kept: a pending always timer needs it");
+  assert.equal(readLifecycle(old.id), undefined, "a closed record past 7 days goes");
+  assert.equal(readLifecycle(deadLive.id), undefined, `a live record whose pid ${deadRecord.pid} is dead goes`);
+  assert.ok(readLifecycle(aliveLive.id), "a live record whose pi is still running stays");
+  assert.ok(readLifecycle(recentLive.id), "a live record seen recently stays");
+});
+
+test("a manual open after a failure (short of a backoff) resets the count", () => {
+  fresh();
+  const { session, entry } = crashedWithTimer({ liveSince: NOW - 5 * MIN, closedAt: NOW - 2 * MIN, lastSeen: NOW - 2 * MIN });
+  writeIndex({ [session.id]: entry });
+  seedState({ failures: { [`${HOST}:${session.id}`]: { count: 1, lastAt: NOW - 30 * MIN, lastReason: "no-start" } } });
+  runWakePhase(machine().deps);
+  assert.equal(state().failures[`${HOST}:${session.id}`], undefined);
+
+  // Not opened since the failure: the count stays.
+  fresh();
+  const later = crashedWithTimer({ liveSince: NOW - 90 * MIN });
+  writeIndex({ [later.session.id]: later.entry });
+  seedState({ failures: { [`${HOST}:${later.session.id}`]: { count: 1, lastAt: NOW - 30 * MIN, lastReason: "no-start" } } });
+  runWakePhase(machine().deps);
+  assert.equal(state().failures[`${HOST}:${later.session.id}`].count, 1);
+});
+
+test("another host's in-flight wakes are pruned after 24 h", () => {
+  fresh();
+  const session = makeSession();
+  const wake = (id, at) => ({ wakeId: id, sessionId: session.id, host: "elsewhere", sessionFile: session.file, cwd: session.cwd, reason: "timer", dueAt: at, at });
+  seedState({ wakes: { aaaa: wake("aaaa", NOW - 25 * 60 * MIN), bbbb: wake("bbbb", NOW - 60 * MIN) } });
+  runWakePhase(machine().deps);
+  assert.deepEqual(Object.keys(state().wakes), ["bbbb"]);
+});
+
+test("wake-exec: a refusal is not a failure, except pi-missing", async () => {
+  fresh();
+  let session = makeSession();
+  const record = lifecycle(session, { state: "live", how: undefined, closedAt: undefined });
+  let wake = inFlight(session);
+  await wakeExec(wake.wakeId, execDeps(machine({ procs: { [record.pid]: record.pidStart } }), []));
+  assert.deepEqual(state().failures, {}, "live: the check working");
+
+  fresh({ pi: join(scratch, "no-such-pi") });
+  session = makeSession();
+  lifecycle(session);
+  wake = inFlight(session);
+  const spawned = [];
+  assert.notEqual(await wakeExec(wake.wakeId, execDeps(machine(), spawned)), 0);
+  assert.equal(spawned.length, 0);
+  assert.equal(state().failures[`${HOST}:${session.id}`].count, 1);
+  assert.equal(state().failures[`${HOST}:${session.id}`].lastReason, "pi-missing");
+});
+
+test("wake-exec logs a lock timeout instead of crashing", async () => {
+  fresh();
+  const session = makeSession();
+  lifecycle(session);
+  const wake = inFlight(session);
+  mkdirSync(`${wakeStatePath()}.lock`);
+  try {
+    const spawned = [];
+    const code = await wakeExec(wake.wakeId, { ...execDeps(machine(), spawned), lockAttempts: 2 });
+    assert.notEqual(code, 0);
+    assert.equal(spawned.length, 0);
+    assert.match(log(), /refuse - reason=lock-timeout wakeId=0123456789abcdef/);
+  } finally {
+    rmSync(`${wakeStatePath()}.lock`, { recursive: true, force: true });
+  }
+});
+
+test("on Linux a failed systemd-run never falls back to a plain server", () => {
+  fresh();
+  const bin = mkdtempSync(join(scratch, "bin-"));
+  const systemdRun = join(bin, "systemd-run");
+  writeFileSync(systemdRun, "#!/bin/sh\nexit 99\n");
+  chmodSync(systemdRun, 0o755);
+  const { session, entry } = crashedWithTimer();
+  writeIndex({ [session.id]: entry });
+  const m = machine({ platform: "linux", serverRunning: false, sessions: [], env: { PATH: `${bin}:/usr/bin:/bin` } });
+  const run = m.deps.run;
+  m.deps.run = (file, args) => (file === systemdRun ? { status: 1, stdout: "", stderr: "" } : run(file, args));
+  runWakePhase(m.deps);
+  assert.ok(!m.calls.some((c) => c[0] === TMUX && c[1] === "new-session"), "no plain new-session");
+  assert.equal(m.newWindows().length, 0);
+  assert.match(log(), /spawn-failed \S+ why=tmux-target/);
+});
+
+test("on macOS a failed launchctl asuser falls back to a plain server, still moved out of the background band", () => {
+  fresh();
+  const { session, entry } = crashedWithTimer();
+  writeIndex({ [session.id]: entry });
+  const m = machine({ serverRunning: false, sessions: [] });
+  const run = m.deps.run;
+  m.deps.run = (file, args) => {
+    if (file === "/bin/launchctl") {
+      m.calls.push([file, ...args]);
+      return { status: 1, stdout: "", stderr: "" };
+    }
+    return run(file, args);
+  };
+  runWakePhase(m.deps);
+  assert.ok(m.calls.some((c) => c[0] === TMUX && c[1] === "new-session"), "plain new-session");
+  assert.ok(m.calls.some((c) => c[0] === "/usr/sbin/taskpolicy" && c[1] === "-B" && c[3] === "4242"));
+  assert.equal(m.newWindows().length, 1);
 });

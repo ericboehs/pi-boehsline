@@ -30,7 +30,7 @@ function newProcess() {
   globalThis[SLOT] = { exitInstalled: true };
 }
 
-async function mount({ mode = "tui", sessionId = `sess-${process.pid}-${++counter}`, withFile = true, reason = "startup" } = {}) {
+async function mount({ mode = "tui", sessionId = `sess-${process.pid}-${++counter}`, withFile = true, reason = "startup", afterStart } = {}) {
   writeFileSync(configPath, "{}");
   const dir = mkdtempSync(join(tmpdir(), "lifecycle-"));
   const sessionFile = join(dir, `${sessionId}.jsonl`);
@@ -57,10 +57,12 @@ async function mount({ mode = "tui", sessionId = `sess-${process.pid}-${++counte
       getBranch: () => [],
       ...(withFile ? { getSessionFile: () => sessionFile } : { getSessionFile: () => undefined }),
     },
-    ui: { notify() {}, confirm: async () => true, setStatus() {} },
+    ui: { notify: (message, level) => notices.push({ message, level }), confirm: async () => true, setStatus() {} },
   };
+  const notices = [];
   sessionScheduler(pi);
   await handlers.session_start({ reason }, ctx);
+  afterStart?.(sessionId);
   // The live record is written on the tick after session_start (ps is a sync spawn).
   await new Promise((resolve) => setTimeout(resolve, 30));
   return {
@@ -68,6 +70,7 @@ async function mount({ mode = "tui", sessionId = `sess-${process.pid}-${++counte
     sessionFile,
     handlers,
     ctx,
+    notices,
     record: () => readLifecycle(sessionId),
     shutdown: (why = "quit") => handlers.session_shutdown({ reason: why }, ctx),
   };
@@ -199,7 +202,47 @@ test("a reload keeps the record's open time and opener", async () => {
   await again.shutdown();
 });
 
-test("a crash (exit with no shutdown) is recorded from the exit listener", () => {
+test("the live record is on disk as soon as session_start returns, without a pid start yet", async () => {
+  newProcess();
+  let atStart;
+  const ui = await mount({ afterStart: (id) => { atStart = readLifecycle(id); } });
+  assert.equal(atStart?.state, "live", "written synchronously");
+  assert.equal(atStart.pid, process.pid);
+  assert.equal(atStart.pidStart, undefined, "unknown start: the tick reads it as never wake");
+  assert.equal(ui.record().pidStart, processStart(process.pid), "the timer fills it in");
+  await ui.shutdown();
+});
+
+test("opening a session another live pi holds warns", async () => {
+  newProcess();
+  const sessionId = `rival-${process.pid}`;
+  // The parent of this test process: alive, on this host, with a known start.
+  const rival = process.ppid;
+  writeFileSync(lifecyclePath(sessionId), JSON.stringify({
+    v: 1, sessionFile: "/x.jsonl", cwd: "/", host: hostname(), pid: rival, pidStart: processStart(rival),
+    liveSince: Date.now() - 1000, lastSeen: Date.now() - 1000, state: "live", opener: "manual",
+  }));
+  const ui = await mount({ sessionId });
+  assert.ok(ui.notices.some((n) => n.level === "warning" && n.message.includes(`pid ${rival}`)), JSON.stringify(ui.notices));
+  await ui.shutdown();
+
+  newProcess();
+  const quiet = await mount();
+  assert.equal(quiet.notices.filter((n) => n.level === "warning").length, 0, "no rival, no warning");
+  await quiet.shutdown();
+});
+
+test("a reload keeps the slot, so an exit before the next session_start is a crash, not a vanish", async () => {
+  newProcess();
+  const ui = await mount();
+  await ui.shutdown("reload");
+  const slot = globalThis[SLOT];
+  assert.equal(slot.current?.sessionId, ui.sessionId, "still held across the reload");
+  assert.equal(ui.record().state, "live");
+  slot.current = undefined;
+});
+
+test("a crash (exit with no shutdown) is recorded from the exit listener, also after a reload that never came back", () => {
   const script = `
     const { default: sessionScheduler } = await import(${JSON.stringify(new URL("../extensions/session-scheduler.ts", import.meta.url).href)});
     const handlers = {};
@@ -213,21 +256,24 @@ test("a crash (exit with no shutdown) is recorded from the exit listener", () =>
       ui: { notify() {}, confirm: async () => true, setStatus() {} } };
     await handlers.session_start({ reason: "startup" }, ctx);
     await new Promise((r) => setTimeout(r, 50));
+    if (process.env.RELOAD_FIRST) await handlers.session_shutdown({ reason: "reload" }, ctx);
     process.exit(1);
   `;
-  const sid = `crash-${process.pid}`;
-  const sfile = join(mkdtempSync(join(tmpdir(), "lifecycle-crash-")), "s.jsonl");
-  writeFileSync(sfile, "");
-  const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
-    env: { ...process.env, SID: sid, SFILE: sfile, PI_SCHEDULER_DIR: schedulerDir, BOEHSLINE_CONFIG: configPath },
-    encoding: "utf8",
-    cwd: fileURLToPath(new URL("..", import.meta.url)),
-    timeout: 20_000,
-  });
-  assert.equal(run.status, 1, run.stderr);
-  const record = JSON.parse(readFileSync(lifecyclePath(sid), "utf8"));
-  assert.equal(record.state, "closed");
-  assert.equal(record.how, "crash");
+  for (const reloadFirst of ["", "1"]) {
+    const sid = `crash-${process.pid}${reloadFirst ? "-reload" : ""}`;
+    const sfile = join(mkdtempSync(join(tmpdir(), "lifecycle-crash-")), "s.jsonl");
+    writeFileSync(sfile, "");
+    const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, SID: sid, SFILE: sfile, PI_SCHEDULER_DIR: schedulerDir, BOEHSLINE_CONFIG: configPath, RELOAD_FIRST: reloadFirst },
+      encoding: "utf8",
+      cwd: fileURLToPath(new URL("..", import.meta.url)),
+      timeout: 20_000,
+    });
+    assert.equal(run.status, 1, run.stderr);
+    const record = JSON.parse(readFileSync(lifecyclePath(sid), "utf8"));
+    assert.equal(record.state, "closed", reloadFirst ? "after a failed reload" : "plain crash");
+    assert.equal(record.how, "crash");
+  }
 });
 
 test("crashRecord keeps a seen signal, and tmuxServerPid reads $TMUX", () => {

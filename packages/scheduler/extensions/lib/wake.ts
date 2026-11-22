@@ -101,8 +101,13 @@ export interface WakeConfig {
   pi?: string;
 }
 
+/**
+ * Off until turned on with `pi-scheduler wake on`: a wake runs the model with
+ * nobody watching, so no session reopens on its own until the device test has
+ * passed on that machine.
+ */
 export const DEFAULT_WAKE_CONFIG: WakeConfig = {
-  enabled: true,
+  enabled: false,
   bg: true,
   tmuxTarget: "pi-wake",
   perSessionHourly: 3,
@@ -125,8 +130,12 @@ const positive = (value: unknown, fallback: number) =>
 const absolute = (value: unknown) => (typeof value === "string" && isAbsolute(value) ? value : undefined);
 const TARGET_RE = /^[A-Za-z0-9_.@-]{1,64}$/;
 
-/** wake.json, filled in from the defaults. A file that will not parse reads as the defaults plus an error. */
-export function readWakeConfig(): { config: WakeConfig; error?: string } {
+/**
+ * wake.json, filled in from the defaults. A file that will not parse reads as
+ * the defaults plus an error. `enabledSet` says whether `enabled` came from the
+ * file rather than the default.
+ */
+export function readWakeConfig(): { config: WakeConfig; error?: string; enabledSet?: boolean } {
   let raw: string;
   try {
     raw = readFileSync(wakeConfigPath(), "utf8");
@@ -155,7 +164,7 @@ export function readWakeConfig(): { config: WakeConfig; error?: string } {
   const pi = absolute(parsed.pi);
   if (tmux) config.tmux = tmux;
   if (pi) config.pi = pi;
-  return { config };
+  return { config, enabledSet: typeof parsed.enabled === "boolean" };
 }
 
 /** Merge `patch` into wake.json, keeping whatever else is in it. */
@@ -511,6 +520,10 @@ function serverRunning(tmux: string, deps: WakeDeps): boolean {
  * When the server already runs, a plain `new-session` asks it to create the
  * session, and the server (not the tick) forks the shell, so none of this is
  * needed.
+ *
+ * On Linux there is no plain fallback: a server started inside the oneshot
+ * unit's control group dies when `check` exits, taking the woken pi with it.
+ * On macOS the plain fallback (asuser failed) still gets `taskpolicy -B`.
  */
 export function createSession(name: string, tmux: string, deps: WakeDeps): { ok: boolean; how: string; error?: string } {
   const home = homeOf(deps);
@@ -526,24 +539,50 @@ export function createSession(name: string, tmux: string, deps: WakeDeps): { ok:
       const result = deps.run(systemdRun, ["--user", "--scope", "--quiet", "--collect", "--", ...newSession]);
       if (result.status === 0) return { ok: true, how: "systemd-scope" };
       appendWakeLog("tmux-scope-failed", undefined, { status: result.status ?? -1 }, deps.now());
+      return { ok: false, how: "systemd-scope", error: `systemd-run exited ${result.status ?? -1}` };
     }
+    // Under a systemd unit (INVOCATION_ID) with no way out of its cgroup: refuse.
+    if (deps.env.INVOCATION_ID) return { ok: false, how: "systemd-scope", error: "systemd-run not found" };
   }
 
+  let how = "plain";
+  let created = false;
   if (deps.platform === "darwin" && deps.uid !== undefined) {
     const result = deps.run("/bin/launchctl", [
       "asuser", String(deps.uid), "/usr/sbin/taskpolicy", "-d", "default", "-g", "default", ...newSession,
     ]);
     if (result.status === 0) {
-      const pid = deps.run(tmux, ["display-message", "-p", "-t", `${name}:`, "#{pid}"]).stdout.trim();
-      const unthrottled = /^\d+$/.test(pid) && deps.run("/usr/sbin/taskpolicy", ["-B", "-p", pid]).status === 0;
-      if (!unthrottled) appendWakeLog("tmux-throttled", undefined, { pid: pid || "?" }, deps.now());
-      return { ok: true, how: unthrottled ? "launchctl-asuser" : "launchctl-asuser-throttled" };
+      how = "launchctl-asuser";
+      created = true;
+    } else {
+      appendWakeLog("tmux-asuser-failed", undefined, { status: result.status ?? -1 }, deps.now());
     }
-    appendWakeLog("tmux-asuser-failed", undefined, { status: result.status ?? -1 }, deps.now());
   }
+  if (!created) {
+    const result = deps.run(newSession[0] as string, newSession.slice(1));
+    if (result.status !== 0) return { ok: false, how: "plain", error: result.stderr.trim() || result.error };
+  }
+  if (deps.platform === "darwin") {
+    // Whichever way it was created, move the server out of the background band.
+    const pid = deps.run(tmux, ["display-message", "-p", "-t", `${name}:`, "#{pid}"]).stdout.trim();
+    const unthrottled = /^\d+$/.test(pid) && deps.run("/usr/sbin/taskpolicy", ["-B", "-p", pid]).status === 0;
+    if (!unthrottled) {
+      appendWakeLog("tmux-throttled", undefined, { pid: pid || "?" }, deps.now());
+      how += "-throttled";
+    }
+  }
+  return { ok: true, how };
+}
 
-  const result = deps.run(newSession[0] as string, newSession.slice(1));
-  return result.status === 0 ? { ok: true, how: "plain" } : { ok: false, how: "plain", error: result.stderr.trim() || result.error };
+/** The running tmux server's pid and scheduling (`ps -o pri,nice`), for `wake status`. */
+export function tmuxServerInfo(tmux: string | undefined, deps: WakeDeps): { pid?: number; pri?: string; nice?: string } | undefined {
+  if (!tmux) return undefined;
+  const result = deps.run(tmux, ["display-message", "-p", "#{pid}"]);
+  const pid = result.status === 0 ? result.stdout.trim() : "";
+  if (!/^\d+$/.test(pid)) return undefined;
+  const ps = deps.run(which("ps", deps.env.PATH) ?? "/bin/ps", ["-o", "pri=", "-o", "nice=", "-p", pid]);
+  const [pri, nice] = ps.status === 0 ? ps.stdout.trim().split(/\s+/) : [];
+  return { pid: Number(pid), ...(pri ? { pri } : {}), ...(nice ? { nice } : {}) };
 }
 
 /** The session to open the window in, created when it does not exist. */
@@ -791,8 +830,9 @@ function evaluateSession(sessionId: string, ctx: EvaluateContext): WakeDecision 
     return skip("in-flight", { quiet: true });
   }
   const record = readLifecycle(sessionId);
-  // No record is unknown: an old pi, print mode, a subagent. Never woken.
-  if (!record) return skip("no-record");
+  // No record is unknown: an old pi, print mode, a subagent. Never woken, and
+  // not logged: a print-mode bg exit would say so every hour for a day.
+  if (!record) return skip("no-record", { quiet: true });
   if (record.host !== host) return skip("host-mismatch");
 
   const entry = ctx.index[sessionId];
@@ -817,19 +857,33 @@ function evaluateSession(sessionId: string, ctx: EvaluateContext): WakeDecision 
     } else {
       return skip("backoff");
     }
+  } else if (failure && record.opener === "manual" && record.liveSince > failure.lastAt) {
+    // A failure short of a backoff, then opened by hand: the streak is broken.
+    delete state.failures[key];
+    ctx.onDirty();
   }
 
   const close = classifyClose(record, deps, vanished);
+  // Each due time on its own: one past the 24 h catch-up window (a crash timer
+  // that went due while backed off, say) must not block a fresher reason.
   const options: Array<{ reason: WakeReason; dueAt: number }> = [];
-  let blocked = false;
+  const blocked: number[] = [];
+  let staleDue: number | undefined;
+  const consider = (reason: WakeReason, dueAt: number, eligible: boolean) => {
+    if (now - dueAt > STALE_MS) {
+      staleDue = Math.min(staleDue ?? dueAt, dueAt);
+      return;
+    }
+    if (eligible) options.push({ reason, dueAt });
+    else blocked.push(dueAt);
+  };
   if (entry && entry.host === host) {
     if (entry.nextWakeDueAt !== undefined && entry.nextWakeDueAt <= now) {
-      if (close.crash) options.push({ reason: "timer", dueAt: entry.nextWakeDueAt });
-      else blocked = true;
+      consider("timer", entry.nextWakeDueAt, close.crash);
     }
     // `always` reopens even a deliberate quit; it still obeys everything else.
     if (entry.nextAlwaysDueAt !== undefined && entry.nextAlwaysDueAt <= now) {
-      options.push({ reason: "always", dueAt: entry.nextAlwaysDueAt });
+      consider("always", entry.nextAlwaysDueAt, true);
     }
   }
   const exits = ctx.bgExits.get(sessionId);
@@ -837,17 +891,15 @@ function evaluateSession(sessionId: string, ctx: EvaluateContext): WakeDecision 
     // Only exits after the session's last live moment: earlier ones it saw itself.
     const since = record.state === "closed" ? (record.closedAt ?? record.lastSeen) : record.lastSeen;
     const fresh = exits.filter((at) => at > since && now - at <= STALE_MS);
-    if (fresh.length > 0) {
-      if (close.crash) options.push({ reason: "bg", dueAt: Math.min(...fresh) });
-      else blocked = true;
-    }
+    if (fresh.length > 0) consider("bg", Math.min(...fresh), close.crash);
   }
   if (options.length === 0) {
-    return skip(blocked ? "user-closed" : "nothing-due", { close: close.why, quiet: !blocked });
+    if (blocked.length > 0) return skip("user-closed", { close: close.why, dueAt: Math.min(...blocked) });
+    if (staleDue !== undefined) return skip("stale", { dueAt: staleDue, close: close.why });
+    return skip("nothing-due", { close: close.why, quiet: true });
   }
   options.sort((left, right) => left.dueAt - right.dueAt);
   const chosen = options[0] as { reason: WakeReason; dueAt: number };
-  if (now - chosen.dueAt > STALE_MS) return skip("stale", { dueAt: chosen.dueAt, close: close.why });
 
   const checked = sessionFileProblem(sessionId, record.sessionFile);
   if (checked.problem) return skip(checked.problem, { dueAt: chosen.dueAt });
@@ -1007,12 +1059,21 @@ function evaluateAll(
   return [...ids].filter((id) => SESSION_ID_RE.test(id)).map((id) => evaluateSession(id, ctx));
 }
 
-/** Log a skip, at most once an hour per session and reason. Returns whether the state changed. */
+/** Skips that will not change until their due time does: logged once per due time. */
+const ONCE_PER_DUE = new Set(["stale", "user-closed"]);
+/** How long a once-per-due-time key is remembered. */
+const DUE_LOG_KEEP_MS = 7 * 24 * HOUR;
+
+/**
+ * Log a skip: `stale` and `user-closed` once per due time, the rest at most
+ * once an hour per session and reason. Returns whether the state changed.
+ */
 function logSkip(state: WakeState, decision: WakeDecision, host: string, now: number): boolean {
   if (decision.quiet) return false;
-  const key = `${host}:${decision.sessionId}:${decision.reason}`;
+  const perDue = ONCE_PER_DUE.has(decision.reason) && decision.dueAt !== undefined;
+  const key = `${host}:${decision.sessionId}:${decision.reason}${perDue ? `@${decision.dueAt}` : ""}`;
   const last = state.logged[key];
-  if (last !== undefined && now - last < SKIP_LOG_EVERY_MS) return false;
+  if (last !== undefined && (perDue || now - last < SKIP_LOG_EVERY_MS)) return false;
   state.logged[key] = now;
   appendWakeLog("skip", decision.sessionId, {
     reason: decision.reason,
@@ -1022,7 +1083,7 @@ function logSkip(state: WakeState, decision: WakeDecision, host: string, now: nu
   return true;
 }
 
-function pruneState(state: WakeState, now: number): boolean {
+function pruneState(state: WakeState, now: number, host: string): boolean {
   let dirty = false;
   const ledger = state.ledger.filter((entry) => now - entry.at < HOUR);
   if (ledger.length !== state.ledger.length) {
@@ -1030,8 +1091,16 @@ function pruneState(state: WakeState, now: number): boolean {
     dirty = true;
   }
   for (const [key, at] of Object.entries(state.logged)) {
-    if (now - at >= SKIP_LOG_EVERY_MS) {
+    if (now - at >= (key.includes("@") ? DUE_LOG_KEEP_MS : SKIP_LOG_EVERY_MS)) {
       delete state.logged[key];
+      dirty = true;
+    }
+  }
+  // Another host's in-flight wakes are its own to settle; one a day old is
+  // never coming back (that host is gone, or its state was copied here).
+  for (const [id, wake] of Object.entries(state.wakes)) {
+    if (wake.host !== host && now - wake.at > STALE_MS) {
+      delete state.wakes[id];
       dirty = true;
     }
   }
@@ -1066,11 +1135,20 @@ export function runWakePhase(deps: WakeDeps, { dryRun = false }: { dryRun?: bool
   return withWakeState((state) => {
     const now = deps.now();
     const host = deps.hostname();
-    let dirty = pruneState(state, now);
+    let dirty = pruneState(state, now, host);
     const tmux = resolveTmux(config, deps);
     if (settleWakes(state, deps, tmux)) dirty = true;
     if (state.lastPruneAt === undefined || now - state.lastPruneAt > LIFECYCLE_PRUNE_EVERY_MS) {
-      pruneLifecycle(now, LIFECYCLE_MAX_AGE_MS);
+      // Never a record a pending wake or always timer still needs (a 30-day
+      // `--wake=always` timer after a /quit), and drop live records whose pi
+      // is long dead (no shutdown, no exit listener: a SIGKILL, a power loss).
+      const keep = new Set(Object.entries(index.sessions)
+        .filter(([, entry]) => entry.nextWakeDueAt !== undefined || entry.nextAlwaysDueAt !== undefined)
+        .map(([id]) => id));
+      pruneLifecycle(now, LIFECYCLE_MAX_AGE_MS, {
+        keep,
+        isDead: (record) => record.host === host && recordLiveness(record, deps) === "dead",
+      });
       state.lastPruneAt = now;
       dirty = true;
     }
@@ -1222,6 +1300,8 @@ function spawnWake(decision: WakeDecision, state: WakeState, config: WakeConfig,
 export interface WakeExecDeps extends WakeDeps {
   /** Start pi and resolve with its exit code. Injected so tests never start one. */
   spawnPi(pi: string, args: string[], options: { cwd: string; env: Record<string, string | undefined> }): Promise<{ code: number; stderrTail: string[] }>;
+  /** Lock attempts (about 20 ms each); tests shorten it. Default 500, about 10 s. */
+  lockAttempts?: number;
 }
 
 /**
@@ -1234,58 +1314,89 @@ export interface WakeExecDeps extends WakeDeps {
  * can stop at a "found in a different project" prompt nobody will answer.
  */
 export async function wakeExec(wakeId: string, deps: WakeExecDeps): Promise<number> {
+  const lockAttempts = deps.lockAttempts ?? 500;
   const host = deps.hostname();
-  const wake = withWakeState((state) => state.wakes[wakeId], 500);
+  const safeId = /^[0-9a-f]{1,32}$/.test(wakeId) ? wakeId : "?";
+  let wake: InFlightWake | undefined;
+  try {
+    wake = withWakeState((state) => state.wakes[wakeId], lockAttempts);
+  } catch {
+    // The tick held the lock too long (slow tmux or ps). Its next pass settles
+    // this wake as no-start; say why here, since nothing else will.
+    appendWakeLog("refuse", undefined, { reason: "lock-timeout", wakeId: safeId }, deps.now());
+    return 4;
+  }
   if (!wake) {
-    appendWakeLog("refuse", undefined, { reason: "unknown-wake", wakeId: /^[0-9a-f]{1,32}$/.test(wakeId) ? wakeId : "?" }, deps.now());
+    appendWakeLog("refuse", undefined, { reason: "unknown-wake", wakeId: safeId }, deps.now());
     return 2;
   }
+  const found = wake;
+  /**
+   * A refusal is the safety check working (live, file or cwd gone), not a
+   * failed wake, and the hourly ledger already bounds repeats. The one
+   * exception is a missing pi: that will fail the same way every time.
+   */
   const refuse = (reason: string) => {
-    withWakeState((state) => {
-      delete state.wakes[wakeId];
-      writeWakeState(state);
-    }, 500);
-    appendWakeLog("refuse", wake.sessionId, { reason, wakeId }, deps.now());
+    appendWakeLog("refuse", found.sessionId, { reason, wakeId }, deps.now());
+    try {
+      withWakeState((state) => {
+        delete state.wakes[wakeId];
+        if (reason === "pi-missing") recordFailure(state, found, reason, deps.now());
+        writeWakeState(state);
+      }, lockAttempts);
+    } catch {
+      appendWakeLog("refuse", found.sessionId, { reason: "lock-timeout", wakeId }, deps.now());
+    }
     return 3;
   };
-  if (wake.host !== host) return refuse("host-mismatch");
+  if (found.host !== host) return refuse("host-mismatch");
 
   const { config } = readWakeConfig();
   const pi = resolvePi(config, deps);
   if (!pi) return refuse("pi-missing");
 
-  const verdict = withLockedFile(lifecyclePath(wake.sessionId), () => readLifecycle(wake.sessionId), (record) => {
-    if (record && record.host !== host) return { problem: "host-mismatch" };
-    if (record?.state === "live") {
-      const liveness = recordLiveness(record, deps);
-      if (liveness === "live") return { problem: "live" };
-      if (liveness === "unknown") return { problem: "ps-unknown" };
-    }
-    const { index } = readSessionIndex();
-    const holder = indexHolderLive(index.sessions[wake.sessionId], host, deps);
-    if (holder === "live") return { problem: "live" };
-    const checked = sessionFileProblem(wake.sessionId, wake.sessionFile);
-    if (checked.problem) return { problem: checked.problem };
-    return { cwd: (checked.header as SessionHeader).cwd };
-  }, { attempts: 500 });
+  type Verdict = { problem?: string; cwd?: string };
+  let verdict: Verdict;
+  try {
+    verdict = withLockedFile(lifecyclePath(found.sessionId), () => readLifecycle(found.sessionId), (record): Verdict => {
+      if (record && record.host !== host) return { problem: "host-mismatch" };
+      if (record?.state === "live") {
+        const liveness = recordLiveness(record, deps);
+        if (liveness === "live") return { problem: "live" };
+        if (liveness === "unknown") return { problem: "ps-unknown" };
+      }
+      const { index } = readSessionIndex();
+      const holder = indexHolderLive(index.sessions[found.sessionId], host, deps);
+      if (holder === "live") return { problem: "live" };
+      const checked = sessionFileProblem(found.sessionId, found.sessionFile);
+      if (checked.problem) return { problem: checked.problem };
+      return { cwd: (checked.header as SessionHeader).cwd };
+    }, { attempts: lockAttempts });
+  } catch {
+    return refuse("lock-timeout");
+  }
   if (verdict.problem) return refuse(verdict.problem);
 
-  withWakeState((state) => {
-    const current = state.wakes[wakeId];
-    if (current) {
-      current.execAt = deps.now();
-      writeWakeState(state);
-    }
-  }, 500);
-  appendWakeLog("exec", wake.sessionId, { wakeId }, deps.now());
+  try {
+    withWakeState((state) => {
+      const current = state.wakes[wakeId];
+      if (current) {
+        current.execAt = deps.now();
+        writeWakeState(state);
+      }
+    }, lockAttempts);
+  } catch {
+    // Only a marker for status; the lifecycle record is what settles the wake.
+  }
+  appendWakeLog("exec", found.sessionId, { wakeId }, deps.now());
 
-  const { code, stderrTail } = await deps.spawnPi(pi, ["--session", wake.sessionFile], {
+  const { code, stderrTail } = await deps.spawnPi(pi, ["--session", found.sessionFile], {
     cwd: verdict.cwd as string,
     env: { ...deps.env, PI_WAKE_ID: wakeId },
   });
   if (code !== 0) {
-    appendWakeLog("exit", wake.sessionId, { code, wakeId }, deps.now());
-    for (const line of stderrTail) appendWakeLog("stderr", wake.sessionId, { wakeId, line: line.slice(0, 500) }, deps.now());
+    appendWakeLog("exit", found.sessionId, { code, wakeId }, deps.now());
+    for (const line of stderrTail) appendWakeLog("stderr", found.sessionId, { wakeId, line: line.slice(0, 500) }, deps.now());
   }
   return code;
 }

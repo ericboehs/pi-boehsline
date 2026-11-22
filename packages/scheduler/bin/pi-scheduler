@@ -97,6 +97,7 @@ import {
   resolveTmux,
   runWakePhase,
   spawnPiInTerminal,
+  tmuxServerInfo,
   tmuxVersion,
   updateWakeConfig,
   wakeConfigPath,
@@ -776,6 +777,7 @@ Description=Run due pi scheduled tasks
 
 [Service]
 Type=oneshot
+KillMode=process
 ${environment}
 ExecStart=${NODE} ${SELF} check
 `);
@@ -894,17 +896,21 @@ function describeDecision(decision) {
 
 function commandWakeStatus() {
   const deps = defaultWakeDeps(SELF);
-  const { config, error } = readWakeConfig();
+  const { config, error, enabledSet } = readWakeConfig();
   const host = deps.hostname();
   const now = deps.now();
   const tmux = resolveTmux(config, deps);
   const version = tmuxVersion(tmux, deps);
+  const server = tmuxServerInfo(tmux, deps);
+  const switchText = config.enabled
+    ? "on"
+    : enabledSet ? "off" : "off (default) — run `pi-scheduler wake on` after the device test";
   const pi = resolvePi(config, deps);
   const bgOff = bgWakeOff(config, deps);
   const { state, corrupt } = readWakeState();
   const recent = state.ledger.filter((entry) => entry.host === host && now - entry.at < 3_600_000);
   const lines = [
-    `wake        ${config.enabled ? "on" : "off"}${error ? `  (${error}; using defaults)` : ""}`,
+    `wake        ${switchText}${error ? `  (${error}; using defaults)` : ""}`,
     `bg wake     ${bgOff ? `off (${bgOff})` : "on, for crash-class closes"}`,
     `target      tmux session ${config.tmuxTarget}`,
     `host        ${host}`,
@@ -913,6 +919,7 @@ function commandWakeStatus() {
     `scheduler   ${SELF}`,
     `pi          ${pi ?? "not found (set \"pi\" in wake.json)"}`,
     `tmux        ${tmux ? `${tmux} (${version ? version.join(".") : "version unknown"})` : "not found (set \"tmux\" in wake.json)"}`,
+    `tmux server ${server ? `pid ${server.pid}, pri ${server.pri ?? "?"}, nice ${server.nice ?? "?"}` : "not running"}`,
     `PATH        ${windowPath(deps)}`,
     `bg registry ${bgStateDir(deps)}`,
     `config      ${wakeConfigPath()}`,

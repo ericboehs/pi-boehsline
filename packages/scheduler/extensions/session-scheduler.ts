@@ -36,7 +36,7 @@ import {
   updateSessionIndex,
 } from "./lib/session-index.ts";
 import type { MisfirePolicy } from "./lib/task-registry.ts";
-import { processStart } from "./lib/process-identity.ts";
+import { probeProcess, processStart } from "./lib/process-identity.ts";
 import {
   type LifecycleRecord,
   LIFECYCLE_VERSION,
@@ -1010,19 +1010,41 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     }
 
     const now = Date.now();
-    const draft: LifecycleRecord = {
-      v: LIFECYCLE_VERSION,
-      sessionFile: file,
-      cwd: ctx.cwd,
-      host: hostname(),
-      pid: process.pid,
-      liveSince: now,
-      lastSeen: now,
-      state: "live",
-      opener: envWake && reason === "startup" ? "wake" : "manual",
-      ...(envWake && reason === "startup" ? { wakeId: envWake } : {}),
-    };
+    const host = hostname();
+    const before = readLifecycle(id);
+    // A /reload keeps slot.current (endLifecycle leaves it): same process,
+    // same session, so it keeps its open time, opener and wake id. The record
+    // on disk is the fallback, for an instance that predates that.
+    const reloaded = slot.current?.sessionId === id && slot.current.record.pid === process.pid
+      ? slot.current.record
+      : reason === "reload" && before?.state === "live" && before.pid === process.pid && before.host === host
+        ? before
+        : undefined;
+    const draft: LifecycleRecord = reloaded
+      ? { ...reloaded, sessionFile: file, cwd: ctx.cwd, lastSeen: now, state: "live" }
+      : {
+        v: LIFECYCLE_VERSION,
+        sessionFile: file,
+        cwd: ctx.cwd,
+        host,
+        pid: process.pid,
+        liveSince: now,
+        lastSeen: now,
+        state: "live",
+        opener: envWake && reason === "startup" ? "wake" : "manual",
+        ...(envWake && reason === "startup" ? { wakeId: envWake } : {}),
+      };
     slot.current = { sessionId: id, record: draft };
+
+    // Another pi that may hold this session live right now: checked below,
+    // once ps can run.
+    const rival = before?.state === "live" && before.pid !== process.pid && before.host === host ? before : undefined;
+
+    // On disk before session_start returns, so a wake tick (or wake-exec's
+    // re-check) sees this session live from the first moment. No pidStart
+    // yet: the tick reads that as "unknown", which means never woken.
+    lastSeenWritten = now;
+    writeLifecycleSafely(id, draft);
 
     // ps is a synchronous spawn: do it after session_start returns, so the
     // two lookups (our start time, the tmux server's) cost the first frame
@@ -1032,14 +1054,19 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
       lifecycleTimer = undefined;
       if (slot.current?.sessionId !== id) return;
       const ownStart = pidStart ??= processStart(process.pid);
-      const existing = readLifecycle(id);
       const record: LifecycleRecord = { ...slot.current.record };
       if (ownStart !== undefined) record.pidStart = ownStart;
-      // A /reload of the same process keeps the session's open time and opener.
-      if (existing?.state === "live" && existing.pid === process.pid && existing.pidStart === ownStart) {
-        record.liveSince = existing.liveSince;
-        record.opener = existing.opener;
-        if (existing.wakeId !== undefined) record.wakeId = existing.wakeId;
+      if (rival) {
+        // The residual race the record cannot close: someone (a wake, Botsun,
+        // another terminal) opened this session in a second pi.
+        const probe = probeProcess(rival.pid);
+        if (probe.state === "alive" && (rival.pidStart === undefined || probe.start === rival.pidStart)) {
+          try {
+            notice(ctx, `This session is already open in pid ${rival.pid}; two pi processes writing one session can corrupt it.`, "warning");
+          } catch {
+            // A ctx gone stale (a reload in between) has nowhere to show it.
+          }
+        }
       }
       const serverPid = tmuxServerPid(process.env.TMUX);
       const serverStart = serverPid === undefined ? undefined : processStart(serverPid);
@@ -1072,13 +1099,15 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     }
     const current = slot.current;
     const signal = slot.signal;
-    slot.current = undefined;
     slot.signal = undefined;
     if (!current) return;
     const how = closeHow(reason, signal);
     // /reload is the same process and the same session: leave it live, and
-    // let the next instance's session_start pick it up again.
+    // keep slot.current, so the next instance's session_start picks it up
+    // again, and an exit before then still leaves a crash record rather than
+    // a live one that later reads as vanished.
     if (how === "reload") return;
+    slot.current = undefined;
     const now = Date.now();
     writeLifecycleSafely(current.sessionId, {
       ...current.record,
