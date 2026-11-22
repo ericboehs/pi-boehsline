@@ -100,7 +100,7 @@
  *                     to seconds first — models confuse the units constantly
  */
 
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -115,6 +115,13 @@ import {
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { commandRunsCursorRunner, maskDiffSecrets, readJobDetails, trustJobDetails } from "../../lib/cursor-diff.ts";
+// ps lstart identity, shared with the session-timer index so both read the
+// same "this pid is still that process" answer.
+import {
+	type ProcessIdentity,
+	processIdentity,
+	processIdentitySync,
+} from "../../packages/scheduler/extensions/lib/process-identity.ts";
 import { cursorDetailsRequested } from "../opt-in/cursor-agent/runner.ts";
 import { registerBgCodemode } from "./codemode.ts";
 
@@ -241,50 +248,6 @@ function signalName(number: number): NodeJS.Signals | undefined {
 		if (value === number) return name as NodeJS.Signals;
 	}
 	return undefined;
-}
-
-interface ProcessIdentity {
-	/** ps lstart, pinned to C locale and UTC: the same process always reads the same. */
-	start: string;
-	args: string;
-}
-const psArgs = (pid: number) => ["-ww", "-o", "lstart=", "-o", "args=", "-p", String(pid)];
-const PS_OPTIONS = { env: { ...process.env, LC_ALL: "C", TZ: "UTC" }, timeout: 3000, encoding: "utf8" as const };
-/** The synchronous lookup (before a stop) blocks the UI: give up sooner. */
-const PS_SYNC_TIMEOUT_MS = 1000;
-const LSTART_RE = /^\s*([A-Z][a-z]{2} [A-Z][a-z]{2} [ \d]\d \d{2}:\d{2}:\d{2} \d{4})\s+(.*)$/;
-
-function parsePs(out: string): ProcessIdentity | undefined {
-	const match = LSTART_RE.exec(out.split("\n")[0] ?? "");
-	return match?.[1] && match[2] !== undefined ? { start: match[1], args: match[2] } : undefined;
-}
-
-function processIdentity(pid: number): Promise<ProcessIdentity | undefined> {
-	return new Promise((resolve) => {
-		try {
-			execFile("ps", psArgs(pid), PS_OPTIONS, (error, stdout) =>
-				resolve(error ? undefined : parsePs(String(stdout))),
-			);
-		} catch {
-			resolve(undefined);
-		}
-	});
-}
-
-function processIdentitySync(pid: number): ProcessIdentity | undefined {
-	try {
-		return parsePs(
-			String(
-				execFileSync("ps", psArgs(pid), {
-					...PS_OPTIONS,
-					timeout: PS_SYNC_TIMEOUT_MS,
-					stdio: ["ignore", "pipe", "ignore"],
-				}),
-			),
-		);
-	} catch {
-		return undefined;
-	}
 }
 
 /**
