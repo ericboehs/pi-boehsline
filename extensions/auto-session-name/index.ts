@@ -458,9 +458,10 @@ export default function (pi: ExtensionAPI) {
     void autoName(ctx).catch(() => {});
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
-    await autoName(ctx);
-  });
+  // Not awaited, as on message_end: pi runs every settled handler before later extensions get
+  // theirs (botsun-owner's idle is one), and a naming call is a model round trip. It marks the
+  // attempt before its first await, so a second settle can't start a second call.
+  pi.on("agent_settled", (_event, ctx) => void autoName(ctx).catch(() => {}));
 
   pi.registerCommand("auto-name", {
     description: "Generate a Title Case session name from recent context",
