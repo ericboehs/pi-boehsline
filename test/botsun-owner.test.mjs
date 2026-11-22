@@ -136,6 +136,45 @@ test("hello on connect, then busy/idle/prompt/prompt_end/bye", async () => {
 	await srv.stop();
 });
 
+// The done signal's stamp: busy, stream_end and idle say when they were written in epoch ms, and
+// idle says how long pi took to settle after agent_end. Botsun subtracts its own clock from at
+// (lag_ms) and reads settle_ms, to see a slow settle chain (the canvas extension's runs first).
+test("busy, stream_end and idle are stamped in ms; idle carries the settle gap", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const before = Date.now();
+	await m.fire("agent_start");
+	await m.fire("message_update", { message: { role: "assistant", content: [{ type: "text", text: "hi" }] } });
+	await m.fire("message_end", { message: { role: "assistant", content: [{ type: "text", text: "hi" }] } });
+	await m.fire("agent_end");
+	// A settle chain that takes a moment (canvas's writes run before this handler in the real one).
+	await sleep(60);
+	await m.fire("agent_settled");
+	await until(() => srv.types().includes("idle"));
+	const line = (type) => srv.lines.find((l) => l.type === type);
+	const busy = line("busy");
+	const streamEnd = line("stream_end");
+	const idle = line("idle");
+	assert.equal(typeof busy.at, "number", "busy: epoch ms, not the ISO at every other line has");
+	assert.equal(typeof streamEnd.at, "number");
+	assert.equal(typeof idle.at, "number");
+	assert.ok(busy.at >= before && streamEnd.at >= before && idle.at >= before);
+	assert.ok(idle.at >= busy.at, "idle is written after the run it ends");
+	assert.ok(idle.settle_ms >= 50 && idle.settle_ms < 5_000, `settle_ms spans agent_end to idle (got ${idle.settle_ms})`);
+	assert.equal(typeof idle.pid, "number", "the usual fields are still there");
+	assert.equal(typeof idle.name, "string");
+	// A run whose agent_end this extension never saw says so rather than sending a nonsense gap.
+	await m.fire("agent_start");
+	await m.fire("agent_settled");
+	await until(() => srv.lines.filter((l) => l.type === "idle").length >= 2);
+	assert.equal(srv.lines.filter((l) => l.type === "idle")[1].settle_ms, null);
+	await m.fire("session_shutdown", { reason: "quit" });
+	await srv.stop();
+});
+
 test("name: agent-link registry, else pi session name; re-read per line", async () => {
 	const srv = await server();
 	process.env.BOTSUN_OWNER_SOCK = srv.path;

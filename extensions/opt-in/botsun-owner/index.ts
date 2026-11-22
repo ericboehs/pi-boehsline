@@ -2641,6 +2641,9 @@ function main(pi: ExtensionAPI): void {
 	if (process.env.PI_SUBAGENT_CHILD === "1") return;
 
 	let conn: Conn | undefined;
+	// When pi's agent_end last ran (0: none since the last idle): the phone's idle says how long the
+	// run took to settle after it ended (settle_ms).
+	let agentEndAt = 0;
 	let held: Array<{ content: string | UserContent[]; steer?: SteerMeta }> = [];
 	// The waiting steers' turn_end and agent_settled steps (set in session_start, where pi and ctx are).
 	let turnEndSteers: (aborted: boolean, pending: boolean) => void = () => {};
@@ -2735,7 +2738,12 @@ function main(pi: ExtensionAPI): void {
 		try { ctx.ui.notify(reply.error ?? "Botsun refused the icon", "error"); } catch {}
 	};
 	pi.on("message_end", (_event, ctx) => void flushPendingIcon(ctx));
-	pi.on("agent_end", (_event, ctx) => void flushPendingIcon(ctx));
+	pi.on("agent_end", (_event, ctx) => {
+		// The run's own end, before the settle chain: idle carries the gap, so a slow agent_settled
+		// (pi awaits each handler in turn, canvas's can take seconds) shows up as settle_ms.
+		agentEndAt = Date.now();
+		void flushPendingIcon(ctx);
+	});
 
 	// The guardian's bypass, as it announces it (on start and on each change): the phone shows it.
 	pi.events?.on(GUARDIAN_BYPASS_STATE_EVENT, (state: unknown) => {
@@ -3092,7 +3100,7 @@ function main(pi: ExtensionAPI): void {
 		clearTimeout(streamTimer);
 		streamTimer = undefined;
 		streamText = "";
-		write(conn, "stream_end");
+		write(conn, "stream_end", { at: Date.now() });
 	});
 
 	// The model (and thinking level) on the phone's header follow /model, Ctrl+P and settings.
@@ -3196,7 +3204,7 @@ function main(pi: ExtensionAPI): void {
 		if (!conn || conn.closed || conn.busy) return;
 		conn.busy = true;
 		conn.quietSent = runIsQuiet();
-		write(conn, "busy", { quiet: conn.quietSent });
+		write(conn, "busy", { quiet: conn.quietSent, at: Date.now() });
 	});
 
 	// A turn: a busy steer said now waits for its end (holdsSteer), where pi reads its queue.
@@ -3236,7 +3244,11 @@ function main(pi: ExtensionAPI): void {
 		if (!conn || conn.closed || !conn.busy) return;
 		conn.busy = false;
 		conn.quietSent = undefined;
-		write(conn, "idle");
+		// at (ms) is when idle was written; settle_ms, how long after agent_end that was. Botsun logs
+		// both against its own clock (lag_ms) for the done signal's delay.
+		const now = Date.now();
+		write(conn, "idle", { at: now, settle_ms: agentEndAt ? now - agentEndAt : null });
+		agentEndAt = 0;
 		reportContext();
 	});
 
