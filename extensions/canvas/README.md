@@ -594,6 +594,65 @@ Files live in `~/.pi/canvas/<session-id>/` (`meta.json`, `status.json`,
 on its first status or section. The daemon deletes folders idle for 30 days
 whose pi process is gone (`PI_CANVAS_RETAIN_DAYS`).
 
+**Cleanup.** [`prune.mjs`](prune.mjs) keeps a long-running session's folder from
+piling up thousands of files. The daemon runs it once 10 minutes after it
+starts, then daily at 04:00 local (unref'd `setTimeout`s, no launchd job). It
+runs async and yields between sessions, so pages and SSE keep being served
+while it reads. It can be run by hand:
+
+```sh
+node extensions/canvas/prune.mjs --dry-run         # say what would go, change nothing
+node extensions/canvas/prune.mjs --days 60         # a longer folder retention
+node extensions/canvas/prune.mjs --now 2026-12-01  # judge ages as of another day
+```
+
+Ages are `max(mtime, ctime)`: a copying tool can hand a file its source's old
+mtime, but ctime is when it was created or renamed into place. A section's age
+is the newer of its file's and its `at`, so a section posted today from a file
+last edited months ago is not stale.
+
+Per session folder, and only for a folder whose pi is gone (a live one gets
+only its tracking pruned, and nothing at all while it is busy):
+
+- **Busy means untouched.** A turn running, or a live session with anything in
+  its folder written in the last 10 minutes (the settle work — diffs, copies,
+  the tracking JSONs — runs for seconds after `turn.ended`), takes no pruning
+  at all.
+- **The folder itself** goes when its pi is not running (the daemon's own
+  liveness: `meta.json`'s `ended` and pid) and nothing in it has moved in 30
+  days (`--days`, else `PI_CANVAS_RETAIN_DAYS`), and its pi session transcript
+  in `~/.pi/agent/sessions/**/<stamp>_<id>.jsonl` has not either. A transcript
+  that no longer exists counts as stale. The daemon's own 6-hourly
+  `prune(ROOT)` uses the same test (`folderDead`), so the two agree: a folder
+  `/resume`d back into still says `ended` in its meta, and only the transcript
+  keeps it.
+- **Sections** the agent made go after 14 days without a change, with their
+  `extra` media: from `sections.json` (written to a temp file and renamed, like
+  every canvas write) and from disk. `auto-*` sections, `by: "auto"` sections
+  and `tracker` sections are never aged out. A live session's sections are
+  never touched.
+- **Files changed tracking**: an entry in `auto-files.json`, `auto-diffs.json`
+  or `auto-copies.json` goes after 7 days untouched (its own `at`, the source's
+  `mtimeMs` from its last diff, else its `diff-*`/`cur-*` file's time), with
+  its `base-*`, `cur-*` and `diff-*` files. Emptied tracking files are removed;
+  when `auto-files.json` ends empty, the Files changed card goes too (only in a
+  dead folder: a live one's sections are not ours to rewrite).
+- **Orphans**: a file no section, tracking entry or `auto-shots.json` entry
+  names, and whose name the canvas writes (a section file, `base-*`, `cur-*`,
+  `diff-*`, `shot-*`, or a `*.tmp` over an hour old), is deleted. Anything
+  unrecognized, and everything in a folder whose `sections.json` or tracking
+  JSON doesn't parse, stays — and so does every file in a folder where a text
+  section's body was too big for the scan or could not be read, since that body
+  may be what names them. Only bodies that can name media (`.md`, `.html`,
+  `.mmd`, `.chart`, `.table`, `.steps`, `.compare`, …) are read; images, patches
+  and copies never are.
+
+Each JSON is read again right before it is written, and only this run's removals
+are applied to that fresh copy: a section, or a tracked file, that the extension
+added while the prune ran survives. One line per session goes to
+`~/.pi/canvas/.daemon.log` (`canvas prune: <id>: …`); `--dry-run` writes
+nothing, not even the log.
+
 The daemon is spawned detached on `session_start` when none answers
 `/health`. Its version is a hash of `daemon.mjs` and `page.mjs` on disk, so
 after an edit the next pi to start replaces it. Logs go to
@@ -681,5 +740,5 @@ status runs, `PI_CANVAS_TMUX=0` turns off tmux follow mode,
 Subagent children skip the canvas.
 
 ```sh
-node --test test/canvas.test.mjs test/canvas-nav.test.mjs test/canvas-render.test.mjs test/canvas-security.test.mjs test/canvas-meeting.test.mjs test/canvas-embed.test.mjs test/canvas-settle.test.mjs
+node --test test/canvas.test.mjs test/canvas-nav.test.mjs test/canvas-render.test.mjs test/canvas-security.test.mjs test/canvas-meeting.test.mjs test/canvas-embed.test.mjs test/canvas-settle.test.mjs test/canvas-prune.test.mjs
 ```

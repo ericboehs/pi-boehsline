@@ -799,7 +799,7 @@ test("prune keeps a fresh empty session folder", () => {
   const { root } = tempRoot();
   try {
     mkdirSync(join(root, "empty1"));
-    assert.deepEqual(prune(root, 30), []);
+    assert.deepEqual(prune(root, 30, Date.now(), { sessionFiles: new Map() }), []);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -816,8 +816,15 @@ test("prune deletes only old sessions whose pi is gone", () => {
       utimesSync(join(root, id, "meta.json"), past, past);
       utimesSync(join(root, id), past, past);
     }
-    assert.deepEqual(prune(root, 30), ["old-dead"]);
+    // No transcript map: no session has one, so nothing is kept for a transcript's sake.
+    assert.deepEqual(prune(root, 30, Date.now(), { sessionFiles: new Map() }), ["old-dead"]);
     assert.deepEqual(listSessions(root).map((s) => s.id).sort(), ["new-dead", "old-live"]);
+    // A transcript still in use keeps a dead folder: /resume into an old folder leaves its meta
+    // saying ended, so the folder alone can't say nobody is in it. prune.mjs reads the same map.
+    utimesSync(join(root, "new-dead", "meta.json"), past, past);
+    utimesSync(join(root, "new-dead"), past, past);
+    assert.deepEqual(prune(root, 30, Date.now(), { sessionFiles: new Map([["new-dead", Date.now() - 86_400_000]]) }), []);
+    assert.deepEqual(prune(root, 30, Date.now(), { sessionFiles: new Map([["new-dead", Date.now() - 40 * 86_400_000]]) }), ["new-dead"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
