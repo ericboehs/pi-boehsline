@@ -35,7 +35,7 @@ import { schedulerDir } from "./task-registry.ts";
 
 export const INDEX_VERSION = 1;
 
-/** The strongest wake level among a session's tasks: still a future brief's input. */
+/** The strongest wake level among a session's tasks: what the wake tick (lib/wake.ts) reads. */
 export type WakeLevel = "crash" | "always";
 
 export interface SessionIndexEntry {
@@ -55,6 +55,12 @@ export interface SessionIndexEntry {
   nextDueAt?: number;
   /** Earliest due time among the tasks that carry a `wake` level. */
   nextWakeDueAt?: number;
+  /**
+   * Earliest due time among the `wake: "always"` tasks only. The wake tick may
+   * reopen a session the user quit on purpose for these and nothing else, so
+   * it needs them apart from the `crash` ones.
+   */
+  nextAlwaysDueAt?: number;
   /** `always` > `crash` > absent, over the unpaused tasks. */
   wake?: WakeLevel;
   /** Unpaused tasks. Zero means the entry is removed. */
@@ -88,6 +94,7 @@ function isEntry(value: unknown): value is SessionIndexEntry {
     && (entry.pidStart === undefined || typeof entry.pidStart === "string")
     && (entry.nextDueAt === undefined || Number.isFinite(entry.nextDueAt))
     && (entry.nextWakeDueAt === undefined || Number.isFinite(entry.nextWakeDueAt))
+    && (entry.nextAlwaysDueAt === undefined || Number.isFinite(entry.nextAlwaysDueAt))
     && (entry.wake === undefined || entry.wake === "crash" || entry.wake === "always");
 }
 
@@ -200,6 +207,7 @@ export interface IndexPlanInput {
   closedAt?: number;
   nextDueAt?: number;
   nextWakeDueAt?: number;
+  nextAlwaysDueAt?: number;
   wake?: WakeLevel;
   count: number;
 }
@@ -229,6 +237,7 @@ export function planIndexEntry(input: IndexPlanInput, now = Date.now()): Session
   if (input.closedAt !== undefined) entry.closedAt = input.closedAt;
   if (input.nextDueAt !== undefined) entry.nextDueAt = input.nextDueAt;
   if (input.nextWakeDueAt !== undefined) entry.nextWakeDueAt = input.nextWakeDueAt;
+  if (input.nextAlwaysDueAt !== undefined) entry.nextAlwaysDueAt = input.nextAlwaysDueAt;
   if (input.wake !== undefined) entry.wake = input.wake;
   return entry;
 }

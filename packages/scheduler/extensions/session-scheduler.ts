@@ -4,6 +4,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
+import { hostname } from "node:os";
 import { Type } from "typebox";
 
 // Boehsline's shared config and tool_search helper. The tool is an opt-in on
@@ -36,6 +37,15 @@ import {
 } from "./lib/session-index.ts";
 import type { MisfirePolicy } from "./lib/task-registry.ts";
 import { processStart } from "./lib/process-identity.ts";
+import {
+  type LifecycleRecord,
+  LIFECYCLE_VERSION,
+  SESSION_ID_RE,
+  closeHow,
+  readLifecycle,
+  tmuxServerPid,
+  writeLifecycle,
+} from "./lib/lifecycle.ts";
 
 const SNAPSHOT_TYPE = "session-scheduler:snapshot";
 const SNAPSHOT_VERSION = 1;
@@ -88,8 +98,8 @@ export interface ScheduledTask extends Schedule {
   /**
    * Whether pi should reopen this session for this timer. Absent means never:
    * `crash` only after a session that died without being quit, `always` even
-   * after a deliberate quit. Nothing reopens anything yet — this is the field
-   * the index publishes so the tick can.
+   * after a deliberate quit. The index publishes it, and the pi-scheduler tick
+   * (lib/wake.ts) does the reopening.
    */
   wake?: WakeLevel;
   /**
@@ -749,6 +759,58 @@ function makeTaskId(existing: ScheduledTask[]): string {
   return id;
 }
 
+// ── lifecycle records ──
+//
+// How this session last closed, for the wake tick (lib/lifecycle.ts). The
+// state that a `process.on("exit")` listener needs lives on globalThis, keyed
+// by Symbol.for, because /reload re-imports this module and the listener must
+// be installed once per process, not once per instance.
+
+const LIFECYCLE_KEY = Symbol.for("pi-boehsline.scheduler.lifecycle");
+
+interface LifecycleSlot {
+  /** The session this process holds live right now, or nothing between sessions. */
+  current?: { sessionId: string; record: LifecycleRecord };
+  /** SIGHUP or SIGTERM, seen by our listener before pi's own shutdown ran. */
+  signal?: string;
+  exitInstalled?: boolean;
+  /** PI_WAKE_ID is taken by the first session_start only: a later /new is not the woken session. */
+  wakeConsumed?: boolean;
+}
+
+function lifecycleSlot(): LifecycleSlot {
+  const holder = globalThis as unknown as { [LIFECYCLE_KEY]?: LifecycleSlot };
+  holder[LIFECYCLE_KEY] ??= {};
+  return holder[LIFECYCLE_KEY];
+}
+
+/** The close a process exit implies when no session_shutdown came first. */
+export function crashRecord(record: LifecycleRecord, signal: string | undefined, now: number): LifecycleRecord {
+  const how = signal === "SIGHUP" || signal === "SIGTERM" ? (`signal:${signal}` as const) : "crash";
+  return { ...record, state: "closed", how, closedAt: now, lastSeen: now };
+}
+
+function installExitListener(slot: LifecycleSlot): void {
+  if (slot.exitInstalled) return;
+  slot.exitInstalled = true;
+  // Synchronous by necessity: nothing asynchronous runs in an exit listener.
+  // This is the only trace an uncaughtCrash (process.exit(1)) or a dead
+  // terminal (exit 129) leaves, since neither emits session_shutdown.
+  process.on("exit", () => {
+    const current = slot.current;
+    if (!current) return;
+    slot.current = undefined;
+    try {
+      writeLifecycle(current.sessionId, crashRecord(current.record, slot.signal, Date.now()));
+    } catch {
+      // Nothing to report to, and no record reads as "unknown": never woken.
+    }
+  });
+}
+
+/** How often a live session refreshes `lastSeen`, at most. */
+const LAST_SEEN_EVERY_MS = 5 * 60_000;
+
 /**
  * Session-scoped timers: `/once` and `/loop`.
  *
@@ -776,6 +838,10 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
   /** The session file this process has indexed, so a late-flushed one is retried. */
   let indexedFile: string | undefined;
   let indexWarned = false;
+  /** Our SIGHUP/SIGTERM listeners, installed at session_start and removed at shutdown. */
+  let signalListeners: Array<[NodeJS.Signals, () => void]> = [];
+  let lifecycleTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastSeenWritten = 0;
 
   const notice = (ctx: ExtensionContext, message: string, level: NoticeLevel = "info") => {
     if (ctx.hasUI) ctx.ui.notify(message, level);
@@ -859,6 +925,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     const unpaused = tasks.filter((task) => !task.paused);
     const armed = armedTasks();
     const wakeTasks = armed.filter((task) => task.wake !== undefined);
+    const alwaysTasks = wakeTasks.filter((task) => task.wake === "always");
     const wake: WakeLevel | undefined = wakeTasks.some((task) => task.wake === "always")
       ? "always"
       : wakeTasks.length > 0 ? "crash" : undefined;
@@ -873,6 +940,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
       ...(closed ? { closedAt: Date.now() } : {}),
       ...(armed.length > 0 ? { nextDueAt: Math.min(...armed.map((task) => task.nextRunAt)) } : {}),
       ...(wakeTasks.length > 0 ? { nextWakeDueAt: Math.min(...wakeTasks.map((task) => task.nextRunAt)) } : {}),
+      ...(alwaysTasks.length > 0 ? { nextAlwaysDueAt: Math.min(...alwaysTasks.map((task) => task.nextRunAt)) } : {}),
       ...(wake ? { wake } : {}),
     });
 
@@ -889,6 +957,137 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     // Recorded only on success, so a failed update is retried on the next
     // agent_settled rather than considered done.
     if (!error) indexedFile = file;
+  };
+
+  // ── the lifecycle record ──
+
+  /** TUI only: print mode, --no-session and subagent children never write one. */
+  const tracksLifecycle = (ctx: ExtensionContext): string | undefined => {
+    if (ctx.mode !== "tui" || process.env.PI_SUBAGENT_CHILD === "1") return undefined;
+    const id = ctx.sessionManager.getSessionId();
+    if (!id || !SESSION_ID_RE.test(id) || !sessionFilePath(ctx)) return undefined;
+    return id;
+  };
+
+  const removeSignalListeners = () => {
+    for (const [signal, listener] of signalListeners) process.off(signal, listener);
+    signalListeners = [];
+  };
+
+  const writeLifecycleSafely = (id: string, record: LifecycleRecord) => {
+    try {
+      writeLifecycle(id, record);
+    } catch {
+      // The record only matters to the wake tick, and a missing one means
+      // "never wake", which is the safe reading. Never throw out of a handler.
+    }
+  };
+
+  const startLifecycle = (ctx: ExtensionContext, reason: string | undefined) => {
+    const slot = lifecycleSlot();
+    // A wake id names the session the tick opened; only the process's first
+    // session_start can be it, and its children must not inherit it.
+    const envWake = slot.wakeConsumed ? undefined : process.env.PI_WAKE_ID;
+    slot.wakeConsumed = true;
+    delete process.env.PI_WAKE_ID;
+
+    const id = tracksLifecycle(ctx);
+    if (!id) return;
+    const file = sessionFilePath(ctx) as string;
+    installExitListener(slot);
+
+    // Prepended, so this runs before pi's own SIGHUP/SIGTERM listener, and in
+    // any case before session_shutdown: pi's shutdown yields at its first
+    // await (session.abort) before it emits the event.
+    removeSignalListeners();
+    slot.signal = undefined;
+    for (const signal of ["SIGHUP", "SIGTERM"] as const) {
+      const listener = () => {
+        slot.signal = signal;
+      };
+      process.prependListener(signal, listener);
+      signalListeners.push([signal, listener]);
+    }
+
+    const now = Date.now();
+    const draft: LifecycleRecord = {
+      v: LIFECYCLE_VERSION,
+      sessionFile: file,
+      cwd: ctx.cwd,
+      host: hostname(),
+      pid: process.pid,
+      liveSince: now,
+      lastSeen: now,
+      state: "live",
+      opener: envWake && reason === "startup" ? "wake" : "manual",
+      ...(envWake && reason === "startup" ? { wakeId: envWake } : {}),
+    };
+    slot.current = { sessionId: id, record: draft };
+
+    // ps is a synchronous spawn: do it after session_start returns, so the
+    // two lookups (our start time, the tmux server's) cost the first frame
+    // nothing. An exit before then still writes a crash record from the draft.
+    if (lifecycleTimer) clearTimeout(lifecycleTimer);
+    lifecycleTimer = setTimeout(() => {
+      lifecycleTimer = undefined;
+      if (slot.current?.sessionId !== id) return;
+      const ownStart = pidStart ??= processStart(process.pid);
+      const existing = readLifecycle(id);
+      const record: LifecycleRecord = { ...slot.current.record };
+      if (ownStart !== undefined) record.pidStart = ownStart;
+      // A /reload of the same process keeps the session's open time and opener.
+      if (existing?.state === "live" && existing.pid === process.pid && existing.pidStart === ownStart) {
+        record.liveSince = existing.liveSince;
+        record.opener = existing.opener;
+        if (existing.wakeId !== undefined) record.wakeId = existing.wakeId;
+      }
+      const serverPid = tmuxServerPid(process.env.TMUX);
+      const serverStart = serverPid === undefined ? undefined : processStart(serverPid);
+      if (serverPid !== undefined && serverStart !== undefined) record.tmux = { pid: serverPid, start: serverStart };
+      slot.current = { sessionId: id, record };
+      lastSeenWritten = Date.now();
+      writeLifecycleSafely(id, record);
+    }, 0);
+    lifecycleTimer.unref?.();
+  };
+
+  /** Refresh lastSeen now and then, so a vanished session's last live time is close to true. */
+  const touchLifecycle = () => {
+    const slot = lifecycleSlot();
+    const current = slot.current;
+    if (!current || lifecycleTimer) return;
+    const now = Date.now();
+    if (now - lastSeenWritten < LAST_SEEN_EVERY_MS) return;
+    lastSeenWritten = now;
+    current.record = { ...current.record, lastSeen: now };
+    writeLifecycleSafely(current.sessionId, current.record);
+  };
+
+  const endLifecycle = (reason: string | undefined) => {
+    const slot = lifecycleSlot();
+    removeSignalListeners();
+    if (lifecycleTimer) {
+      clearTimeout(lifecycleTimer);
+      lifecycleTimer = undefined;
+    }
+    const current = slot.current;
+    const signal = slot.signal;
+    slot.current = undefined;
+    slot.signal = undefined;
+    if (!current) return;
+    const how = closeHow(reason, signal);
+    // /reload is the same process and the same session: leave it live, and
+    // let the next instance's session_start pick it up again.
+    if (how === "reload") return;
+    const now = Date.now();
+    writeLifecycleSafely(current.sessionId, {
+      ...current.record,
+      ...(current.record.pidStart === undefined && pidStart !== undefined ? { pidStart } : {}),
+      state: "closed",
+      how,
+      closedAt: now,
+      lastSeen: now,
+    });
   };
 
   const clearRuntime = () => {
@@ -1691,11 +1890,13 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
   // on a real restore. `new`, `fork` and `clone` have nothing to catch up —
   // the snapshot names a session id that no longer exists — and `session_tree`
   // must not replay a slot another branch already fired.
-  pi.on("session_start", (event, ctx) =>
+  pi.on("session_start", (event, ctx) => {
+    startLifecycle(ctx, event?.reason);
     restoreRuntime(ctx, {
       catchUp: event?.reason === "startup" || event?.reason === "resume" || event?.reason === "reload",
       opened: true,
-    }));
+    });
+  });
   pi.on("session_tree", (_event, ctx) => restoreRuntime(ctx));
   pi.on("agent_settled", (_event, ctx) => {
     deliveryInFlight = false;
@@ -1703,12 +1904,14 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     // pi writes the session file with the first reply, so a session that had
     // none at restore time can be indexed now.
     if (indexedFile !== sessionFilePath(ctx)) writeIndex(ctx);
+    touchLifecycle();
     drainPending();
   });
   pi.on("session_shutdown", (event, ctx) => {
     // Any reason: the process may outlive this session (/new, /resume, /fork),
     // and the index must not keep claiming a live pi holds it afterwards.
     writeIndex(ctx, { closed: true });
+    endLifecycle(event?.reason);
     clearRuntime();
     if (ctx.hasUI) ctx.ui.setStatus("session-scheduler", undefined);
     activeCtx = undefined;

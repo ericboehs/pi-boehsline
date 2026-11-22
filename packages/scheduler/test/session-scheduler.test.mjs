@@ -1292,6 +1292,15 @@ test("the index follows create, edit, pause, resume and cancel", async (t) => {
   assert.equal(entry().wake, "always", "the strongest level wins");
   const wakeTask = latestTasks(ui).find((task) => task.wake === "always");
   assert.equal(entry().nextWakeDueAt, wakeTask.nextRunAt, "the earliest wake timer, not the earliest timer");
+  assert.equal(entry().nextAlwaysDueAt, wakeTask.nextRunAt);
+
+  // A sooner crash-only timer moves nextWakeDueAt, never nextAlwaysDueAt: the
+  // tick may reopen a session the user quit only for an `always` one.
+  await ui.run("once", "--wake 2h crash only");
+  const crashTask = latestTasks(ui).find((task) => task.wake === "crash");
+  assert.equal(entry().nextWakeDueAt, crashTask.nextRunAt);
+  assert.equal(entry().nextAlwaysDueAt, wakeTask.nextRunAt);
+  await ui.run("once", `cancel ${crashTask.id}`);
 
   await ui.run("loop", "pause all");
   assert.equal(entry(), undefined, "no unpaused timers: the entry is removed");
