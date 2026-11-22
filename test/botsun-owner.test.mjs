@@ -1529,18 +1529,19 @@ test("compaction: words held for one pi never announced go in when it turns idle
 	assert.deepEqual(m.sent, [{ content: text, options: undefined }]);
 });
 
-test("compaction: a send pi refuses goes back to held, and the phone hears held, not prompt", async () => {
+test("compaction: a send pi's own refusal would swallow is never made, and the words wait for it", async () => {
 	const key = phoneKey();
 	writeKeys({ 7: key.raw.toString("base64") });
 	const srv = await server();
 	process.env.BOTSUN_OWNER_SOCK = srv.path;
 	const m = await mount();
-	m.ctx.isIdle = () => true;
-	// pi's own refusal is async and only reaches the runner's error listeners (send_user_message),
-	// which no extension can hear: a pi that throws instead must not lose the words either.
-	let refusals = 2; // the send, and the release's retry
-	m.pi.sendUserMessage = (content, options) => {
-		if (refusals-- > 0) throw new Error("Cannot submit a prompt while compaction is in progress");
+	let takes = false;
+	m.ctx.isIdle = () => takes;
+	// pi's refusal is asynchronous: the send returns, then the error goes to the runner's error
+	// listeners (send_user_message), which no extension can hear. A send pi refuses here is a send lost.
+	const refused = [];
+	m.pi.sendUserMessage = async (content, options) => {
+		if (!takes) { refused.push(content); return; }
 		m.sent.push({ content, options });
 	};
 	await m.fire("session_start", { reason: "startup" });
@@ -1548,15 +1549,19 @@ test("compaction: a send pi refuses goes back to held, and the phone hears held,
 	const { nonce } = await ask({ type: "nonce" });
 	const text = "sent while it compacts";
 	assert.deepEqual(await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) }), { ok: true, delivered: "held" });
-	assert.equal(m.sent.length, 0, "held, not lost");
-	// The compaction ends and its handlers run: the release sends what was held.
+	assert.deepEqual(refused, [], "never sent blind: the check before it is the guard");
+	// The compaction ends and its handlers run: the release sends what was held, once pi takes it.
 	await m.fire("session_before_compact", { reason: "manual" });
 	await m.fire("session_compact", { reason: "manual" });
 	await settle(20);
+	assert.equal(m.sent.length, 0, "pi still counts the compaction as running");
+	takes = true;
+	await settle(400);
 	assert.deepEqual(m.sent, [{ content: text, options: undefined }], "in once, as a prompt");
+	assert.deepEqual(refused, [], "and never into a refusal");
 });
 
-test("compaction: a running turn's steer and a prompt on its way in are not held", async () => {
+test("compaction: a running turn's steer and a prompt on its way in are not held, the latter as a follow-up", async () => {
 	const key = phoneKey();
 	writeKeys({ 7: key.raw.toString("base64") });
 	const m = await owner();
@@ -1569,10 +1574,39 @@ test("compaction: a running turn's steer and a prompt on its way in are not held
 	assert.equal((await say("steer this")).delivered, "steer");
 	assert.deepEqual(m.sent.at(-1).options, { deliverAs: "steer" });
 	await m.fire("agent_settled");
-	// A prompt sent, its turn not started: pi's input handler marks the moment (inputAt).
+	// A prompt sent, its turn not started: pi's input handler marks the moment (inputAt). pi reads as
+	// idle then, but it is already streaming (its turn's start, or a compaction's own check): a bare
+	// prompt would be refused, asynchronously, past any try/catch. A follow-up waits for the turn.
 	await m.fire("input", { type: "input", text: "typed at the Mac", source: "interactive" });
 	assert.equal((await say("right after your prompt")).delivered, "prompt");
-	assert.deepEqual(m.sent.at(-1), { content: "right after your prompt", options: undefined });
+	assert.deepEqual(m.sent.at(-1), { content: "right after your prompt", options: { deliverAs: "followUp" } });
+});
+
+test("compaction: a session ending with words held stops the poll and hands them back", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	let stale = false;
+	// A compaction pi never announces: the release poll waits for it, ten minutes at most.
+	m.ctx.isIdle = () => {
+		if (stale) throw new Error("ctx is stale");
+		return false;
+	};
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const { nonce } = await ask({ type: "nonce" });
+	const text = "the share sheet one";
+	assert.equal((await ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) })).delivered, "held");
+	// A quit aborts the compaction and takes the session down: a tick after it reaches pi's stale ctx,
+	// and a throw inside a timer is uncaught, which takes pi down (interactive-mode exits on those).
+	stale = true;
+	await m.fire("session_shutdown", { reason: "quit" });
+	await until(() => srv.lines.some((l) => l.type === "returned"));
+	assert.deepEqual(srv.lines.find((l) => l.type === "returned").steers.map((s) => [s.text, s.why]), [[text, "stopped"]]);
+	await settle(600); // no tick of its own comes: the poll was stopped, not left to throw
+	assert.equal(m.sent.length, 0, "never into a session that left");
 });
 
 test("compaction: words held for ten minutes go back to the phone, not into the void", async () => {
@@ -1643,8 +1677,26 @@ async function heldCall() {
 		idle = !b;
 		await m.fire(b ? "agent_start" : "agent_settled");
 	};
-	return { m, hold, busy, aborts: () => aborts };
+	// Said, not held: released at once (a compaction can still hold it, as it holds the phone's says).
+	const say = async (text) => {
+		const { nonce } = await ask({ type: "nonce" });
+		const lines = ["botsun-decide-v1", "7", nonce, "session", "sid-a", "say_audio", wav];
+		const signature = cryptoSign("sha256", Buffer.from(lines.join("\n")), { key: call.privateKey, dsaEncoding: "der" }).toString("base64");
+		return ask({ type: "say_audio", text, nonce, device_id: 7, wav_sha256: wav, signature });
+	};
+	return { m, hold, say, busy, setIdle: (v) => { idle = v; }, aborts: () => aborts };
 }
+
+test("say_audio: a compaction holds the call's words too, and the phone hears held", async () => {
+	const { m, say, setIdle } = await heldCall();
+	// A compaction pi hasn't announced: not idle, no turn running, so a prompt would be refused.
+	setIdle(false);
+	assert.deepEqual(await say("and the linter too"), { ok: true, delivered: "held" });
+	assert.deepEqual(m.sent, [], "never a prompt into a compaction");
+	setIdle(true);
+	await settle(400); // the hold's poll releases it once pi takes prompts
+	assert.deepEqual(m.sent, [{ content: "and the linter too", options: undefined }]);
+});
 
 test("held call words go in only when released: queued after the turn, or steered in", async () => {
 	const { m, hold, busy } = await heldCall();
@@ -3888,9 +3940,10 @@ test("unsteer: one held steer per turn_end, and none while pi holds one of its o
 	await m.fire("turn_start", { turnIndex: 2 });
 	await m.fire("turn_end", { outcome: "completed" });
 	assert.deepEqual(m.sent.map((s) => s.content), ["first", "second"]);
-	// The run settles with one still held (no turn_end left for it): his next prompt, not lost.
+	// The run settles with one still held (no turn_end left for it): his next prompt, not lost. A
+	// follow-up, as a prompt is still on its way in (pi idle takes it as a prompt).
 	await m.fire("agent_settled", { aborted: false });
-	assert.deepEqual(m.sent.at(-1), { content: "third", options: undefined });
+	assert.deepEqual(m.sent.at(-1), { content: "third", options: { deliverAs: "followUp" } });
 	assert.equal(m.entries.filter((e) => e.data.text === "third").length, 0, "a prompt is no steer: no mark");
 });
 

@@ -1243,9 +1243,10 @@ function sayAudio(c: Conn, r: Record<string, unknown>): Record<string, unknown> 
 		debug(`owner say_audio held (${text.length} chars)`);
 		return { ok: true, held: id };
 	}
-	c.inject(text, c.busy);
+	// A compaction (announced or not) holds these too: the phone hears "held", not a steer it lost.
+	const kept = c.inject(text, c.busy);
 	debug(`owner say_audio accepted (${text.length} chars)`);
-	return { ok: true, delivered: c.busy ? "steer" : "prompt" };
+	return { ok: true, delivered: kept === "held" ? "held" : c.busy ? "steer" : "prompt" };
 }
 
 const HELD_MAX = 20;
@@ -2831,7 +2832,7 @@ function main(pi: ExtensionAPI): void {
 				return undefined;
 			}
 			if (c) notePhoneSay(c, content, steer?.id);
-			return sendOrHold(ctx, content, busy ? { deliverAs: "steer" } : undefined, steer) ? undefined : "held";
+			return sendOrHold(ctx, content, busy ? { deliverAs: "steer" } : promptOptions(ctx), steer) ? undefined : "held";
 		};
 		// The oldest waiting steer, to pi now as a steer (turn_end), its phone say noted for its mark.
 		const flushSteer = (c: Conn): void => {
@@ -2851,7 +2852,10 @@ function main(pi: ExtensionAPI): void {
 			reportSteers(c);
 			left.forEach((s, i) => {
 				if (!s.noted) notePhoneSay(c, s.content, s.clientId);
-				sendOrHold(ctx, s.content, i > 0 ? { deliverAs: "followUp" } : undefined);
+				// Its own id and words, so one held and dropped comes back as the phone's bubble, not a new one.
+				sendOrHold(ctx, s.content, i > 0 ? { deliverAs: "followUp" } : promptOptions(ctx), {
+					...(s.clientId ? { id: s.clientId } : {}), text: s.text, withdrawable: s.withdrawable, attachments: s.attachments,
+				});
 			});
 		};
 		settleSteers = (aborted: boolean): void => {
@@ -2876,7 +2880,7 @@ function main(pi: ExtensionAPI): void {
 			const idle = ctx.isIdle();
 			// A compaction, announced or not, holds these (pendingCompact): the phone hears "held".
 			if (mode === "steer" || pendingCompact(ctx)) return inject(text, !idle) ?? (idle ? "prompt" : "steer");
-			if (idle) return sendOrHold(ctx, text) ? "prompt" : "held";
+			if (idle) return sendOrHold(ctx, text, promptOptions(ctx)) ? "prompt" : "held";
 			if (mode === "queue") return sendOrHold(ctx, text, { deliverAs: "followUp" }) ? "queue" : "held";
 			// The phone's steers the abort drops go again first (they were sent first), then these words:
 			// the waiting ones in words alone too; one with photos goes back to the phone (turn_end).
@@ -2919,7 +2923,7 @@ function main(pi: ExtensionAPI): void {
 		// prompt, a follow-up or a trigger may have started one since the reply).
 		const running = () =>
 			!ctx.isIdle() || compacting !== null || conn?.busy === true || conn?.framing !== undefined || (conn?.steers?.length ?? 0) > 0 ||
-			promptStarting() || ctx.hasPendingMessages?.() === true;
+			held.length > 0 || promptStarting() || ctx.hasPendingMessages?.() === true;
 		const close = (opts?: { idleOnly?: boolean }) => {
 			if (opts?.idleOnly && running()) return null;
 			const shutdown = () => {
@@ -3265,6 +3269,14 @@ function main(pi: ExtensionAPI): void {
 	 */
 	const pendingCompact = (ctx: ExtensionContext): boolean =>
 		compacting !== null || (!ctx.isIdle() && conn?.busy !== true && !promptStarting());
+	/**
+	 * A prompt's options where pi may already be busy with one: none when it is idle and takes a plain
+	 * prompt (pi ignores deliverAs then), a follow-up while it isn't (a turn's start, a prompt in its
+	 * input handler, a compaction's own check): a second bare prompt then throws "Agent is already
+	 * processing" asynchronously, past any try/catch, and the words would be lost.
+	 */
+	const promptOptions = (ctx: ExtensionContext): Parameters<ExtensionAPI["sendUserMessage"]>[1] =>
+		!ctx.isIdle() || promptStarting() ? { deliverAs: "followUp" } : undefined;
 	// The phone's words a compaction holds: they wait in `held`, in order, until pi takes a prompt
 	// again (releaseHeld). Never sent blind, and never dropped without going back to the phone.
 	const holdWords = (ctx: ExtensionContext, content: string | UserContent[], steer?: SteerMeta): void => {
@@ -3279,7 +3291,9 @@ function main(pi: ExtensionAPI): void {
 	 * send that throws anyway (an older pi that refuses first) re-holds them rather than losing them.
 	 */
 	const sendOrHold = (ctx: ExtensionContext, content: string | UserContent[], options?: Parameters<ExtensionAPI["sendUserMessage"]>[1], steer?: SteerMeta): boolean => {
-		if (pendingCompact(ctx)) {
+		// Words still waiting go first, in order: one sent now would jump ahead of them (and a bare
+		// prompt racing a released one loses one of them).
+		if (pendingCompact(ctx) || held.length > 0) {
 			holdWords(ctx, content, steer);
 			return false;
 		}
@@ -3293,12 +3307,20 @@ function main(pi: ExtensionAPI): void {
 	};
 	// One release poll at a time: a hold while one waits joins it, and a compaction's end starts one.
 	let releasing = false;
+	// The poll's pending tick, so a shutdown can stop it: it captures ctx, which goes stale under it.
+	let releaseTimer: ReturnType<typeof setTimeout> | undefined;
 	// When the waiting words' clock started (Date.now: wall time, so a test can move it).
 	let heldAt = 0;
 	const startRelease = (ctx: ExtensionContext): void => {
 		if (releasing) return;
 		releasing = true;
 		releaseHeld(ctx);
+	};
+	/** The poll stops and its words stay where they are, for the next hold or compaction's end. */
+	const stopRelease = (): void => {
+		clearTimeout(releaseTimer);
+		releaseTimer = undefined;
+		releasing = false;
 	};
 	/**
 	 * pi emits session_compact while the compaction still counts as running, and a prompt sent then is
@@ -3308,6 +3330,16 @@ function main(pi: ExtensionAPI): void {
 	 * back to the phone (dropHeld) instead, so nothing waits forever and nothing vanishes.
 	 */
 	const releaseHeld = (ctx: ExtensionContext): void => {
+		// A stale ctx (a /new, /resume, /fork or /reload under the poll) throws in here, and a throw
+		// inside a timer is uncaught, which takes pi down: the poll just stops.
+		try {
+			releaseWords(ctx);
+		} catch (e) {
+			stopRelease();
+			debug(`release poll stopped: ${(e as Error).message}`);
+		}
+	};
+	const releaseWords = (ctx: ExtensionContext): void => {
 		// An announced compaction ends with session_compact, which starts this again (endCompaction).
 		if (compacting || held.length === 0) {
 			releasing = false;
@@ -3320,7 +3352,11 @@ function main(pi: ExtensionAPI): void {
 				dropHeld();
 				return;
 			}
-			setTimeout(() => releaseHeld(ctx), 250).unref();
+			releaseTimer = setTimeout(() => {
+				releaseTimer = undefined;
+				releaseHeld(ctx);
+			}, 250);
+			releaseTimer.unref();
 			return; // still releasing: one poll at a time
 		}
 		releasing = false;
@@ -3334,7 +3370,8 @@ function main(pi: ExtensionAPI): void {
 				holdSteer(c, content, steer, { noted: true });
 				return;
 			}
-			const options = i > 0 ? { deliverAs: "followUp" as const } : idle ? undefined : { deliverAs: "steer" as const };
+			// A prompt still on its way in (a keyboard one reads as idle): a follow-up, never a second bare one.
+			const options = i > 0 || promptStarting() ? { deliverAs: "followUp" as const } : idle ? undefined : { deliverAs: "steer" as const };
 			// One pi still won't take stays held, for the next hold or compaction's end.
 			try { sendUser(pi, content, options); } catch { held.push({ content, ...(steer ? { steer } : {}) }); }
 		});
@@ -3342,28 +3379,29 @@ function main(pi: ExtensionAPI): void {
 		if (!held.length) heldAt = 0;
 	};
 	/**
-	 * Words held past HELD_MAX_MS, back to the phone's message box: the channel a returned steer uses
-	 * (Botsun's `returned` line, which puts it in the phone's box), so the phone hears they weren't
-	 * delivered. Never silently dropped; why "withdrawn" is the only one Botsun knows that fits.
+	 * Words held past HELD_MAX_MS (or a session ending), back to the phone's message box: the channel a
+	 * returned steer uses (Botsun's `returned` line, which puts it in the phone's box), so the phone
+	 * hears they weren't delivered. Never silently dropped; `why` says which: "withdrawn" for the wait's
+	 * cap, "stopped" for a session ending on them.
 	 */
-	const dropHeld = (): void => {
+	const dropHeld = (why: ReturnedSteer["why"] = "withdrawn"): void => {
 		const c = conn;
+		if (!held.length) return;
+		// No connection to hand them back through: they stay held (a reconnect's hello asks again).
+		if (!c) return;
 		const out = held;
 		held = [];
 		heldAt = 0;
-		if (!out.length) return;
-		debug(`held words dropped after ${HELD_MAX_MS / 60_000} minutes`); // never the text
-		if (!c || c.closed) return;
-		const now = Date.now();
+		debug(`held words dropped (${why})`); // never the text
 		escrow(c, out.map(({ content, steer }) => {
 			const text = (steer?.text ?? contentTextOf(content)).trim();
 			const n = Math.max(1, steer?.attachments ?? 0);
 			return {
 				id: steer?.id && STEER_ID.test(steer.id) ? steer.id : randomUUID(),
 				text: text || `[${n} attachment${n === 1 ? "" : "s"}]`,
-				at: now,
+				at: Date.now(),
 				sessionId: c.sessionId,
-				why: "withdrawn" as const,
+				why,
 			};
 		}));
 	};
@@ -3391,6 +3429,11 @@ function main(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", (event) => {
+		// The release poll holds ctx: /new, /resume, /fork and /reload abort a compaction under it, and
+		// the next tick's ctx.isIdle() throws ("ctx is stale") inside a timer, which takes pi down.
+		// Stop it, and the words it waited for go back to the phone rather than dying here.
+		stopRelease();
+		dropHeld("stopped");
 		const c = conn;
 		conn = undefined;
 		if (!c || c.closed) return;
