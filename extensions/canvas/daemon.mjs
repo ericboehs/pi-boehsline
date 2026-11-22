@@ -1140,6 +1140,13 @@ export function start() {
   process.on("uncaughtException", (e) => console.error(`${new Date().toISOString()} canvas daemon: uncaught: ${e?.stack || e}`));
   prune(ROOT);
   setInterval(() => prune(ROOT), 6 * 3_600_000).unref();
+  // The nightly cleanup (prune.mjs): the whole folder, its sections, the Files
+  // changed tracking and orphans, once 10 minutes after startup and then daily
+  // at 04:00 local. Imported here rather than at the top so prune.mjs can use
+  // this file's liveness check (pidAlive, sessionState) without a cycle.
+  void import("./prune.mjs")
+    .then((m) => m.schedulePrune({ root: ROOT }))
+    .catch((e) => console.error(`${new Date().toISOString()} canvas daemon: prune failed to load: ${e?.message || e}`));
   // Liveness is a pid check, so a pi that dies without session_shutdown only
   // flips to "ended" on the next poll. Nudge index viewers once a minute.
   setInterval(() => publish("*", { tick: true }), 60_000).unref();
