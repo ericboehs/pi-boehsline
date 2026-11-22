@@ -61,7 +61,9 @@ function fakePi(dir, { lingerSeconds = 1 } = {}) {
 
 function cli(dir, args, extraEnv = {}) {
   return run(process.execPath, [CLI, ...args], {
-    env: { ...process.env, PI_SCHEDULER_DIR: dir, ...extraEnv },
+    // The bg registry too: `check`'s wake phase reads it, and a test must
+    // never read (let alone act on) the developer's real one.
+    env: { ...process.env, PI_SCHEDULER_DIR: dir, PI_BG_STATE_DIR: join(dir, "pi-bg"), ...extraEnv },
     cwd: dir,
   });
 }
@@ -491,4 +493,100 @@ test("a history line with the wrong type for error does not take down runs", asy
   const { stdout } = await cli(dir, ["runs", "nightly"]);
   assert.match(stdout, /ok/, "the good record still lists");
   assert.doesNotMatch(stdout, /42/, "the malformed one is dropped, not rendered");
+});
+
+// ── session wake ──
+
+test("wake on|off|bg on|off edit wake.json; status and run --dry-run report without changing anything", async (t) => {
+  const dir = withTempDir(t);
+  assert.match((await cli(dir, ["wake", "off"])).stdout, /Session wake is off/);
+  assert.equal(JSON.parse(readFileSync(join(dir, "wake.json"), "utf8")).enabled, false);
+  assert.match((await cli(dir, ["wake", "run", "--dry-run"])).stdout, /Session wake is off/);
+  assert.match((await cli(dir, ["wake", "on"])).stdout, /Session wake is on/);
+  assert.match((await cli(dir, ["wake", "bg", "off"])).stdout, /bg-job wakes are off/);
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, "wake.json"), "utf8")), { enabled: true, bg: false });
+
+  const status = (await cli(dir, ["wake", "status"])).stdout;
+  assert.match(status, /^wake\s+on/m);
+  assert.match(status, /^bg wake\s+off \(wake\.json bg:false\)/m);
+  assert.match(status, /^target\s+tmux session pi-wake/m);
+  assert.match(status, /Candidates: none due/);
+  assert.match((await cli(dir, ["wake", "run", "--dry-run"])).stdout, /Nothing due/);
+  assert.equal(existsSync(join(dir, "wake-state.json")), false, "status and dry runs write no state");
+  assert.equal(existsSync(join(dir, "wake.log")), false);
+
+  await assert.rejects(cli(dir, ["wake", "status", "--dry-run"]), /--dry-run goes with wake run/);
+  await assert.rejects(cli(dir, ["wake", "run"]), /only takes --dry-run/);
+  await assert.rejects(cli(dir, ["wake", "bg", "maybe"]), /wants on or off/);
+  await assert.rejects(cli(dir, ["list", "--dry-run"]), /not a flag this command takes/);
+});
+
+/**
+ * A fake tmux: records each invocation (args NUL-separated, one per line) and
+ * answers the handful of verbs the wake phase uses.
+ */
+function fakeTmux(dir) {
+  const calls = join(dir, "tmux-calls");
+  const bin = join(dir, "fake-tmux");
+  writeFileSync(bin, [
+    "#!/bin/sh",
+    `printf '%s\\0' "$@" >> ${JSON.stringify(calls)}; echo >> ${JSON.stringify(calls)}`,
+    'case "$1" in',
+    "  -V) echo 'tmux 3.4' ;;",
+    "  list-sessions) printf '0\\tpi-wake\\n' ;;",
+    "  new-window) echo '@7' ;;",
+    "esac",
+    "exit 0",
+  ].join("\n"), { mode: 0o700 });
+  chmodSync(bin, 0o700);
+  return {
+    bin,
+    calls: () => (existsSync(calls) ? readFileSync(calls, "utf8").split("\n").filter(Boolean).map((line) => line.split("\0").filter((part, i, all) => i < all.length - 1)) : []),
+  };
+}
+
+test("check reopens a crashed session through tmux, argv form, before the durable runs", async (t) => {
+  const dir = withTempDir(t);
+  const tmux = fakeTmux(dir);
+  const pi = fakePi(dir, { lingerSeconds: 0 });
+  writeFileSync(join(dir, "wake.json"), JSON.stringify({ tmux: tmux.bin, pi: pi.bin }));
+  const id = "0193abcd-0000-7000-8000-000000000001";
+  const cwd = join(dir, "project");
+  mkdirSync(cwd);
+  const sessionFile = join(dir, `${id}.jsonl`);
+  writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd })}\n`);
+  const now = Date.now();
+  const host = (await run(process.execPath, ["-p", "require('node:os').hostname()"])).stdout.trim();
+  mkdirSync(join(dir, "sessions"), { mode: 0o700 });
+  writeFileSync(join(dir, "sessions", `${id}.json`), JSON.stringify({
+    v: 1, sessionFile, cwd, host, pid: await deadPid(), pidStart: "Sun Nov 22 10:00:00 2026",
+    liveSince: now - 3_600_000, lastSeen: now - 600_000, state: "closed", how: "crash", closedAt: now - 600_000, opener: "manual",
+  }));
+  writeFileSync(join(dir, "session-timers.json"), JSON.stringify({ v: 1, sessions: { [id]: {
+    sessionFile, cwd, host, liveSince: now - 3_600_000, closedAt: now - 600_000, count: 1, updatedAt: now,
+    wake: "crash", nextDueAt: now - 60_000, nextWakeDueAt: now - 60_000,
+  } } }));
+  seed(dir);
+
+  const result = await cli(dir, ["check"], { PI_SCHEDULER_PI_BIN: pi.bin });
+  const lines = result.stdout.trim().split("\n");
+  assert.match(lines[0], new RegExp(`wake ${id} \\(timer\\)`), "the wake phase runs first");
+  assert.match(lines[1], /nightly ok/);
+
+  const newWindow = tmux.calls().find((call) => call[0] === "new-window");
+  assert.ok(newWindow, "a window was opened");
+  const tail = newWindow.slice(newWindow.indexOf("--") + 1);
+  assert.equal(tail[0], process.execPath, "absolute node");
+  assert.equal(tail[1], CLI, "absolute pi-scheduler");
+  assert.equal(tail[2], "wake-exec");
+  assert.match(tail[3], /^[0-9a-f]{16}$/);
+  assert.equal(tail.length, 4);
+  assert.equal(newWindow[newWindow.indexOf("-c") + 1], cwd);
+  assert.ok(newWindow.some((arg) => arg.startsWith("PATH=/")), "-e PATH");
+  assert.ok(tmux.calls().some((call) => call[0] === "set-option" && call.includes("@pi-session") && call.at(-1) === id));
+
+  const state = JSON.parse(readFileSync(join(dir, "wake-state.json"), "utf8"));
+  assert.equal(Object.values(state.wakes)[0].sessionId, id);
+  assert.match(readFileSync(join(dir, "wake.log"), "utf8"), new RegExp(`wake ${id} reason=timer`));
+  assert.equal(pi.invocations(), 1, "only the durable task ran pi; the wake never did");
 });

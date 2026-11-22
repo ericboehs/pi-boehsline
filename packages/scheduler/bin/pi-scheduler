@@ -23,6 +23,11 @@
  *   pause|resume <id|name>
  *   remove <id|name>
  *   install|uninstall         manage the per-minute tick (launchd or systemd)
+ *   wake status               the session-wake switch, paths, in-flight wakes and log
+ *   wake on|off|bg on|off     turn waking closed sessions (or bg-job wakes) on or off
+ *   wake reset <session>      clear a session's failed-wake backoff
+ *   wake run --dry-run        what the next tick would wake, and why the rest wait
+ *   wake-exec <wakeId>        internal: what a woken tmux window runs
  *
  * Flags for add/edit:
  *   --name <name>        stable handle, nicer than the generated id
@@ -81,6 +86,25 @@ import {
   withRegistry,
 } from "../extensions/lib/task-registry.ts";
 import { piArgsFor, runTask } from "../extensions/lib/runner.ts";
+import {
+  bgStateDir,
+  bgWakeOff,
+  defaultWakeDeps,
+  readWakeConfig,
+  readWakeState,
+  resetWake,
+  resolvePi,
+  resolveTmux,
+  runWakePhase,
+  spawnPiInTerminal,
+  tmuxVersion,
+  updateWakeConfig,
+  wakeConfigPath,
+  wakeExec,
+  wakeLogPath,
+  wakeLogTail,
+  windowPath,
+} from "../extensions/lib/wake.ts";
 
 const SELF = fileURLToPath(import.meta.url);
 const LABEL = "com.ericboehs.pi-scheduler";
@@ -131,6 +155,10 @@ function usage() {
     "  remove <id|name>",
     "  prune                     drop run logs for tasks that no longer exist",
     "  install|uninstall         manage the per-minute tick (launchd or systemd)",
+    "  wake status               session wake: switch, paths, in-flight wakes, log tail",
+    "  wake on|off | bg on|off   turn waking closed sessions (or bg-job wakes) on or off",
+    "  wake reset <session>      clear a session's failed-wake backoff",
+    "  wake run --dry-run        what the next tick would wake, and why the rest wait",
     "",
     "Flags: --name --model --cwd --without <tools,extensions,...> --with <none|...>",
     "       --tools/--no-tools --deliver/--no-deliver",
@@ -172,13 +200,15 @@ const COMMAND_FLAGS = {
   prune: [],
   install: [],
   uninstall: [],
+  wake: ["dry-run"],
+  "wake-exec": [],
 };
 
 /** Flags that take a value, as written on the command line. */
 const VALUE_FLAGS = new Set([
   "name", "model", "cwd", "with", "without", "deliver", "misfire", "timeout", "prompt", "schedule",
 ]);
-const BOOL_FLAGS = new Set(["tools", "no-tools", "no-deliver", "all"]);
+const BOOL_FLAGS = new Set(["tools", "no-tools", "no-deliver", "all", "dry-run"]);
 
 /**
  * Split flags out of an argv tail, leaving the positional words untouched.
@@ -207,6 +237,7 @@ function parseFlags(argv, allowed) {
     if (arg === "--no-tools") { permit("no-tools", arg); flags.tools = false; continue; }
     if (arg === "--no-deliver") { permit("no-deliver", arg); flags.deliver = null; continue; }
     if (arg === "--all") { permit("all", arg); flags.all = true; continue; }
+    if (arg === "--dry-run") { permit("dry-run", arg); flags.dryRun = true; continue; }
     if (arg === "-n") {
       permit("limit", arg);
       const raw = argv[++index];
@@ -283,7 +314,27 @@ function applyFlags(task, flags) {
   return task;
 }
 
+/**
+ * The wake phase: reopen closed sessions whose wake timers are due or whose
+ * bg jobs finished (extensions/lib/wake.ts). First, because the durable runs
+ * below are sequential agent runs that can take many minutes, and launchd
+ * never overlaps ticks. Never allowed to stop those runs.
+ */
+function wakePhase() {
+  try {
+    const { spawned } = runWakePhase(defaultWakeDeps(SELF));
+    for (const decision of spawned) {
+      process.stdout.write(`${new Date().toISOString()} wake ${decision.sessionId} (${decision.reason})\n`);
+    }
+  } catch (error) {
+    process.stderr.write(
+      `${new Date().toISOString()} wake phase failed: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+  }
+}
+
 async function commandCheck() {
+  wakePhase();
   const claimed = withRegistry((registry) => {
     const now = Date.now();
     const toRun = [];
@@ -622,8 +673,16 @@ function commandRemove(selector) {
  */
 function serviceEnv() {
   const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: homedir() };
-  if (process.env.PI_SCHEDULER_DIR) env.PI_SCHEDULER_DIR = process.env.PI_SCHEDULER_DIR;
-  if (process.env.PI_AGENT_DIR) env.PI_AGENT_DIR = process.env.PI_AGENT_DIR;
+  // The rest only when set. TMUX_TMPDIR so the wake phase talks to the same
+  // tmux server you do, not a second one; the bg dirs and PI_BG_WAKE so a bg
+  // wake reads the registry, and honours the setting, that pi does;
+  // PI_SCHEDULER_WAKE_BG=0 turns bg wakes off.
+  for (const key of [
+    "PI_SCHEDULER_DIR", "PI_AGENT_DIR", "TMUX_TMPDIR", "XDG_STATE_HOME",
+    "PI_BG_STATE_DIR", "PI_BG_DIR", "PI_BG_WAKE", "PI_SCHEDULER_WAKE_BG",
+  ]) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
   return env;
 }
 
@@ -819,6 +878,111 @@ function commandUninstall() {
   process.stdout.write(`Removed the scheduler tick; tasks are kept in ${schedulerDir()}\n`);
 }
 
+function onOff(word, what) {
+  if (word === "on") return true;
+  if (word === "off") return false;
+  return die(`${what} wants on or off`);
+}
+
+function describeDecision(decision) {
+  const due = decision.dueAt === undefined ? "" : ` due ${new Date(decision.dueAt).toLocaleString()}`;
+  const close = decision.close ? ` (closed: ${decision.close})` : "";
+  return decision.action === "wake"
+    ? `  would wake ${decision.sessionId} for ${decision.reason}${due}${close}`
+    : `  skip ${decision.sessionId}: ${decision.reason}${due}${close}`;
+}
+
+function commandWakeStatus() {
+  const deps = defaultWakeDeps(SELF);
+  const { config, error } = readWakeConfig();
+  const host = deps.hostname();
+  const now = deps.now();
+  const tmux = resolveTmux(config, deps);
+  const version = tmuxVersion(tmux, deps);
+  const pi = resolvePi(config, deps);
+  const bgOff = bgWakeOff(config, deps);
+  const { state, corrupt } = readWakeState();
+  const recent = state.ledger.filter((entry) => entry.host === host && now - entry.at < 3_600_000);
+  const lines = [
+    `wake        ${config.enabled ? "on" : "off"}${error ? `  (${error}; using defaults)` : ""}`,
+    `bg wake     ${bgOff ? `off (${bgOff})` : "on, for crash-class closes"}`,
+    `target      tmux session ${config.tmuxTarget}`,
+    `host        ${host}`,
+    `caps        ${config.perSessionHourly}/session/hour, ${config.globalHourly}/hour, ${config.perTick}/tick; ${recent.length} used this hour`,
+    `node        ${NODE}`,
+    `scheduler   ${SELF}`,
+    `pi          ${pi ?? "not found (set \"pi\" in wake.json)"}`,
+    `tmux        ${tmux ? `${tmux} (${version ? version.join(".") : "version unknown"})` : "not found (set \"tmux\" in wake.json)"}`,
+    `PATH        ${windowPath(deps)}`,
+    `bg registry ${bgStateDir(deps)}`,
+    `config      ${wakeConfigPath()}`,
+    `log         ${wakeLogPath()}`,
+  ];
+  if (corrupt) lines.push(`state       unreadable (${corrupt}); the next tick starts it over`);
+  const inFlight = Object.values(state.wakes);
+  lines.push("", inFlight.length ? "In flight:" : "In flight: none");
+  for (const wake of inFlight) {
+    lines.push(`  ${wake.sessionId} ${wake.reason} since ${new Date(wake.at).toLocaleString()}`
+      + `${wake.window ? ` in ${wake.window}` : ""}${wake.host === host ? "" : ` on ${wake.host}`}`);
+  }
+  const failures = Object.entries(state.failures);
+  lines.push("", failures.length ? "Failures and backoffs:" : "Failures and backoffs: none");
+  for (const [key, failure] of failures) {
+    lines.push(`  ${key} ${failure.count} failed (last: ${failure.lastReason}, ${new Date(failure.lastAt).toLocaleString()})`
+      + `${failure.backoffSince !== undefined ? "; backed off until opened by hand or `wake reset`" : ""}`);
+  }
+  const { decisions, idle } = runWakePhase(deps, { dryRun: true });
+  lines.push("", idle === "off" ? "Candidates: none (wake is off)" : decisions.length ? "Candidates:" : "Candidates: none due");
+  for (const decision of decisions.slice(0, 10)) lines.push(describeDecision(decision));
+  const tail = wakeLogTail(20);
+  lines.push("", tail.length ? "wake.log:" : "wake.log: empty");
+  for (const line of tail) lines.push(`  ${line}`);
+  process.stdout.write(`${lines.join("\n")}\n`);
+}
+
+function commandWake(rest, flags) {
+  const [sub = "status", arg] = rest;
+  if (flags.dryRun && sub !== "run") die("--dry-run goes with wake run");
+  // A table, not a switch: these are wake's own verbs, not top-level commands.
+  const verbs = {
+    status: () => commandWakeStatus(),
+    on: () => setWakeEnabled(true),
+    off: () => setWakeEnabled(false),
+    bg: () => {
+      const config = updateWakeConfig({ bg: onOff(arg, "wake bg") });
+      process.stdout.write(`bg-job wakes are ${config.bg ? "on" : "off"}\n`);
+      const off = config.bg ? bgWakeOff(config, defaultWakeDeps(SELF)) : undefined;
+      if (off) process.stderr.write(`Note: still off here because of ${off}\n`);
+    },
+    reset: () => {
+      if (!arg) die("wake reset needs a session id");
+      const cleared = resetWake(arg, defaultWakeDeps(SELF).hostname());
+      process.stdout.write(cleared.length ? `Cleared ${cleared.join(", ")}\n` : `Nothing to clear for ${arg}\n`);
+    },
+    run: () => {
+      if (!flags.dryRun) die("wake run only takes --dry-run; the tick (check) does the real run");
+      const { decisions, idle } = runWakePhase(defaultWakeDeps(SELF), { dryRun: true });
+      if (idle === "off") process.stdout.write("Session wake is off\n");
+      else if (decisions.length === 0) process.stdout.write("Nothing due\n");
+      for (const decision of decisions) process.stdout.write(`${describeDecision(decision)}\n`);
+    },
+  };
+  const verb = Object.hasOwn(verbs, sub) ? verbs[sub] : undefined;
+  if (!verb) die(`unknown wake command ${sub}; use status, on, off, bg on|off, reset <id> or run --dry-run`);
+  return verb();
+}
+
+function setWakeEnabled(enabled) {
+  const config = updateWakeConfig({ enabled });
+  process.stdout.write(`Session wake is ${config.enabled ? "on" : "off"}\n`);
+}
+
+async function commandWakeExec(wakeId) {
+  const deps = { ...defaultWakeDeps(SELF), spawnPi: spawnPiInTerminal };
+  const code = await wakeExec(wakeId, deps);
+  if (code !== 0) process.exitCode = code;
+}
+
 async function main() {
   const [command, ...argv] = process.argv.slice(2);
   if (command === undefined || command === "help" || command === "-h" || command === "--help") {
@@ -842,6 +1006,8 @@ async function main() {
     case "prune": return commandPrune();
     case "install": return commandInstall();
     case "uninstall": return commandUninstall();
+    case "wake": return commandWake(rest, flags);
+    case "wake-exec": return commandWakeExec(rest[0] ?? die("wake-exec needs a wake id"));
     default: return die(`unknown command ${command}`);
   }
 }

@@ -16,7 +16,7 @@
  * of them ends up silently never matching.
  */
 
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 
 export interface ProcessIdentity {
   /** ps lstart, pinned to C locale and UTC: the same process always reads the same. */
@@ -60,6 +60,41 @@ export function processIdentitySync(pid: number): ProcessIdentity | undefined {
     );
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * What `ps` can say about a pid, with "I could not tell" kept apart from "there
+ * is no such process".
+ *
+ * The wake tick needs the distinction: a dead holder makes a session wakeable,
+ * and an unknown one must not, or a `ps` that times out under load would read
+ * as "everything is dead" and reopen every session at once.
+ */
+export type ProcessProbe =
+  | { state: "alive"; start: string; args: string }
+  | { state: "dead" }
+  | { state: "unknown" };
+
+export function probeProcess(pid: number): ProcessProbe {
+  if (!Number.isInteger(pid) || pid <= 0) return { state: "dead" };
+  const result = spawnSync("ps", psArgs(pid), {
+    ...PS_OPTIONS,
+    timeout: PS_SYNC_TIMEOUT_MS,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.error) return { state: "unknown" };
+  const identity = parsePs(String(result.stdout ?? ""));
+  if (identity) return { state: "alive", ...identity };
+  // ps printed nothing usable: confirm with kill(0) rather than trusting an
+  // empty answer, which is also what a ps killed by its timeout prints.
+  try {
+    process.kill(pid, 0);
+    return { state: "unknown" };
+  } catch (error) {
+    // EPERM: the pid belongs to another user now, so it is not our pi.
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === "ESRCH" || code === "EPERM" ? { state: "dead" } : { state: "unknown" };
   }
 }
 
