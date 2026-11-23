@@ -20,6 +20,7 @@
  *   edit <id|name> [flags]    change model, prompt, delivery, schedule
  *   run <id|name>             run now, ignoring the schedule
  *   stop <id|name> [--json]   end a running run (its child's process group)
+ *   stop --id <id> [--json]   the same, matching the exact id only (never a name)
  *   runs <id|name> [-n N]     recent run history
  *   pause|resume <id|name>
  *   remove <id|name>
@@ -160,6 +161,7 @@ function usage() {
     "  edit <id|name> [flags]    change model, prompt, delivery, schedule",
     "  run <id|name>             run now, ignoring the schedule",
     "  stop <id|name> [--json]   end a running run on this machine",
+    "  stop --id <id> [--json]   the same, by exact id only (never a name or prefix)",
     "  runs <id|name> [-n N]     recent run history",
     "  pause|resume <id|name>",
     "  remove <id|name>",
@@ -200,7 +202,7 @@ const COMMAND_FLAGS = {
   edit: [...TASK_FLAGS, "prompt", "schedule"],
   update: [...TASK_FLAGS, "prompt", "schedule"],
   run: [],
-  stop: ["json"],
+  stop: ["json", "id"],
   runs: ["limit"],
   history: ["limit"],
   pause: [],
@@ -217,7 +219,7 @@ const COMMAND_FLAGS = {
 
 /** Flags that take a value, as written on the command line. */
 const VALUE_FLAGS = new Set([
-  "name", "model", "cwd", "with", "without", "deliver", "misfire", "timeout", "prompt", "schedule",
+  "name", "model", "cwd", "with", "without", "deliver", "misfire", "timeout", "prompt", "schedule", "id",
 ]);
 const BOOL_FLAGS = new Set(["tools", "no-tools", "no-deliver", "all", "dry-run", "json"]);
 
@@ -476,8 +478,12 @@ async function commandRun(selector) {
 }
 
 /** `stop`: see lib/stop.ts. Not running is { stopped: false } and exit 0. */
-async function commandStop(selector, flags) {
-  const result = await stopRun(selector);
+async function commandStop(rest, flags) {
+  // --id: the exact id, never a name. A caller that resolved the task by id
+  // (Botsun) must not stop a task created meanwhile with that id as its name.
+  if (flags.id !== undefined && rest.length > 0) die("stop takes a task or --id <id>, not both");
+  const selector = flags.id ?? rest[0] ?? die("stop needs a task");
+  const result = await stopRun(selector, { exactId: flags.id !== undefined });
   if (flags.json) process.stdout.write(`${JSON.stringify(result)}\n`);
   else process.stdout.write(`${result.stopped ? "Stopped" : "Did not stop"} ${result.task}${result.reason ? `: ${result.reason}` : ""}\n`);
 }
@@ -1042,7 +1048,7 @@ async function main() {
     case "add": case "create": return commandAdd(rest, flags);
     case "edit": case "update": return commandEdit(rest[0] ?? die("edit needs a task"), flags);
     case "run": return commandRun(rest[0] ?? die("run needs a task"));
-    case "stop": return commandStop(rest[0] ?? die("stop needs a task"), flags);
+    case "stop": return commandStop(rest, flags);
     case "runs": case "history": return commandRuns(rest[0] ?? die("runs needs a task"), flags.limit);
     case "pause": return commandSetPaused(rest[0] ?? die("pause needs a task"), true);
     case "resume": return commandSetPaused(rest[0] ?? die("resume needs a task"), false);

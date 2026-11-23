@@ -668,3 +668,14 @@ test("stop ends a running run's whole process tree and the run is recorded as st
   const history = await cli(dir, ["runs", "nightly"]);
   assert.match(history.stdout, /stopped/);
 });
+
+test("stop --id takes the exact id only, and not alongside a selector", async (t) => {
+  const dir = withTempDir(t);
+  seed(dir);
+  const byId = await cli(dir, ["stop", "--id", "aaaa1111", "--json"]);
+  assert.deepEqual(JSON.parse(byId.stdout), { task: "nightly", stopped: false, reason: "not running" });
+  await assert.rejects(cli(dir, ["stop", "--id", "nightly"]), /No scheduled task has the id nightly/);
+  await assert.rejects(cli(dir, ["stop", "--id", "aaaa"]), /No scheduled task has the id aaaa/);
+  await assert.rejects(cli(dir, ["stop", "nightly", "--id", "aaaa1111"]), /not both/);
+  await assert.rejects(cli(dir, ["run", "--id", "aaaa1111"]), /--id is not a flag this command takes/);
+});

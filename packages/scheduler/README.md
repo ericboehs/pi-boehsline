@@ -522,6 +522,7 @@ pi-scheduler add daily 15:30 :: check grades --name grades
 pi-scheduler run grades       # ignore the schedule and run now
 pi-scheduler runs grades      # recent history
 pi-scheduler stop grades      # end its running run (this machine only); recorded as "stopped"
+pi-scheduler stop --id a1b2c3d4  # the same, by exact id only (scripts: never a name or prefix)
 pi-scheduler check            # what the timer calls (session wakes first, then due tasks)
 pi-scheduler wake status      # see Waking closed sessions
 pi-scheduler uninstall
