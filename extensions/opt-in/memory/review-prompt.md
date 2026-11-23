@@ -41,7 +41,10 @@ qmd query -c sessions "<the question you are trying to answer>"
 
 Start with `qmd search -c sessions` (fast, keyword); use `qmd query -c sessions`
 when the words are not distinctive or the hits are thin. At most about 4
-searches per fact. The results name the session file: a session's id is that
+searches per fact. Run each search as its own plain `bash` call, one at a time:
+never batch them through `codemode` or run them in parallel. The approval
+guardian stops the whole review after three refused calls in a row, and a batch
+of three refused at once ends it immediately. The results name the session file: a session's id is that
 file's name with its extension removed (`….jsonl` → `…`), which is the id this
 host's sessions use everywhere else.
 
