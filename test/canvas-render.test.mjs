@@ -1085,7 +1085,7 @@ const at = (s) => new Date(SCHED_NOW + s * 1000).toISOString();
 // The shape index.ts's jobsSpec() writes in `scheduled`. A prompt never arrives, only a short name.
 const SCHED = [
   { id: "s1", name: "<img src=x onerror=alert(1)>check CI", kind: "interval", every: "every 5m", next: at(252), last: null, status: "armed", source: "session" },
-  { id: "d1", name: "nightly grades", kind: "daily", every: "daily 15:30", next: at(7500), last: at(-90), status: "ok", source: "durable" },
+  { id: "d1", name: "nightly backup", kind: "daily", every: "daily 15:30", next: at(7500), last: at(-90), status: "ok", source: "durable" },
   { id: "d2", name: "deploy check", kind: "cron", every: "cron 30 15 * * 1-5", next: at(-5), last: at(-3600), status: "running", source: "durable" },
   { id: "d3", name: "report", kind: "interval", every: "every 1h", next: at(100_000), last: at(-30), status: "error", source: "durable" },
   { id: "a1", name: "remind me", kind: "once", every: "once", next: null, last: null, status: "paused", source: "agent" },

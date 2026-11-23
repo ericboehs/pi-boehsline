@@ -153,14 +153,14 @@ test("a title goes to bg.ts, the completion meta and the subagents list; without
     reqs.push(r);
     r.reply({ id: `j${reqs.length}`, logPath: `/tmp/pi-bg-test/j${reqs.length}.log` });
   });
-  const task = "First `cd ~/tmp/wt-worklog-after-text` (Botsun worktree, branch worklog-after-text off origin/main). Then fix it.";
+  const task = "First `cd ~/tmp/wt-feature-x` (a worktree, branch feature-x off origin/main). Then fix it.";
   await h.run({ tasks: [{ agent: "worker", task, title: "Work log order" }, { agent: "scout", task }], background: true });
-  assert.deepEqual(reqs.map((r) => r.title), ["Work log order", "Worklog after text"]);
-  assert.deepEqual(reqs.map((r) => r.meta.title), ["Work log order", "Worklog after text"], "the completion details name it too");
+  assert.deepEqual(reqs.map((r) => r.title), ["Work log order", "Feature x"]);
+  assert.deepEqual(reqs.map((r) => r.meta.title), ["Work log order", "Feature x"], "the completion details name it too");
   assert.ok(reqs.every((r) => r.summary.endsWith(task)), "the full prompt stays where it was");
   const kids = listChildren("s-title");
-  assert.deepEqual(kids.map((k) => k.title), ["Work log order", "Worklog after text"]);
-  assert.ok(kids.every((k) => k.task.startsWith("First `cd ~/tmp/wt-worklog")), "task keeps the prompt");
+  assert.deepEqual(kids.map((k) => k.title), ["Work log order", "Feature x"]);
+  assert.ok(kids.every((k) => k.task.startsWith("First `cd ~/tmp/wt-feature")), "task keeps the prompt");
   resetChildren();
 });
 

@@ -177,11 +177,11 @@ test("parseScheduleSpec understands every schedule form the same way twice", () 
   assert.equal(hourly.schedule.intervalMs, 3_600_000);
   assert.equal(hourly.prompt, "check status");
 
-  const daily = parseScheduleSpec("daily 3:30p check grades", now);
+  const daily = parseScheduleSpec("daily 3:30p check the backup", now);
   assert.deepEqual(daily.schedule, { kind: "daily", dailyAt: "15:30" });
   assert.equal(new Date(daily.nextRunAt).getHours(), 15);
 
-  const cron = parseScheduleSpec("cron 30 15 * * 1-5 check grades", now);
+  const cron = parseScheduleSpec("cron 30 15 * * 1-5 check the backup", now);
   assert.equal(cron.schedule.cronExpr, "30 15 * * 1-5");
   assert.equal(new Date(cron.nextRunAt).getDay(), 1, "2026-08-22 is a Saturday, so Monday is next");
 
@@ -218,13 +218,13 @@ test("a cron expression eaten by the shell says so, rather than just 'bad syntax
   // What `cron 30 15 * * 1-5 :: x` becomes when the shell expands the stars
   // against the current directory. The fields are real words, so the only clue
   // is that the asterisks are gone.
-  const globbed = parseScheduleSpec("cron 30 15 Documents Downloads 1-5 :: check grades");
+  const globbed = parseScheduleSpec("cron 30 15 Documents Downloads 1-5 :: check the backup");
   assert.match(globbed.error, /shell probably expanded it/);
   assert.match(globbed.error, /'cron 30 15 \* \* 1-5'/, "shows the quoted form to copy");
 
   // A genuinely malformed expression that still has stars gets the plain
   // message; blaming the shell there would be a wrong guess.
-  const wrong = parseScheduleSpec("cron 99 * * * :: check grades");
+  const wrong = parseScheduleSpec("cron 99 * * * :: check the backup");
   assert.match(wrong.error, /Cron syntax/);
   assert.doesNotMatch(wrong.error, /shell/);
 });

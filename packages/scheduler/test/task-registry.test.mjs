@@ -63,7 +63,7 @@ function task(overrides = {}) {
     id: "aaaa1111",
     kind: "daily",
     dailyAt: "15:30",
-    prompt: "check grades",
+    prompt: "check the backup",
     createdAt: 1_000,
     nextRunAt: 100_000,
     ...overrides,
@@ -178,8 +178,8 @@ test("ids are unique against what is already stored", () => {
 });
 
 test("tasks are selected by name first, then by id prefix", () => {
-  const tasks = [task({ id: "abc12345", name: "grades" }), task({ id: "abd99999" })];
-  assert.equal(findTask(tasks, "grades").id, "abc12345");
+  const tasks = [task({ id: "abc12345", name: "backup" }), task({ id: "abd99999" })];
+  assert.equal(findTask(tasks, "backup").id, "abc12345");
   assert.equal(findTask(tasks, "abc").id, "abc12345");
   assert.throws(() => findTask(tasks, "ab"), /ambiguous/);
   assert.throws(() => findTask(tasks, "zzz"), /No scheduled task matches/);
@@ -401,8 +401,8 @@ test("truncate leaves short values untouched", () => {
 
 test("a task summarizes as one scannable line", () => {
   const now = Date.now();
-  const line = formatTask(task({ name: "grades", model: "cerebras/gpt-oss-120b:low", lastStatus: "ok" }), now);
-  assert.match(line, /aaaa1111 \(grades\)/);
+  const line = formatTask(task({ name: "backup", model: "cerebras/gpt-oss-120b:low", lastStatus: "ok" }), now);
+  assert.match(line, /aaaa1111 \(backup\)/);
   assert.match(line, /daily 15:30/);
   assert.match(line, /cerebras\/gpt-oss-120b:low/);
   assert.match(line, /last ok/);

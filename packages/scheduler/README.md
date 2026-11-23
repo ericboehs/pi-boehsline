@@ -478,7 +478,7 @@ not pi is open, which is the point: a weekday grade check at 15:30 cannot
 depend on a terminal being left running.
 
 ```text
-/schedule --name grades --model openai/gpt-5-mini daily 15:30 :: check the kids' grades
+/schedule --name backup --model openai/gpt-5-mini daily 15:30 :: check the nightly backup
 /schedule cron 30 15 * * 1-5 :: weekday grade check
 /schedule --misfire always once 8p :: check in on the deploy
 /schedule list [all] | show <id> | runs <id>
@@ -497,7 +497,7 @@ option is taken here (delivery and the rest: `pi-scheduler edit`). It refuses
 a task that is running.
 
 ```text
-/schedule edit grades --model openai/gpt-5-mini --cwd /Users/me/Code/school daily 15:30 :: check the kids' grades
+/schedule edit backup --model openai/gpt-5-mini --cwd /Users/me/Code/ops daily 15:30 :: check the nightly backup
 ```
 
 `/schedule run` fires a task now, exactly as the timer would: **its own pi, its
@@ -518,10 +518,10 @@ The same tasks are managed from the shell:
 ```sh
 pi-scheduler install          # per-minute launchd job, or systemd --user timer
 pi-scheduler list
-pi-scheduler add daily 15:30 :: check grades --name grades
-pi-scheduler run grades       # ignore the schedule and run now
-pi-scheduler runs grades      # recent history
-pi-scheduler stop grades      # end its running run (this machine only); recorded as "stopped"
+pi-scheduler add daily 15:30 :: check the backup --name backup
+pi-scheduler run backup       # ignore the schedule and run now
+pi-scheduler runs backup      # recent history
+pi-scheduler stop backup      # end its running run (this machine only); recorded as "stopped"
 pi-scheduler stop --id a1b2c3d4  # the same, by exact id only (scripts: never a name or prefix)
 pi-scheduler check            # what the timer calls (session wakes first, then due tasks)
 pi-scheduler wake status      # see Waking closed sessions
@@ -603,9 +603,9 @@ selected three days ago.
 than argv, so neither shows up in `ps`.
 
 ```sh
-pi-scheduler add --name grades --model openai/gpt-5-mini \
+pi-scheduler add --name backup --model openai/gpt-5-mini \
   --deliver 'my-slack-webhook-script' \
-  'cron 30 15 * * 1-5' :: 'Summarize these grades and flag anything below 80.'
+  'cron 30 15 * * 1-5' :: 'Summarize the backup log and flag any failures.'
 ```
 
 A run is only recorded `ok` if the delivery command also exits 0, so a broken

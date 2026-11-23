@@ -127,14 +127,14 @@ test("tokenize keeps quoted runs together", () => {
     "daily",
     "9a",
   ]);
-  assert.deepEqual(tokenize('--name "kids grades"'), ["--name", "kids grades"]);
+  assert.deepEqual(tokenize('--name "nightly backup"'), ["--name", "nightly backup"]);
   assert.deepEqual(tokenize("   "), []);
 });
 
 test("flags are read from the front and stop at the schedule", () => {
-  const parsed = parseLeadingFlags("--model cerebras/gpt-oss-120b:low --name grades daily 15:30 :: check grades");
-  assert.deepEqual(parsed.flags, { model: "cerebras/gpt-oss-120b:low", name: "grades" });
-  assert.equal(parsed.rest, "daily 15:30 :: check grades");
+  const parsed = parseLeadingFlags("--model cerebras/gpt-oss-120b:low --name backup daily 15:30 :: check the backup");
+  assert.deepEqual(parsed.flags, { model: "cerebras/gpt-oss-120b:low", name: "backup" });
+  assert.equal(parsed.rest, "daily 15:30 :: check the backup");
 });
 
 test("a flag value containing spaces survives quoting", () => {
@@ -172,15 +172,15 @@ test("/schedule writes a durable task with its own model and delivery", async (t
   withTempDir(t);
   const ui = mount();
 
-  await ui.run("--name grades --model cerebras/gpt-oss-120b:low --deliver 'slack-noti' daily 15:30 :: check the kids' grades");
+  await ui.run("--name backup --model cerebras/gpt-oss-120b:low --deliver 'slack-noti' daily 15:30 :: check the nightly backup");
 
   const [task] = readRegistry().tasks;
-  assert.equal(task.name, "grades");
+  assert.equal(task.name, "backup");
   assert.equal(task.kind, "daily");
   assert.equal(task.dailyAt, "15:30");
   assert.equal(task.model, "cerebras/gpt-oss-120b:low");
   assert.equal(task.deliver, "slack-noti");
-  assert.equal(task.prompt, "check the kids' grades");
+  assert.equal(task.prompt, "check the nightly backup");
   assert.equal(task.without, undefined, "a full pi by default, like the one you typed into");
 });
 
@@ -210,7 +210,7 @@ test("/schedule reports the catch-up policy it chose, since the Mac sleeps", asy
   withTempDir(t);
   const ui = mount();
 
-  await ui.run("daily 15:30 :: check grades");
+  await ui.run("daily 15:30 :: check the backup");
   assert.match(ui.last().message, /catch up within 2h/);
 
   await ui.run("--misfire skip daily 16:30 :: strict");
@@ -247,8 +247,8 @@ test("names must be unique, because they are how tasks get selected", async (t) 
   withTempDir(t);
   const ui = mount();
 
-  await ui.run("--name grades daily 15:30 :: first");
-  await ui.run("--name grades daily 16:30 :: second");
+  await ui.run("--name backup daily 15:30 :: first");
+  await ui.run("--name backup daily 16:30 :: second");
   assert.equal(ui.last().level, "error");
   assert.match(ui.last().message, /already exists/);
   assert.equal(readRegistry().tasks.length, 1);
@@ -261,23 +261,23 @@ test("/schedule list is empty until something is scheduled, and names the store"
   await ui.run("list");
   assert.match(ui.last().message, /No durable tasks .*tasks\.json/);
 
-  await ui.run("--name grades daily 15:30 :: check grades");
+  await ui.run("--name backup daily 15:30 :: check the backup");
   await ui.run("list");
-  assert.match(ui.last().message, /grades/);
+  assert.match(ui.last().message, /backup/);
 });
 
 test("a paused task is hidden from list but shown by list all", async (t) => {
   withTempDir(t);
   const ui = mount();
 
-  await ui.run("--name grades daily 15:30 :: check grades");
-  await ui.run("pause grades");
+  await ui.run("--name backup daily 15:30 :: check the backup");
+  await ui.run("pause backup");
   assert.match(ui.last().message, /paused/);
 
   await ui.run("list");
   assert.match(ui.last().message, /No durable tasks/);
   await ui.run("list all");
-  assert.match(ui.last().message, /grades/);
+  assert.match(ui.last().message, /backup/);
 });
 
 test("resuming does not replay the slots missed while paused", async (t) => {
@@ -307,8 +307,8 @@ test("/schedule show explains what the run will actually be", async (t) => {
   withTempDir(t);
   const ui = mount();
 
-  await ui.run("--name grades --model cerebras/gpt-oss-120b:low daily 15:30 :: check grades");
-  await ui.run("show grades");
+  await ui.run("--name backup --model cerebras/gpt-oss-120b:low daily 15:30 :: check the backup");
+  await ui.run("show backup");
   const shown = ui.last().message;
   assert.match(shown, /schedule\s+daily 15:30/);
   assert.match(shown, /model\s+cerebras\/gpt-oss-120b:low/);
@@ -491,25 +491,25 @@ test("/schedule run claims the task, so the next tick cannot double-run it", asy
 test("run and runs are different commands, and neither shadows the other", async (t) => {
   const dir = withTempDir(t);
   const ui = mount();
-  await ui.run("--name grades daily 9a :: x");
+  await ui.run("--name backup daily 9a :: x");
 
   // `runs?` once matched both, so `run` silently showed history and never ran
   // anything -- the sort of failure you notice at 3:30pm, not at the prompt.
-  await ui.run("runs grades");
+  await ui.run("runs backup");
   assert.match(ui.last().message, /No runs recorded yet/);
   assert.equal(readRegistry().tasks[0].runningSince, undefined, "history is read-only");
 
   fakePi(t, dir);
 
-  await ui.run("run grades");
-  assert.match(ui.last().message, /Running grades/);
+  await ui.run("run backup");
+  assert.match(ui.last().message, /Running backup/);
   assert.ok(readRegistry().tasks[0].runningSince > 0, "run actually starts something");
 });
 
 test("a mistyped subcommand is told its own shape, not handed the full usage", async (t) => {
   withTempDir(t);
   const ui = mount();
-  await ui.run("--name grades daily 9a :: x");
+  await ui.run("--name backup daily 9a :: x");
 
   // Each of these previously fell through to the creation path and dumped the
   // entire usage block, which buries the one line that matters.
@@ -520,8 +520,8 @@ test("a mistyped subcommand is told its own shape, not handed the full usage", a
     ["pause", /Usage: \/schedule pause <id\|name\|all>/],
     ["remove", /Usage: \/schedule remove <id\|name>/],
     ["list all extra", /Usage: \/schedule list \[all\]/],
-    ["show grades extra", /Usage: \/schedule show <id\|name>/],
-    ["runs grades 20", /Usage: \/schedule runs <id\|name>/],
+    ["show backup extra", /Usage: \/schedule show <id\|name>/],
+    ["runs backup 20", /Usage: \/schedule runs <id\|name>/],
   ];
   for (const [input, expected] of cases) {
     await ui.run(input);
@@ -576,9 +576,9 @@ test("/schedule remove takes the task out of the registry", async (t) => {
   withTempDir(t);
   const ui = mount();
 
-  await ui.run("--name grades daily 15:30 :: check grades");
-  await ui.run("remove grades");
-  assert.match(ui.last().message, /Removed grades/);
+  await ui.run("--name backup daily 15:30 :: check the backup");
+  await ui.run("remove backup");
+  assert.match(ui.last().message, /Removed backup/);
   assert.deepEqual(readRegistry().tasks, []);
 });
 
@@ -586,26 +586,26 @@ test("/schedule edit swaps the schedule and prompt and keeps everything else", a
   withTempDir(t);
   const ui = mount();
 
-  await ui.run("--name grades --model cerebras/gpt-oss-120b:low --deliver slack-noti daily 15:30 :: check grades");
+  await ui.run("--name backup --model cerebras/gpt-oss-120b:low --deliver slack-noti daily 15:30 :: check the backup");
   const [before] = readRegistry().tasks;
   await ui.run(`pause ${before.id}`);
-  await ui.run(`edit ${before.id} cron 30 7 * * 1-5 :: summarize :: grades\nthen flag anything under 80`);
+  await ui.run(`edit ${before.id} cron 30 7 * * 1-5 :: summarize :: backup\nthen flag anything under 80`);
   assert.match(ui.last().message, /^Edited /);
   const [after] = readRegistry().tasks;
   assert.equal(after.id, before.id);
   assert.equal(after.kind, "cron");
   assert.equal(after.cronExpr, "30 7 * * 1-5");
   assert.equal(after.dailyAt, undefined, "the old schedule's field goes");
-  assert.equal(after.prompt, "summarize :: grades\nthen flag anything under 80", "only the first :: separates");
+  assert.equal(after.prompt, "summarize :: backup\nthen flag anything under 80", "only the first :: separates");
   assert.deepEqual([after.name, after.model, after.deliver, after.cwd, after.createdAt, after.paused],
     [before.name, before.model, before.deliver, before.cwd, before.createdAt, true]);
 
-  await ui.run("edit grades every 45m :: poll");
+  await ui.run("edit backup every 45m :: poll");
   const [interval] = readRegistry().tasks;
   assert.deepEqual([interval.kind, interval.intervalMs, interval.cronExpr, interval.prompt], ["interval", 2_700_000, undefined, "poll"]);
 
   const at = new Date(Date.now() + 3_600_000).toISOString();
-  await ui.run(`edit grades once ${at} :: once more`);
+  await ui.run(`edit backup once ${at} :: once more`);
   const [once] = readRegistry().tasks;
   assert.deepEqual([once.kind, once.intervalMs, once.nextRunAt, once.prompt], ["once", undefined, Date.parse(at), "once more"]);
 });
@@ -613,13 +613,13 @@ test("/schedule edit swaps the schedule and prompt and keeps everything else", a
 test("/schedule edit refuses a bad schedule, a missing task and a running one, changing nothing", async (t) => {
   withTempDir(t);
   const ui = mount();
-  await ui.run("--name grades daily 15:30 :: check grades");
+  await ui.run("--name backup daily 15:30 :: check the backup");
   const snapshot = JSON.stringify(readRegistry());
 
-  await ui.run("edit grades every 10s :: too fast");
+  await ui.run("edit backup every 10s :: too fast");
   assert.equal(ui.last().level, "error");
   assert.match(ui.last().message, /at least 1m[\s\S]*Usage: \/schedule edit/);
-  await ui.run("edit grades daily 15:30");
+  await ui.run("edit backup daily 15:30");
   assert.equal(ui.last().level, "error");
   await ui.run("edit nope daily 9a :: x");
   assert.match(ui.last().message, /No scheduled task matches nope/);
@@ -631,7 +631,7 @@ test("/schedule edit refuses a bad schedule, a missing task and a running one, c
   registry.tasks[0] = { ...registry.tasks[0], runningSince: Date.now(), runnerPid: livePid(t) };
   writeRegistry(registry);
   const running = JSON.stringify(readRegistry());
-  await ui.run("edit grades daily 9a :: x");
+  await ui.run("edit backup daily 9a :: x");
   assert.equal(ui.last().level, "error");
   assert.match(ui.last().message, /is running; edit it once this run finishes/);
   assert.equal(JSON.stringify(readRegistry()), running);
@@ -643,7 +643,7 @@ test("/schedule edit moves a task's model and folder, before the id or after it,
   const spaced = join(dir, "My Project :: x");
   mkdirSync(spaced);
 
-  await ui.run("--name grades --model cerebras/gpt-oss-120b:low --deliver slack-noti daily 15:30 :: check grades");
+  await ui.run("--name backup --model cerebras/gpt-oss-120b:low --deliver slack-noti daily 15:30 :: check the backup");
   const [before] = readRegistry().tasks;
   settleRun(before.id, before.nextRunAt, Date.now(), { status: "ok", output: "fine" });
   const history = readRuns(before.id, 10);
@@ -658,12 +658,12 @@ test("/schedule edit moves a task's model and folder, before the id or after it,
     ["openai/gpt-5-mini", spaced, "interval", 2_700_000, "poll"], "a quoted folder keeps its spaces and its ::");
   assert.deepEqual(readRuns(before.id, 10), history, "the run history stays with the id");
 
-  await ui.run(`edit --no-model --cwd '${dir}' grades daily 9a :: check`);
+  await ui.run(`edit --no-model --cwd '${dir}' backup daily 9a :: check`);
   const [cleared] = readRegistry().tasks;
   assert.deepEqual([cleared.id, cleared.model, cleared.cwd, cleared.dailyAt], [before.id, undefined, dir, "09:00"]);
   assert.equal("model" in cleared, false, "pi's default: no model at all");
 
-  await ui.run(`edit grades --model=anthropic/claude-sonnet-4-5 every 1h :: --cwd /etc stays the prompt`);
+  await ui.run(`edit backup --model=anthropic/claude-sonnet-4-5 every 1h :: --cwd /etc stays the prompt`);
   const [last] = readRegistry().tasks;
   assert.deepEqual([last.model, last.cwd, last.prompt], ["anthropic/claude-sonnet-4-5", dir, "--cwd /etc stays the prompt"]);
 });
@@ -673,7 +673,7 @@ test("/schedule edit refuses a bad model or folder, and any other option, changi
   const ui = mount();
   const file = join(dir, "a-file");
   writeFileSync(file, "");
-  await ui.run(`--name grades --model m1 --cwd ${dir} daily 15:30 :: check grades`);
+  await ui.run(`--name backup --model m1 --cwd ${dir} daily 15:30 :: check the backup`);
   const snapshot = JSON.stringify(readRegistry());
 
   for (const [args, why] of [
@@ -692,7 +692,7 @@ test("/schedule edit refuses a bad model or folder, and any other option, changi
     ["--bogus daily 9a :: x", /Unknown option --bogus/],
     ["--model", /--model needs a value/],
   ]) {
-    await ui.run(`edit grades ${args}`);
+    await ui.run(`edit backup ${args}`);
     assert.equal(ui.last().level, "error", args);
     assert.match(ui.last().message, why, args);
     assert.match(ui.last().message, /Usage: \/schedule edit/, args);

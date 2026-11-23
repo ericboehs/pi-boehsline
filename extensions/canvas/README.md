@@ -285,7 +285,7 @@ the review prompt — so a renderer never reaches for a page global.
   `"host"` for a durable task that runs on this Mac on its own (one made by
   another session or by the `pi-scheduler` CLI). Every durable task on this
   Mac is listed, whatever its cwd, so "On this Mac" shows memory-review,
-  kids-grades and the like in every session (session-scheduler timers are
+  nightly-backup and the like in every session (session-scheduler timers are
   this session's alone). A running durable task has `since`, when the current
   run started (its `runningSince`), so a running clock counts from this run
   and not from `last`, the previous one; it is `null` otherwise. It also has
@@ -300,7 +300,7 @@ the review prompt — so a renderer never reaches for a page global.
   ```json
   {
     "jobs": [
-      { "id": "a1b2c3", "name": "sa:worker", "title": "Work log order", "command": "PI_SUBAGENT_CHILD=1 … 'Task: First `cd ~/tmp/wt-worklog-after-text` …'",
+      { "id": "a1b2c3", "name": "sa:worker", "title": "Work log order", "command": "PI_SUBAGENT_CHILD=1 … 'Task: First `cd ~/tmp/wt-feature-x` …'",
         "log": "/tmp/pi-bg-501/a1b2c3.log", "started": "2026-11-22T15:04:05.000Z", "ended": null, "exit": null,
         "signal": null, "stopped": false, "tail": "· turn 3 · read lib/foo.rb", "hidden": false }
     ],

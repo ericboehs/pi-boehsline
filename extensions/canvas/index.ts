@@ -788,7 +788,7 @@ export function sessionViews(list: unknown): ScheduledView[] {
 
 /**
  * Every durable /schedule task on this Mac, as views, whatever its cwd: Botsun's "On this Mac"
- * shows memory-review, kids-grades and the like in every session. A task whose createdBySession
+ * shows memory-review, nightly-backup and the like in every session. A task whose createdBySession
  * is sessionId is this session's (scope "session"); every other is "host". After /fork the new
  * session has a new id, so a task its parent created shows as "host" there.
  */

@@ -470,7 +470,7 @@ export function findTasks(tasks: DurableTask[], selector: string): DurableTask[]
 
 /**
  * Whether `name` collides with an existing task, compared case-insensitively
- * because `findTask` resolves names that way: `Grades` alongside `grades`
+ * because `findTask` resolves names that way: `Backup` alongside `backup`
  * would make both permanently ambiguous.
  */
 export function nameTaken(tasks: DurableTask[], name: string, exceptId?: string): boolean {

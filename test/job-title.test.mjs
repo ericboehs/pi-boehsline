@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { cleanTitle, deriveTitle, GIVEN_TITLE_MAX, humanize, jobTitle, TITLE_MAX } from "../lib/job-title.ts";
 
 test("a wt-* worktree path in the prompt names it, humanized", () => {
-	assert.equal(deriveTitle("First `cd ~/tmp/wt-worklog-after-text` (Botsun worktree, branch worklog-after-text off origin/main). Then fix it."), "Worklog after text");
+	assert.equal(deriveTitle("First `cd ~/tmp/wt-feature-x` (a worktree, branch feature-x off origin/main). Then fix it."), "Feature x");
 	assert.equal(deriveTitle("cd /Users/me/tmp/wt-jobs_title.scope && npm test"), "Jobs title scope");
 	assert.equal(deriveTitle("Work in ~/tmp/wt-ios-push. Nothing else."), "Ios push", "a sentence's period is not the name's");
 });
