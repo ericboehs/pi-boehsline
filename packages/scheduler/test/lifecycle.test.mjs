@@ -10,13 +10,16 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import sessionScheduler, { crashRecord } from "../extensions/session-scheduler.ts";
-import { closeHow, lifecyclePath, readLifecycle, tmuxServerPid } from "../extensions/lib/lifecycle.ts";
+import { closeHow, decideCloseVerdict, lifecyclePath, readLifecycle, tmuxServerPid } from "../extensions/lib/lifecycle.ts";
 import { processStart } from "../extensions/lib/process-identity.ts";
 
 // Run from inside pi (a subagent, a bash tool call) these are set, and each
 // would change what is under test.
 delete process.env.PI_SUBAGENT_CHILD;
 delete process.env.PI_WAKE_ID;
+// And a test run inside tmux must not probe that server; the tests that want
+// one set it.
+delete process.env.TMUX;
 
 const SLOT = Symbol.for("pi-boehsline.scheduler.lifecycle");
 let counter = 0;
@@ -284,4 +287,73 @@ test("crashRecord keeps a seen signal, and tmuxServerPid reads $TMUX", () => {
   assert.equal(tmuxServerPid("/private/tmp/tmux-501/default,12345,0"), 12345);
   assert.equal(tmuxServerPid(undefined), undefined);
   assert.equal(tmuxServerPid("garbage"), undefined);
+});
+
+test("decideCloseVerdict: a server that outlives the wait is user; one gone or replaced is tmux-gone", () => {
+  const server = { pid: 777, start: "Sat Nov 21 08:00:00 2026" };
+  const run = (states) => {
+    let calls = 0;
+    let slept = 0;
+    const verdict = decideCloseVerdict(server, {
+      probe: () => states[Math.min(calls++, states.length - 1)],
+      sleep: (ms) => { slept += ms; },
+      waitMs: 300,
+      stepMs: 100,
+      now: () => 42,
+    });
+    return { verdict, calls, slept };
+  };
+  const alive = { state: "alive", start: server.start, args: "tmux" };
+  const stillUp = run([alive]);
+  assert.deepEqual(stillUp.verdict, { closeVerdict: "user", decidedAt: 42 });
+  assert.equal(stillUp.slept, 300, "watched for the whole wait before calling it alive");
+
+  const dies = run([alive, alive, { state: "dead" }]);
+  assert.deepEqual(dies.verdict, { closeVerdict: "tmux-gone", decidedAt: 42 }, "the last window closing takes the server with it");
+  assert.equal(dies.slept, 200, "and says so as soon as it sees it");
+
+  assert.equal(run([{ state: "alive", start: "Sun Nov 22 11:00:00 2026", args: "tmux" }]).verdict.closeVerdict, "tmux-gone", "a reused pid");
+  assert.equal(run([{ state: "unknown" }]).verdict, undefined, "ps could not tell");
+  assert.equal(decideCloseVerdict(undefined), undefined, "not in tmux");
+});
+
+test("a SIGHUP close records, once, whether the tmux server outlived it; a plain quit records nothing", async () => {
+  const dead = spawnSync(process.execPath, ["-e", "0"]).pid;
+  for (const [serverPid, expected] of [[process.pid, "user"], [dead, "tmux-gone"]]) {
+    newProcess();
+    // This process stands in for a tmux server that stays; an exited child for one that went.
+    process.env.TMUX = `/tmp/tmux-test/default,${process.pid},0`;
+    let ui;
+    try {
+      ui = await mount();
+      assert.equal(ui.record().tmux?.pid, process.pid);
+    } finally {
+      delete process.env.TMUX;
+    }
+    if (serverPid !== process.pid) {
+      // Swap in the dead server, as if tmux exited with this window.
+      const slot = globalThis[SLOT];
+      slot.current.record = { ...slot.current.record, tmux: { pid: serverPid, start: "Sat Nov 21 08:00:00 2026" } };
+    }
+    process.emit("SIGHUP", "SIGHUP");
+    await ui.shutdown("quit");
+    const record = ui.record();
+    assert.equal(record.how, "signal:SIGHUP");
+    assert.equal(record.closeVerdict, expected);
+    assert.equal(typeof record.decidedAt, "number");
+  }
+
+  newProcess();
+  const quit = await mount();
+  await quit.shutdown("quit");
+  assert.equal(quit.record().how, "user");
+  assert.equal(quit.record().closeVerdict, undefined);
+});
+
+test("crashRecord decides the verdict for a signal exit, and not for a crash", () => {
+  const live = { v: 1, sessionFile: "/s", cwd: "/", host: "h", pid: 1, liveSince: 0, lastSeen: 0, state: "live", opener: "manual",
+    tmux: { pid: 777, start: "x" } };
+  const decide = () => ({ closeVerdict: "tmux-gone", decidedAt: 5 });
+  assert.equal(crashRecord(live, "SIGHUP", 5, decide).closeVerdict, "tmux-gone");
+  assert.equal(crashRecord(live, undefined, 5, decide).closeVerdict, undefined);
 });

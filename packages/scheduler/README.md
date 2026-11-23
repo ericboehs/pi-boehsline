@@ -253,8 +253,10 @@ never write one, and **no record means never woken**.
 |---|---|---|
 | `/quit`, Ctrl+C, Ctrl+D (`user`) | no | yes |
 | `/new`, `/resume`, `/fork` away (`switched`) | no | yes |
-| SIGHUP/SIGTERM, tmux server still alive, no reboot since | no (someone closed the window) | yes |
-| SIGHUP/SIGTERM, and the machine rebooted since or the tmux server is gone | yes (see below) | yes |
+| SIGHUP/SIGTERM, and the tmux server outlived it (`kill-window`, Botsun) | no (someone closed the window) | yes |
+| SIGHUP/SIGTERM, and the tmux server was gone right after (`tmux-gone`) | no (see below) | yes |
+| SIGHUP/SIGTERM, not in tmux (a terminal window closed) | no | yes |
+| SIGHUP/SIGTERM, and the machine booted within an hour after it (`reboot`) | yes, unless the tmux server outlived it | yes |
 | `crash`: exited without a shutdown (uncaught error, dead terminal) | yes | yes |
 | the record says live but its pid is dead (SIGKILL, OOM, power loss) | yes | yes |
 
@@ -265,11 +267,41 @@ that is due fires on restore, whichever timer woke it. A due time more than
 own: a fresher reason (a later `always` timer, a new bg exit) still wakes the
 session, and it is skipped as `stale` only when nothing fresher is due.
 
-**Known false positive: a reboot after a deliberate close.** A window closed by
-hand is a SIGHUP, and a SIGHUP followed by a reboot reads as `reboot`. Close a
-Ghostty window at 5 PM, reboot the next morning, and a `crash` timer or bg
-job due after boot reopens that session. pi cannot tell those apart; `/quit`
-instead of closing the window avoids it.
+**A signal close is judged once, when it happens.** On a SIGHUP or SIGTERM,
+the closing pi watches its tmux server (the `$TMUX` pid and its `ps` start)
+for up to 300 ms and writes what it saw into the lifecycle record as
+`closeVerdict` (`user`: the server outlived the close; `tmux-gone`: it was gone
+or replaced) with `decidedAt`. The tick never looks at the tmux server to
+judge a close: a server that dies an hour later, for whatever reason, does not
+turn an old `kill-window` into a crash. The only later input is the boot time,
+and only within an hour of the close (a restart or an OS update, not
+yesterday's close and this morning's boot).
+
+**The last window.** Closing the last window on a tmux server takes the
+server with it (tmux exits once it has no sessions), so the closing pi sees
+the server gone, exactly as it would after `tmux kill-server`, a tmux crash or
+a logout without linger. Nothing the closing pi can observe tells these apart,
+so `tmux-gone` is **not** crash-class: it is skipped as `user-closed
+close=tmux-gone`, and only an `always` timer (or a reboot within the hour)
+reopens it. A missed wake beats a surprise reopen.
+
+**Known false negatives** (not woken, though nobody meant to close it):
+
+- `tmux kill-server`, a tmux server crash, or a logout without linger
+  (`tmux-gone`, above).
+- A shutdown followed by more than an hour powered off: the boot is too long
+  after the close to blame it.
+- A shutdown whose SIGHUP/SIGTERM reached pi while its tmux server stayed up
+  for another 300 ms: recorded as `user`.
+- A bg job that finished while bg wakes were off (see bg jobs).
+
+**Known false positives** (woken, though closed on purpose):
+
+- A window closed outside tmux (Ghostty on its own: a SIGHUP with no server
+  to check) or a `kill` of pi, followed by a reboot within the hour. `/quit`
+  instead of closing the window avoids it.
+- The closing pi could not run `ps` in time (no `closeVerdict`), then a
+  reboot within the hour.
 
 Liveness is pid + `ps` lstart + host, so a reused pid is not mistaken for pi,
 and a `ps` that cannot answer means "unknown", which is never woken.

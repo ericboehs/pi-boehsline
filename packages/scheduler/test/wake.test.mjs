@@ -20,6 +20,7 @@ import test from "node:test";
 
 import {
   GRACE_MS,
+  REBOOT_WINDOW_MS,
   SETTLE_MS,
   STUCK_MS,
   appendWakeLog,
@@ -340,30 +341,52 @@ test("switched (/new, /resume, /fork away) is not eligible", () => {
   assert.equal(result.decisions[0].close, "switched");
 });
 
-test("a SIGHUP with its tmux server still alive is a user close", () => {
+test("a SIGHUP whose tmux server outlived it is a user close, even after that server dies", () => {
   fresh();
   const tmuxServer = { pid: 777, start: "Sat Nov 21 08:00:00 2026" };
-  const { session, entry } = crashedWithTimer({ how: "signal:SIGHUP", tmux: tmuxServer });
+  const { session, entry } = crashedWithTimer({
+    how: "signal:SIGHUP", tmux: tmuxServer, closeVerdict: "user", decidedAt: NOW - 30 * MIN,
+  });
   writeIndex({ [session.id]: entry });
-  const m = machine({ procs: { 777: tmuxServer.start } });
+  // The server is dead now (killed later, for some other reason): the close
+  // was decided when it happened, not by what the server does afterwards.
+  const m = machine({ procs: {} });
   const result = runWakePhase(m.deps);
   assert.equal(m.newWindows().length, 0);
   assert.equal(result.decisions[0].close, "signal");
   assert.equal(result.decisions[0].reason, "user-closed");
+
+  // Nor a reboot right after.
+  fresh();
+  const later = crashedWithTimer({ how: "signal:SIGHUP", tmux: tmuxServer, closeVerdict: "user", decidedAt: NOW - 30 * MIN });
+  writeIndex({ [later.session.id]: later.entry });
+  const rebooted = machine({ boot: NOW - 25 * MIN });
+  runWakePhase(rebooted.deps);
+  assert.equal(rebooted.newWindows().length, 0, "the server outlived the close: a reboot after it is not why it closed");
 });
 
-test("a SIGHUP whose tmux server has died (or been replaced) is eligible", () => {
+test("a SIGHUP whose tmux server was gone at the close is not woken: it may have been the last window", () => {
   fresh();
   const tmuxServer = { pid: 777, start: "Sat Nov 21 08:00:00 2026" };
-  const { session, entry } = crashedWithTimer({ how: "signal:SIGHUP", tmux: tmuxServer });
+  const { session, entry } = crashedWithTimer({
+    how: "signal:SIGHUP", tmux: tmuxServer, closeVerdict: "tmux-gone", decidedAt: NOW - 30 * MIN,
+  });
   writeIndex({ [session.id]: entry });
-  const m = machine({ procs: { 777: "Sun Nov 22 11:00:00 2026" } });
+  const m = machine();
   const result = runWakePhase(m.deps);
-  assert.equal(m.newWindows().length, 1);
-  assert.equal(result.spawned[0].close, "tmux-gone");
+  assert.equal(m.newWindows().length, 0, "kill-server, a crash and closing the last window look the same");
+  assert.equal(result.decisions[0].reason, "user-closed");
+  assert.equal(result.decisions[0].close, "tmux-gone");
+  assert.match(log(), new RegExp(`skip ${session.id} reason=user-closed close=tmux-gone`));
 });
 
-test("a SIGTERM before the last boot is a reboot: eligible", () => {
+test("an older record with no verdict is never judged by the tmux server as it is now", () => {
+  const record = { v: 1, how: "signal:SIGHUP", closedAt: NOW, lastSeen: NOW, tmux: { pid: 777, start: "x" } };
+  const probe = () => assert.fail("the tick must not probe the server");
+  assert.deepEqual(classifyClose(record, { bootTime: () => NOW - 60 * MIN, probe }), { crash: false, why: "signal" });
+});
+
+test("a SIGTERM or SIGHUP the machine rebooted right after is a reboot: eligible", () => {
   fresh();
   const { session, entry } = crashedWithTimer({ how: "signal:SIGTERM", closedAt: NOW - 30 * MIN });
   writeIndex({ [session.id]: entry });
@@ -371,12 +394,42 @@ test("a SIGTERM before the last boot is a reboot: eligible", () => {
   const result = runWakePhase(m.deps);
   assert.equal(m.newWindows().length, 1);
   assert.equal(result.spawned[0].close, "reboot");
+
+  // tmux-gone at the close, then the reboot: the shutdown took the server down.
+  const gone = { v: 1, how: "signal:SIGHUP", closedAt: NOW - 30 * MIN, lastSeen: NOW - 30 * MIN, closeVerdict: "tmux-gone" };
+  assert.deepEqual(classifyClose(gone, { bootTime: () => NOW - 28 * MIN }), { crash: true, why: "reboot" });
+});
+
+test("a reboot long after a signal close is not why it closed", () => {
+  for (const closeVerdict of [undefined, "tmux-gone"]) {
+    const record = { v: 1, how: "signal:SIGHUP", closedAt: NOW - 20 * 60 * MIN, lastSeen: NOW - 20 * 60 * MIN, closeVerdict };
+    assert.equal(classifyClose(record, { bootTime: () => NOW - 2 * 60 * MIN }).crash, false, String(closeVerdict));
+    assert.equal(classifyClose(record, { bootTime: () => NOW - 20 * 60 * MIN + REBOOT_WINDOW_MS }).crash, true, "within the window");
+  }
 });
 
 test("SIGHUP, no tmux, booted before the close: a user close", () => {
   const record = { v: 1, how: "signal:SIGHUP", closedAt: NOW, lastSeen: NOW };
-  const close = classifyClose(record, { bootTime: () => NOW - 60 * MIN, probe: () => ({ state: "dead" }) });
+  const close = classifyClose(record, { bootTime: () => NOW - 60 * MIN });
   assert.deepEqual(close, { crash: false, why: "signal" });
+});
+
+test("an always timer still wakes after any close, tmux-gone and user verdicts included", () => {
+  for (const fields of [
+    { how: "signal:SIGHUP", closeVerdict: "tmux-gone", tmux: { pid: 777, start: "x" } },
+    { how: "signal:SIGHUP", closeVerdict: "user", tmux: { pid: 777, start: "x" } },
+    { how: "signal:SIGTERM" },
+    { how: "user" },
+    { how: "switched" },
+  ]) {
+    fresh();
+    const { session, entry } = crashedWithTimer(fields, { wake: "always", nextWakeDueAt: NOW - MIN, nextAlwaysDueAt: NOW - MIN });
+    writeIndex({ [session.id]: entry });
+    const m = machine();
+    const result = runWakePhase(m.deps);
+    assert.equal(m.newWindows().length, 1, JSON.stringify(fields));
+    assert.equal(result.spawned[0].reason, "always");
+  }
 });
 
 // ── always vs crash timers ──

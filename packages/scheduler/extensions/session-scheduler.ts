@@ -42,6 +42,7 @@ import {
   LIFECYCLE_VERSION,
   SESSION_ID_RE,
   closeHow,
+  decideCloseVerdict,
   readLifecycle,
   tmuxServerPid,
   writeLifecycle,
@@ -785,9 +786,15 @@ function lifecycleSlot(): LifecycleSlot {
 }
 
 /** The close a process exit implies when no session_shutdown came first. */
-export function crashRecord(record: LifecycleRecord, signal: string | undefined, now: number): LifecycleRecord {
+export function crashRecord(
+  record: LifecycleRecord,
+  signal: string | undefined,
+  now: number,
+  decide: typeof decideCloseVerdict = decideCloseVerdict,
+): LifecycleRecord {
   const how = signal === "SIGHUP" || signal === "SIGTERM" ? (`signal:${signal}` as const) : "crash";
-  return { ...record, state: "closed", how, closedAt: now, lastSeen: now };
+  const verdict = how === "crash" ? undefined : decide(record.tmux);
+  return { ...record, state: "closed", how, closedAt: now, lastSeen: now, ...verdict };
 }
 
 function installExitListener(slot: LifecycleSlot): void {
@@ -1109,6 +1116,9 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     if (how === "reload") return;
     slot.current = undefined;
     const now = Date.now();
+    // A signal close settles here, once, whether the tmux server outlived it:
+    // the tick must never re-judge it by a server that died later.
+    const verdict = how === "signal:SIGHUP" || how === "signal:SIGTERM" ? decideCloseVerdict(current.record.tmux) : undefined;
     writeLifecycleSafely(current.sessionId, {
       ...current.record,
       ...(current.record.pidStart === undefined && pidStart !== undefined ? { pidStart } : {}),
@@ -1116,6 +1126,7 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
       how,
       closedAt: now,
       lastSeen: now,
+      ...verdict,
     });
   };
 

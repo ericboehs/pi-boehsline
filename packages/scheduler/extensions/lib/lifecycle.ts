@@ -27,6 +27,7 @@ import { chmodSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, st
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 
+import { type ProcessProbe, probeProcess } from "./process-identity.ts";
 import { schedulerDir } from "./task-registry.ts";
 
 export const LIFECYCLE_VERSION = 1;
@@ -38,11 +39,27 @@ export const LIFECYCLE_VERSION = 1;
  *  - `switched`: /new, /resume or /fork moved this process to another
  *    session. The same as `user` for waking.
  *  - `signal:SIGHUP` / `signal:SIGTERM`: a signal reached pi. Crash-class only
- *    when the machine rebooted since, or the tmux server pi ran in is gone;
- *    otherwise it is someone closing the window, which is `user`.
+ *    when the machine rebooted right after it (see `closeVerdict` and
+ *    lib/wake.ts `classifyClose`); otherwise it is someone closing the
+ *    window, which is `user`.
  *  - `crash`: the process exited without a shutdown.
  */
 export type CloseHow = "user" | "switched" | "signal:SIGHUP" | "signal:SIGTERM" | "crash";
+
+/**
+ * What the closing pi saw of its tmux server just after a SIGHUP or SIGTERM,
+ * decided once, at close time, so a server that dies later for some other
+ * reason never turns an old close into a crash:
+ *  - `user`: the server outlived the close, so someone closed the window
+ *    (`kill-window`, Botsun, a pane exit). Never crash-class, not even after
+ *    a reboot.
+ *  - `tmux-gone`: the server was gone (or replaced) right after. That is a
+ *    `kill-server`, a server crash, a logout, a reboot, or the last window
+ *    being closed on purpose (tmux exits with its last session), and those
+ *    cannot be told apart from here. Not crash-class by itself; only a reboot
+ *    right after the close makes it one.
+ */
+export type CloseVerdict = "user" | "tmux-gone";
 
 export interface TmuxServerIdentity {
   pid: number;
@@ -67,6 +84,10 @@ export interface LifecycleRecord {
   opener: "wake" | "manual";
   /** The tmux server pi ran under ($TMUX), so a SIGHUP can be told from a dead server. */
   tmux?: TmuxServerIdentity;
+  /** Set at a signal close when `tmux` was known: see CloseVerdict. */
+  closeVerdict?: CloseVerdict;
+  /** When `closeVerdict` was decided. */
+  decidedAt?: number;
 }
 
 const HOWS: CloseHow[] = ["user", "switched", "signal:SIGHUP", "signal:SIGTERM", "crash"];
@@ -99,6 +120,8 @@ export function isLifecycleRecord(value: unknown): value is LifecycleRecord {
     && (record.closedAt === undefined || time(record.closedAt))
     && (record.wakeId === undefined || typeof record.wakeId === "string")
     && (record.opener === "wake" || record.opener === "manual")
+    && (record.closeVerdict === undefined || record.closeVerdict === "user" || record.closeVerdict === "tmux-gone")
+    && (record.decidedAt === undefined || time(record.decidedAt))
     && (record.tmux === undefined
       || (typeof record.tmux === "object" && record.tmux !== null
         && Number.isInteger(record.tmux.pid) && typeof record.tmux.start === "string"));
@@ -196,4 +219,50 @@ export function tmuxServerPid(tmuxEnv: string | undefined): number | undefined {
   if (!tmuxEnv) return undefined;
   const pid = Number(tmuxEnv.split(",")[1]);
   return Number.isInteger(pid) && pid > 1 ? pid : undefined;
+}
+
+/** Block this thread for `ms`: the closing pi has nothing else left to do. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+export interface CloseVerdictDeps {
+  probe?: (pid: number) => ProcessProbe;
+  sleep?: (ms: number) => void;
+  /** How long to watch the server after the signal. */
+  waitMs?: number;
+  stepMs?: number;
+  now?: () => number;
+}
+
+/** How long a closing pi watches its tmux server for: a server on its way out exits within milliseconds. */
+export const CLOSE_PROBE_MS = 300;
+
+/**
+ * Decide, at a signal close, whether this pi's tmux server outlived it.
+ *
+ * Called from the closing process, synchronously (one caller is the exit
+ * listener). The server is watched for `waitMs`: a server that is exiting
+ * (killed, crashed, or out of sessions) is gone within milliseconds of the
+ * hangup it sent, and one that is still the same process after that stayed.
+ * Undefined when there is no server to ask about or `ps` cannot tell.
+ */
+export function decideCloseVerdict(
+  server: TmuxServerIdentity | undefined,
+  { probe = probeProcess, sleep = sleepSync, waitMs = CLOSE_PROBE_MS, stepMs = 100, now = Date.now }: CloseVerdictDeps = {},
+): { closeVerdict: CloseVerdict; decidedAt: number } | undefined {
+  if (!server) return undefined;
+  let waited = 0;
+  for (;;) {
+    const seen = probe(server.pid);
+    if (seen.state === "dead" || (seen.state === "alive" && seen.start !== server.start)) {
+      return { closeVerdict: "tmux-gone", decidedAt: now() };
+    }
+    if (waited >= waitMs) {
+      return seen.state === "alive" ? { closeVerdict: "user", decidedAt: now() } : undefined;
+    }
+    const step = Math.min(stepMs, waitMs - waited);
+    sleep(step);
+    waited += step;
+  }
 }
