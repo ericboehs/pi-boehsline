@@ -97,6 +97,7 @@ import {
   resolvePi,
   resolveTmux,
   runWakePhase,
+  setBgWake,
   spawnPiInTerminal,
   tmuxServerInfo,
   tmuxVersion,
@@ -915,7 +916,7 @@ function commandWakeStatus() {
   const recent = state.ledger.filter((entry) => entry.host === host && now - entry.at < 3_600_000);
   const lines = [
     `wake        ${switchText}${error ? `  (${error}; using defaults)` : ""}`,
-    `bg wake     ${bgOff ? `off (${bgOff})` : "on, for crash-class closes"}`,
+    `bg wake     ${bgOff ? `off (${bgOff})` : "on, for crash-class closes"}${!bgOff && config.bgOnSince ? `; exits before ${new Date(config.bgOnSince).toLocaleString()} stay quiet` : ""}`,
     `target      tmux session ${config.tmuxTarget}`,
     `host        ${host}`,
     `caps        ${config.perSessionHourly}/session/hour, ${config.globalHourly}/hour, ${config.perTick}/tick; ${recent.length} used this hour`,
@@ -960,7 +961,7 @@ function commandWake(rest, flags) {
     on: () => setWakeEnabled(true),
     off: () => setWakeEnabled(false),
     bg: () => {
-      const config = updateWakeConfig({ bg: onOff(arg, "wake bg") });
+      const config = setBgWake(onOff(arg, "wake bg"));
       process.stdout.write(`bg-job wakes are ${config.bg ? "on" : "off"}\n`);
       const off = config.bg ? bgWakeOff(config, defaultWakeDeps(SELF)) : undefined;
       if (off) process.stderr.write(`Note: still off here because of ${off}\n`);

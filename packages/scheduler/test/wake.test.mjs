@@ -26,9 +26,11 @@ import {
   absolutePath,
   appendWakeLog,
   classifyClose,
+  readWakeConfig,
   readWakeState,
   resetWake,
   runWakePhase,
+  setBgWake,
   wakeExec,
   wakeLogPath,
   wakeStatePath,
@@ -824,6 +826,90 @@ test("bg wake is skipped when PI_BG_WAKE is off or nextTurn, or turned off in wa
   const m = machine({ env: { PI_BG_WAKE: "followUp" } });
   runWakePhase(m.deps);
   assert.equal(m.newWindows().length, 1);
+});
+
+test("a bg job that would have woken its session while bg is off logs one bg-off skip, and shows in a dry run", () => {
+  fresh({ bg: false });
+  const session = makeSession();
+  lifecycle(session);
+  bgJob(session, { exitAt: NOW - 5 * MIN });
+  const userClosed = makeSession();
+  lifecycle(userClosed, { how: "user" });
+  bgJob(userClosed, { exitAt: NOW - 5 * MIN });
+  const m = machine();
+
+  const dry = runWakePhase(m.deps, { dryRun: true });
+  const decision = dry.decisions.find((d) => d.sessionId === session.id);
+  assert.equal(decision.reason, "bg-off");
+  assert.ok(Math.abs(decision.dueAt - (NOW - 5 * MIN)) < 1000, "due is the job's exit");
+  assert.equal(existsSync(wakeLogPath()), false, "a dry run logs nothing");
+
+  runWakePhase(m.deps);
+  assert.equal(m.newWindows().length, 0);
+  m.clock.now += 2 * 60 * MIN;
+  runWakePhase(m.deps);
+  const lines = log().split("\n").filter((line) => line.includes(" skip ") && line.includes("reason=bg-off"));
+  assert.equal(lines.length, 1, "once per job, not once an hour");
+  assert.match(lines[0], new RegExp(`skip ${session.id} reason=bg-off close=crash due=`));
+  assert.ok(!lines[0].includes(userClosed.id), "a session that would not have woken anyway says nothing about bg");
+});
+
+test("wake bg on stamps bgOnSince only when bg was off; jobs that finished while it was off stay quiet", () => {
+  fresh({ bg: false });
+  const session = makeSession();
+  lifecycle(session, { closedAt: NOW - 60 * MIN });
+  bgJob(session, { exitAt: NOW - 30 * MIN });
+  const m = machine();
+  runWakePhase(m.deps);
+  assert.equal(m.newWindows().length, 0);
+
+  setBgWake(true, NOW + MIN);
+  assert.equal(readWakeConfig().config.bgOnSince, NOW + MIN);
+  setBgWake(true, NOW + 2 * MIN);
+  assert.equal(readWakeConfig().config.bgOnSince, NOW + MIN, "already on: left alone");
+
+  m.clock.now = NOW + 2 * MIN;
+  const result = runWakePhase(m.deps);
+  assert.equal(m.newWindows().length, 0, "finished while bg was off");
+  assert.equal(result.decisions[0].reason, "bg-off");
+
+  // A job finishing after bg came back on wakes as usual.
+  bgJob(session, { exitAt: NOW + 3 * MIN });
+  m.clock.now = NOW + 4 * MIN;
+  const woke = runWakePhase(m.deps);
+  assert.equal(m.newWindows().length, 1);
+  assert.equal(woke.spawned[0].reason, "bg");
+
+  setBgWake(false);
+  assert.equal(readWakeConfig().config.bg, false);
+});
+
+test("bg turned off and on again by the service environment: the tick notices, and the old exits stay quiet", () => {
+  fresh();
+  const session = makeSession();
+  lifecycle(session, { closedAt: NOW - 60 * MIN });
+  const m = machine({ env: { PI_SCHEDULER_WAKE_BG: "0" } });
+  runWakePhase(m.deps);
+  assert.equal(state().bgOffSince, NOW, "the tick saw bg go off, with nothing due at all");
+
+  bgJob(session, { exitAt: NOW + MIN });
+  m.clock.now = NOW + 2 * MIN;
+  runWakePhase(m.deps);
+  assert.equal(m.newWindows().length, 0);
+
+  // The service is reinstalled without the variable.
+  delete m.deps.env.PI_SCHEDULER_WAKE_BG;
+  m.clock.now = NOW + 3 * MIN;
+  const result = runWakePhase(m.deps);
+  assert.equal(m.newWindows().length, 0, "the exit came while bg was off");
+  assert.equal(result.decisions[0].reason, "bg-off");
+  assert.equal(state().bgOnSince, NOW + 3 * MIN);
+  assert.equal(state().bgOffSince, undefined);
+
+  bgJob(session, { exitAt: NOW + 4 * MIN });
+  m.clock.now = NOW + 5 * MIN;
+  runWakePhase(m.deps);
+  assert.equal(m.newWindows().length, 1, "a later exit wakes");
 });
 
 // ── privacy and the log ──

@@ -321,6 +321,14 @@ globally with `pi-scheduler wake bg off` or `PI_SCHEDULER_WAKE_BG=0` in the
 service environment, and implicitly when the service's `PI_BG_WAKE` is `off` or
 `nextTurn`, since the reopened session would then report the job without a turn.
 
+A job that finished while bg wakes were off never wakes its session later.
+`wake bg on` (when they were off) stamps `bgOnSince` in `wake.json`, and the
+tick keeps its own `bgOffSince`/`bgOnSince` in `wake-state.json` for the
+switches only it sees (`PI_SCHEDULER_WAKE_BG`, `PI_BG_WAKE`); a bg exit at or
+before the later of the two stays quiet. A job that would have woken its
+session while bg wakes are off (a crash-class close, a fresh exit) is logged
+once per job as `skip <id> reason=bg-off`, and `wake run --dry-run` lists it.
+
 ### How a wake runs
 
 The wake phase runs at the start of `check`, before any durable task (those are
@@ -349,9 +357,10 @@ lifecycle record with the wake id and `opener: "wake"`.
 Skipped before spawning, each logged at most once an hour per session and
 reason: another host, live, `ps` unknown, session file missing, header
 mismatch, header cwd missing, tmux missing or older than 3.0, pi not found, a
-window already tagged `@pi-session=<id>`, the hourly caps, a backoff. `stale`
-and `user-closed` cannot change until the due time does, so each is logged once
-per due time; no record (print mode, subagents) is not logged at all.
+window already tagged `@pi-session=<id>`, the hourly caps, a backoff. `stale`,
+`user-closed` and `bg-off` cannot change until the due time (for `bg-off`, the
+job's exit) does, so each is logged once per due time; no record (print mode,
+subagents) is not logged at all.
 
 `wake-exec` refusing (live, file or cwd gone, `ps` unknown, a lock timeout) is
 the safety check working, not a failed wake: it is logged as `refuse`, and the
@@ -393,14 +402,14 @@ pi-scheduler wake status          # switch, paths under the service env, in-flig
                                   # backoffs, caps, next candidates, wake.log tail
 pi-scheduler wake run --dry-run   # what the next tick would wake, and why the rest wait
 pi-scheduler wake on|off          # the global switch (off by default)
-pi-scheduler wake bg on|off       # bg-job wakes
+pi-scheduler wake bg on|off       # bg-job wakes; on stamps bgOnSince, earlier exits stay quiet
 pi-scheduler wake reset <id>      # clear a backoff
 ```
 
 `~/.pi/agent/scheduler/wake.json`, all optional:
 
 ```json
-{ "enabled": false, "bg": true, "tmuxTarget": "pi-wake",
+{ "enabled": false, "bg": true, "bgOnSince": 1795000000000, "tmuxTarget": "pi-wake",
   "perSessionHourly": 3, "globalHourly": 10, "perTick": 1,
   "tmux": "/opt/homebrew/bin/tmux", "pi": "/Users/you/.pi/agent/bin/pi" }
 ```

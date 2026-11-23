@@ -13,10 +13,11 @@
  *     files.
  *
  * Its own files, under the scheduler dir (0700/0600):
- *   - wake.json        config: { enabled, bg, tmuxTarget, perSessionHourly,
- *                      globalHourly, perTick, tmux?, pi? }
+ *   - wake.json        config: { enabled, bg, bgOnSince?, tmuxTarget,
+ *                      perSessionHourly, globalHourly, perTick, tmux?, pi? }
  *   - wake-state.json  in-flight wakes, consecutive failures and backoffs, the
- *                      hourly ledger, and when each skip was last logged
+ *                      hourly ledger, when each skip was last logged, and when
+ *                      the tick last saw bg wakes go off and on again
  *   - wake.log         one line per wake, skip and failure; rotated at 1 MB
  *
  * Privacy: ids, paths, reasons and times only. Nothing here ever copies a bg
@@ -96,6 +97,11 @@ export interface WakeConfig {
   enabled: boolean;
   /** Wake for finished bg jobs (crash-class closes only). */
   bg: boolean;
+  /**
+   * When `wake bg on` last turned bg wakes back on: exits before it happened
+   * while they were off, and never wake.
+   */
+  bgOnSince?: number;
   /** "pi-wake" (default, created if missing), "attached", or a session name. */
   tmuxTarget: string;
   perSessionHourly: number;
@@ -168,13 +174,19 @@ export function readWakeConfig(): { config: WakeConfig; error?: string; enabledS
   };
   const tmux = absolute(parsed.tmux);
   const pi = absolute(parsed.pi);
+  if (typeof parsed.bgOnSince === "number" && Number.isFinite(parsed.bgOnSince)) config.bgOnSince = parsed.bgOnSince;
   if (tmux) config.tmux = tmux;
   if (pi) config.pi = pi;
   return { config, enabledSet: typeof parsed.enabled === "boolean" };
 }
 
-/** Merge `patch` into wake.json, keeping whatever else is in it. */
-export function updateWakeConfig(patch: Partial<WakeConfig>): WakeConfig {
+/**
+ * Merge `patch` into wake.json, keeping whatever else is in it. A function
+ * patch sees the file as it is under the lock.
+ */
+export function updateWakeConfig(
+  patch: Partial<WakeConfig> | ((current: Record<string, unknown>) => Partial<WakeConfig>),
+): WakeConfig {
   return withLockedFile(wakeConfigPath(), () => {
     try {
       const parsed: unknown = JSON.parse(readFileSync(wakeConfigPath(), "utf8"));
@@ -183,9 +195,21 @@ export function updateWakeConfig(patch: Partial<WakeConfig>): WakeConfig {
       return {};
     }
   }, (current) => {
-    const next = { ...current, ...patch };
+    const next = { ...current, ...(typeof patch === "function" ? patch(current) : patch) };
     writePrivateJson(wakeConfigPath(), next);
     return readWakeConfig().config;
+  });
+}
+
+/**
+ * `wake bg on|off`. Turning bg wakes on when they were off stamps
+ * `bgOnSince`, so jobs that finished while they were off stay quiet; turning
+ * them on again when already on leaves it alone.
+ */
+export function setBgWake(on: boolean, now = Date.now()): WakeConfig {
+  return updateWakeConfig((current) => {
+    const wasOn = typeof current.bg === "boolean" ? current.bg : DEFAULT_WAKE_CONFIG.bg;
+    return on && !wasOn ? { bg: true, bgOnSince: now } : { bg: on };
   });
 }
 
@@ -232,6 +256,10 @@ export interface WakeState {
   logged: Record<string, number>;
   lastTickAt?: number;
   lastPruneAt?: number;
+  /** Set while the tick sees bg wakes off (for any reason, env included). */
+  bgOffSince?: number;
+  /** When the tick last saw bg wakes come back on: exits before it stay quiet. */
+  bgOnSince?: number;
 }
 
 export function emptyWakeState(): WakeState {
@@ -263,6 +291,8 @@ export function readWakeState(): { state: WakeState; corrupt?: string } {
     if (parsed.logged && typeof parsed.logged === "object") state.logged = { ...parsed.logged };
     if (typeof parsed.lastTickAt === "number") state.lastTickAt = parsed.lastTickAt;
     if (typeof parsed.lastPruneAt === "number") state.lastPruneAt = parsed.lastPruneAt;
+    if (typeof parsed.bgOffSince === "number") state.bgOffSince = parsed.bgOffSince;
+    if (typeof parsed.bgOnSince === "number") state.bgOnSince = parsed.bgOnSince;
     return { state };
   } catch (error) {
     return { state: emptyWakeState(), corrupt: error instanceof Error ? error.message : String(error) };
@@ -850,6 +880,8 @@ interface EvaluateContext {
   index: Record<string, SessionIndexEntry>;
   bgExits: Map<string, number[]>;
   bgOff?: string;
+  /** bg exits at or before this happened while bg wakes were off. */
+  bgOnSince?: number;
   /** Mutated: backoffs cleared by a manual open. */
   onDirty(): void;
 }
@@ -921,14 +953,22 @@ function evaluateSession(sessionId: string, ctx: EvaluateContext): WakeDecision 
     }
   }
   const exits = ctx.bgExits.get(sessionId);
-  if (exits && ctx.bgOff === undefined) {
+  /** The earliest exit that would have woken this session, had bg wakes been on. */
+  let bgHeld: number | undefined;
+  if (exits) {
     // Only exits after the session's last live moment: earlier ones it saw itself.
     const since = record.state === "closed" ? (record.closedAt ?? record.lastSeen) : record.lastSeen;
     const fresh = exits.filter((at) => at > since && now - at <= STALE_MS);
-    if (fresh.length > 0) consider("bg", Math.min(...fresh), close.crash);
+    // An exit while bg wakes were off stays quiet after they come back on.
+    const offWhen = (at: number) => ctx.bgOff !== undefined || (ctx.bgOnSince !== undefined && at <= ctx.bgOnSince);
+    const held = fresh.filter(offWhen);
+    const wakeable = fresh.filter((at) => !offWhen(at));
+    if (wakeable.length > 0) consider("bg", Math.min(...wakeable), close.crash);
+    if (held.length > 0 && close.crash) bgHeld = Math.min(...held);
   }
   if (options.length === 0) {
     if (blocked.length > 0) return skip("user-closed", { close: close.why, dueAt: Math.min(...blocked) });
+    if (bgHeld !== undefined) return skip("bg-off", { close: close.why, dueAt: bgHeld });
     if (staleDue !== undefined) return skip("stale", { dueAt: staleDue, close: close.why });
     return skip("nothing-due", { close: close.why, quiet: true });
   }
@@ -1059,7 +1099,7 @@ export interface WakePhaseResult {
 }
 
 /** Whether there is anything at all to look at, without taking the lock: idle ticks touch nothing. */
-function anyCandidates(config: WakeConfig, deps: WakeDeps, index: Record<string, SessionIndexEntry>, bgExits: Map<string, number[]>): boolean {
+function anyCandidates(index: Record<string, SessionIndexEntry>, bgExits: Map<string, number[]>, deps: WakeDeps): boolean {
   const now = deps.now();
   const host = deps.hostname();
   for (const entry of Object.values(index)) {
@@ -1067,8 +1107,33 @@ function anyCandidates(config: WakeConfig, deps: WakeDeps, index: Record<string,
     if ((entry.nextWakeDueAt ?? Number.POSITIVE_INFINITY) <= now) return true;
     if ((entry.nextAlwaysDueAt ?? Number.POSITIVE_INFINITY) <= now) return true;
   }
-  if (bgExits.size > 0 && bgWakeOff(config, deps) === undefined) return true;
+  // With bg wakes off too: a would-be wake is logged as a bg-off skip.
+  if (bgExits.size > 0) return true;
   return isFile(wakeStatePath());
+}
+
+/**
+ * Follow bg wakes going off and on, whatever turned them off (wake.json, or
+ * the service's PI_SCHEDULER_WAKE_BG or PI_BG_WAKE, which only the tick
+ * sees): `bgOnSince` is when this tick first saw them on again. Only the
+ * transitions write anything. Returns whether the state changed.
+ */
+function trackBgSwitch(state: WakeState, bgOff: string | undefined, now: number): boolean {
+  if (bgOff !== undefined) {
+    if (state.bgOffSince !== undefined) return false;
+    state.bgOffSince = now;
+    return true;
+  }
+  if (state.bgOffSince === undefined) return false;
+  delete state.bgOffSince;
+  state.bgOnSince = now;
+  return true;
+}
+
+/** The later of `wake bg on` and the tick's own sighting of bg wakes coming back. */
+function bgOnSince(config: WakeConfig, state: WakeState): number | undefined {
+  const times = [config.bgOnSince, state.bgOnSince].filter((at): at is number => at !== undefined);
+  return times.length > 0 ? Math.max(...times) : undefined;
 }
 
 function evaluateAll(
@@ -1082,24 +1147,33 @@ function evaluateAll(
   const now = deps.now();
   const host = deps.hostname();
   const bgOff = bgWakeOff(config, deps);
+  const since = bgOnSince(config, state);
   const ids = new Set<string>();
   for (const [id, entry] of Object.entries(index)) {
     if (entry.host !== host) continue;
     const due = Math.min(entry.nextWakeDueAt ?? Number.POSITIVE_INFINITY, entry.nextAlwaysDueAt ?? Number.POSITIVE_INFINITY);
     if (due <= now) ids.add(id);
   }
-  if (bgOff === undefined) for (const id of bgExits.keys()) ids.add(id);
-  const ctx: EvaluateContext = { config, deps, state, host, now, index, bgExits, ...(bgOff ? { bgOff } : {}), onDirty };
+  for (const id of bgExits.keys()) ids.add(id);
+  const ctx: EvaluateContext = {
+    config, deps, state, host, now, index, bgExits,
+    ...(bgOff ? { bgOff } : {}),
+    ...(since !== undefined ? { bgOnSince: since } : {}),
+    onDirty,
+  };
   return [...ids].filter((id) => SESSION_ID_RE.test(id)).map((id) => evaluateSession(id, ctx));
 }
 
-/** Skips that will not change until their due time does: logged once per due time. */
-const ONCE_PER_DUE = new Set(["stale", "user-closed"]);
+/**
+ * Skips that will not change until their due time does: logged once per due
+ * time (for `bg-off`, the job's exit time).
+ */
+const ONCE_PER_DUE = new Set(["stale", "user-closed", "bg-off"]);
 /** How long a once-per-due-time key is remembered. */
 const DUE_LOG_KEEP_MS = 7 * 24 * HOUR;
 
 /**
- * Log a skip: `stale` and `user-closed` once per due time, the rest at most
+ * Log a skip: `stale`, `user-closed` and `bg-off` once per due time, the rest at most
  * once an hour per session and reason. Returns whether the state changed.
  */
 function logSkip(state: WakeState, decision: WakeDecision, host: string, now: number): boolean {
@@ -1155,21 +1229,28 @@ export function runWakePhase(deps: WakeDeps, { dryRun = false }: { dryRun?: bool
   if (!config.enabled) return { decisions: [], spawned: [], idle: "off" };
 
   const { index } = readSessionIndex();
-  const bgExits = bgWakeOff(config, deps) === undefined ? bgExitsBySession(deps) : new Map<string, number[]>();
+  // Read with bg wakes off too: a job that would have woken its session is
+  // logged as a bg-off skip, and shows in `wake run --dry-run`.
+  const bgExits = bgExitsBySession(deps);
+  const bgOff = bgWakeOff(config, deps);
 
   if (dryRun) {
     const { state } = readWakeState();
+    trackBgSwitch(state, bgOff, deps.now());
     const decisions = evaluateAll(state, config, deps, index.sessions, bgExits, () => {});
     applyPreSpawn(decisions, state, config, deps, { dryRun: true });
     return { decisions, spawned: decisions.filter((decision) => decision.action === "wake") };
   }
 
-  if (!anyCandidates(config, deps, index.sessions, bgExits)) return { decisions: [], spawned: [], idle: "nothing" };
+  // A bg switch the tick has not recorded yet takes the lock too.
+  const bgSwitched = (bgOff !== undefined) !== (readWakeState().state.bgOffSince !== undefined);
+  if (!bgSwitched && !anyCandidates(index.sessions, bgExits, deps)) return { decisions: [], spawned: [], idle: "nothing" };
 
   return withWakeState((state) => {
     const now = deps.now();
     const host = deps.hostname();
     let dirty = pruneState(state, now, host);
+    if (trackBgSwitch(state, bgOff, now)) dirty = true;
     const tmux = resolveTmux(config, deps);
     if (settleWakes(state, deps, tmux)) dirty = true;
     if (state.lastPruneAt === undefined || now - state.lastPruneAt > LIFECYCLE_PRUNE_EVERY_MS) {
