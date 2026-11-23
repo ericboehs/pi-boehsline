@@ -226,8 +226,12 @@ function store(): Store {
 
 const oneLine = (s: string) => s.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
 
+/** At most n characters, "…" included when cut; never splits a surrogate pair (a lone half breaks Swift's and Ruby's JSON). */
 function cap(s: string, n: number): string {
-	return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+	if (s.length <= n) return s;
+	let head = s.slice(0, n - 1);
+	if (/[\uD800-\uDBFF]$/.test(head)) head = head.slice(0, -1);
+	return `${head}…`;
 }
 
 /** One line, likely inline secrets masked, at most n characters. */
@@ -717,6 +721,7 @@ export function childTask(task: unknown): string {
 
 /** A child's title as the list shows it (trackChild): the given one or one derived from the task (lib/job-title.ts), masked. */
 export function childTitle(title: unknown, task: unknown): string {
+	// jobTitle masks the whole prompt before it cuts; clean masks the title once more.
 	return clean(jobTitle(title, task), 60);
 }
 

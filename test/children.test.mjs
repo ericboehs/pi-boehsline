@@ -162,6 +162,20 @@ test("a title: the caller's (one line, masked, capped), else derived from the ta
 	assert.equal(childTitle(undefined, ""), "", "nothing to go on: empty");
 });
 
+test("a title never shows a bare token, whole or cut", () => {
+	const ghp = `ghp_${"A1b2C3d4E5".repeat(3)}O5p6Q7`;
+	assert.equal(childTitle(undefined, `Use ${ghp}`), "Use •••");
+	assert.ok(!/AKIA|IOSFODNN/.test(childTitle(undefined, "/tmp/wt-AKIAIOSFODNN7EXAMPLE")));
+	const sk = `sk-ant-api03-${"x9Y8z7W6v5".repeat(4)}`;
+	assert.ok(!/sk-ant|x9Y8/.test(childTitle(undefined, `Please call the API with key ${sk} and report`)));
+	assert.ok(!/sk-ant|x9Y8/.test(childTitle(`Use ${sk}`, "t")), "a given title too");
+});
+
+test("a capped string never ends in half an emoji", () => {
+	const row = trackChild({ kind: "pi", agent: "a", task: "😀".repeat(150), title: "🎉".repeat(40), sessionId: "s-e" });
+	for (const s of [one(row.id).task, one(row.id).title]) assert.ok(!JSON.stringify(s).includes("\\ud"), JSON.stringify(s).slice(-20));
+});
+
 test("states: done, failed, stopped; a stop asked always ends stopped", () => {
 	const done = trackChild({ kind: "pi", agent: "a", task: "t", sessionId: "s" });
 	const failed = trackChild({ kind: "pi", agent: "b", task: "t", sessionId: "s" });

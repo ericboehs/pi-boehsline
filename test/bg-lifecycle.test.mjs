@@ -453,6 +453,9 @@ test("bg:start title: on bg:list and bg:jobs, one line and capped, kept across /
   assert.equal(cleanJobTitle("x".repeat(100)).length, 60);
   assert.equal(cleanJobTitle("  \n"), undefined);
   assert.equal(cleanJobTitle(5), undefined);
+  assert.equal(cleanJobTitle(`Use ghp_${"A1b2C3d4E5".repeat(3)}O5p6Q7`), "Use •••", "a bare token, masked before the cut");
+  assert.ok(!/AKIA/.test(cleanJobTitle("/tmp/wt-AKIAIOSFODNN7EXAMPLE")));
+  assert.ok(!JSON.stringify(cleanJobTitle("😀".repeat(70))).includes("\\ud"), "no half emoji");
 
   await h.shutdown("reload");
   h.goStale();

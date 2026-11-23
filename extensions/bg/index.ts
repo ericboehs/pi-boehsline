@@ -652,7 +652,8 @@ export function cleanJobName(raw: unknown): string | undefined {
 
 /**
  * A bg:start caller's short title (a subagent's or Cursor run's, lib/job-title.ts): one line,
- * secret-masked, at most GIVEN_TITLE_MAX. What the canvas jobs feed shows for its row.
+ * secret-masked whole before the cut and again after (cleanTitle), at most GIVEN_TITLE_MAX code
+ * points. What the canvas jobs feed shows for its row.
  */
 export function cleanJobTitle(raw: unknown): string | undefined {
 	const title = cleanTitle(raw);
