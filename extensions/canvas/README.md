@@ -283,8 +283,13 @@ the review prompt — so a renderer never reaches for a page global.
   own timers (session-scheduler's `/once`, `/loop` and tool timers, and a
   durable `/schedule` task whose `createdBySession` is this session's id),
   `"host"` for a durable task that runs on this Mac on its own (one made by
-  another session or by the `pi-scheduler` CLI). Both fields are additive: an
-  older reader ignores them. For example:
+  another session or by the `pi-scheduler` CLI). Every durable task on this
+  Mac is listed, whatever its cwd, so "On this Mac" shows memory-review,
+  kids-grades and the like in every session (session-scheduler timers are
+  this session's alone). `/fork` (and anything else that starts a new session
+  id) leaves a task the parent created behind: in the fork it shows as
+  `"host"`, not `"session"`. Both fields are additive: an older reader ignores
+  them. For example:
 
   ```json
   {

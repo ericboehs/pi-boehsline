@@ -578,7 +578,8 @@ A task added with `/schedule` also records the session that made it
 (`createdBySession`, its id; the `pi-scheduler` CLI sets none). It changes
 nothing about the run: pi-boehsline's canvas jobs feed only uses it to list the
 task under that session (`scope: "session"`) rather than this Mac's
-(`"host"`).
+(`"host"`). The feed lists every durable task, whatever its cwd, in every
+session; after `/fork` the new session id makes the parent's task `"host"`.
 
 `--without` strips pieces back out: `extensions`, `skills`, `templates`,
 `context`, `tools`. `--without tools` makes a run answer-only, worth doing for
