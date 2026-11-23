@@ -155,6 +155,20 @@ change behaviour; each one says what it breaks.
 
 ### Fixed
 
+- `stop` signals a run's child only while the claim's runner is alive and is
+  that pid's parent, with the pid leading its own group (`ps -o ppid=,pgid=`):
+  a crashed runner's leftover `runChildPid`, possibly reused by the OS for an
+  unrelated group leader, is left alone (`its runner is gone`). The SIGTERM is
+  sent before `stopRequestedAt` is written, so a run that had already ended on
+  its own is not reported "stopped" with its failure alert swallowed.
+- `stop --id <id>` matches the exact id only, never a name or an id prefix, so a
+  caller that resolved the task by id can't stop a task named after that id.
+- A run's output log is opened with `O_NOFOLLOW` and chmodded through its fd: a
+  symlink at its path is refused rather than written through. At its 5 MB cap
+  it gets one `[log capped: …]` line, so a live tail shows why it stopped.
+- A task with `runChildPid` or `stopRequestedAt` but no claim (what an older
+  runner's stale-claim takeover can leave) has the two fields dropped on read
+  instead of being quarantined.
 - `/once help`, `/loop help` and the bare-command usage now document `--wake`,
   `--misfire` and the catch-up behaviour they used to deny.
 - `--wake` / `--no-wake` / `--misfire=` are only read as flags in the positions

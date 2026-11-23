@@ -568,3 +568,25 @@ test("run output logs are pruned to the newest few, and go with the task", (t) =
   assert.deepEqual(pruneRuns([]), { removed: 1, failed: [] }, "one task, counted once");
   assert.equal(existsSync(join(dir, "runs", "dead4567")), false, "an orphan's output logs go too");
 });
+
+test("a run's child or stop request left without a claim is dropped on read, not quarantined", (t) => {
+  const dir = withTempDir(t);
+  // What an older runner's releaseTask (a stale-claim takeover) could leave behind.
+  writeFileSync(join(dir, "tasks.json"), JSON.stringify({
+    version: 1,
+    tasks: [task({ runChildPid: 4321, stopRequestedAt: 9 }), task({ id: "bbbb2222", stopRequestedAt: 9 })],
+  }));
+  const read = readRegistry();
+  assert.equal(read.quarantined.length, 0, "the tasks still run");
+  assert.deepEqual(read.tasks.map((stored) => stored.id), ["aaaa1111", "bbbb2222"]);
+  for (const stored of read.tasks) {
+    assert.equal("runChildPid" in stored, false);
+    assert.equal("stopRequestedAt" in stored, false);
+  }
+  // Inside a claim they are still checked: a bad pid there is a torn write.
+  writeFileSync(join(dir, "tasks.json"), JSON.stringify({
+    version: 1,
+    tasks: [{ ...claimTask(task(), 5_000, 1234), runChildPid: 1 }],
+  }));
+  assert.equal(readRegistry().quarantined.length, 1);
+});

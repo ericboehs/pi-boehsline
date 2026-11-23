@@ -375,6 +375,23 @@ export class RegistryUnreadableError extends Error {
  * goes wrong throws. Individual malformed tasks are still dropped rather than
  * failing the whole file, since one bad entry should not strand the others.
  */
+/**
+ * A task's runChildPid and stopRequestedAt without a claim, dropped.
+ *
+ * They mean nothing once the claim is gone, and an older runner's releaseTask
+ * (a stale-claim takeover) can leave them behind. Rejecting the task for them
+ * would quarantine it, and a task that silently stops running is far worse
+ * than two stale bookkeeping fields. The next write persists the cleanup.
+ */
+export function stripOrphanedRunFields(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const task = value as Record<string, unknown>;
+  if (task.runningSince !== undefined) return value;
+  if (!("runChildPid" in task) && !("stopRequestedAt" in task)) return value;
+  const { runChildPid: _child, stopRequestedAt: _stop, ...rest } = task;
+  return rest;
+}
+
 export function readRegistry(): Registry {
   let raw: string;
   try {
@@ -399,8 +416,9 @@ export function readRegistry(): Registry {
   if (!Array.isArray(candidate.tasks)) {
     throw new RegistryUnreadableError("tasks is not an array");
   }
-  const tasks = candidate.tasks.filter(isDurableTask);
-  const quarantined = candidate.tasks.filter((task) => !isDurableTask(task));
+  const entries = candidate.tasks.map(stripOrphanedRunFields);
+  const tasks = entries.filter(isDurableTask);
+  const quarantined = entries.filter((task) => !isDurableTask(task));
   if (quarantined.length > 0) {
     // Kept, not dropped — but still worth saying, because they are inert and
     // the user is presumably wondering where their task went.
