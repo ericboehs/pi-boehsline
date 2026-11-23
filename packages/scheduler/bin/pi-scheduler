@@ -87,6 +87,7 @@ import {
 } from "../extensions/lib/task-registry.ts";
 import { piArgsFor, runTask } from "../extensions/lib/runner.ts";
 import {
+  absolutePath,
   bgStateDir,
   bgWakeOff,
   defaultWakeDeps,
@@ -671,9 +672,12 @@ function commandRemove(selector) {
  * looks exactly like a scheduler that silently does nothing.
  *
  * Reinstall after moving node, pi or mise, or after changing these.
+ *
+ * Only PATH's absolute entries: a relative one (`.git/safe/../../bin`) would
+ * resolve against whatever cwd the service runs in.
  */
 function serviceEnv() {
-  const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: homedir() };
+  const env = { PATH: absolutePath(process.env.PATH) || "/usr/bin:/bin", HOME: homedir() };
   // The rest only when set. TMUX_TMPDIR so the wake phase talks to the same
   // tmux server you do, not a second one; the bg dirs and PI_BG_WAKE so a bg
   // wake reads the registry, and honours the setting, that pi does;

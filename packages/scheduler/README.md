@@ -333,6 +333,11 @@ tmux new-window -d -t pi-wake: -n wake:<id8> -c <cwd> -e PATH=<service PATH> \
 tmux set-option -w -t <window> @pi-session <session id>
 ```
 
+When the tick creates the `pi-wake` session (or a named `tmuxTarget`) itself,
+tmux gives it a shell window of its own; the tick closes that once the wake
+window is in, so no idle shell lingers there. A session that already existed is
+left as it is.
+
 Argv form only, never a shell string, and never a session id. `wake-exec`
 checks again under the per-session lock, right before starting pi, that the
 session is not live, the file exists, its header names this session, its cwd
@@ -439,6 +444,9 @@ exception: when a woken pi exits nonzero, the last 20 lines of its stderr go to
 - `install` captures `TMUX_TMPDIR`, `XDG_STATE_HOME`, the `PI_BG_*` dirs,
   `PI_BG_WAKE` and `PI_SCHEDULER_WAKE_BG` along with PATH, so the tick talks to
   your tmux server and reads your bg registry. Reinstall after changing them.
+  Only PATH's absolute entries go into the plist or unit (and a woken window's
+  `-e PATH`): a relative one such as `.git/safe/../../bin` would resolve against
+  whatever cwd the service runs in.
 
 ## Durable tasks: `/schedule`
 

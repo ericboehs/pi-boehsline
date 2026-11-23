@@ -449,10 +449,21 @@ export function resolvePi(config: WakeConfig, deps: WakeDeps): string | undefine
   return executable(wrapper) ? wrapper : which("pi", deps.env.PATH);
 }
 
+/**
+ * A PATH with only its absolute entries, in order, without repeats. A
+ * relative entry (`.git/safe/../../bin`, `node_modules/.bin`) resolves against
+ * whatever cwd the process has, which under a service or in a woken window is
+ * nobody's project.
+ */
+export function absolutePath(path: string | undefined): string {
+  const parts = (path ?? "").split(delimiter).filter((part) => part && isAbsolute(part));
+  return [...new Set(parts)].join(delimiter);
+}
+
 /** PATH for a woken window: the service's, with this node's directory first so the pi wrapper's `exec node` resolves. */
 export function windowPath(deps: WakeDeps): string {
   const nodeDir = dirname(deps.node);
-  const parts = (deps.env.PATH ?? "/usr/bin:/bin").split(delimiter).filter(Boolean);
+  const parts = (absolutePath(deps.env.PATH) || "/usr/bin:/bin").split(delimiter);
   return [nodeDir, ...parts.filter((part) => part !== nodeDir)].join(delimiter);
 }
 
@@ -591,8 +602,18 @@ export function tmuxServerInfo(tmux: string | undefined, deps: WakeDeps): { pid?
   return { pid: Number(pid), ...(pri ? { pri } : {}), ...(nice ? { nice } : {}) };
 }
 
-/** The session to open the window in, created when it does not exist. */
-export function ensureTarget(config: WakeConfig, tmux: string, deps: WakeDeps): { target?: string; error?: string } {
+/**
+ * The session to open the window in, created when it does not exist.
+ *
+ * A new session comes with a window running a shell nobody asked for; its id
+ * comes back as `placeholder`, for the caller to close once the wake window
+ * is open, so no idle shell lingers in `pi-wake`.
+ */
+export function ensureTarget(
+  config: WakeConfig,
+  tmux: string,
+  deps: WakeDeps,
+): { target?: string; placeholder?: string; error?: string } {
   let name = config.tmuxTarget;
   if (name === "attached") {
     const listed = deps.run(tmux, ["list-sessions", "-F", "#{session_attached}\t#{session_name}"]);
@@ -606,7 +627,10 @@ export function ensureTarget(config: WakeConfig, tmux: string, deps: WakeDeps): 
   const created = createSession(name, tmux, deps);
   if (!created.ok) return { error: `could not create tmux session ${name}: ${created.error ?? "unknown"}` };
   appendWakeLog("tmux-session", undefined, { name, how: created.how }, deps.now());
-  return { target: name };
+  const listed = deps.run(tmux, ["list-windows", "-t", `=${name}`, "-F", "#{window_id}"]);
+  const ids = listed.status === 0 ? listed.stdout.split("\n").filter(Boolean) : [];
+  const placeholder = ids.length === 1 && /^@\d+$/.test(ids[0] as string) ? ids[0] : undefined;
+  return { target: name, ...(placeholder ? { placeholder } : {}) };
 }
 
 /**
@@ -1261,6 +1285,11 @@ function spawnWake(decision: WakeDecision, state: WakeState, config: WakeConfig,
   const now = deps.now();
   const host = deps.hostname();
   const target = ensureTarget(config, tmux, deps);
+  // The new session's own shell window: closed once the wake window is in, or
+  // the attempt failed, so pi-wake never keeps an idle shell around.
+  const dropPlaceholder = () => {
+    if (target.placeholder) deps.run(tmux, ["kill-window", "-t", target.placeholder]);
+  };
   if (!target.target) {
     appendWakeLog("spawn-failed", decision.sessionId, { why: "tmux-target" }, now);
     return false;
@@ -1282,6 +1311,7 @@ function spawnWake(decision: WakeDecision, state: WakeState, config: WakeConfig,
   writeWakeState(state);
 
   const result = deps.run(tmux, newWindowArgs(target.target, wake, deps));
+  dropPlaceholder();
   if (result.status !== 0 || result.error) {
     delete state.wakes[wake.wakeId];
     state.ledger.pop();

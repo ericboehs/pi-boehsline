@@ -23,6 +23,7 @@ import {
   REBOOT_WINDOW_MS,
   SETTLE_MS,
   STUCK_MS,
+  absolutePath,
   appendWakeLog,
   classifyClose,
   readWakeState,
@@ -147,6 +148,10 @@ function machine({
         return { status: 0, stdout: `${tmuxVersion}\n`, stderr: "" };
       case "list-windows":
         if (!tmux.serverRunning) return { status: 1, stdout: "", stderr: "no server running on /tmp/tmux-501/default\n" };
+        if (args.includes("-t")) {
+          const name = args[args.indexOf("-t") + 1].replace(/^=/, "");
+          return { status: 0, stdout: tmux.windows.filter((w) => w.session === name).map((w) => `${w.id}\n`).join(""), stderr: "" };
+        }
         return {
           status: 0,
           stdout: tmux.windows.map((w) => `${w.id}\t${w.piSession}\t${w.paneDead ? 1 : 0}\n`).join(""),
@@ -159,14 +164,23 @@ function machine({
         const name = args[args.indexOf("-t") + 1].replace(/^=/, "");
         return { status: tmux.serverRunning && tmux.sessions.has(name) ? 0 : 1, stdout: "", stderr: "" };
       }
-      case "new-session":
+      case "new-session": {
+        // Like tmux: a new session comes with a window running a shell.
+        const name = args[args.indexOf("-s") + 1];
         tmux.serverRunning = true;
-        tmux.sessions.add(args[args.indexOf("-s") + 1]);
+        tmux.sessions.add(name);
+        tmux.windows.push({ id: `@${tmux.next++}`, session: name, piSession: "", paneDead: false });
         return { status: 0, stdout: "", stderr: "" };
+      }
       case "new-window": {
         const id = `@${tmux.next++}`;
-        tmux.windows.push({ id, piSession: "", paneDead: false });
+        tmux.windows.push({ id, session: args[args.indexOf("-t") + 1].replace(/:$/, ""), piSession: "", paneDead: false });
         return { status: 0, stdout: `${id}\n`, stderr: "" };
+      }
+      case "kill-window": {
+        const id = args[args.indexOf("-t") + 1];
+        tmux.windows = tmux.windows.filter((w) => w.id !== id);
+        return { status: 0, stdout: "", stderr: "" };
       }
       case "set-option": {
         const window = tmux.windows.find((w) => w.id === args[args.indexOf("-t") + 1]);
@@ -261,7 +275,8 @@ test("the spawn is argv form with absolute paths, -e PATH and the wake id, and t
   assert.ok(!args.slice(args.indexOf("--") + 1).includes(session.id), "never the session id");
 
   const tag = m.calls.find((c) => c[0] === TMUX && c[1] === "set-option" && c.includes("@pi-session"));
-  assert.deepEqual(tag.slice(1), ["set-option", "-w", "-t", "@1", "@pi-session", session.id]);
+  // @1 is the new pi-wake session's own shell window; the wake window is @2.
+  assert.deepEqual(tag.slice(1), ["set-option", "-w", "-t", "@2", "@pi-session", session.id]);
 });
 
 // ── liveness ──
@@ -653,7 +668,9 @@ test("a pane alive but never live after 10 minutes is stuck: a failure, and neve
   assert.ok(NOW + 11 * MIN - NOW >= STUCK_MS);
   assert.equal(state().wakes[wake.wakeId], undefined);
   assert.match(log(), /reason=stuck/);
-  assert.ok(!m.calls.some((c) => c[1] === "kill-window" || c[1] === "kill-pane"), "never killed");
+  // The only kill is the new pi-wake session's placeholder shell, never the wake's window.
+  assert.ok(!m.calls.some((c) => (c[1] === "kill-window" || c[1] === "kill-pane") && c.includes(wake.window)), "never killed");
+  assert.ok(m.tmux.windows.some((w) => w.id === wake.window));
   // Its window is still there, so the next tick will not open a second.
   const result = runWakePhase(m.deps);
   assert.equal(result.decisions[0]?.reason, "window-exists");
@@ -878,6 +895,43 @@ test("the pi-wake session is created when missing: through launchctl asuser + ta
   assert.deepEqual(asuser.slice(asuser.indexOf(TMUX) + 1, asuser.indexOf(TMUX) + 5), ["new-session", "-d", "-s", "pi-wake"]);
   assert.ok(m.calls.some((c) => c[0] === "/usr/sbin/taskpolicy" && c[1] === "-B" && c[3] === "4242"), "moved out of the background band");
   assert.equal(m.newWindows().length, 1);
+});
+
+test("a pi-wake session the tick creates keeps no idle shell window; an existing one is left alone", () => {
+  fresh();
+  const { session, entry } = crashedWithTimer();
+  writeIndex({ [session.id]: entry });
+  const m = machine({ serverRunning: false, sessions: [] });
+  runWakePhase(m.deps);
+  const inWake = m.tmux.windows.filter((w) => w.session === "pi-wake");
+  assert.deepEqual(inWake.map((w) => w.piSession), [session.id], "only the wake window is left");
+  const kill = m.calls.find((c) => c[0] === TMUX && c[1] === "kill-window");
+  const newWindowAt = m.calls.findIndex((c) => c[0] === TMUX && c[1] === "new-window");
+  assert.ok(m.calls.indexOf(kill) > newWindowAt, "closed only once the wake window is in, so the session never empties");
+
+  // pi-wake already there, with whatever you left in it: nothing is killed.
+  fresh();
+  const again = crashedWithTimer();
+  writeIndex({ [again.session.id]: again.entry });
+  const existing = machine({ sessions: ["pi-wake"] });
+  existing.tmux.windows.push({ id: "@99", session: "pi-wake", piSession: "", paneDead: false });
+  existing.tmux.next = 100;
+  runWakePhase(existing.deps);
+  assert.ok(!existing.calls.some((c) => c[0] === TMUX && c[1] === "kill-window"));
+  assert.ok(existing.tmux.windows.some((w) => w.id === "@99"));
+});
+
+test("absolutePath drops relative PATH entries and repeats, for the service files and woken windows", () => {
+  assert.equal(absolutePath(".git/safe/../../bin:/usr/bin:bin::/bin:/usr/bin:node_modules/.bin"), "/usr/bin:/bin");
+  assert.equal(absolutePath(undefined), "");
+  fresh();
+  const { session, entry } = crashedWithTimer();
+  writeIndex({ [session.id]: entry });
+  const m = machine({ env: { PATH: ".git/safe/../../bin:/opt/homebrew/bin:/usr/bin" } });
+  runWakePhase(m.deps);
+  const [call] = m.newWindows();
+  const path = call.find((arg) => arg.startsWith("PATH="));
+  assert.equal(path, "PATH=/abs/bin:/opt/homebrew/bin:/usr/bin");
 });
 
 test("on Linux the server is started in its own systemd scope", (t) => {
