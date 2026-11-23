@@ -15,7 +15,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { chmodSync, closeSync, mkdirSync, openSync, statSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, fchmodSync, mkdirSync, openSync, statSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 
@@ -222,30 +222,59 @@ function capture(
 }
 
 /** Past this a run's output log stops growing (the in-memory capture is capped too). */
-const MAX_RUN_LOG_FILE = 5_000_000;
+export const MAX_RUN_LOG_FILE = 5_000_000;
+
+/** Written once when the log reaches its cap, so a live tail shows why it stopped moving. */
+export const RUN_LOG_CAPPED_MARKER = "\n[log capped: the run is still going, but its output is no longer written here]\n";
 
 /**
  * A run's output log: private (0600, in a 0700 directory), appended as chunks
  * arrive, capped. Best-effort: a log that can't be opened or written never
  * fails the run, it just isn't there to tail.
+ *
+ * Opened with O_NOFOLLOW and chmodded through the fd: a symlink planted at the
+ * path is refused rather than followed, so neither the output nor the mode
+ * change lands on its target. At the cap the log gets one marker line.
  */
-function openRunLog(path: string | undefined): { write: (chunk: Buffer) => void; close: () => void } {
+export function openRunLog(
+  path: string | undefined,
+  maxBytes = MAX_RUN_LOG_FILE,
+): { write: (chunk: Buffer) => void; close: () => void } {
   let fd: number | undefined;
   let written = 0;
+  let capped = false;
   if (path) {
     try {
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-      fd = openSync(path, "a", 0o600);
-      chmodSync(path, 0o600);
+      fd = openSync(
+        path,
+        fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      fchmodSync(fd, 0o600);
     } catch {
+      if (fd !== undefined) {
+        try {
+          closeSync(fd);
+        } catch {
+          // Best-effort.
+        }
+      }
       fd = undefined;
     }
   }
   return {
     write(chunk) {
-      if (fd === undefined || written >= MAX_RUN_LOG_FILE) return;
+      if (fd === undefined || capped) return;
       try {
-        written += writeSync(fd, chunk);
+        const room = maxBytes - written;
+        if (chunk.length <= room) {
+          written += writeSync(fd, chunk);
+          return;
+        }
+        if (room > 0) written += writeSync(fd, chunk.subarray(0, room));
+        capped = true;
+        writeSync(fd, RUN_LOG_CAPPED_MARKER);
       } catch {
         // Best-effort.
       }

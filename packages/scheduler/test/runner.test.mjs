@@ -8,11 +8,11 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-const { runTask } = await import("../extensions/lib/runner.ts");
+const { runTask, openRunLog, RUN_LOG_CAPPED_MARKER } = await import("../extensions/lib/runner.ts");
 
 function withTempDir(t) {
   const dir = mkdtempSync(join(tmpdir(), "pi-sched-run-"));
@@ -361,4 +361,34 @@ test("a run that `stop` ended is stopped, not an error, and pages nobody", async
 
   const failed = await runTask(task(dir, { deliver }), { piBin, alertOnFailure: true, wasStopped: () => false });
   assert.equal(failed.status, "error", "the same exit without a stop is still a failure");
+});
+
+test("a run log refuses a symlink at its path: nothing goes through it, its target's mode is untouched", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-sched-log-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const target = join(dir, "elsewhere");
+  writeFileSync(target, "keep\n");
+  chmodSync(target, 0o644);
+  mkdirSync(join(dir, "runs", "aaaa1111"), { recursive: true });
+  const path = join(dir, "runs", "aaaa1111", "5000.log");
+  symlinkSync(target, path);
+  const log = openRunLog(path);
+  log.write(Buffer.from("run output\n"));
+  log.close();
+  assert.equal(readFileSync(target, "utf8"), "keep\n");
+  assert.equal(statSync(target).mode & 0o777, 0o644);
+  assert.ok(lstatSync(path).isSymbolicLink());
+});
+
+test("a run log that reaches its cap says so once, so a live tail shows why it stopped moving", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-sched-log-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "runs", "aaaa1111", "5000.log");
+  const log = openRunLog(path, 10);
+  log.write(Buffer.from("123456"));
+  log.write(Buffer.from("789abc"));
+  log.write(Buffer.from("more"));
+  log.close();
+  assert.equal(readFileSync(path, "utf8"), `123456789a${RUN_LOG_CAPPED_MARKER}`);
+  assert.equal(statSync(path).mode & 0o777, 0o600);
 });
