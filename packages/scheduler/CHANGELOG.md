@@ -158,6 +158,29 @@ change behaviour; each one says what it breaks.
   persist and every fire. Taking a stale lock is a rename now, so two waiters
   cannot both decide it is stale and one delete the other's fresh lock. Pruning
   makes at most four `ps` calls per write.
+- **A closed tmux window no longer reopens later.** A SIGHUP/SIGTERM close was
+  judged on every tick by probing the tmux server then, so a `kill-window`
+  (skipped as `user-closed`) was woken as `tmux-gone` once that server died
+  for another reason, or because it was the last window and tmux exited. The
+  closing pi now watches its server for up to 300 ms and records
+  `closeVerdict` (`user` | `tmux-gone`) and `decidedAt` in the lifecycle
+  record; the tick never probes the server to judge a close. `tmux-gone` is no
+  longer crash-class: closing the last window looks exactly like
+  `kill-server`, a tmux crash or a logout, so none of them wake (`always`
+  timers still do). A reboot counts only within an hour after the close, and
+  never when the server outlived it.
+- **`wake bg on` no longer reopens jobs that finished while bg wakes were
+  off.** It stamps `bgOnSince` in `wake.json` (when they were off), and the
+  tick records its own `bgOffSince`/`bgOnSince` for switches only it sees
+  (`PI_SCHEDULER_WAKE_BG=0`, `PI_BG_WAKE`); exits at or before that stay
+  quiet. A bg job that would have woken its session while bg wakes are off is
+  logged once per job as `skip … reason=bg-off`, and shown by `wake run
+  --dry-run`.
+- A `pi-wake` session the tick creates no longer keeps its idle shell window:
+  it is closed once the wake window is in.
+- `install` writes only PATH's absolute entries into the launchd plist and the
+  systemd unit (a shell's `.git/safe/../../bin` used to be copied in), and a
+  woken window's `-e PATH` drops relative entries too.
 
 
 ## [0.2.0] — 2026-08-24
