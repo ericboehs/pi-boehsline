@@ -48,6 +48,8 @@ export interface BgStartRequest {
 	ctx: unknown;
 	name: string;
 	summary: string;
+	/** A short title for the job's row (lib/job-title.ts), on bg:jobs and the canvas jobs feed. */
+	title?: string;
 	tailLines: number;
 	tailMaxChars: number;
 	/** The job writes `<log>.details.json` (PI_BG_LOG) for its completion message. */
@@ -72,7 +74,7 @@ const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 export async function startJob(
 	events: { emit(channel: string, data: unknown): void },
 	spec: RunSpec,
-	job: { ctx: unknown; name: string; summary: string; meta?: Record<string, string | number | boolean | null> },
+	job: { ctx: unknown; name: string; summary: string; title?: string; meta?: Record<string, string | number | boolean | null> },
 ): Promise<BgReply | null> {
 	const dir = mkdtempSync(join(tmpdir(), "pi-cursor-"));
 	const specPath = join(dir, "spec.json");
@@ -85,6 +87,7 @@ export async function startJob(
 			ctx: job.ctx,
 			name: job.name,
 			summary: job.summary,
+			...(job.title ? { title: job.title } : {}),
 			tailLines: 1000,
 			tailMaxChars: WAKE_CHARS,
 			details: true,

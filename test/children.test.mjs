@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { after, beforeEach, test } from "node:test";
 import {
 	bindChildren,
+	childTitle,
 	childTranscript,
 	cursorCall,
 	cursorLabel,
@@ -148,6 +149,17 @@ test("a task is its first 200 characters, masked, on one line", () => {
 	const { task } = one(c.id);
 	assert.equal(task.length, 200);
 	assert.match(task, /^Use password=••• then y+…$/);
+});
+
+test("a title: the caller's (one line, masked, capped), else derived from the task, which stays whole", () => {
+	const given = trackChild({ kind: "pi", agent: "worker", task: "First `cd ~/tmp/wt-a-b` and go", title: "Rotate\n password=hunter2", sessionId: "s-t" });
+	assert.equal(one(given.id).title, "Rotate password=•••");
+	const derived = trackChild({ kind: "cursor", agent: "cursor", task: "First `cd ~/tmp/wt-worklog-after-text` (Botsun worktree). Fix it.", sessionId: "s-t" });
+	assert.equal(one(derived.id).title, "Worklog after text");
+	assert.match(one(derived.id).task, /^First `cd ~\/tmp\/wt-worklog-after-text`/, "the task is still the prompt");
+	const long = trackChild({ kind: "pi", agent: "a", task: "t", title: "w ".repeat(60), sessionId: "s-t" });
+	assert.ok(one(long.id).title.length <= 60);
+	assert.equal(childTitle(undefined, ""), "", "nothing to go on: empty");
 });
 
 test("states: done, failed, stopped; a stop asked always ends stopped", () => {

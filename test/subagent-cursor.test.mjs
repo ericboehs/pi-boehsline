@@ -341,7 +341,7 @@ test("background end to end through the real bg extension: the wake carries the 
 	cursorRuns();
 });
 
-test("background completion details name the tracked child: kind, child_id, agent, task, model", async () => {
+test("background completion details name the tracked child: kind, child_id, agent, task, title, model", async () => {
 	const { listChildren, resetChildren } = await import("../lib/children.ts");
 	resetChildren();
 	const h = mount();
@@ -371,7 +371,7 @@ test("background completion details name the tracked child: kind, child_id, agen
 	assert.match(piKid.id, /^p-[0-9a-f]{10}$/);
 	assert.deepEqual(
 		{ ...pi, seconds: 0 },
-		{ id: piJob, v: 1, kind: "subagent", name: "sa:scout", named: true, status: "succeeded", exit_code: 0, seconds: 0, cwd: repo, child_id: piKid.id, agent: "scout", task: piKid.task, model: "anthropic/claude-x" },
+		{ id: piJob, v: 1, kind: "subagent", name: "sa:scout", named: true, status: "succeeded", exit_code: 0, seconds: 0, cwd: repo, child_id: piKid.id, agent: "scout", task: piKid.task, title: "Map the repo and every module in it…", model: "anthropic/claude-x" },
 	);
 	assert.ok(Number.isInteger(pi.seconds) && pi.seconds >= 0);
 	assert.equal(pi.task.length, 200, "capped as the list caps it");
@@ -383,6 +383,8 @@ test("background completion details name the tracked child: kind, child_id, agen
 	assert.equal(cursor.child_id, cursorKid.id);
 	assert.equal(cursor.agent, "cursor");
 	assert.equal(cursor.task, cursorKid.task);
+	assert.deepEqual([cursor.title, cursorKid.title], ["Fix the bug", "Fix the bug"], "the details' title is the list's");
+	assert.equal(pi.title, piKid.title);
 	assert.equal(cursor.model, "composer-2");
 	assert.equal(cursor.status, "succeeded");
 	assert.equal(cursor.v, 1);

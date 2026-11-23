@@ -713,7 +713,7 @@ export function streamable(command: string): boolean {
 }
 
 /** A job as bg.ts reports it on `bg:jobs`. */
-export type BgJob = { id: string; name: string; command: string; cwd?: string; logPath: string; startedAt: number; endedAt?: number; exitCode?: number | null; signal?: string | null; killedByUser?: boolean };
+export type BgJob = { id: string; name: string; title?: string; command: string; cwd?: string; logPath: string; startedAt: number; endedAt?: number; exitCode?: number | null; signal?: string | null; killedByUser?: boolean };
 
 // eslint-disable-next-line no-control-regex
 const ANSI = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g;
@@ -847,6 +847,8 @@ export function jobsSpec(jobs: BgJob[], read: (path: string) => string | null, l
       return {
         id: j.id,
         name: j.name,
+        // A subagent's or Cursor run's short title (bg:start's title), for its row; a plain bash job has none.
+        ...(typeof j.title === "string" && j.title ? { title: j.title } : {}),
         command: j.command.replace(/\s+/g, " ").trim().slice(0, 300),
         log: j.logPath,
         started: iso(j.startedAt),

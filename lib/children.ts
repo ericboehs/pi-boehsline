@@ -32,6 +32,7 @@
 import { randomBytes } from "node:crypto";
 import { closeSync, openSync, readSync, rmSync } from "node:fs";
 import { maskSecrets } from "../extensions/opt-in/op-broker/broker.ts";
+import { jobTitle } from "./job-title.ts";
 import { commandRunsCursorRunner, type CursorDiffInfo, type CursorEditArg, maskDiffSecrets, readJobDetails, trustCursorDiff, trustEdit } from "./cursor-diff.ts";
 
 export type ChildKind = "pi" | "cursor";
@@ -59,6 +60,8 @@ export interface ChildInfo {
 	agent: string;
 	/** The first 200 characters, likely secrets masked. */
 	task: string;
+	/** A short title for its row (lib/job-title.ts): the caller's, else derived from the task. Masked. */
+	title: string;
 	model?: string;
 	state: ChildState;
 	startedAt: number;
@@ -654,6 +657,8 @@ export interface ChildStart {
 	id?: string;
 	agent: string;
 	task: string;
+	/** A short title the caller gave (the subagent or cursor tool's `title`); derived from the task when absent. */
+	title?: string;
 	model?: string;
 	/** The context window of its model (modelWindow), when known. */
 	window?: number;
@@ -710,6 +715,11 @@ export function childTask(task: unknown): string {
 	return clean(task, TASK_MAX);
 }
 
+/** A child's title as the list shows it (trackChild): the given one or one derived from the task (lib/job-title.ts), masked. */
+export function childTitle(title: unknown, task: unknown): string {
+	return clean(jobTitle(title, task), 60);
+}
+
 /** An id a child will have, minted ahead of trackChild (Botsun validates the shape). */
 const CHILD_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
@@ -733,6 +743,7 @@ export function trackChild(start: ChildStart): ChildHandle {
 		kind: start.kind,
 		agent: childAgent(start.agent),
 		task: childTask(start.task),
+		title: childTitle(start.title, start.task),
 		...(start.model ? { model: clean(start.model, 80) } : {}),
 		...(start.window ? { window: start.window } : {}),
 		state: "running",

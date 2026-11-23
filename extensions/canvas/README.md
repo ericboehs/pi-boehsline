@@ -275,6 +275,33 @@ the review prompt — so a renderer never reaches for a page global.
   count, no "new" dot, and its 2 s rewrites don't reload the page (the daemon
   leaves it out of `/api/s/<id>` and ignores changes to its body; the page
   also drops it if an embedding host passes it through).
+  The body is `{ jobs: [...], scheduled: [...] }`. A job started through
+  `bg:start` with a `title` (a subagent's or Cursor run's 3-5 word title, or
+  one derived from its prompt by `lib/job-title.ts`) has `title` beside its
+  `name`, for the row; a plain `bash` job has none, and `command` is
+  unchanged. Each scheduled task has `scope`: `"session"` for this session's
+  own timers (session-scheduler's `/once`, `/loop` and tool timers, and a
+  durable `/schedule` task whose `createdBySession` is this session's id),
+  `"host"` for a durable task that runs on this Mac on its own (one made by
+  another session or by the `pi-scheduler` CLI). Both fields are additive: an
+  older reader ignores them. For example:
+
+  ```json
+  {
+    "jobs": [
+      { "id": "a1b2c3", "name": "sa:worker", "title": "Work log order", "command": "PI_SUBAGENT_CHILD=1 … 'Task: First `cd ~/tmp/wt-worklog-after-text` …'",
+        "log": "/tmp/pi-bg-501/a1b2c3.log", "started": "2026-11-22T15:04:05.000Z", "ended": null, "exit": null,
+        "signal": null, "stopped": false, "tail": "· turn 3 · read lib/foo.rb", "hidden": false }
+    ],
+    "scheduled": [
+      { "id": "t1", "name": "check CI", "kind": "interval", "every": "every 5m", "next": "2026-11-22T15:10:00.000Z",
+        "last": null, "status": "armed", "source": "agent", "scope": "session" },
+      { "id": "d1", "name": "memory-review", "kind": "daily", "every": "daily 09:00", "next": "2026-11-23T09:00:00.000Z",
+        "last": "2026-11-22T09:00:00.000Z", "status": "ok", "source": "durable", "scope": "host" }
+    ]
+  }
+  ```
+
   `PI_CANVAS_SHOW_JOBS=1` in the daemon's environment (it inherits
   `PI_CANVAS_*` from the pi that starts it; restart the daemon) draws it again,
   as below. Drawn, it sits at the top of the side panel, above Tasks. Each job is

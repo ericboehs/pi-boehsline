@@ -1114,6 +1114,10 @@ test("Background jobs: log tails and the card spec", () => {
   assert.deepEqual([d2.tail, d2.hidden, d2.stopped, d2.exit], [null, true, true, 1], "a secret-printing command never shows its log");
   assert.deepEqual([d1.exit, d1.ended, d1.log], [0, "1970-01-01T00:00:05.000Z", "/t/b.log"]);
   assert.equal(jobsSpec([{ id: "x", name: "x", command: "x", logPath: "/gone.log", startedAt: 0 }], read).jobs[0].tail, null, "an unreadable log");
+  assert.equal("title" in r1, false, "a plain bash job: no title field");
+  const titled = jobsSpec([{ id: "sa", name: "sa:worker", title: "Work log order", command: "PI_SUBAGENT_CHILD=1 pi ... 'Task: First `cd ~/tmp/wt-x`'", logPath: "/t/a.log", startedAt: 0 }], read).jobs[0];
+  assert.deepEqual([titled.name, titled.title], ["sa:worker", "Work log order"], "a subagent's title beside its name; the command stays");
+  assert.match(titled.command, /Task: First/);
 });
 
 test("Scheduled: session views keep only the contract's fields", () => {

@@ -1794,13 +1794,15 @@ export const SUBAGENTS_EVERY_MS = 1_000;
 
 /** One child as Botsun takes it (snake_case). `context` and `window` are what the phone's
  * context bar needs: absent when the child hasn't said (a Cursor run, a pi child whose model pi
- * doesn't know), so an older phone reads the line as before. */
+ * doesn't know), so an older phone reads the line as before. `title` is the row's short name
+ * (lib/job-title.ts: the caller's, else derived from the task); `task` stays the prompt. */
 function childWire(k: ChildInfo, tail: number, text: number): Record<string, unknown> {
 	return {
 		id: k.id,
 		kind: k.kind,
 		agent: k.agent,
 		task: k.task,
+		...(k.title ? { title: k.title } : {}),
 		...(k.model ? { model: k.model } : {}),
 		state: k.state,
 		started_at: k.startedAt,
