@@ -38,7 +38,8 @@ test("only task-registry.ts writes the fields that make up a claim", () => {
   // as a set. A consumer that hand-rolls two of the three writes a claim that
   // looks valid and behaves wrongly — which is exactly how `/schedule run`
   // ended up unable to recover a dead runner while the CLI could.
-  const assignment = /\b(?:runningSince|runnerPid|runnerHost)\s*[:=](?!=)/;
+  // runChildPid (recordRunChild) and stopRequestedAt (requestStop) are part of the claim too.
+  const assignment = /\b(?:runningSince|runnerPid|runnerHost|runChildPid|stopRequestedAt)\s*[:=](?!=)/;
   for (const path of CONSUMERS) {
     const offenders = offendingLines(read(path), assignment);
     assert.deepEqual(

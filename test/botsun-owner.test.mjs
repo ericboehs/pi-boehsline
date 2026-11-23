@@ -3781,6 +3781,42 @@ test("stop_child: Eric's phone, signed v2, stops only this session's child", asy
 	kids.resetChildren();
 });
 
+test("stop_job: Eric's phone, signed v2, stops only this session's bg job, through bg:kill", async () => {
+	const decide = phoneKey();
+	writeFileSync(keysFile, JSON.stringify({ devices: { 7: decide.raw.toString("base64") } }));
+	chmodSync(keysFile, 0o600);
+	const m = await owner();
+	// bg.ts's side, as it answers them.
+	const jobs = [{ id: "a1b2c3", command: "sleep 99" }, { id: "dddddd", command: "true", endedAt: 5 }];
+	const kills = [];
+	m.pi.events.on("bg:list", (d) => d.reply(jobs.map((j) => ({ ...j }))));
+	m.pi.events.on("bg:kill", (req) => { req.accepted = true; kills.push({ id: req.id, wake: req.wake }); req.reply({ killed: true }); });
+	const stop = async (id, { key = decide, signedId = id } = {}) => {
+		const { nonce, features } = await ask({ type: "nonce" });
+		assert.ok(features.includes("jobs"));
+		return ask({ type: "stop_job", job_id: id, nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "stop_job", `stop_job\n${signedId}`) });
+	};
+	assert.equal((await stop("a1b2c3", { key: phoneKey() })).error, "signature does not verify");
+	const { nonce: n1 } = await ask({ type: "nonce" });
+	const digest = createHash("sha256").update("stop_job\na1b2c3", "utf8").digest("hex");
+	const msg = ["botsun-decide-v1", "7", n1, "session", "sid-a", "stop_job", digest].join("\n");
+	const v1 = { type: "stop_job", job_id: "a1b2c3", nonce: n1, device_id: 7, signature: cryptoSign("sha256", Buffer.from(msg), { key: decide.privateKey, dsaEncoding: "der" }).toString("base64") };
+	assert.match((await ask(v1)).error ?? "", /^stop_job needs a v2 signature/);
+	assert.equal((await stop("a1b2c3", { signedId: "eeeeee" })).error, "signature does not verify", "signed for another job");
+	assert.equal((await stop("eeeeee")).error, "no such job in this session");
+	assert.equal((await stop("..")).error, "bad request", "never a path's folder");
+	assert.equal((await ask({ type: "stop_job", job_id: "a1b2c3" })).error, "bad request", "unsigned");
+	assert.deepEqual(kills, []);
+	assert.deepEqual(await stop("dddddd"), { ok: true, stopped: false }, "already ended: not an error, nothing killed");
+	assert.deepEqual(kills, []);
+	assert.deepEqual(await stop("a1b2c3"), { ok: true, stopped: true });
+	assert.deepEqual(kills, [{ id: "a1b2c3", wake: true }], "the model hears it was killed");
+	const { nonce } = await ask({ type: "nonce" });
+	const sig = signV2(decide, nonce, "session", "stop_job", "stop_job\na1b2c3");
+	await ask({ type: "stop_job", job_id: "a1b2c3", nonce, device_id: 7, sig_v: 2, signature: sig });
+	assert.equal((await ask({ type: "stop_job", job_id: "a1b2c3", nonce, device_id: 7, sig_v: 2, signature: sig })).error, "nonce is expired or used", "one try per nonce");
+});
+
 test("child_transcript: a page of this session's subagent's conversation, unsigned, never another session's", async () => {
 	kids.resetChildren();
 	await owner();

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -44,8 +44,13 @@ const {
   pruneRuns,
   readRegistry,
   readRuns,
+  recordRunChild,
   registryPath,
   releaseTask,
+  requestStop,
+  runLogPath,
+  pruneRunLogs,
+  stopRequested,
   selectDue,
   settleRun,
   truncate,
@@ -500,4 +505,66 @@ test("a claim carrying an unknown host is valid, not quarantined", () => {
   // as corruption and park the task.
   assert.equal(isDurableTask({ ...task(), runningSince: 1, runnerPid: 2, runnerHost: "other" }), true);
   assert.equal(isDurableTask({ ...task(), runningSince: 1, runnerPid: 2, runnerHost: 7 }), false);
+});
+
+test("a run's child and a stop request live only inside a claim, and releasing clears both", () => {
+  const claimed = claimTask(task(), 5_000, 1234);
+  assert.equal(isDurableTask({ ...claimed, runChildPid: 4321 }), true);
+  assert.equal(isDurableTask({ ...task(), runChildPid: 4321 }), false, "a child without a claim is a torn write");
+  assert.equal(isDurableTask({ ...claimed, runChildPid: 1 }), false, "never pid 1 (or -1, every process)");
+  assert.equal(isDurableTask({ ...claimed, runChildPid: "4321" }), false);
+  assert.equal(isDurableTask({ ...task(), stopRequestedAt: 9 }), false);
+  const stopping = requestStop({ ...claimed, runChildPid: 4321 }, 6_000);
+  assert.equal(stopping.stopRequestedAt, 6_000);
+  const released = releaseTask(stopping, 7_000, "stopped");
+  assert.equal(released.runChildPid, undefined);
+  assert.equal(released.stopRequestedAt, undefined);
+  assert.equal(released.lastStatus, "stopped");
+});
+
+test("recordRunChild and stopRequested touch only the claim that is still current", (t) => {
+  withTempDir(t);
+  writeRegistry({ version: 1, tasks: [claimTask(task(), 5_000, 1234)] });
+  recordRunChild("aaaa1111", 4_000, 999);
+  assert.equal(readRegistry().tasks[0].runChildPid, undefined, "an older claim's runner records nothing");
+  recordRunChild("aaaa1111", 5_000, 999);
+  assert.equal(readRegistry().tasks[0].runChildPid, 999);
+  assert.equal(stopRequested("aaaa1111", 5_000), false);
+  withRegistry((r) => { r.tasks[0] = requestStop(r.tasks[0], 6_000); writeRegistry(r); });
+  assert.equal(stopRequested("aaaa1111", 5_000), true);
+  assert.equal(stopRequested("aaaa1111", 4_000), false, "another run's stop is not this one's");
+  recordRunChild("aaaa1111", 5_000, undefined);
+  assert.equal(readRegistry().tasks[0].runChildPid, undefined, "cleared when the child exits");
+});
+
+test("a run's output log path is built from plain ids only, and settle names the run by its claim", (t) => {
+  const dir = withTempDir(t);
+  assert.equal(runLogPath("aaaa1111", "5000"), join(dir, "runs", "aaaa1111", "5000.log"));
+  assert.equal(runLogPath("../x", "5000"), undefined);
+  assert.equal(runLogPath("aaaa1111", "../5000"), undefined);
+  assert.equal(runLogPath("aaaa1111", "abc"), undefined);
+  writeRegistry({ version: 1, tasks: [claimTask(task(), 5_000, 1234)] });
+  settleRun("aaaa1111", 100_000, 5_007, { status: "stopped" }, 5_000);
+  const [record] = readRuns("aaaa1111");
+  assert.equal(record.runId, "5000", "the same id as its output log");
+  assert.equal(record.status, "stopped", "a stopped run is a valid history line");
+});
+
+test("run output logs are pruned to the newest few, and go with the task", (t) => {
+  const dir = withTempDir(t);
+  const logs = join(dir, "runs", "aaaa1111");
+  mkdirSync(logs, { recursive: true });
+  for (let i = 1; i <= 13; i += 1) writeFileSync(join(logs, `${i * 1000}.log`), "x");
+  pruneRunLogs("aaaa1111", 10);
+  const kept = readdirSync(logs).sort((a, b) => parseInt(a) - parseInt(b));
+  assert.deepEqual(kept, Array.from({ length: 10 }, (_, i) => `${(i + 4) * 1000}.log`));
+  appendRun("aaaa1111", { runId: "1", startedAt: 1, endedAt: 2, status: "ok" });
+  assert.equal(forgetRuns("aaaa1111"), true);
+  assert.equal(existsSync(logs), false, "the run output goes with the history");
+
+  mkdirSync(join(dir, "runs", "dead4567"), { recursive: true });
+  writeFileSync(join(dir, "runs", "dead4567", "1.log"), "x");
+  appendRun("dead4567", { runId: "1", startedAt: 1, endedAt: 2, status: "ok" });
+  assert.deepEqual(pruneRuns([]), { removed: 1, failed: [] }, "one task, counted once");
+  assert.equal(existsSync(join(dir, "runs", "dead4567")), false, "an orphan's output logs go too");
 });

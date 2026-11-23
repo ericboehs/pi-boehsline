@@ -19,6 +19,7 @@
  *   add <spec> <prompt>       daily 15:30 / cron 0 9 * * 1-5 / every 2h / once 8p
  *   edit <id|name> [flags]    change model, prompt, delivery, schedule
  *   run <id|name>             run now, ignoring the schedule
+ *   stop <id|name> [--json]   end a running run (its child's process group)
  *   runs <id|name> [-n N]     recent run history
  *   pause|resume <id|name>
  *   remove <id|name>
@@ -78,7 +79,10 @@ import {
   pruneRuns,
   readRegistry,
   readRuns,
+  recordRunChild,
   releaseTask,
+  runLogPath,
+  stopRequested,
   schedulerDir,
   selectDue,
   settleRun,
@@ -86,6 +90,7 @@ import {
   withRegistry,
 } from "../extensions/lib/task-registry.ts";
 import { piArgsFor, runTask } from "../extensions/lib/runner.ts";
+import { stopRun } from "../extensions/lib/stop.ts";
 import {
   absolutePath,
   bgOnSince,
@@ -154,6 +159,7 @@ function usage() {
     "  add <spec> <prompt>       daily 15:30 | cron 0 9 * * 1-5 | every 2h | once 8p",
     "  edit <id|name> [flags]    change model, prompt, delivery, schedule",
     "  run <id|name>             run now, ignoring the schedule",
+    "  stop <id|name> [--json]   end a running run on this machine",
     "  runs <id|name> [-n N]     recent run history",
     "  pause|resume <id|name>",
     "  remove <id|name>",
@@ -194,6 +200,7 @@ const COMMAND_FLAGS = {
   edit: [...TASK_FLAGS, "prompt", "schedule"],
   update: [...TASK_FLAGS, "prompt", "schedule"],
   run: [],
+  stop: ["json"],
   runs: ["limit"],
   history: ["limit"],
   pause: [],
@@ -212,7 +219,7 @@ const COMMAND_FLAGS = {
 const VALUE_FLAGS = new Set([
   "name", "model", "cwd", "with", "without", "deliver", "misfire", "timeout", "prompt", "schedule",
 ]);
-const BOOL_FLAGS = new Set(["tools", "no-tools", "no-deliver", "all", "dry-run"]);
+const BOOL_FLAGS = new Set(["tools", "no-tools", "no-deliver", "all", "dry-run", "json"]);
 
 /**
  * Split flags out of an argv tail, leaving the positional words untouched.
@@ -242,6 +249,7 @@ function parseFlags(argv, allowed) {
     if (arg === "--no-deliver") { permit("no-deliver", arg); flags.deliver = null; continue; }
     if (arg === "--all") { permit("all", arg); flags.all = true; continue; }
     if (arg === "--dry-run") { permit("dry-run", arg); flags.dryRun = true; continue; }
+    if (arg === "--json") { permit("json", arg); flags.json = true; continue; }
     if (arg === "-n") {
       permit("limit", arg);
       const raw = argv[++index];
@@ -337,6 +345,20 @@ function wakePhase() {
   }
 }
 
+/**
+ * What a claimed run tells the registry as it goes: its output log
+ * (runs/<id>/<runningSince>.log), its child's pid for `stop`, and whether a
+ * `stop` ended it.
+ */
+function runHooks(task) {
+  const claimedAt = task.runningSince;
+  return {
+    runLogPath: runLogPath(task.id, `${claimedAt}`),
+    onChild: (pid) => recordRunChild(task.id, claimedAt, pid),
+    wasStopped: () => stopRequested(task.id, claimedAt),
+  };
+}
+
 async function commandCheck() {
   wakePhase();
   const claimed = withRegistry((registry) => {
@@ -385,7 +407,7 @@ async function commandCheck() {
       // The tick is unattended, so a failed run pages the task's own
       // --deliver channel instead of waiting for someone to read `runs`.
       // Manual `run` below does not: whoever ran it is already watching.
-      outcome = await runTask(task, { alertOnFailure: true });
+      outcome = await runTask(task, { alertOnFailure: true, ...runHooks(task) });
     } catch (error) {
       // Never leave a claim behind: an unreleased task is invisible to every
       // later tick until CLAIM_STALE_MS elapses.
@@ -432,7 +454,7 @@ async function commandRun(selector) {
   process.stderr.write(`Running ${task.name ?? task.id}…\n`);
   let outcome;
   try {
-    outcome = await runTask(task);
+    outcome = await runTask(task, runHooks(task));
   } catch (error) {
     // Never leave a claim behind, even if the runner threw.
     outcome = { status: "error", output: "", error: error instanceof Error ? error.message : String(error) };
@@ -451,6 +473,13 @@ async function commandRun(selector) {
     process.stderr.write(`pi-scheduler: could not record this run: ${settleError}\n`);
   }
   if (outcome.status !== "ok" || settleError) process.exitCode = 1;
+}
+
+/** `stop`: see lib/stop.ts. Not running is { stopped: false } and exit 0. */
+async function commandStop(selector, flags) {
+  const result = await stopRun(selector);
+  if (flags.json) process.stdout.write(`${JSON.stringify(result)}\n`);
+  else process.stdout.write(`${result.stopped ? "Stopped" : "Did not stop"} ${result.task}${result.reason ? `: ${result.reason}` : ""}\n`);
 }
 
 function commandList(flags) {
@@ -1013,6 +1042,7 @@ async function main() {
     case "add": case "create": return commandAdd(rest, flags);
     case "edit": case "update": return commandEdit(rest[0] ?? die("edit needs a task"), flags);
     case "run": return commandRun(rest[0] ?? die("run needs a task"));
+    case "stop": return commandStop(rest[0] ?? die("stop needs a task"), flags);
     case "runs": case "history": return commandRuns(rest[0] ?? die("runs needs a task"), flags.limit);
     case "pause": return commandSetPaused(rest[0] ?? die("pause needs a task"), true);
     case "resume": return commandSetPaused(rest[0] ?? die("resume needs a task"), false);

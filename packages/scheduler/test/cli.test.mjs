@@ -10,8 +10,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFile, spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -610,4 +610,61 @@ test("check reopens a crashed session through tmux, argv form, before the durabl
   assert.equal(Object.values(state.wakes)[0].sessionId, id);
   assert.match(readFileSync(join(dir, "wake.log"), "utf8"), new RegExp(`wake ${id} reason=timer`));
   assert.equal(pi.invocations(), 1, "only the durable task ran pi; the wake never did");
+});
+
+test("stop: a task not running, or claimed on another machine, is never signalled", async (t) => {
+  const dir = withTempDir(t);
+  seed(dir);
+  const idle = await cli(dir, ["stop", "nightly", "--json"]);
+  assert.deepEqual(JSON.parse(idle.stdout), { task: "nightly", stopped: false, reason: "not running" }, "a stale tap is not an error");
+
+  // A live pid that is ours to signal: only the host check keeps it alive.
+  const victim = spawn("sleep", ["30"], { detached: true, stdio: "ignore" });
+  t.after(() => { try { process.kill(-victim.pid, "SIGKILL"); } catch {} });
+  seed(dir, { runningSince: Date.now(), runnerPid: process.pid, runnerHost: "some-other-mac", runChildPid: victim.pid });
+  await assert.rejects(cli(dir, ["stop", "nightly"]), /running on some-other-mac, not this one/);
+  process.kill(victim.pid, 0); // still alive
+  const stored = JSON.parse(readFileSync(join(dir, "tasks.json"), "utf8")).tasks[0];
+  assert.equal(stored.stopRequestedAt, undefined, "nothing written either");
+
+  seed(dir, { runningSince: Date.now(), runnerPid: process.pid, runnerHost: hostname() });
+  const between = await cli(dir, ["stop", "nightly", "--json"]);
+  assert.equal(JSON.parse(between.stdout).stopped, false, "no child recorded: nothing to signal");
+});
+
+test("stop ends a running run's whole process tree and the run is recorded as stopped", async (t) => {
+  const dir = withTempDir(t);
+  const grandchild = join(dir, "grandchild.pid");
+  const bin = join(dir, "fake-pi");
+  // A pi that shells out: the grandchild holds the pipes, so only a group kill ends it.
+  writeFileSync(bin, ["#!/bin/sh", "cat > /dev/null", "echo started", `sleep 60 & echo $! > ${JSON.stringify(grandchild)}`, "wait"].join("\n"), { mode: 0o700 });
+  chmodSync(bin, 0o700);
+  seed(dir);
+  const running = cli(dir, ["run", "nightly"], { PI_SCHEDULER_PI_BIN: bin }).catch((error) => error);
+
+  const tasksPath = join(dir, "tasks.json");
+  const deadline = Date.now() + 10_000;
+  let claim;
+  while (Date.now() < deadline) {
+    claim = JSON.parse(readFileSync(tasksPath, "utf8")).tasks[0];
+    if (claim.runChildPid && existsSync(grandchild)) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(claim.runChildPid, "the runner recorded its child");
+  assert.equal(claim.runnerHost, hostname());
+  const logPath = join(dir, "runs", "aaaa1111", `${claim.runningSince}.log`);
+  assert.match(readFileSync(logPath, "utf8"), /started/, "the output is on disk while it runs");
+  assert.equal(statSync(logPath).mode & 0o777, 0o600);
+  const sleeper = Number(readFileSync(grandchild, "utf8"));
+
+  const stop = await cli(dir, ["stop", "nightly", "--json"]);
+  assert.deepEqual(JSON.parse(stop.stdout), { task: "nightly", stopped: true });
+  await running;
+  assert.throws(() => process.kill(sleeper, 0), /ESRCH/, "the grandchild went with the group");
+  const [settled] = JSON.parse(readFileSync(tasksPath, "utf8")).tasks;
+  assert.equal(settled.lastStatus, "stopped");
+  assert.equal(settled.runningSince, undefined);
+  assert.equal(settled.runChildPid, undefined);
+  const history = await cli(dir, ["runs", "nightly"]);
+  assert.match(history.stdout, /stopped/);
 });

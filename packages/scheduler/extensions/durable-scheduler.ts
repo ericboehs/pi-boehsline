@@ -31,12 +31,16 @@ import {
   parseFeatures,
   readRegistry,
   readRuns,
+  recordRunChild,
   registryPath,
+  runLogPath,
   settleRun,
+  stopRequested,
   writeRegistry,
   withRegistry,
 } from "./lib/task-registry.ts";
 import { runTask } from "./lib/runner.ts";
+import { stopRun } from "./lib/stop.ts";
 
 type NoticeLevel = "info" | "warning" | "error";
 
@@ -228,6 +232,7 @@ const SUBCOMMAND_SHAPES: Record<string, string> = {
   runs: "runs <id|name>",
   history: "runs <id|name>",
   run: "run <id|name>",
+  stop: "stop <id|name>",
   edit: "edit <id|name> [--model <model>|--no-model] [--cwd <dir>] <schedule> :: <prompt>",
   pause: "pause <id|name|all>",
   resume: "resume <id|name|all>",
@@ -277,6 +282,7 @@ export default function durableScheduler(pi: ExtensionAPI): void {
         "  /schedule [options] once <duration|HH:MM|ISO> :: <prompt>",
         "  /schedule list [all] | show <id> | runs <id>",
         "  /schedule run <id>   run now, in its own pi (not this session)",
+        "  /schedule stop <id>  end its running run (on this Mac)",
         "  /schedule pause <id> | resume <id> | remove <id>",
         "  /schedule edit <id> [--model <m>|--no-model] [--cwd <dir>] <schedule> :: <prompt>",
         "",
@@ -451,6 +457,14 @@ export default function durableScheduler(pi: ExtensionAPI): void {
           return;
         }
 
+        // The same as `pi-scheduler stop` (lib/stop.ts): its child's process group, this Mac only.
+        const stop = input.match(/^stop\s+(\S+)$/i);
+        if (stop?.[1]) {
+          const result = await stopRun(stop[1]);
+          notice(ctx, `${result.stopped ? "Stopped" : "Did not stop"} ${result.task}${result.reason ? `: ${result.reason}` : ""}`);
+          return;
+        }
+
         const run = input.match(/^run\s+(\S+)$/i);
         if (run?.[1]) {
           const selector = run[1];
@@ -487,7 +501,14 @@ export default function durableScheduler(pi: ExtensionAPI): void {
           void (async () => {
             let outcome;
             try {
-              outcome = await runTask(claimed);
+              // The same hooks as pi-scheduler's: a live output log, and the child
+              // `pi-scheduler stop` (Botsun's Stop) signals.
+              const claimedAt = claimed.runningSince as number;
+              outcome = await runTask(claimed, {
+                runLogPath: runLogPath(claimed.id, `${claimedAt}`),
+                onChild: (pid) => recordRunChild(claimed.id, claimedAt, pid),
+                wasStopped: () => stopRequested(claimed.id, claimedAt),
+              });
             } catch (error) {
               outcome = {
                 status: "error" as const,

@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -328,4 +328,37 @@ test("a failure notice that cannot be delivered never rewrites the run's own sto
   assert.equal(outcome.status, "error");
   assert.match(outcome.error, /the model is down/, "the original failure, not the notice's");
   assert.doesNotMatch(outcome.error, /slack is down too/);
+});
+
+test("a run's output goes to its log file as it arrives, private, and the child's pid is reported", async (t) => {
+  const dir = withTempDir(t);
+  const piBin = script(dir, "pi", 'cat > /dev/null; echo "to stdout"; echo "to stderr" >&2');
+  const logPath = join(dir, "runs", "run00001", "1700000000000.log");
+  const children = [];
+
+  const outcome = await runTask(task(dir), { piBin, runLogPath: logPath, onChild: (pid) => children.push(pid) });
+
+  assert.equal(outcome.status, "ok");
+  assert.equal(outcome.output, "to stdout", "the in-memory capture is unchanged");
+  const log = readFileSync(logPath, "utf8");
+  assert.match(log, /to stdout/);
+  assert.match(log, /to stderr/);
+  assert.equal(statSync(logPath).mode & 0o777, 0o600);
+  assert.equal(statSync(join(dir, "runs", "run00001")).mode & 0o777, 0o700);
+  assert.equal(children.length, 2, "spawned, then gone");
+  assert.ok(Number.isInteger(children[0]) && children[0] > 1, "the child's pid (its own process group)");
+  assert.equal(children[1], undefined, "cleared once it exited, so stop never signals a stale pid");
+});
+
+test("a run that `stop` ended is stopped, not an error, and pages nobody", async (t) => {
+  const dir = withTempDir(t);
+  const piBin = script(dir, "pi", "cat > /dev/null; kill -TERM $$");
+  const deliver = `echo paged >> ${JSON.stringify(join(dir, "paged"))}`;
+
+  const outcome = await runTask(task(dir, { deliver }), { piBin, alertOnFailure: true, wasStopped: () => true });
+  assert.equal(outcome.status, "stopped");
+  assert.equal(existsSync(join(dir, "paged")), false, "no failure page for a stop Eric asked for");
+
+  const failed = await runTask(task(dir, { deliver }), { piBin, alertOnFailure: true, wasStopped: () => false });
+  assert.equal(failed.status, "error", "the same exit without a stop is still a failure");
 });

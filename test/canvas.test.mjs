@@ -1127,7 +1127,7 @@ test("Scheduled: session views keep only the contract's fields", () => {
     { id: "bad", kind: "weekly" },
     null,
   ]);
-  assert.deepEqual(views.map((v) => Object.keys(v).sort()), [0, 1].map(() => ["every", "id", "kind", "last", "name", "next", "scope", "since", "source", "status"]));
+  assert.deepEqual(views.map((v) => Object.keys(v).sort()), [0, 1].map(() => ["every", "id", "kind", "last", "name", "next", "runId", "scope", "since", "source", "status"]));
   assert.deepEqual(views.map((v) => v.since), [null, null], "a session timer has no run start");
   assert.deepEqual(views.map((v) => v.scope), ["session", "session"], "session-scheduler timers are this session's");
   assert.equal(views[0].name.length, 40);
@@ -1163,11 +1163,14 @@ test("Scheduled: durable tasks come from a temp store, every cwd's, with no priv
     assert.deepEqual(views.map((v) => v.id), ["d1", "d2", "d3", "d4", "d5"], "every valid task on this Mac, whatever its cwd (or none)");
     assert.equal(JSON.stringify(views).match(/SECRET|mail me|x\/y|"h"|42|proj|other/g), null, "no prompt beyond the label, deliver, model, runner or cwd");
     const [d1, d2, d3, d4] = views;
-    assert.deepEqual(d1, { id: "d1", name: "grades", kind: "daily", every: "daily 15:30", next: "2026-10-31T15:30:00.000Z", last: "2026-10-30T15:30:00.000Z", status: "ok", source: "durable", scope: "host", since: null });
+    assert.deepEqual(d1, { id: "d1", name: "grades", kind: "daily", every: "daily 15:30", next: "2026-10-31T15:30:00.000Z", last: "2026-10-30T15:30:00.000Z", status: "ok", source: "durable", scope: "host", since: null, runId: null });
     assert.equal(d2.name, "first line of the prompt that goes on a…");
     assert.equal(d2.name.length, 40);
     assert.deepEqual([d2.every, d2.status, d2.last, d2.since], ["cron 30 15 * * 1-5", "running", null, "1970-01-01T00:00:00.005Z"], "a running task's since is this run's start");
     assert.deepEqual([d3.since, d4.since], [null, null], "not running: no since");
+    assert.equal(d2.runId, "5", "a running task's runId (its runningSince): Botsun finds runs/<id>/<runId>.log from it, no path in the feed");
+    assert.deepEqual([d3.runId, d4.runId], [null, null], "not running: no runId");
+    assert.equal(durableViews([{ ...tasks[0], lastStatus: "stopped" }])[0].status, "stopped", "a run Botsun's Stop ended");
     assert.deepEqual([d3.name, d3.status, d3.next, d3.every], ["nightly check", "paused", null, "every 5m"]);
     assert.equal(d4.scope, "host", "another directory's task is the host's");
     assert.deepEqual(readDurableViews(join(root, "missing.json")), [], "no store: none");

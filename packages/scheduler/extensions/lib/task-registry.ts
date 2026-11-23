@@ -14,17 +14,23 @@
  *     tasks.json          the registry (atomically replaced)
  *     tasks.json.lock/    a mkdir mutex held only across read-modify-write
  *     runs/<id>.jsonl     per-task run history, newest last
+ *     runs/<id>/<runId>.log  a run's live output (stdout+stderr as it arrives),
+ *                         the newest MAX_RUN_OUTPUT_LOGS kept per task. runId is
+ *                         the claim's runningSince, so Botsun can find the
+ *                         running one from tasks.json alone.
  */
 
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -55,7 +61,8 @@ export const DEFAULT_TIMEOUT_MS = 900_000;
 /** How long a claim may look alive before the runner is presumed dead. */
 export const CLAIM_STALE_MS = 6 * 3_600_000;
 
-export const RUN_STATUSES = ["ok", "error", "timeout", "skipped"] as const;
+/** "stopped": `pi-scheduler stop` (Botsun's Stop) ended the run. */
+export const RUN_STATUSES = ["ok", "error", "timeout", "skipped", "stopped"] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
 /**
@@ -168,6 +175,18 @@ export interface DurableTask extends Schedule {
    * ESRCH for a runner that is very much alive, and runs the task again.
    */
   runnerHost?: string;
+  /**
+   * The run's child (pi, then its `deliver`), set by the runner once it has
+   * spawned it and cleared when it exits. It leads its own process group, so
+   * `pi-scheduler stop` signals `-runChildPid`. Only ever alongside a claim,
+   * and only meaningful on `runnerHost`.
+   */
+  runChildPid?: number;
+  /**
+   * `pi-scheduler stop` asked this claim's run to end (ms). The runner reports
+   * the run as "stopped" rather than as the error its killed child looks like.
+   */
+  stopRequestedAt?: number;
 }
 
 export interface Registry {
@@ -199,6 +218,8 @@ export interface RunRecord {
 export const MAX_RECORDED_OUTPUT = 4_000;
 export const MAX_RUN_LOG_RECORDS = 200;
 export const MAX_RUN_LOG_BYTES = 1_000_000;
+/** Run output logs (runs/<id>/<runId>.log) kept per task, newest by name. */
+export const MAX_RUN_OUTPUT_LOGS = 10;
 
 export function schedulerDir(): string {
   return process.env.PI_SCHEDULER_DIR
@@ -211,6 +232,44 @@ export function registryPath(): string {
 
 function runsPath(taskId: string): string {
   return join(schedulerDir(), "runs", `${taskId}.jsonl`);
+}
+
+/** A task or run id as a file name: no separators, no dot-dot, nothing a path could hide in. */
+const SAFE_NAME = /^[A-Za-z0-9][\w-]{0,63}$/;
+
+/**
+ * Where a run's live output goes: runs/<taskId>/<runId>.log. runId is the
+ * claim's runningSince (ms), so the path follows from tasks.json alone and no
+ * path ever travels in a feed. Undefined for an id that isn't a plain name.
+ */
+export function runLogPath(taskId: string, runId: string): string | undefined {
+  if (!SAFE_NAME.test(taskId) || !/^\d{1,16}$/.test(runId)) return undefined;
+  return join(schedulerDir(), "runs", taskId, `${runId}.log`);
+}
+
+/**
+ * Keep the newest `keep` run output logs of a task (by runId, which is a
+ * time), and never the one still being written (`except`). Housekeeping:
+ * failures are swallowed.
+ */
+export function pruneRunLogs(taskId: string, keep = MAX_RUN_OUTPUT_LOGS, except?: string): void {
+  if (!SAFE_NAME.test(taskId)) return;
+  const dir = join(schedulerDir(), "runs", taskId);
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((name) => /^\d{1,16}\.log$/.test(name));
+  } catch {
+    return;
+  }
+  names.sort((a, b) => Number(b.slice(0, -4)) - Number(a.slice(0, -4)));
+  for (const name of names.slice(keep)) {
+    if (except && name === `${except}.log`) continue;
+    try {
+      unlinkSync(join(dir, name));
+    } catch {
+      // Housekeeping.
+    }
+  }
 }
 
 function ensureDir(path: string): void {
@@ -273,6 +332,15 @@ export function isDurableTask(value: unknown): value is DurableTask {
   // written by an older version has claims without it. Quarantining those
   // would make an upgrade look like the tasks had vanished.
   if (task.runnerHost !== undefined && typeof task.runnerHost !== "string") return false;
+  // The run's child and a stop request belong to a claim: never one without it.
+  if (task.runChildPid !== undefined
+    && (task.runningSince === undefined || !Number.isInteger(task.runChildPid) || task.runChildPid <= 1)) {
+    return false;
+  }
+  if (task.stopRequestedAt !== undefined
+    && (task.runningSince === undefined || !Number.isFinite(task.stopRequestedAt))) {
+    return false;
+  }
 
   if (task.kind === "interval") {
     return typeof task.intervalMs === "number" && task.intervalMs >= MIN_INTERVAL_MS;
@@ -500,11 +568,14 @@ export function releaseTask(
   delete released.runningSince;
   delete released.runnerPid;
   delete released.runnerHost;
+  delete released.runChildPid;
+  delete released.stopRequestedAt;
   if (next === undefined) return undefined;
   return { ...released, nextRunAt: next };
 }
 
-export function appendRun(taskId: string, record: RunRecord): void {  const trimmed: RunRecord = {
+export function appendRun(taskId: string, record: RunRecord): void {
+  const trimmed: RunRecord = {
     ...record,
     output: record.output ? truncate(record.output, MAX_RECORDED_OUTPUT) : undefined,
   };
@@ -586,15 +657,26 @@ export function readRuns(taskId: string, limit = 20): RunRecord[] {
   return records.slice(-limit);
 }
 
-/** Returns false if a log existed and could not be removed. */
+/** Returns false if a log existed and could not be removed. Its run output logs go too. */
 export function forgetRuns(taskId: string): boolean {
+  let ok = true;
   try {
     unlinkSync(runsPath(taskId));
-    return true;
   } catch (error) {
     // Nothing recorded yet is the common case and not a failure.
-    return (error as NodeJS.ErrnoException).code === "ENOENT";
+    ok = (error as NodeJS.ErrnoException).code === "ENOENT";
   }
+  if (SAFE_NAME.test(taskId)) {
+    const dir = join(schedulerDir(), "runs", taskId);
+    try {
+      // A directory of our own, never a link out of runs/.
+      if (lstatSync(dir).isDirectory()) rmSync(dir, { recursive: true, force: true });
+      else ok = false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") ok = false;
+    }
+  }
+  return ok;
 }
 
 /**
@@ -617,9 +699,12 @@ export function pruneRuns(tasks: DurableTask[]): { removed: number; failed: stri
   }
   let removed = 0;
   const failed: string[] = [];
+  const seen = new Set<string>();
   for (const entry of entries) {
-    const id = entry.endsWith(".jsonl") ? entry.slice(0, -".jsonl".length) : undefined;
-    if (id === undefined || live.has(id)) continue;
+    // runs/<id>.jsonl and runs/<id>/ (its output logs): one task, counted once.
+    const id = entry.endsWith(".jsonl") ? entry.slice(0, -".jsonl".length) : SAFE_NAME.test(entry) ? entry : undefined;
+    if (id === undefined || live.has(id) || seen.has(id)) continue;
+    seen.add(id);
     if (forgetRuns(id)) removed += 1;
     else failed.push(id);
   }
@@ -662,9 +747,11 @@ export function settleRun(
   // "running" is invisible to every later tick until CLAIM_STALE_MS, and a
   // one-shot would never retire. Capture the failure, release, then report it.
   let historyError: unknown;
+  // The run id is the claim's (its output log's name), when the caller has it.
+  const runId = `${claimedAt ?? startedAt}`;
   try {
     appendRun(taskId, {
-      runId: `${startedAt}`,
+      runId,
       startedAt,
       endedAt,
       scheduledFor,
@@ -691,7 +778,41 @@ export function settleRun(
     writeRegistry(registry);
   });
 
+  pruneRunLogs(taskId, MAX_RUN_OUTPUT_LOGS);
   if (historyError) throw historyError;
+}
+
+/**
+ * Record (or clear, with undefined) the running claim's child, if the claim is
+ * still the one this runner wrote. The runner calls it as each child starts
+ * and exits, so `pi-scheduler stop` never signals a pid that has since ended.
+ */
+export function recordRunChild(taskId: string, claimedAt: number, pid: number | undefined): void {
+  withRegistry((registry) => {
+    const index = registry.tasks.findIndex((candidate) => candidate.id === taskId);
+    const current = registry.tasks[index];
+    if (!current || current.runningSince !== claimedAt) return;
+    const next: DurableTask = { ...current };
+    if (pid === undefined) delete next.runChildPid;
+    else next.runChildPid = pid;
+    registry.tasks[index] = next;
+    writeRegistry(registry);
+  });
+}
+
+/** The claim as `pi-scheduler stop` leaves it: its run is to be reported "stopped". */
+export function requestStop(task: DurableTask, now: number): DurableTask {
+  return { ...task, stopRequestedAt: now };
+}
+
+/** Whether `pi-scheduler stop` asked this claim's run to end. Read-only, no lock. */
+export function stopRequested(taskId: string, claimedAt: number): boolean {
+  try {
+    const task = readRegistry().tasks.find((candidate) => candidate.id === taskId);
+    return task !== undefined && task.runningSince === claimedAt && task.stopRequestedAt !== undefined;
+  } catch {
+    return false;
+  }
 }
 
 export function formatTask(task: DurableTask, now = Date.now()): string {

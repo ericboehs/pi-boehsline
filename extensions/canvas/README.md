@@ -288,7 +288,11 @@ the review prompt — so a renderer never reaches for a page global.
   kids-grades and the like in every session (session-scheduler timers are
   this session's alone). A running durable task has `since`, when the current
   run started (its `runningSince`), so a running clock counts from this run
-  and not from `last`, the previous one; it is `null` otherwise. `/fork` (and anything else that starts a new session
+  and not from `last`, the previous one; it is `null` otherwise. It also has
+  `runId` (the run's id, its `runningSince` in ms), from which Botsun builds
+  the run's live output log, `scheduler/runs/<id>/<runId>.log`, to tail it:
+  no path goes in the feed. `status` can be `"stopped"`, a run ended by
+  `pi-scheduler stop`. `/fork` (and anything else that starts a new session
   id) leaves a task the parent created behind: in the fork it shows as
   `"host"`, not `"session"`. These fields are additive: an older reader ignores
   them. For example:
@@ -302,10 +306,10 @@ the review prompt — so a renderer never reaches for a page global.
     ],
     "scheduled": [
       { "id": "t1", "name": "check CI", "kind": "interval", "every": "every 5m", "next": "2026-11-22T15:10:00.000Z",
-        "last": null, "status": "armed", "source": "agent", "scope": "session", "since": null },
+        "last": null, "status": "armed", "source": "agent", "scope": "session", "since": null, "runId": null },
       { "id": "d1", "name": "memory-review", "kind": "daily", "every": "daily 09:00", "next": "2026-11-24T09:00:00.000Z",
         "last": "2026-11-22T09:00:00.000Z", "status": "running", "source": "durable", "scope": "host",
-        "since": "2026-11-23T09:00:02.000Z" }
+        "since": "2026-11-23T09:00:02.000Z", "runId": "1795424402000" }
     ]
   }
   ```

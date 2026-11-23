@@ -7,6 +7,13 @@ change behaviour; each one says what it breaks.
 
 ### Added
 
+- `pi-scheduler stop <id> [--json]` and `/schedule stop <id>`: end a running run
+  on this machine (SIGTERM to its child's process group, SIGKILL after 5s if the
+  claim is still the same run). It is recorded as the new status `stopped`. A
+  run's output is written as it arrives to `runs/<id>/<runId>.log` (0600, the
+  newest 10 kept per task), and the claim carries the child's pid
+  (`runChildPid`) while it runs.
+
 - A durable task added with `/schedule` records the session that made it,
   `createdBySession` (its id; the CLI's `add` sets none, and an edit or
   pause keeps it). Optional and informational: validation, runs and older

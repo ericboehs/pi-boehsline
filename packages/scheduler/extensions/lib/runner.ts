@@ -15,8 +15,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { statSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync, statSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
+import { dirname } from "node:path";
 
 import {
   DEFAULT_TIMEOUT_MS,
@@ -80,9 +81,19 @@ interface CaptureResult {
 function capture(
   command: string,
   args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv; input?: string; timeoutMs: number },
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    input?: string;
+    timeoutMs: number;
+    /** Append stdout and stderr here as they arrive (mode 0600), for a live tail. */
+    logPath?: string;
+    /** The child's pid (its process group) once spawned, then undefined once it has exited. */
+    onChild?: (pid: number | undefined) => void;
+  },
 ): Promise<CaptureResult> {
   return new Promise((resolve, reject) => {
+    const log = openRunLog(options.logPath);
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
@@ -121,10 +132,31 @@ function capture(
       giveUpTimer = undefined;
     };
 
+    let childReported = false;
+    const childGone = () => {
+      if (!childReported) return;
+      childReported = false;
+      try {
+        options.onChild?.(undefined);
+      } catch {
+        // Bookkeeping for `stop`; never fail a run over it.
+      }
+    };
+    if (child.pid !== undefined && options.onChild) {
+      try {
+        options.onChild(child.pid);
+        childReported = true;
+      } catch {
+        // As above.
+      }
+    }
+
     const finish = (code: number | null, signal: NodeJS.Signals | null) => {
       if (settled) return;
       settled = true;
       stopTimers();
+      childGone();
+      log.close();
       resolve({ code, signal, stdout, stderr, timedOut, truncated, stdinError });
     };
 
@@ -153,14 +185,18 @@ function capture(
     timer.unref?.();
 
     child.stdout.on("data", (chunk: Buffer) => {
+      log.write(chunk);
       if (stdout.length < MAX_CAPTURED_OUTPUT) stdout += chunk.toString();
       else truncated = true;
     });
     child.stderr.on("data", (chunk: Buffer) => {
+      log.write(chunk);
       if (stderr.length < MAX_CAPTURED_OUTPUT) stderr += chunk.toString();
     });
     child.on("error", (error) => {
       stopTimers();
+      childGone();
+      log.close();
       if (!settled) {
         settled = true;
         reject(error);
@@ -183,6 +219,47 @@ function capture(
     if (options.input !== undefined) child.stdin.end(options.input);
     else child.stdin.end();
   });
+}
+
+/** Past this a run's output log stops growing (the in-memory capture is capped too). */
+const MAX_RUN_LOG_FILE = 5_000_000;
+
+/**
+ * A run's output log: private (0600, in a 0700 directory), appended as chunks
+ * arrive, capped. Best-effort: a log that can't be opened or written never
+ * fails the run, it just isn't there to tail.
+ */
+function openRunLog(path: string | undefined): { write: (chunk: Buffer) => void; close: () => void } {
+  let fd: number | undefined;
+  let written = 0;
+  if (path) {
+    try {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      fd = openSync(path, "a", 0o600);
+      chmodSync(path, 0o600);
+    } catch {
+      fd = undefined;
+    }
+  }
+  return {
+    write(chunk) {
+      if (fd === undefined || written >= MAX_RUN_LOG_FILE) return;
+      try {
+        written += writeSync(fd, chunk);
+      } catch {
+        // Best-effort.
+      }
+    },
+    close() {
+      if (fd === undefined) return;
+      try {
+        closeSync(fd);
+      } catch {
+        // Best-effort.
+      }
+      fd = undefined;
+    },
+  };
 }
 
 /** The output as the environment can carry it, marked if it had to be cut. */
@@ -224,6 +301,12 @@ export interface RunOptions {
    * motivated it. Manual runs leave it off; whoever asked is already watching.
    */
   alertOnFailure?: boolean;
+  /** Write the run's output here as it arrives (task-registry's runLogPath), for a live tail. */
+  runLogPath?: string;
+  /** Told each child's pid once spawned and undefined once it exits (the claim's runChildPid). */
+  onChild?: (pid: number | undefined) => void;
+  /** Whether `pi-scheduler stop` ended this run: it is then "stopped", not an error, and pages nobody. */
+  wasStopped?: () => boolean;
 }
 
 /**
@@ -236,8 +319,11 @@ export interface RunOptions {
  * channel, so an unattended tick cannot fail quietly.
  */
 export async function runTask(task: DurableTask, options: RunOptions = {}): Promise<RunOutcome> {
-  const outcome = await executeTask(task, options);
-  if (options.alertOnFailure && task.deliver && outcome.status !== "ok") {
+  let outcome = await executeTask(task, options);
+  if (outcome.status !== "ok" && options.wasStopped?.()) {
+    outcome = { ...outcome, status: "stopped", error: "stopped by pi-scheduler stop" };
+  }
+  if (options.alertOnFailure && task.deliver && outcome.status !== "ok" && outcome.status !== "stopped") {
     await alertFailure(task, task.deliver, outcome, options);
   }
   return outcome;
@@ -297,7 +383,7 @@ async function alertFailure(
 
 async function executeTask(
   task: DurableTask,
-  options: { piBin?: string; env?: NodeJS.ProcessEnv; deliveryTimeoutMs?: number },
+  options: RunOptions,
 ): Promise<RunOutcome> {
   const piBin = options.piBin ?? process.env.PI_SCHEDULER_PI_BIN ?? "pi";
   const env = options.env ?? process.env;
@@ -313,6 +399,8 @@ async function executeTask(
       env,
       input: task.prompt,
       timeoutMs,
+      logPath: options.runLogPath,
+      onChild: options.onChild,
     });
   } catch (error) {
     return {
@@ -365,6 +453,7 @@ async function executeTask(
       env: { ...env, PI_SCHEDULER_OUTPUT: envOutput(output), PI_SCHEDULER_TASK: task.name ?? task.id },
       input: output,
       timeoutMs: deliveryTimeoutMs,
+      onChild: options.onChild,
     });
   } catch (error) {
     return {

@@ -738,6 +738,10 @@ export function logTail(text: string, n = 20): string {
  *
  * since: when the current run started (a durable task's runningSince), for a running clock;
  * null when it isn't running and for session-scheduler timers.
+ *
+ * runId: the running durable run's id (its runningSince in ms, as a string), null otherwise. Botsun
+ * builds the run's output log from id + runId (scheduler/runs/<id>/<runId>.log) to tail it: no
+ * path ever goes in the feed.
  */
 export type ScheduledView = {
   id: string;
@@ -746,14 +750,15 @@ export type ScheduledView = {
   every: string;
   next: string | null;
   last: string | null;
-  status: "armed" | "paused" | "running" | "ok" | "error" | "timeout" | "skipped";
+  status: "armed" | "paused" | "running" | "ok" | "error" | "timeout" | "skipped" | "stopped";
   source: "session" | "agent" | "durable";
   scope: "session" | "host";
   since: string | null;
+  runId: string | null;
 };
 export const MAX_SCHEDULED = 20;
 const SCHED_KINDS = new Set(["once", "interval", "daily", "cron"]);
-const SCHED_STATUSES = new Set(["armed", "paused", "running", "ok", "error", "timeout", "skipped"]);
+const SCHED_STATUSES = new Set(["armed", "paused", "running", "ok", "error", "timeout", "skipped", "stopped"]);
 const isoOrNull = (v: unknown) => (typeof v === "string" && !Number.isNaN(Date.parse(v)) ? new Date(v).toISOString() : null);
 const msIso = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? new Date(v).toISOString() : null);
 
@@ -775,6 +780,7 @@ export function sessionViews(list: unknown): ScheduledView[] {
       source: t.source === "agent" ? "agent" : "session",
       scope: "session",
       since: null,
+      runId: null,
     });
   }
   return out;
@@ -805,6 +811,7 @@ export function durableViews(tasks: unknown, sessionId = ""): ScheduledView[] {
         source: "durable",
         scope: sessionId && (t as { createdBySession?: unknown }).createdBySession === sessionId ? "session" : "host",
         since: msIso(t.runningSince),
+        runId: typeof t.runningSince === "number" && Number.isSafeInteger(t.runningSince) && t.runningSince > 0 ? String(t.runningSince) : null,
       });
     } catch {
       continue;

@@ -155,6 +155,8 @@ interface Conn {
 	pendingCompact?: () => boolean;
 	/** Runs a slash command from the phone: undefined = not one (send as text), null = ran, string = why not. */
 	command?: (text: string, busy: boolean) => string | null | undefined;
+	/** Stop one of this session's bg jobs (stopBgJob over this pi's events); the phone's Stop on a job row. */
+	stopJob?: (id: string) => StopJobResult;
 	/** The commands the phone can run here, for its "/" list; read lazily. */
 	commands?: () => PhoneCommand[];
 	/** Delivers released call words: queued after the turn, steered in, or stopping the run first. */
@@ -691,6 +693,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (r.type === "stop") return stopRequest(c, r);
 	if (r.type === "unsteer") return unsteerRequest(c, r);
 	if (r.type === "stop_child") return stopChildRequest(c, r);
+	if (r.type === "stop_job") return stopJobRequest(c, r);
 	if (r.type === "close") return r.key !== undefined ? closeCall(c, r) : closeRequest(c, r);
 	if (r.type === "reload" || r.type === "restart") return reloadOrRestart(c, r, r.type);
 	// Display only (a chip's mode, as a click on the footer flips it): not signed, nothing acts.
@@ -1773,6 +1776,61 @@ function stopChildRequest(c: Conn, r: Record<string, unknown>): Record<string, u
 	return { ok: true, stopped: result === "stopped" };
 }
 
+/** A v1-signed stop_job: it takes v2 or newer only. */
+export const STOP_JOB_V1_REFUSED = "stop_job needs a v2 signature: v1 is refused (update Botsun and the app)";
+/** A bg job id (bg.ts makes 6 hex digits): never "." or "..", since the phone puts it in a route's path. */
+const JOB_ID = /^[A-Za-z0-9][\w-]{0,39}$/;
+
+export type StopJobResult = "stopped" | "ended" | "not_found" | "unstoppable";
+
+/**
+ * Stop a bg job of this session: only one on bg.ts's own list (bg:list, this pi's jobs), through
+ * bg:kill with wake, so the model hears "killed" rather than waiting on a result (a stop it didn't
+ * ask for). A job that already ended is "ended", not an error: the phone's list can be a few
+ * seconds stale.
+ */
+export function stopBgJob(events: { emit(channel: string, data: unknown): void } | undefined, id: string): StopJobResult {
+	if (!events) return "unstoppable";
+	let jobs: unknown = null;
+	try {
+		events.emit("bg:list", { reply: (list: unknown) => { jobs = list; } });
+	} catch {
+		return "unstoppable";
+	}
+	if (!Array.isArray(jobs)) return "unstoppable";
+	const job = (jobs as Array<Record<string, unknown> | null>).find((j) => j?.id === id);
+	if (!job) return "not_found";
+	if (typeof job.endedAt === "number") return "ended";
+	let killed = false;
+	const req = { id, wake: true, accepted: false, reply: (r: { killed: boolean }) => { killed = r.killed; } };
+	try {
+		events.emit("bg:kill", req);
+	} catch {
+		return "unstoppable";
+	}
+	if (!req.accepted) return "unstoppable";
+	return killed ? "stopped" : "ended";
+}
+
+/**
+ * The phone's Stop on a shell job's row (its info sheet). Signed with the decision key, v2 or
+ * newer, over "stop_job\n<id>" (this session's nonce: single use). Only a job on this session's
+ * own bg list is stopped.
+ */
+function stopJobRequest(c: Conn, r: Record<string, unknown>): Record<string, unknown> {
+	const id = typeof r.job_id === "string" && JOB_ID.test(r.job_id) ? r.job_id : null;
+	if (!id) return { error: "bad request" };
+	const payload = `stop_job\n${id}`;
+	const denied = verifyDevice(c, r, { decision: "stop_job", digest: () => sha256hex(Buffer.from(payload, "utf8")),
+		v2: { kind: "session", decision: "stop_job", payload: () => payload } });
+	if (denied) return { error: denied };
+	if (!atLeastV2(r)) return { error: STOP_JOB_V1_REFUSED };
+	const result = c.stopJob?.(id) ?? "unstoppable";
+	if (result === "not_found") return { error: "no such job in this session" };
+	if (result === "unstoppable") return { error: "this job can't be stopped from the phone" };
+	return { ok: true, stopped: result === "stopped" };
+}
+
 /**
  * One page of a subagent's conversation for its chat on the phone (lib/children.ts's
  * childTranscript): the entries past `since`, at most PAGE_BYTES of them, so the reply stays one
@@ -2216,6 +2274,8 @@ function featureList(c: Conn): string[] {
 		// answers this with its own features line (OwnerSessions' HOST_FEATURES).
 		"model_pages",
 		"subagents", "subagent_chats",
+		// The phone's Stop on a shell job row (stopJobRequest).
+		"jobs",
 		// Phone steers wait here for the turn's end, and the phone can take them back (unsteerRequest).
 		"unsteer",
 		...(hasStash ? ["stash"] : []), ...(c.reload ? ["reload"] : []),
@@ -2789,6 +2849,7 @@ function main(pi: ExtensionAPI): void {
 	// /color, as the color extension announces it: Botsun keeps the session's color the same.
 	pi.events?.on?.(COLOR_STATE_EVENT, (state: unknown) => reportColor(conn, state));
 	const color = colorHooks(pi);
+	const stopJob = (id: string): StopJobResult => stopBgJob(pi.events, id);
 
 	pi.on("session_start", (_event, ctx) => {
 		// Interactive TUI only: print/json have no UI, and Botsun drives its own
@@ -3006,6 +3067,7 @@ function main(pi: ExtensionAPI): void {
 			conn.context = context;
 			conn.confirm = confirm;
 			conn.color = color;
+			conn.stopJob = stopJob;
 			// A connection made by an older version of this extension (T1, before /reload) has
 			// no nonce map or owner socket yet: upgrade it in place.
 			conn.nonces ??= new Map();
@@ -3063,7 +3125,7 @@ function main(pi: ExtensionAPI): void {
 		conn = {
 			connected: false, closed: false, delay: retryBase(),
 			busy: false, prompt: null, promptDepth: 0, sessionName, setSessionName, ...info, launch: g[LAUNCH],
-			nonces: new Map(), inject, pendingCompact: () => pendingCompact(ctx), steerStatus, deliver, stop, stopReturning, close, reload, restart, command, commands, models, context, confirm, color,
+			nonces: new Map(), inject, pendingCompact: () => pendingCompact(ctx), steerStatus, deliver, stop, stopReturning, close, reload, restart, command, commands, models, context, confirm, color, stopJob,
 			model: modelOf(ctx),
 		};
 		store[STORE] = conn;

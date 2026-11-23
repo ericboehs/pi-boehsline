@@ -482,7 +482,7 @@ depend on a terminal being left running.
 /schedule cron 30 15 * * 1-5 :: weekday grade check
 /schedule --misfire always once 8p :: check in on the deploy
 /schedule list [all] | show <id> | runs <id>
-/schedule run <id> | pause <id|all> | resume <id|all> | remove <id>
+/schedule run <id> | stop <id> | pause <id|all> | resume <id|all> | remove <id>
 /schedule edit <id> [--model <model>|--no-model] [--cwd <dir>] <schedule> :: <prompt>
 ```
 
@@ -521,6 +521,7 @@ pi-scheduler list
 pi-scheduler add daily 15:30 :: check grades --name grades
 pi-scheduler run grades       # ignore the schedule and run now
 pi-scheduler runs grades      # recent history
+pi-scheduler stop grades      # end its running run (this machine only); recorded as "stopped"
 pi-scheduler check            # what the timer calls (session wakes first, then due tasks)
 pi-scheduler wake status      # see Waking closed sessions
 pi-scheduler uninstall
