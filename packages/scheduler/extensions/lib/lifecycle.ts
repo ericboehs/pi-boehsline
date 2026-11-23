@@ -51,8 +51,9 @@ export type CloseHow = "user" | "switched" | "signal:SIGHUP" | "signal:SIGTERM" 
  * decided once, at close time, so a server that dies later for some other
  * reason never turns an old close into a crash:
  *  - `user`: the server outlived the close, so someone closed the window
- *    (`kill-window`, Botsun, a pane exit). Never crash-class, not even after
- *    a reboot.
+ *    (`kill-window`, Botsun, a pane exit). A SIGHUP with it is never
+ *    crash-class, not even after a reboot; a SIGTERM still is after a reboot
+ *    within the hour (a shutdown can SIGTERM pi before tmux exits).
  *  - `tmux-gone`: the server was gone (or replaced) right after. That is a
  *    `kill-server`, a server crash, a logout, a reboot, or the last window
  *    being closed on purpose (tmux exits with its last session), and those
@@ -86,7 +87,7 @@ export interface LifecycleRecord {
   tmux?: TmuxServerIdentity;
   /** Set at a signal close when `tmux` was known: see CloseVerdict. */
   closeVerdict?: CloseVerdict;
-  /** When `closeVerdict` was decided. */
+  /** When `closeVerdict` was decided. Diagnostic only: nothing reads it. */
   decidedAt?: number;
 }
 
@@ -229,7 +230,7 @@ function sleepSync(ms: number): void {
 export interface CloseVerdictDeps {
   probe?: (pid: number) => ProcessProbe;
   sleep?: (ms: number) => void;
-  /** How long to watch the server after the signal. */
+  /** How long to watch the server after the signal, `ps` time included. */
   waitMs?: number;
   stepMs?: number;
   now?: () => number;
@@ -242,27 +243,51 @@ export const CLOSE_PROBE_MS = 300;
  * Decide, at a signal close, whether this pi's tmux server outlived it.
  *
  * Called from the closing process, synchronously (one caller is the exit
- * listener). The server is watched for `waitMs`: a server that is exiting
- * (killed, crashed, or out of sessions) is gone within milliseconds of the
- * hangup it sent, and one that is still the same process after that stayed.
- * Undefined when there is no server to ask about or `ps` cannot tell.
+ * listener). The server is watched for `waitMs` of wall-clock time, the `ps`
+ * calls included (a slow `ps` can take up to a second): a server that is
+ * exiting (killed, crashed, or out of sessions) is gone within milliseconds
+ * of the hangup it sent, and one that is still the same process after that
+ * stayed. Undefined when there is no server to ask about or `ps` cannot tell.
  */
 export function decideCloseVerdict(
   server: TmuxServerIdentity | undefined,
   { probe = probeProcess, sleep = sleepSync, waitMs = CLOSE_PROBE_MS, stepMs = 100, now = Date.now }: CloseVerdictDeps = {},
 ): { closeVerdict: CloseVerdict; decidedAt: number } | undefined {
   if (!server) return undefined;
-  let waited = 0;
+  const start = now();
   for (;;) {
     const seen = probe(server.pid);
     if (seen.state === "dead" || (seen.state === "alive" && seen.start !== server.start)) {
       return { closeVerdict: "tmux-gone", decidedAt: now() };
     }
-    if (waited >= waitMs) {
+    const elapsed = now() - start;
+    if (elapsed >= waitMs) {
       return seen.state === "alive" ? { closeVerdict: "user", decidedAt: now() } : undefined;
     }
-    const step = Math.min(stepMs, waitMs - waited);
-    sleep(step);
-    waited += step;
+    sleep(Math.min(stepMs, waitMs - elapsed));
   }
+}
+
+/**
+ * Write a closed record, then, for a signal close, watch the tmux server and
+ * write it again with the verdict. The record goes to disk before the probe,
+ * so a pi killed during the probe (a SIGKILL after a stop timeout) leaves a
+ * signal close with no verdict, which reads as a user close, rather than a
+ * `live` record that the tick would read as vanished, a crash.
+ */
+export function writeClosedRecord(
+  sessionId: string,
+  closed: LifecycleRecord,
+  { write = writeLifecycle, decide = decideCloseVerdict }: {
+    write?: (sessionId: string, record: LifecycleRecord) => void;
+    decide?: typeof decideCloseVerdict;
+  } = {},
+): LifecycleRecord {
+  write(sessionId, closed);
+  if (closed.how !== "signal:SIGHUP" && closed.how !== "signal:SIGTERM") return closed;
+  const verdict = decide(closed.tmux);
+  if (!verdict) return closed;
+  const decided = { ...closed, ...verdict };
+  write(sessionId, decided);
+  return decided;
 }

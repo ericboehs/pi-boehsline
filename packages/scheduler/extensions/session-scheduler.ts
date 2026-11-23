@@ -42,9 +42,9 @@ import {
   LIFECYCLE_VERSION,
   SESSION_ID_RE,
   closeHow,
-  decideCloseVerdict,
   readLifecycle,
   tmuxServerPid,
+  writeClosedRecord,
   writeLifecycle,
 } from "./lib/lifecycle.ts";
 
@@ -785,16 +785,13 @@ function lifecycleSlot(): LifecycleSlot {
   return holder[LIFECYCLE_KEY];
 }
 
-/** The close a process exit implies when no session_shutdown came first. */
-export function crashRecord(
-  record: LifecycleRecord,
-  signal: string | undefined,
-  now: number,
-  decide: typeof decideCloseVerdict = decideCloseVerdict,
-): LifecycleRecord {
+/**
+ * The close a process exit implies when no session_shutdown came first, with
+ * no verdict yet: writeClosedRecord writes it, then decides one for a signal.
+ */
+export function crashRecord(record: LifecycleRecord, signal: string | undefined, now: number): LifecycleRecord {
   const how = signal === "SIGHUP" || signal === "SIGTERM" ? (`signal:${signal}` as const) : "crash";
-  const verdict = how === "crash" ? undefined : decide(record.tmux);
-  return { ...record, state: "closed", how, closedAt: now, lastSeen: now, ...verdict };
+  return { ...record, state: "closed", how, closedAt: now, lastSeen: now };
 }
 
 function installExitListener(slot: LifecycleSlot): void {
@@ -808,7 +805,7 @@ function installExitListener(slot: LifecycleSlot): void {
     if (!current) return;
     slot.current = undefined;
     try {
-      writeLifecycle(current.sessionId, crashRecord(current.record, slot.signal, Date.now()));
+      writeClosedRecord(current.sessionId, crashRecord(current.record, slot.signal, Date.now()));
     } catch {
       // Nothing to report to, and no record reads as "unknown": never woken.
     }
@@ -1117,17 +1114,21 @@ export default function sessionScheduler(pi: ExtensionAPI): void {
     slot.current = undefined;
     const now = Date.now();
     // A signal close settles here, once, whether the tmux server outlived it:
-    // the tick must never re-judge it by a server that died later.
-    const verdict = how === "signal:SIGHUP" || how === "signal:SIGTERM" ? decideCloseVerdict(current.record.tmux) : undefined;
-    writeLifecycleSafely(current.sessionId, {
-      ...current.record,
-      ...(current.record.pidStart === undefined && pidStart !== undefined ? { pidStart } : {}),
-      state: "closed",
-      how,
-      closedAt: now,
-      lastSeen: now,
-      ...verdict,
-    });
+    // the tick must never re-judge it by a server that died later. The
+    // closed record is written before the probe, so a kill during it still
+    // leaves a close (with no verdict), not a live record read as a crash.
+    try {
+      writeClosedRecord(current.sessionId, {
+        ...current.record,
+        ...(current.record.pidStart === undefined && pidStart !== undefined ? { pidStart } : {}),
+        state: "closed",
+        how,
+        closedAt: now,
+        lastSeen: now,
+      });
+    } catch {
+      // As writeLifecycleSafely: a missing record means "never wake".
+    }
   };
 
   const clearRuntime = () => {

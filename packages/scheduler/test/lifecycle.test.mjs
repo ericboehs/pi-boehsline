@@ -10,7 +10,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import sessionScheduler, { crashRecord } from "../extensions/session-scheduler.ts";
-import { closeHow, decideCloseVerdict, lifecyclePath, readLifecycle, tmuxServerPid } from "../extensions/lib/lifecycle.ts";
+import { closeHow, decideCloseVerdict, lifecyclePath, readLifecycle, tmuxServerPid, writeClosedRecord, writeLifecycle } from "../extensions/lib/lifecycle.ts";
+import { classifyClose } from "../extensions/lib/wake.ts";
 import { processStart } from "../extensions/lib/process-identity.ts";
 
 // Run from inside pi (a subagent, a bash tool call) these are set, and each
@@ -291,30 +292,102 @@ test("crashRecord keeps a seen signal, and tmuxServerPid reads $TMUX", () => {
 
 test("decideCloseVerdict: a server that outlives the wait is user; one gone or replaced is tmux-gone", () => {
   const server = { pid: 777, start: "Sat Nov 21 08:00:00 2026" };
-  const run = (states) => {
+  const run = (states, probeMs = 0) => {
     let calls = 0;
     let slept = 0;
+    let clock = 42;
     const verdict = decideCloseVerdict(server, {
-      probe: () => states[Math.min(calls++, states.length - 1)],
-      sleep: (ms) => { slept += ms; },
+      probe: () => { clock += probeMs; return states[Math.min(calls++, states.length - 1)]; },
+      sleep: (ms) => { slept += ms; clock += ms; },
       waitMs: 300,
       stepMs: 100,
-      now: () => 42,
+      now: () => clock,
     });
-    return { verdict, calls, slept };
+    return { verdict, calls, slept, clock };
   };
   const alive = { state: "alive", start: server.start, args: "tmux" };
   const stillUp = run([alive]);
-  assert.deepEqual(stillUp.verdict, { closeVerdict: "user", decidedAt: 42 });
+  assert.deepEqual(stillUp.verdict, { closeVerdict: "user", decidedAt: 342 });
   assert.equal(stillUp.slept, 300, "watched for the whole wait before calling it alive");
 
   const dies = run([alive, alive, { state: "dead" }]);
-  assert.deepEqual(dies.verdict, { closeVerdict: "tmux-gone", decidedAt: 42 }, "the last window closing takes the server with it");
+  assert.deepEqual(dies.verdict, { closeVerdict: "tmux-gone", decidedAt: 242 }, "the last window closing takes the server with it");
   assert.equal(dies.slept, 200, "and says so as soon as it sees it");
 
   assert.equal(run([{ state: "alive", start: "Sun Nov 22 11:00:00 2026", args: "tmux" }]).verdict.closeVerdict, "tmux-gone", "a reused pid");
   assert.equal(run([{ state: "unknown" }]).verdict, undefined, "ps could not tell");
   assert.equal(decideCloseVerdict(undefined), undefined, "not in tmux");
+});
+
+test("decideCloseVerdict stops at a wall-clock deadline, ps time included", () => {
+  const server = { pid: 777, start: "Sat Nov 21 08:00:00 2026" };
+  const watch = (state, probeMs) => {
+    let clock = 0;
+    let calls = 0;
+    let slept = 0;
+    const verdict = decideCloseVerdict(server, {
+      probe: () => { calls += 1; clock += probeMs; return state; },
+      sleep: (ms) => { slept += ms; clock += ms; },
+      waitMs: 300,
+      stepMs: 100,
+      now: () => clock,
+    });
+    return { verdict, calls, slept, clock };
+  };
+  // Each ps hangs for its 1 s timeout: one call, no sleep, not four calls and 4.3 s.
+  const slowUnknown = watch({ state: "unknown" }, 1000);
+  assert.equal(slowUnknown.verdict, undefined);
+  assert.equal(slowUnknown.calls, 1);
+  assert.equal(slowUnknown.slept, 0);
+  assert.equal(slowUnknown.clock, 1000);
+
+  // 80 ms per ps: the last sleep shrinks to fit, and the watch ends by ~400 ms.
+  const slowAlive = watch({ state: "alive", start: server.start, args: "tmux" }, 80);
+  assert.equal(slowAlive.verdict.closeVerdict, "user");
+  assert.equal(slowAlive.calls, 3);
+  assert.equal(slowAlive.slept, 140, "100, then the 40 left");
+  assert.equal(slowAlive.clock, 380);
+});
+
+test("a close is on disk before the probe: killed mid-probe, it reads as a user close, not a crash", () => {
+  const sessionId = `midprobe-${process.pid}`;
+  const live = { v: 1, sessionFile: "/s", cwd: "/", host: hostname(), pid: 1, liveSince: 0, lastSeen: 0, state: "live", opener: "manual",
+    tmux: { pid: 777, start: "x" } };
+  writeLifecycle(sessionId, live);
+  for (const signal of ["SIGHUP", "SIGTERM"]) {
+    let onDisk;
+    const died = new Error("SIGKILL");
+    assert.throws(() => writeClosedRecord(sessionId, crashRecord(live, signal, 1_000), {
+      decide: () => {
+        onDisk = readLifecycle(sessionId);
+        throw died; // the process is gone from here on: nothing else gets written
+      },
+    }), died);
+    assert.equal(onDisk.state, "closed", signal);
+    assert.equal(onDisk.how, `signal:${signal}`);
+    assert.equal(onDisk.closeVerdict, undefined);
+    assert.deepEqual(readLifecycle(sessionId), onDisk, "what the tick finds");
+    assert.deepEqual(classifyClose(onDisk, { bootTime: () => 0 }), { crash: false, why: "signal" }, "a user close, not vanished");
+  }
+
+  // Not killed: the verdict lands in a second write.
+  const writes = [];
+  const decided = writeClosedRecord(sessionId, crashRecord(live, "SIGHUP", 1_000), {
+    write: (_id, record) => writes.push(record),
+    decide: () => ({ closeVerdict: "user", decidedAt: 1_300 }),
+  });
+  assert.equal(writes.length, 2);
+  assert.equal(writes[0].closeVerdict, undefined);
+  assert.equal(writes[1].closeVerdict, "user");
+  assert.deepEqual(decided, writes[1]);
+
+  // A crash or a quit has nothing to decide: one write, no probe.
+  const once = [];
+  writeClosedRecord(sessionId, crashRecord(live, undefined, 1_000), {
+    write: (_id, record) => once.push(record),
+    decide: () => assert.fail("no probe for a crash"),
+  });
+  assert.equal(once.length, 1);
 });
 
 test("a SIGHUP close records, once, whether the tmux server outlived it; a plain quit records nothing", async () => {
@@ -350,10 +423,12 @@ test("a SIGHUP close records, once, whether the tmux server outlived it; a plain
   assert.equal(quit.record().closeVerdict, undefined);
 });
 
-test("crashRecord decides the verdict for a signal exit, and not for a crash", () => {
+test("the exit listener's record carries no verdict until the probe has run", () => {
   const live = { v: 1, sessionFile: "/s", cwd: "/", host: "h", pid: 1, liveSince: 0, lastSeen: 0, state: "live", opener: "manual",
     tmux: { pid: 777, start: "x" } };
+  const writes = [];
   const decide = () => ({ closeVerdict: "tmux-gone", decidedAt: 5 });
-  assert.equal(crashRecord(live, "SIGHUP", 5, decide).closeVerdict, "tmux-gone");
-  assert.equal(crashRecord(live, undefined, 5, decide).closeVerdict, undefined);
+  writeClosedRecord("s", crashRecord(live, "SIGHUP", 5), { write: (_id, r) => writes.push(r), decide });
+  assert.deepEqual(writes.map((r) => r.closeVerdict), [undefined, "tmux-gone"]);
+  assert.equal(crashRecord(live, "SIGHUP", 5).closeVerdict, undefined);
 });
