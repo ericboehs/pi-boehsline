@@ -382,6 +382,40 @@ test("a SIGHUP whose tmux server outlived it is a user close, even after that se
   assert.equal(rebooted.newWindows().length, 0, "the server outlived the close: a reboot after it is not why it closed");
 });
 
+test("a SIGTERM the server outlived still wakes after a reboot within the hour; a SIGHUP or no reboot does not", () => {
+  const tmuxServer = { pid: 777, start: "Sat Nov 21 08:00:00 2026" };
+  const close = { tmux: tmuxServer, closeVerdict: "user", closedAt: NOW - 30 * MIN, decidedAt: NOW - 30 * MIN };
+
+  // A shutdown SIGTERMs pi, and tmux takes longer than the probe to go.
+  fresh();
+  const term = crashedWithTimer({ how: "signal:SIGTERM", ...close });
+  writeIndex({ [term.session.id]: term.entry });
+  const rebooted = machine({ boot: NOW - 25 * MIN });
+  const result = runWakePhase(rebooted.deps);
+  assert.equal(rebooted.newWindows().length, 1);
+  assert.equal(result.spawned[0].close, "reboot");
+
+  // kill-window is a SIGHUP: still vetoed, reboot or not.
+  fresh();
+  const hup = crashedWithTimer({ how: "signal:SIGHUP", ...close });
+  writeIndex({ [hup.session.id]: hup.entry });
+  const hupRebooted = machine({ boot: NOW - 25 * MIN });
+  assert.equal(runWakePhase(hupRebooted.deps).decisions[0].reason, "user-closed");
+  assert.equal(hupRebooted.newWindows().length, 0);
+
+  // SIGTERM with no reboot after it: a user close.
+  fresh();
+  const termOnly = crashedWithTimer({ how: "signal:SIGTERM", ...close });
+  writeIndex({ [termOnly.session.id]: termOnly.entry });
+  const noReboot = machine();
+  assert.equal(runWakePhase(noReboot.deps).decisions[0].reason, "user-closed");
+  assert.equal(noReboot.newWindows().length, 0);
+
+  const record = { v: 1, how: "signal:SIGTERM", lastSeen: NOW - 30 * MIN, ...close };
+  assert.deepEqual(classifyClose(record, { bootTime: () => NOW - 25 * MIN }), { crash: true, why: "reboot" });
+  assert.deepEqual(classifyClose({ ...record, how: "signal:SIGHUP" }, { bootTime: () => NOW - 25 * MIN }), { crash: false, why: "signal" });
+});
+
 test("a SIGHUP whose tmux server was gone at the close is not woken: it may have been the last window", () => {
   fresh();
   const tmuxServer = { pid: 777, start: "Sat Nov 21 08:00:00 2026" };

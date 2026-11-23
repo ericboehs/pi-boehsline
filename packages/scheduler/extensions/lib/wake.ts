@@ -762,10 +762,13 @@ export interface CloseClass {
  * A SIGHUP or SIGTERM is judged by what the closing pi recorded, never by the
  * tmux server as it is now (a server that died an hour later for some other
  * reason says nothing about this close):
- *  - `closeVerdict: "user"`, the server outlived the close: someone closed the
- *    window (`tmux kill-window`, Botsun). Never crash-class.
+ *  - a SIGHUP with `closeVerdict: "user"`, the server outlived the close:
+ *    someone closed the window (`tmux kill-window`, Botsun, both a SIGHUP).
+ *    Never crash-class.
  *  - otherwise crash-class only when the machine booted within
- *    REBOOT_WINDOW_MS after the close: the shutdown is what closed it.
+ *    REBOOT_WINDOW_MS after the close: the shutdown is what closed it. That
+ *    includes a SIGTERM whose server outlived it, since a shutdown can
+ *    SIGTERM pi while tmux takes longer than the probe to exit.
  *  - `closeVerdict: "tmux-gone"` and no reboot: kill-server, a server crash or
  *    a logout look exactly like closing the server's last window on purpose
  *    (tmux exits with it), so it is not woken: a missed wake over a surprise
@@ -780,7 +783,7 @@ export function classifyClose(
   if (vanished) return { crash: true, why: "vanished" };
   if (record.how === "crash") return { crash: true, why: "crash" };
   if (record.how === "signal:SIGHUP" || record.how === "signal:SIGTERM") {
-    if (record.closeVerdict === "user") return { crash: false, why: "signal" };
+    if (record.how === "signal:SIGHUP" && record.closeVerdict === "user") return { crash: false, why: "signal" };
     const closedAt = record.closedAt ?? record.lastSeen;
     const boot = deps.bootTime();
     if (boot !== undefined && boot > closedAt && boot - closedAt <= REBOOT_WINDOW_MS) return { crash: true, why: "reboot" };
