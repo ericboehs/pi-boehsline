@@ -235,7 +235,7 @@
 
 - **`/boehsline` menu**, like `/footer`: toggle opt-in extensions (saved, with one reload, when it closes), apply the default keybindings, see which bundled packages loaded with their versions, and show the merged config. The subcommands still work, and without a UI it prints text.
 - **`/boehsline defaults`** shows Boehsline's keybindings ([`defaults/keybindings.json`](defaults/keybindings.json)) as a diff against yours and merges them after you confirm. It moves pi's own Ctrl+S and Ctrl+R actions to Alt, so stash and prompt-history stop colliding with them. A startup hint names the conflict until it's resolved.
-- **A README beside every extension**, with the detailed docs that used to live in dotfiles (VA specifics replaced by settings). The root README is an index of them, and `test/readmes.test.mjs` keeps it that way.
+- **A README beside every extension**, with the detailed docs that used to live in dotfiles (employer specifics replaced by settings). The root README is an index of them, and `test/readmes.test.mjs` keeps it that way.
 - **Benchmarks:** [`docs/benchmarks.md`](docs/benchmarks.md) and `scripts/bench.mjs` measure startup time and starting context against stock pi, overall or one extension at a time (`--each`).
 - `canvas:put` event so other extensions can post canvas sections.
 - footer and provider-usage: Copilot's allowance per workday (↓%/d) and a days-off row in `/footer`.

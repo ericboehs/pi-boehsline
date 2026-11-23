@@ -260,7 +260,7 @@ test("--once: allowed Mac apps print masked text; others print their app id only
 	const mac = macStore(dir);
 	const at = ago(5 * 60_000);
 	const cal = mac.add({ rec: 1, app: "com.apple.ical", title: "Team Weekly Sync", subtitle: "Zoom", body: "in 5 minutes · passcode 482913", at });
-	mac.add({ rec: 2, app: "com.apple.MobileSMS", title: "Ashley", body: "secret family text 4829", at });
+	mac.add({ rec: 2, app: "com.apple.MobileSMS", title: "Lee", body: "secret personal text 4829", at });
 	mac.add({ rec: 3, app: "com.tinyspeck.slackmacgap", title: "Kim", body: "sent the form to Pat", thread: "C1-1791302373", at });
 
 	// Ids match in any case: the Mac store lowercases some (com.apple.ical).
@@ -282,7 +282,7 @@ test("--once: allowed Mac apps print masked text; others print their app id only
 	assert.equal(ev[2].thread, "C1-1791302373");
 	assert.deepEqual(ev[3], { ev: "ready", mac: "ok", iphone: "off", allowed: 2 });
 	assert.equal(ev.length, 4);
-	assert.doesNotMatch(r.out, /secret family|Ashley/, "a dropped app's text never leaves the helper");
+	assert.doesNotMatch(r.out, /secret personal|Lee/, "a dropped app's text never leaves the helper");
 });
 
 test("--once --since prints only what is that recent", { skip }, (t) => {
@@ -306,7 +306,7 @@ test("--once: reads an allowed iPhone app's file and never opens another's", { s
 		"com.microsoft.Office.Outlook": [
 			{ id: "OUT-1", title: "Dana Ruiz", subtitle: "ATO review", body: "Moved to 2:30. Teams code 48 29 13", at, sender: "Dana Ruiz", thread: "conv-9" },
 		],
-		"org.whispersystems.signal": [{ id: "SIG-1", title: "Mom", body: "family text", at }],
+		"org.whispersystems.signal": [{ id: "SIG-1", title: "Alex", body: "personal text", at }],
 		"com.microsoft.skype.teams": null, // nothing on screen: the root is $null
 	});
 	// Unreadable: any attempt to open Signal's file would show as an error.
@@ -329,7 +329,7 @@ test("--once: reads an allowed iPhone app's file and never opens another's", { s
 		},
 		{ ev: "ready", mac: "off", iphone: "ok", allowed: 2 },
 	]);
-	assert.doesNotMatch(r.out, /family|Mom|SIG-1/);
+	assert.doesNotMatch(r.out, /personal|Alex|SIG-1/);
 });
 
 test("--pretty: one readable line and the first line of the body", { skip }, (t) => {
@@ -364,7 +364,7 @@ test("--follow: prints what changes after the first read, plus what --since cove
 
 	mac.remove(1);
 	const added = mac.add({ rec: 3, app: "com.apple.ical", title: "Sync", body: "verification code 482913", at: ago(0) });
-	mac.add({ rec: 4, app: "com.apple.MobileSMS", title: "Ashley", body: "family text", at: ago(0) });
+	mac.add({ rec: 4, app: "com.apple.MobileSMS", title: "Lee", body: "personal text", at: ago(0) });
 	phone.set("com.microsoft.Office.Outlook", [{ id: "OUT-2", title: "Kim", body: "Form sent", at: ago(0) }]);
 
 	const want = [
@@ -378,7 +378,7 @@ test("--follow: prints what changes after the first read, plus what --since cove
 	await w.until((s) => want.every((x) => got(s, x)));
 	assert.equal(w.seen.find((e) => e.id === added).body, "verification code [code]");
 	assert.ok(!w.seen.some((e) => e.ev === "error"), JSON.stringify(w.seen));
-	assert.ok(!JSON.stringify(w.seen).includes("family"));
+	assert.ok(!JSON.stringify(w.seen).includes("personal"));
 });
 
 // ── errors ──
@@ -422,8 +422,8 @@ test("apps: ids and counts from both stores, never text", { skip }, (t) => {
 	const dir = tmpDir(t);
 	const mac = macStore(dir);
 	const at = ago(60_000);
-	mac.add({ rec: 1, app: "com.apple.MobileSMS", title: "Ashley", body: "family text", at });
-	mac.add({ rec: 2, app: "com.apple.MobileSMS", title: "Ashley", body: "more text", at });
+	mac.add({ rec: 1, app: "com.apple.MobileSMS", title: "Lee", body: "personal text", at });
+	mac.add({ rec: 2, app: "com.apple.MobileSMS", title: "Lee", body: "more text", at });
 	const phone = iphoneStore(dir, { "com.microsoft.Office.Outlook": [{ id: "OUT-1", title: "Dana Ruiz", body: "ATO review", at }], "com.microsoft.skype.teams": null });
 	const r = run(["apps", "--db", mac.db, "--remote", phone.root, "--allow", "com.microsoft.Office.Outlook"]);
 	assert.equal(r.code, 0, r.err);

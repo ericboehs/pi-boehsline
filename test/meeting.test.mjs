@@ -1609,11 +1609,11 @@ test("clip: cuts on a word boundary with an ellipsis, never mid-word", () => {
 test("copilot titles: 'Meeting join…' gives way to the shared window's title, then the file name", () => {
 	assert.equal(isJunkTitle("Meeting join  meeting"), true);
 	assert.equal(isJunkTitle("Weekly Sync"), false);
-	assert.equal(fileTitle("/d/20261029_070321-teams-2026-va-daily-it-stand-up-briefing-merged.jsonl"), "2026 va daily it stand up briefing");
+	assert.equal(fileTitle("/d/20261029_070321-teams-2026-daily-platform-stand-up-merged.jsonl"), "2026 daily platform stand up");
 	assert.equal(fileTitle("20261029_070321-weekly-sync.jsonl"), "Weekly sync", "older names have no app token");
 	assert.equal(bestTitle("Weekly Sync", { shared: "x", file: "y" }), "Weekly Sync");
-	assert.equal(bestTitle("Meeting join  meeting", { shared: "2026 VA Daily IT Stand-Up Briefing", file: "/d/20261030_070210-teams-meeting-join-meeting.jsonl" }), "2026 VA Daily IT Stand-Up Briefing");
-	assert.equal(bestTitle("Meeting join  meeting", { file: "/d/20261030_070210-teams-cio-standup.jsonl" }), "Cio standup");
+	assert.equal(bestTitle("Meeting join  meeting", { shared: "2026 Daily Platform Stand-Up", file: "/d/20261030_070210-teams-meeting-join-meeting.jsonl" }), "2026 Daily Platform Stand-Up");
+	assert.equal(bestTitle("Meeting join  meeting", { file: "/d/20261030_070210-teams-team-standup.jsonl" }), "Team standup");
 	assert.equal(bestTitle("Meeting join  meeting", { file: "/d/20261030_070210-teams-meeting-join-meeting.jsonl" }), "Meeting join  meeting", "all junk: as recorded");
 	assert.equal(sharedTitle("Shared content | Platform Sync\nAgenda"), "Platform Sync");
 	assert.equal(sharedTitle("Agenda"), "");

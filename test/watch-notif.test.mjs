@@ -90,12 +90,12 @@ test("/watch apps: a row per group and route with counts, groups off marked, nev
 // ── notif-watch lines ──
 
 test("parseNotifLine keeps known events, fills missing text with empty strings, clips long fields", () => {
-	assert.deepEqual(parseNotifLine('{"ev":"posted","src":"iphone","app":"com.apple.MobileSMS","id":"iphone:x:1","title":"Ashley","body":"[code] is yours"}'), {
+	assert.deepEqual(parseNotifLine('{"ev":"posted","src":"iphone","app":"com.apple.MobileSMS","id":"iphone:x:1","title":"Lee","body":"[code] is yours"}'), {
 		ev: "posted",
 		src: "iphone",
 		app: "com.apple.MobileSMS",
 		id: "iphone:x:1",
-		title: "Ashley",
+		title: "Lee",
 		subtitle: "",
 		body: "[code] is yours",
 		sender: "",

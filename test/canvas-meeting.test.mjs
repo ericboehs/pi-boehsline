@@ -1517,24 +1517,24 @@ test("meeting card: short names, one block per speaker run, the in-progress line
   const src = pageSource("page.mjs");
   const code = src.slice(src.indexOf("const meetPad"), src.indexOf("// The card's elapsed time ticks"));
   const { renderMeeting, meetName } = new Function("h", "plural", `${code}; return { renderMeeting, meetName };`)(h, (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`);
-  assert.equal(meetName("Compton, Tori K. (governmentcio Llc)"), "Tori Compton");
-  assert.equal(meetName("Alex Teal"), "Alex Teal");
+  assert.equal(meetName("Rivera, Sam J. (Example Corp Llc)"), "Sam Rivera");
+  assert.equal(meetName("Jo Park"), "Jo Park");
   assert.equal(meetName("Ada B. Lovelace (ORG)"), "Ada Lovelace");
   assert.equal(meetName("Grace"), "Grace");
-  const tori = "Compton, Tori K. (governmentcio Llc)";
+  const sam = "Rivera, Sam J. (Example Corp Llc)";
   const lines = [
-    { type: "caption", speaker: "Alex Teal", text: "One." },
-    { type: "caption", speaker: "Alex Teal", text: "Two." },
-    { type: "caption", speaker: tori, text: "Yeah." },
-    { type: "caption", speaker: tori, text: "At 1:35." },
-    { type: "chat", speaker: tori, text: "link?" },
+    { type: "caption", speaker: "Jo Park", text: "One." },
+    { type: "caption", speaker: "Jo Park", text: "Two." },
+    { type: "caption", speaker: sam, text: "Yeah." },
+    { type: "caption", speaker: sam, text: "At 1:35." },
+    { type: "chat", speaker: sam, text: "link?" },
   ];
-  const card = renderMeeting({ kind: "live", id: "b1b1b1b1b1b1", title: "T", recording: true, startedAt: new Date().toISOString(), lines, live: [{ speaker: tori, text: "and then" }], total: 5, recent: [] });
+  const card = renderMeeting({ kind: "live", id: "b1b1b1b1b1b1", title: "T", recording: true, startedAt: new Date().toISOString(), lines, live: [{ speaker: sam, text: "and then" }], total: 5, recent: [] });
   const rows = [...card.querySelectorAll(".m-line")];
-  assert.deepEqual(rows.map((r) => [r.querySelector("b")?.textContent ?? "", r.className]), [["Alex Teal", "m-line"], ["Tori Compton", "m-line"], ["(chat) Tori Compton", "m-line chat"], ["Tori Compton", "m-line live"]]);
-  assert.equal(rows[0].textContent, "Alex TealOne. Two.");
-  assert.equal(rows[1].textContent, "Tori ComptonYeah. At 1:35.");
-  assert.equal(rows[1].getAttribute("title"), tori, "the full name on hover");
+  assert.deepEqual(rows.map((r) => [r.querySelector("b")?.textContent ?? "", r.className]), [["Jo Park", "m-line"], ["Sam Rivera", "m-line"], ["(chat) Sam Rivera", "m-line chat"], ["Sam Rivera", "m-line live"]]);
+  assert.equal(rows[0].textContent, "Jo ParkOne. Two.");
+  assert.equal(rows[1].textContent, "Sam RiveraYeah. At 1:35.");
+  assert.equal(rows[1].getAttribute("title"), sam, "the full name on hover");
   const long = Array.from({ length: 200 }, (_, i) => `w${i}`).join(" ");
   const lc = renderMeeting({ kind: "live", id: "c1c1c1c1c1c1", title: "T", recording: true, startedAt: new Date().toISOString(), lines: [{ type: "caption", speaker: "Ada", text: long }], live: [], total: 1, recent: [] });
   const txt = lc.querySelector(".m-line").textContent;
@@ -2031,7 +2031,7 @@ test("meetName: suffixes and titles are dropped before 'Last, First' is read; on
   assert.equal(meetName("Smith, John Jr."), "John Smith");
   assert.equal(meetName("John Smith II"), "John Smith");
   assert.equal(meetName("Dr. Jane Doe"), "Jane Doe");
-  assert.equal(meetName("Compton, Tori K. (governmentcio Llc)"), "Tori Compton");
+  assert.equal(meetName("Rivera, Sam J. (Example Corp Llc)"), "Sam Rivera");
   assert.equal(meetName("Ada B. Lovelace (ORG)"), "Ada Lovelace");
   assert.equal(meetName("Grace"), "Grace");
   assert.equal(meetName("ada@example.com"), "ada@example.com");
@@ -2127,9 +2127,9 @@ test("/meeting notes: newest first, capped at 3 with Show all, topics clamp, new
 
 test("titles: junk is empty or 'Meeting join…'; the shared window's title wins, then the slug", () => {
   assert.deepEqual(["", "  ", "Meeting join  meeting", "meeting join - 1234", "Weekly Sync"].map(isJunkTitle), [true, true, true, true, false]);
-  assert.equal(sharedTitle("Shared content | 2026 VA Daily IT Stand-Up Briefing\nCIO Standup"), "2026 VA Daily IT Stand-Up Briefing");
+  assert.equal(sharedTitle("Shared content | 2026 Daily Platform Stand-Up\nTeam Standup"), "2026 Daily Platform Stand-Up");
   assert.equal(sharedTitle("\n  shared content |  Platform Sync  \n"), "Platform Sync");
-  assert.equal(sharedTitle("CIO Standup\nShared content | not first"), "", "only the first line");
+  assert.equal(sharedTitle("Team Standup\nShared content | not first"), "", "only the first line");
   assert.equal(displayTitle("Weekly Sync", { shared: "Other", slug: "x" }), "Weekly Sync");
   assert.equal(displayTitle("Meeting join  meeting", { shared: "Daily Stand-Up", slug: "meeting-join-meeting" }), "Daily Stand-Up");
   assert.equal(displayTitle("Meeting join  meeting", { slug: "platform-weekly-sync" }), "Platform weekly sync");
@@ -2141,27 +2141,27 @@ test("live title: 'Meeting join…' becomes the shared window's title once a sli
   try {
     let now = Date.parse("2026-10-30T07:05:00Z");
     const feed = new MeetingFeed(f.state, { alive: () => true, now: () => now });
-    const jsonl = join(f.root, "data", "20261030_070210-teams-cio-standup.jsonl");
+    const jsonl = join(f.root, "data", "20261030_070210-teams-team-standup.jsonl");
     writeFileSync(jsonl, line({ type: "caption", speaker: "Ada", text: "hi", ts: "t" }));
     f.writeState({ meeting: "Meeting join  meeting", jsonl });
     feed.poll();
-    assert.equal(feed.summary().title, "Cio standup", "no slide yet: the slug");
-    assert.equal(feed.snapshot().state.title, "Cio standup");
+    assert.equal(feed.summary().title, "Team standup", "no slide yet: the slug");
+    assert.equal(feed.snapshot().state.title, "Team standup");
     writeFileSync(join(f.slides, "0001-070500.jpg"), "jpg");
     appendFileSync(join(f.slides, "index.jsonl"), line({ n: 1, file: "0001-070500.jpg" }));
     feed.poll();
-    assert.equal(feed.summary().title, "Cio standup", "no OCR yet");
-    writeFileSync(join(f.slides, "0001-070500.txt"), "Shared content | 2026 VA Daily IT Stand-Up Briefing\nCIO Standup Briefing");
+    assert.equal(feed.summary().title, "Team standup", "no OCR yet");
+    writeFileSync(join(f.slides, "0001-070500.txt"), "Shared content | 2026 Daily Platform Stand-Up\nTeam Standup Briefing");
     feed.poll();
-    assert.equal(feed.summary().title, "Cio standup", "rechecked at most every 5 s");
+    assert.equal(feed.summary().title, "Team standup", "rechecked at most every 5 s");
     now += 5_000;
     feed.poll();
-    assert.equal(feed.summary().title, "2026 VA Daily IT Stand-Up Briefing");
-    assert.equal(feed.snapshot().state.title, "2026 VA Daily IT Stand-Up Briefing");
+    assert.equal(feed.summary().title, "2026 Daily Platform Stand-Up");
+    assert.equal(feed.snapshot().state.title, "2026 Daily Platform Stand-Up");
     // state.json rewritten (still junk): the shared title stays.
     f.writeState({ meeting: "Meeting join  meeting", jsonl, ended: true, ended_at: "2026-10-30T07:30:00Z" });
     feed.poll();
-    assert.equal(feed.summary().title, "2026 VA Daily IT Stand-Up Briefing");
+    assert.equal(feed.summary().title, "2026 Daily Platform Stand-Up");
   } finally {
     f.done();
   }

@@ -2173,7 +2173,7 @@ function renderMeeting(m) {
   out.push(h("div", { class: "m-links" }, h("a", { class: "m-open", href: "/meeting", target: "_blank" }, "Open the live view ↗"), h("a", { class: "m-open", href: "/meetings", target: "_blank" }, "Previous meetings ↗")));
   return h("div", { class: "meet" }, out);
 }
-/** "Compton, Tori K. (Acme Llc)" → "Tori Compton"; "Ada B. Lovelace" → "Ada Lovelace". The card is narrow; /meeting keeps full names. */
+/** "Rivera, Sam J. (Acme Llc)" → "Sam Rivera"; "Ada B. Lovelace" → "Ada Lovelace". The card is narrow; /meeting keeps full names. */
 function meetName(s) {
   const suffix = /^(?:Jr|Sr)\.?$|^(?:II|III|IV)$/i;
   const title = /^(?:Dr|Mr|Mrs|Ms|Mx|Prof)\.?$/i;
