@@ -29,10 +29,10 @@
 
 import { createHash, createPublicKey, randomBytes, randomUUID, verify as verifySignature } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { accessSync, appendFileSync, existsSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, closeSync, copyFileSync, createReadStream, existsSync, chmodSync, constants as fsConstants, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { basename, delimiter, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { optIn } from "../../../lib/opt-in.ts";
@@ -53,6 +53,9 @@ interface Prompt { kind: PromptKind; title: string }
 type UserContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 interface Image { data: string; mime_type: string }
 interface File { name: string; data: string }
+/** A long video Botsun put on this Mac in chunks (its uploads dir) and a say names: the host's
+ * path, and what the phone signed about it. */
+export interface Upload { path: string; name: string; mime: string; bytes: number; sha256: string }
 
 const TITLE_MAX = 500;
 const NAME_MAX = 200;
@@ -71,6 +74,14 @@ const FILE_B64_MAX = Math.ceil((25 * 1024 * 1024) / 3) * 4; // 25 MB a file, bas
 const ATTACH_B64_TOTAL_MAX = Math.ceil((40 * 1024 * 1024) / 3) * 4;
 const ATTACH_MAX = 4;
 export const inboxDir = (): string => process.env.BOTSUN_OWNER_INBOX || join(homedir(), ".local", "state", "botsun", "inbox");
+/** Where Botsun keeps long videos while they upload (its Paths.state("uploads")): the only place an
+ * upload's path may point. */
+export const uploadsDir = (): string => process.env.BOTSUN_UPLOADS_DIR || join(homedir(), ".local", "state", "botsun", "uploads");
+/** A long video: at most this many bytes (Botsun's Uploads::MAX_SIZE), MP4 or QuickTime. */
+const UPLOAD_MAX = 512 * 1024 * 1024;
+const UPLOAD_TYPES = new Set(["video/mp4", "video/quicktime"]);
+const UPLOAD_FILE = /^[0-9a-f]{32}\.part$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 /** Video frames shown to the agent: at most this many per video and per message (on top of the photos). */
 const FRAMES_PER_VIDEO = 8;
 const FRAMES_MAX = 16;
@@ -302,18 +313,22 @@ export function ownerMessage(deviceId: string, nonce: string, sessionId: string,
  * "botsun-say-attach-v2\n<id>\n<lines>" with photos or files. With no id the bytes are exactly
  * the old form, so the id can't be swapped, dropped or added under the same signature.
  */
-export function sayDigest(text: string, images: Image[], files: File[], clientId?: string):
+export function sayDigest(text: string, images: Image[], files: File[], clientId?: string,
+	uploads: Pick<Upload, "name" | "sha256" | "bytes">[] = []):
 	{ decision: string; digest: string; payload: string } {
 	const textHash = sha256hex(Buffer.from(text, "utf8"));
 	let decision = "say";
 	let digest = textHash;
 	// Text's v2 payload replaces the magic's line; an attachment's is the v1 lines with a new magic.
 	let payload = clientId ? `${PROPOSE_TEXT_ID}\n${clientId}\n${text}` : `${PROPOSE_TEXT}\n${text}`;
-	if (files.length) {
-		// "say_attach": sha256(text), then "image <sha256>" per photo, "file <sha256(name)> <sha256(data)>" per file.
+	if (files.length || uploads.length) {
+		// "say_attach": sha256(text), then "image <sha256>" per photo, "file <sha256(name)> <sha256(data)>" per file,
+		// and "upload <sha256(name)> <sha256> <bytes>" per long video (Botsun's record of it, which this
+		// session hashes again before it takes the file).
 		decision = "say_attach";
 		const lines = [textHash, ...images.map((i) => `image ${sha256hex(Buffer.from(i.data, "base64"))}`),
-			...files.map((f) => `file ${sha256hex(Buffer.from(f.name, "utf8"))} ${sha256hex(Buffer.from(f.data, "base64"))}`)].join("\n");
+			...files.map((f) => `file ${sha256hex(Buffer.from(f.name, "utf8"))} ${sha256hex(Buffer.from(f.data, "base64"))}`),
+			...uploads.map((u) => `upload ${sha256hex(Buffer.from(u.name, "utf8"))} ${u.sha256} ${u.bytes}`)].join("\n");
 		digest = sha256hex(lines);
 		payload = clientId ? `${SAY_ATTACH_ID}\n${clientId}\n${lines}` : lines;
 	} else if (images.length) {
@@ -330,13 +345,45 @@ function filesOf(raw: unknown): File[] | string {
 	if (!Array.isArray(raw) || raw.length > ATTACH_MAX) return `at most ${ATTACH_MAX} attachments`;
 	for (const f of raw) {
 		if (!f || typeof f.name !== "string" || typeof f.data !== "string") return "bad file";
-		if (!f.name.trim() || f.name.length > 200 || /[\/\0]/.test(f.name) || f.name.startsWith(".")) return "bad file name";
+		if (badName(f.name)) return "bad file name";
 		if (f.data.length > FILE_B64_MAX || !/^[A-Za-z0-9+/]*={0,2}$/.test(f.data)) return "a file is too big (25 MB) or not base64";
 	}
 	return raw as File[];
 }
 
-interface Saved { path: string; note: string; video: boolean }
+/** A file name the phone may give (a file's or an upload's): one line, no path, no leading dot. */
+const badName = (name: string): boolean => !name.trim() || name.length > 200 || /[\/\0\n\r]/.test(name) || name.startsWith(".");
+
+/**
+ * The long videos a say names (Botsun resolved each upload id to its own file): each path must be
+ * a plain file named by its uid right inside the uploads dir (realpath, never a link), of exactly
+ * the size signed. The session hashes it again before taking it (takeUploads).
+ */
+export function uploadsOf(raw: unknown): Upload[] | string {
+	if (raw === undefined || raw === null) return [];
+	if (!Array.isArray(raw) || raw.length > ATTACH_MAX) return `at most ${ATTACH_MAX} attachments`;
+	let dir: string;
+	try { dir = realpathSync(uploadsDir()); } catch { return "no uploads dir on this Mac"; }
+	for (const u of raw) {
+		if (!u || typeof u.path !== "string" || typeof u.name !== "string" || typeof u.mime !== "string" || typeof u.sha256 !== "string") return "bad upload";
+		if (badName(u.name)) return "bad file name";
+		if (!UPLOAD_TYPES.has(u.mime)) return "a long video is MP4 or QuickTime";
+		if (!Number.isSafeInteger(u.bytes) || u.bytes < 1 || u.bytes > UPLOAD_MAX) return "a long video is at most 512 MB";
+		if (!SHA256_HEX.test(u.sha256)) return "bad upload";
+		if (!u.path.startsWith("/") || !UPLOAD_FILE.test(basename(u.path))) return "an upload must be in Botsun's uploads dir";
+		try {
+			if (realpathSync(dirname(u.path)) !== dir) return "an upload must be in Botsun's uploads dir";
+			const st = lstatSync(u.path);
+			if (st.isSymbolicLink() || !st.isFile()) return "an upload must be a plain file";
+			if (st.size !== u.bytes) return "an upload isn't the size that was signed";
+		} catch {
+			return "an upload must be in Botsun's uploads dir";
+		}
+	}
+	return raw as Upload[];
+}
+
+interface Saved { path: string; note: string; video: boolean; upload?: boolean }
 
 /** Saves attached files where the agent can read them: inbox/<pid>/<time>-<name>, 0600. */
 function saveFiles(files: File[]): Saved[] {
@@ -355,6 +402,87 @@ function saveFiles(files: File[]): Saved[] {
 		const video = VIDEO_NAME.test(f.name) && data.length >= 12 && data.subarray(4, 8).toString("latin1") === "ftyp";
 		return { path, note: `📎 Attached: ${path} (${kb})`, video };
 	});
+}
+
+/** A file's sha256, read in a stream (a 500 MB video is a second or two, never in memory). */
+export function hashFile(path: string): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const hash = createHash("sha256");
+		createReadStream(path).on("error", reject).on("data", (b) => hash.update(b)).on("end", () => resolve(hash.digest("hex")));
+	});
+}
+
+const sizeText = (n: number): string =>
+	n < 1024 ? `${n} B` : n < 1048576 ? `${Math.round(n / 1024)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+
+/** Whether a file starts like an MP4 / QuickTime ("ftyp" at 4), so a renamed file isn't fed to ffmpeg. */
+function startsLikeMovie(path: string): boolean {
+	const fd = openSync(path, "r");
+	try {
+		const head = Buffer.alloc(12);
+		return readSync(fd, head, 0, 12, 0) === 12 && head.subarray(4, 8).toString("latin1") === "ftyp";
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/**
+ * Long videos into the inbox, as saveFiles names a file (inbox/<pid>/<time>-<n>-<rand>-<name>): a
+ * hard link to Botsun's file (the same disk, no copy; a copy across disks), then this session's own
+ * sha256 of what it now holds, which must be the one the phone signed. Anything wrong removes what
+ * it linked and says why; Botsun keeps its copy until the say's ok.
+ */
+export async function takeUploads(uploads: Upload[]): Promise<Saved[] | string> {
+	if (!uploads.length) return [];
+	const dir = join(inboxDir(), String(process.pid));
+	const saved: Saved[] = [];
+	const drop = () => { for (const s of saved) { try { unlinkSync(s.path); } catch {} } };
+	try {
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		chmodSync(dir, 0o700);
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		for (const [i, u] of uploads.entries()) {
+			const path = join(dir, `${stamp}-v${i}-${randomBytes(3).toString("hex")}-${u.name}`);
+			try {
+				linkSync(u.path, path);
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code !== "EXDEV") throw e;
+				copyFileSync(u.path, path, fsConstants.COPYFILE_EXCL);
+			}
+			const taken: Saved = { path, note: `📎 Attached: ${path} (${sizeText(u.bytes)})`, video: false, upload: true };
+			saved.push(taken);
+			const st = lstatSync(path);
+			if (!st.isFile() || st.size !== u.bytes) { drop(); return "an upload isn't the size that was signed"; }
+			chmodSync(path, 0o600);
+			if ((await hashFile(path)) !== u.sha256) { drop(); return "an upload's sha256 doesn't match what was signed"; }
+			taken.video = startsLikeMovie(path);
+		}
+		return saved;
+	} catch (e) {
+		drop();
+		return `couldn't take the video: ${(e as NodeJS.ErrnoException).code ?? "error"}`;
+	}
+}
+
+/** 192.4 → "3m12s", 42 → "42s", 3725 → "1h02m05s": a long video's length in its note. */
+export function span(seconds: number): string {
+	const s = Math.max(0, Math.round(seconds));
+	const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+	if (h) return `${h}h${String(m).padStart(2, "0")}m${String(r).padStart(2, "0")}s`;
+	return m ? `${m}m${String(r).padStart(2, "0")}s` : `${r}s`;
+}
+
+/** A path as one shell word: as it is when it is plain, else in single quotes. */
+const shellWord = (path: string): string => /^[A-Za-z0-9_\/.@%+=:,-]+$/.test(path) ? path : `'${path.replace(/'/g, "'\\''")}'`;
+
+/**
+ * A long video's note for the agent: where it is, how long and how big, and how to look at all of
+ * it (the frames that come with the message are a handful; a debugging session wants more).
+ */
+export function videoNote(path: string, info: { duration?: number; width?: number; height?: number; bytes: number }): string {
+	const parts = [info.duration !== undefined ? span(info.duration) : sizeText(info.bytes),
+		...(info.width && info.height ? [`${info.width}x${info.height}`] : [])];
+	return `Video: ${path} (${parts.join(", ")}). To view it, extract frames, e.g. ffmpeg -i ${shellWord(path)} -vf fps=1 /tmp/frames/%04d.png, then read the PNGs.`;
 }
 
 /** Runs a program (argv, never a shell) with a timeout; resolves its stdout. SIGKILL at the
@@ -407,12 +535,13 @@ const isJpeg = (b: Buffer) => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && 
  * why there are none (appended to the 📎 line by the caller).
  */
 async function videoFrames(path: string, max: number, deadline: number, run: VideoRunner):
-	Promise<{ images: UserContent[]; note: string } | { why: string }> {
+	Promise<{ images: UserContent[]; note: string; duration: number } | { why: string; duration?: number }> {
 	const ffmpeg = findTool("ffmpeg");
 	const ffprobe = findTool("ffprobe");
 	if (!ffmpeg || !ffprobe) return { why: "ffmpeg unavailable" };
 	const left = () => deadline - Date.now();
 	let dir: string | undefined;
+	let got: number | undefined;
 	try {
 		if (left() <= 0) return { why: "ffmpeg timed out" };
 		const out = await run(ffprobe, ["-v", "error", "-protocol_whitelist", "file", "-f", "mov", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path], left());
@@ -422,6 +551,7 @@ async function videoFrames(path: string, max: number, deadline: number, run: Vid
 		chmodSync(dir, 0o700);
 		const images: UserContent[] = [];
 		const at: number[] = [];
+		got = duration;
 		for (const [i, t] of frameTimes(duration, max).entries()) {
 			if (left() <= 0) break;
 			const jpg = join(dir, `frame-${i}.jpg`);
@@ -434,17 +564,32 @@ async function videoFrames(path: string, max: number, deadline: number, run: Vid
 				at.push(t);
 			} catch {}
 		}
-		if (!images.length) return { why: left() <= 0 ? "ffmpeg timed out" : "ffmpeg failed" };
+		if (!images.length) return { why: left() <= 0 ? "ffmpeg timed out" : "ffmpeg failed", duration };
 		const noun = images.length === 1 ? "frame" : "frames";
-		return { images, note: `🎞️ Video ${path} (${clock(duration)}): ${images.length} ${noun} at ${at.map(clock).join(", ")}` };
+		return { images, duration, note: `🎞️ Video ${path} (${clock(duration)}): ${images.length} ${noun} at ${at.map(clock).join(", ")}` };
 	} catch {
-		return { why: left() <= 0 ? "ffmpeg timed out" : "ffmpeg failed" };
+		return { why: left() <= 0 ? "ffmpeg timed out" : "ffmpeg failed", duration: got };
 	} finally {
 		if (dir) rmSync(dir, { recursive: true, force: true });
 	}
 }
 
-/** Every saved file's note, each video's with its frames (or why none); frames after the photos. */
+/** A video's picture size (ffprobe's first video stream), or nothing when it can't say in time. */
+async function videoSize(path: string, deadline: number, run: VideoRunner): Promise<{ width?: number; height?: number }> {
+	const ffprobe = findTool("ffprobe");
+	const left = deadline - Date.now();
+	if (!ffprobe || left <= 0) return {};
+	try {
+		const out = await run(ffprobe, ["-v", "error", "-protocol_whitelist", "file", "-f", "mov", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path], left);
+		const m = out.trim().match(/^(\d{1,5})x(\d{1,5})$/);
+		return m ? { width: Number(m[1]), height: Number(m[2]) } : {};
+	} catch {
+		return {};
+	}
+}
+
+/** Every saved file's note, each video's with its frames (or why none); frames after the photos. A
+ * long video (an upload) gets videoNote's line in place of its 📎 one, frames or not. */
 async function withFrames(saved: Saved[], run: VideoRunner): Promise<{ notes: string[]; frames: UserContent[] }> {
 	const videos = saved.filter((s) => s.video).length;
 	const per = videos ? Math.max(1, Math.min(FRAMES_PER_VIDEO, Math.floor(FRAMES_MAX / videos))) : 0;
@@ -454,8 +599,11 @@ async function withFrames(saved: Saved[], run: VideoRunner): Promise<{ notes: st
 	for (const s of saved) {
 		if (!s.video) { notes.push(s.note); continue; }
 		const got = await videoFrames(s.path, per, deadline, run);
-		if ("why" in got) { notes.push(`${s.note} (no frames: ${got.why})`); continue; }
-		notes.push(s.note, got.note);
+		const note = s.upload
+			? videoNote(s.path, { duration: got.duration, bytes: statSync(s.path).size, ...(await videoSize(s.path, deadline, run)) })
+			: s.note;
+		if ("why" in got) { notes.push(`${note} (no frames: ${got.why})`); continue; }
+		notes.push(note, got.note);
 		frames.push(...got.images);
 	}
 	return { notes, frames };
@@ -707,11 +855,15 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	if (typeof images === "string") return { error: images };
 	const files = filesOf(r.files);
 	if (typeof files === "string") return { error: files };
-	if (images.length + files.length > ATTACH_MAX) return { error: `at most ${ATTACH_MAX} attachments` };
+	const uploads = uploadsOf(r.uploads);
+	if (typeof uploads === "string") return { error: uploads };
+	if (images.length + files.length + uploads.length > ATTACH_MAX) return { error: `at most ${ATTACH_MAX} attachments` };
 	if ([...images, ...files].reduce((n, a) => n + a.data.length, 0) > ATTACH_B64_TOTAL_MAX) {
 		return { error: "attachments are over 40 MB together" };
 	}
-	if (typeof text !== "string" || text.length > TEXT_MAX || (!text.trim() && !images.length && !files.length)) {
+	// A long video is named in v2 or newer only: a v1 signature never covered one.
+	if (uploads.length && !atLeastV2(r)) return { error: "a long video is signed with v2 or newer" };
+	if (typeof text !== "string" || text.length > TEXT_MAX || (!text.trim() && !images.length && !files.length && !uploads.length)) {
 		return { error: "text must be 1 to 20000 characters (or attach something)" };
 	}
 	// The phone's own id for this message, if it sent one: a lowercase UUID, and signed with v2 or
@@ -721,7 +873,7 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	}
 	const clientId = r.client_id as string | undefined;
 	if (clientId && !atLeastV2(r)) return { error: "a message id is signed with v2 or newer" };
-	const say = sayDigest(text, images, files, clientId);
+	const say = sayDigest(text, images, files, clientId, uploads);
 	const denied = verifyDevice(c, r, { decision: say.decision, digest: () => say.digest,
 		v2: { kind: "session", decision: say.decision, payload: () => say.payload } });
 	if (denied) return { error: denied };
@@ -731,6 +883,17 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	const said = clientId ? saidKey(c, r, clientId) : undefined;
 	const digest = said ? say.digest : "";
 	if (said && saidBefore(c, said, digest)) return { ok: true, delivered: "duplicate" };
+	// Long videos: linked into the inbox and hashed again here before anything goes in (a second or
+	// two for 500 MB; Botsun waits up to 30 s), so the reply says whether this session has them.
+	if (uploads.length) {
+		return takeUploads(uploads).then((taken) => {
+			if (typeof taken === "string") return { error: taken };
+			const outcome = deliverSay(c, text, images, files, { clientId, uploads: taken });
+			return outcome instanceof Promise
+				? outcome.then((reply) => saidDone(c, said, digest, reply))
+				: saidDone(c, said, digest, outcome);
+		});
+	}
 	const outcome = deliverSay(c, text, images, files, { clientId });
 	return outcome instanceof Promise
 		? outcome.then((reply) => saidDone(c, said, digest, reply))
@@ -1103,13 +1266,14 @@ function sayCall(c: Conn, r: Record<string, unknown>): Record<string, unknown> |
 /** What a locked-phone reply may not start with: "/" (commands, skills, templates) or "!" (bash). */
 export const LOCKED_COMMAND = /^[\s\p{Cf}]*[\/!]/u; // spaces and invisible format chars, then / or ! (as Botsun checks)
 
-function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts: { noCommands?: boolean; clientId?: string } = {}): Record<string, unknown> | Promise<Record<string, unknown>> {
+function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts: { noCommands?: boolean; clientId?: string; uploads?: Saved[] } = {}): Record<string, unknown> | Promise<Record<string, unknown>> {
 	let saved: Saved[];
 	try {
-		saved = saveFiles(files);
+		saved = [...saveFiles(files), ...(opts.uploads ?? [])];
 	} catch (e) {
 		return { error: `couldn't save the file: ${(e as NodeJS.ErrnoException).code ?? "error"}` };
 	}
+	const attached = images.length + files.length + (opts.uploads?.length ?? 0);
 	const compose = (notes: string[], frames: UserContent[]): string | UserContent[] => {
 		const said = [text, ...notes].filter((t) => t.trim()).join("\n\n");
 		const pics: UserContent[] = [...images.map((i) => ({ type: "image" as const, data: i.data, mimeType: i.mime_type })), ...frames];
@@ -1132,7 +1296,7 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 		const job: Promise<void> = (c.framing ?? Promise.resolve())
 			.then(() => withFrames(saved, runFile))
 			.then(({ notes, frames }) => {
-				c.inject(compose(notes, frames), c.busy, { id: opts.clientId, text, withdrawable: false, attachments: images.length + files.length });
+				c.inject(compose(notes, frames), c.busy, { id: opts.clientId, text, withdrawable: false, attachments: attached });
 			})
 			.catch((e) => debug(`owner say with a video: ${(e as Error).message}`))
 			.finally(() => { if (c.framing === job) c.framing = undefined; });
@@ -1142,7 +1306,7 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 	}
 	// Words alone can be taken back from the phone while they wait for the turn's end; a message with
 	// photos or files can't (yet): the reply that brings a steer back has no room for them.
-	const kept = c.inject(compose(notes, []), c.busy, { id: opts.clientId, text, withdrawable: !images.length && !files.length, attachments: images.length + files.length });
+	const kept = c.inject(compose(notes, []), c.busy, { id: opts.clientId, text, withdrawable: !attached, attachments: attached });
 	debug(`owner say accepted (${text.length} chars, ${images.length} photos, ${files.length} files)`); // never the text
 	// The inject knows what happened just now (`delivered` was guessed before it): a compaction it
 	// held them for, or a send pi refused, and the phone hears "held" rather than a prompt it lost.
@@ -2274,6 +2438,8 @@ function featureList(c: Conn): string[] {
 		// answers this with its own features line (OwnerSessions' HOST_FEATURES).
 		"model_pages",
 		"subagents", "subagent_chats",
+		// Long videos Botsun put on this Mac first: a say names them by path (uploadsOf, takeUploads).
+		"uploads",
 		// The phone's Stop on a shell job row (stopJobRequest).
 		"jobs",
 		// Phone steers wait here for the turn's end, and the phone can take them back (unsteerRequest).

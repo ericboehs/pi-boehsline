@@ -4242,3 +4242,132 @@ test("unsteer: a steer that came in during a compaction waits behind the waiting
 	assert.equal(m.sent.length, 0, "never ahead of the one waiting");
 	assert.deepEqual((await unsteer()).withdrawn.map((s) => s.id), [STEER_A, STEER_B]);
 });
+
+// ---- Long videos (feature "uploads"): Botsun's file, named by path, hashed again here ---------
+// test/fixtures/signing-uploads.json is a byte-identical copy of Botsun's upload vectors.
+const uploadVectors = JSON.parse(readFileSync(new URL("./fixtures/signing-uploads.json", import.meta.url), "utf8"));
+const BOTSUN_UPLOADS_FIXTURE = "/Users/ericboehs/Code/github.com/ericboehs/botsun/test/fixtures/signing-uploads.json";
+
+test("uploads: listed as a feature; a say's upload lines are Botsun's, byte for byte", async () => {
+	const { sayDigest } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const v = uploadVectors.vectors.find((x) => x.name === "session say_attach with an upload and the phone's message id");
+	assert.ok(v, "Botsun's upload vectors have the say");
+	const { decision, payload, digest } = sayDigest(v.inputs.text, vectorImages(v), [], v.inputs.client_id, v.inputs.uploads);
+	assert.equal(decision, "say_attach");
+	assert.equal(payload, v.expect_payload);
+	assert.equal(createHash("sha256").update(payload, "utf8").digest("hex"), v.expect_digest);
+	assert.match(payload, /\nupload [0-9a-f]{64} [0-9a-f]{64} 201326592$/);
+	assert.equal(sayDigest("x", [], [], undefined, []).payload, sayDigest("x", [], []).payload, "no uploads: the old bytes");
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	await owner();
+	assert.ok((await ask({ type: "nonce" })).features.includes("uploads"));
+});
+
+test("uploads: the fixture is byte-identical to Botsun's, when Botsun has it", { skip: !existsSync(BOTSUN_UPLOADS_FIXTURE) && "no Botsun checkout with it" }, () => {
+	assert.ok(readFileSync(BOTSUN_UPLOADS_FIXTURE).equals(readFileSync(new URL("./fixtures/signing-uploads.json", import.meta.url))));
+});
+
+/** A long video say as Botsun hands it on: v2, an id, the upload lines over what it recorded. */
+function uploadSay(key, nonce, text, uploads, clientId = "0b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e", signedAs = uploads) {
+	const hex = (b) => createHash("sha256").update(b).digest("hex");
+	const lines = [hex(Buffer.from(text, "utf8")), ...signedAs.map((u) => `upload ${hex(Buffer.from(u.name, "utf8"))} ${u.sha256} ${u.bytes}`)].join("\n");
+	const payload = `botsun-say-attach-v2\n${clientId}\n${lines}`;
+	return { type: "say", text, uploads, client_id: clientId, nonce, device_id: 7, sig_v: 2, signature: signV2(key, nonce, "session", "say_attach", payload) };
+}
+
+function uploadFile(dir, bytes) {
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const uid = randomHex(16);
+	const path = join(dir, `${uid}.part`);
+	writeFileSync(path, bytes, { mode: 0o600 });
+	return path;
+}
+const randomHex = (n) => Array.from({ length: n * 2 }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
+
+test("uploads: a long video is linked into the inbox, hashed again, and named with an ffmpeg hint", async () => {
+	const { statSync, symlinkSync, unlinkSync: rm } = await import("node:fs");
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
+	const updir = join(home, "uploads");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	// Fake ffprobe / ffmpeg (never the real ones): a 3m12s 1920x1080 recording.
+	const bin = join(home, "fakebin-up");
+	mkdirSync(bin, { recursive: true });
+	writeFileSync(join(bin, "ffprobe"), `#!/bin/sh\ncase "$*" in *stream=width,height*) echo 1920x1080 ;; *) echo 192.4 ;; esac\n`, { mode: 0o755 });
+	writeFileSync(join(bin, "ffmpeg"), `#!/bin/sh\nfor a; do out=$a; done\nprintf '\\377\\330\\377frame' > "$out"\n`, { mode: 0o755 });
+	const path0 = process.env.PATH;
+	const dirs0 = process.env.BOTSUN_OWNER_FFMPEG_DIRS;
+	cleanups.push(() => { process.env.PATH = path0; if (dirs0 === undefined) delete process.env.BOTSUN_OWNER_FFMPEG_DIRS; else process.env.BOTSUN_OWNER_FFMPEG_DIRS = dirs0; });
+	process.env.PATH = bin;
+	process.env.BOTSUN_OWNER_FFMPEG_DIRS = "";
+	const m = await owner();
+	const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from("ftypmp42"), Buffer.alloc(4000, 7)]);
+	const sha = createHash("sha256").update(mp4).digest("hex");
+	const hostPath = uploadFile(updir, mp4);
+	const up = { path: hostPath, name: "Screen Recording.mp4", mime: "video/mp4", bytes: mp4.length, sha256: sha };
+
+	let { nonce } = await ask({ type: "nonce" });
+	let res = await ask(uploadSay(key, nonce, "it breaks here", [up]));
+	assert.deepEqual(res, { ok: true, delivered: "prompt" });
+	await until(() => m.sent.length === 1, 10_000);
+	const [first, ...frames] = m.sent[0].content;
+	assert.equal(frames.length, 8);
+	const inbox = first.text.match(/Video: (.+?) \(3m12s, 1920x1080\)\. /)[1];
+	assert.ok(inbox.startsWith(join(home, "inbox", String(process.pid))) && inbox.endsWith("-Screen Recording.mp4"));
+	assert.ok(first.text.startsWith("it breaks here\n\nVideo: "));
+	assert.ok(first.text.includes(`To view it, extract frames, e.g. ffmpeg -i '${inbox}' -vf fps=1 /tmp/frames/%04d.png, then read the PNGs.`));
+	assert.ok(first.text.includes(`🎞️ Video ${inbox} (3:12): 8 frames`));
+	assert.equal(statSync(inbox).ino, statSync(hostPath).ino, "a hard link, not a copy");
+	assert.equal(statSync(inbox).mode & 0o777, 0o600);
+
+	// A hash that isn't the signed one: refused, and nothing is left in the inbox for it.
+	const other = uploadFile(updir, mp4);
+	const lie = { ...up, path: other, sha256: "ab".repeat(32) };
+	({ nonce } = await ask({ type: "nonce" }));
+	const before = readdirSync(join(home, "inbox", String(process.pid))).length;
+	res = await ask(uploadSay(key, nonce, "x", [lie], "1b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e"));
+	assert.equal(res.error, "an upload's sha256 doesn't match what was signed");
+	assert.equal(readdirSync(join(home, "inbox", String(process.pid))).length, before);
+
+	// A renamed video under the same signature.
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask(uploadSay(key, nonce, "x", [{ ...up, path: other, name: "evil.mp4" }], undefined, [{ ...up, path: other }]));
+	assert.equal(res.error, "signature does not verify");
+
+	// Paths: outside the uploads dir, a link inside it, the wrong size, a name that's a path.
+	const outside = uploadFile(join(home, "elsewhere"), mp4);
+	const link = join(updir, `${randomHex(16)}.part`);
+	symlinkSync(outside, link);
+	const refusals = [
+		[{ ...up, path: outside }, "an upload must be in Botsun's uploads dir"],
+		[{ ...up, path: join(updir, "..", "elsewhere", basenameOf(outside)) }, "an upload must be in Botsun's uploads dir"],
+		[{ ...up, path: join(updir, "notauid.mp4") }, "an upload must be in Botsun's uploads dir"],
+		[{ ...up, path: link }, "an upload must be a plain file"],
+		[{ ...up, path: other, bytes: mp4.length + 1 }, "an upload isn't the size that was signed"],
+		[{ ...up, path: other, name: "../x.mp4" }, "bad file name"],
+		[{ ...up, path: other, mime: "text/plain" }, "a long video is MP4 or QuickTime"],
+	];
+	for (const [bad, why] of refusals) {
+		({ nonce } = await ask({ type: "nonce" }));
+		assert.equal((await ask(uploadSay(key, nonce, "x", [bad]))).error, why, bad.path);
+	}
+	rm(link);
+	// v1 never names one.
+	({ nonce } = await ask({ type: "nonce" }));
+	res = await ask({ ...uploadSay(key, nonce, "x", [{ ...up, path: other }]), sig_v: undefined, client_id: undefined });
+	assert.equal(res.error, "a long video is signed with v2 or newer");
+	assert.equal(m.sent.length, 1);
+});
+
+const basenameOf = (p) => p.split("/").pop();
+
+test("videoNote and span: the length, the size, and a path the shell takes as one word", async () => {
+	const { videoNote, span } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	assert.deepEqual([span(42), span(192.4), span(3725), span(0)], ["42s", "3m12s", "1h02m05s", "0s"]);
+	assert.equal(videoNote("/tmp/a.mp4", { duration: 192, width: 1920, height: 1080, bytes: 1 }),
+		"Video: /tmp/a.mp4 (3m12s, 1920x1080). To view it, extract frames, e.g. ffmpeg -i /tmp/a.mp4 -vf fps=1 /tmp/frames/%04d.png, then read the PNGs.");
+	assert.match(videoNote("/tmp/it's here.mp4", { bytes: 3 * 1048576 }), /^Video: \/tmp\/it's here\.mp4 \(3\.0 MB\)\. .* ffmpeg -i '\/tmp\/it'\\''s here\.mp4' -vf/);
+});
