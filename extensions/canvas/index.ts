@@ -35,7 +35,7 @@ import { Type } from "typebox";
 // pi-scheduler (packages/scheduler, developed here): read-only use of its
 // registry path, validator and schedule wording for the Scheduled group.
 import { describeSchedule, taskLabel, TASK_LABEL_MAX } from "../../packages/scheduler/extensions/lib/schedule-core.ts";
-import { isDurableTask, registryPath } from "../../packages/scheduler/extensions/lib/task-registry.ts";
+import { isClaimStale, isDurableTask, registryPath } from "../../packages/scheduler/extensions/lib/task-registry.ts";
 
 export const PORT = Number(process.env.PI_CANVAS_PORT || 8790);
 export const STATUS_MODEL = process.env.PI_CANVAS_MODEL || "github-copilot/claude-haiku-5.5";
@@ -790,14 +790,17 @@ export function sessionViews(list: unknown): ScheduledView[] {
  * Every durable /schedule task on this Mac, as views, whatever its cwd: Botsun's "On this Mac"
  * shows memory-review, nightly-backup and the like in every session. A task whose createdBySession
  * is sessionId is this session's (scope "session"); every other is "host". After /fork the new
- * session has a new id, so a task its parent created shows as "host" there.
+ * session has a new id, so a task its parent created shows as "host" there. A claim whose runner
+ * is gone (or that outlived its timeout by CLAIM_STALE_MS) is not a run: such a task shows its
+ * last status with since and runId null, so no clock ticks for a run that died.
  */
-export function durableViews(tasks: unknown, sessionId = ""): ScheduledView[] {
+export function durableViews(tasks: unknown, sessionId = "", now = Date.now()): ScheduledView[] {
   if (!Array.isArray(tasks)) return [];
   const out: ScheduledView[] = [];
   for (const t of tasks) {
     if (!isDurableTask(t)) continue;
-    const status: ScheduledView["status"] = t.runningSince !== undefined ? "running" : t.paused ? "paused" : t.lastStatus && SCHED_STATUSES.has(t.lastStatus) ? t.lastStatus : "armed";
+    const running = t.runningSince !== undefined && !isClaimStale(t, now);
+    const status: ScheduledView["status"] = running ? "running" : t.paused ? "paused" : t.lastStatus && SCHED_STATUSES.has(t.lastStatus) ? t.lastStatus : "armed";
     // One task with an odd field (a non-string name, a time out of range) is skipped, not the list.
     try {
       out.push({
@@ -810,8 +813,8 @@ export function durableViews(tasks: unknown, sessionId = ""): ScheduledView[] {
         status,
         source: "durable",
         scope: sessionId && (t as { createdBySession?: unknown }).createdBySession === sessionId ? "session" : "host",
-        since: msIso(t.runningSince),
-        runId: typeof t.runningSince === "number" && Number.isSafeInteger(t.runningSince) && t.runningSince > 0 ? String(t.runningSince) : null,
+        since: running ? msIso(t.runningSince) : null,
+        runId: running && typeof t.runningSince === "number" && Number.isSafeInteger(t.runningSince) && t.runningSince > 0 ? String(t.runningSince) : null,
       });
     } catch {
       continue;
@@ -821,9 +824,9 @@ export function durableViews(tasks: unknown, sessionId = ""): ScheduledView[] {
 }
 
 /** Durable views straight from the registry file; [] when it is missing or unreadable. Read-only, no lock. */
-export function readDurableViews(path = registryPath(), sessionId = ""): ScheduledView[] {
+export function readDurableViews(path = registryPath(), sessionId = "", now = Date.now()): ScheduledView[] {
   try {
-    return durableViews((JSON.parse(readFileSync(path, "utf8")) as { tasks?: unknown } | null)?.tasks, sessionId);
+    return durableViews((JSON.parse(readFileSync(path, "utf8")) as { tasks?: unknown } | null)?.tasks, sessionId, now);
   } catch {
     return [];
   }
@@ -2121,7 +2124,9 @@ export default function canvas(pi: ExtensionAPI) {
       const path = registryPath();
       const st = statSync(path);
       key = `${sessionId}\0${st.mtimeMs}\0${st.size}`;
-      if (key === durableKey) return false;
+      // Unchanged file: nothing new, unless a run shows. Its runner can die without touching
+      // the file, and that claim then has to stop showing as running.
+      if (key === durableKey && !schedDurable.some((v) => v.status === "running")) return false;
       // The session id: a task this session created is its own (scope "session").
       views = readDurableViews(path, sessionId);
     } catch {} // no registry: no durable tasks

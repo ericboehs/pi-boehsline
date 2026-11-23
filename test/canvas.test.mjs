@@ -10,7 +10,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -1137,7 +1137,7 @@ test("Scheduled: session views keep only the contract's fields", () => {
   assert.deepEqual(sessionViews("nope"), []);
 });
 
-test("Scheduled: durable tasks come from a temp store, every cwd's, with no private fields", () => {
+test("Scheduled: durable tasks come from a temp store, every cwd's, with no private fields", async () => {
   const root = mkdtempSync(join(tmpdir(), "canvas-sched-"));
   const store = join(root, "scheduler");
   const was = process.env.PI_SCHEDULER_DIR;
@@ -1159,7 +1159,8 @@ test("Scheduled: durable tasks come from a temp store, every cwd's, with no priv
       { id: "junk", kind: "interval", prompt: "SECRET malformed", cwd: here },
     ];
     writeFileSync(join(store, "tasks.json"), JSON.stringify({ version: 1, tasks }));
-    const views = readDurableViews();
+    // As of 1 min after d2's claim (runningSince 5): a live run, its runner on another host.
+    const views = readDurableViews(undefined, "", 60_005);
     assert.deepEqual(views.map((v) => v.id), ["d1", "d2", "d3", "d4", "d5"], "every valid task on this Mac, whatever its cwd (or none)");
     assert.equal(JSON.stringify(views).match(/SECRET|mail me|x\/y|"h"|42|proj|other/g), null, "no prompt beyond the label, deliver, model, runner or cwd");
     const [d1, d2, d3, d4] = views;
@@ -1171,6 +1172,17 @@ test("Scheduled: durable tasks come from a temp store, every cwd's, with no priv
     assert.equal(d2.runId, "5", "a running task's runId (its runningSince): Botsun finds runs/<id>/<runId>.log from it, no path in the feed");
     assert.deepEqual([d3.runId, d4.runId], [null, null], "not running: no runId");
     assert.equal(durableViews([{ ...tasks[0], lastStatus: "stopped" }])[0].status, "stopped", "a run Botsun's Stop ended");
+    // A stale claim is not a run: no clock counting from it, no runId to tail.
+    const stale = (task, now) => {
+      const [v] = durableViews([task], "", now);
+      return [v.status, v.since, v.runId];
+    };
+    assert.deepEqual(stale(tasks[1], 7 * 3_600_000), ["armed", null, null], "past its timeout + CLAIM_STALE_MS");
+    assert.deepEqual(stale({ ...tasks[1], lastStatus: "ok" }, 7 * 3_600_000), ["ok", null, null], "its last status shows");
+    const gone = spawn(process.execPath, ["-e", ""]);
+    await new Promise((r) => gone.on("exit", r));
+    assert.deepEqual(stale({ ...tasks[1], runnerHost: hostname(), runnerPid: gone.pid }, 60_005), ["armed", null, null], "this Mac's runner is gone");
+    assert.deepEqual(stale({ ...tasks[1], runnerHost: hostname(), runnerPid: process.pid }, 60_005), ["running", "1970-01-01T00:00:00.005Z", "5"], "a live runner's claim still runs");
     assert.deepEqual([d3.name, d3.status, d3.next, d3.every], ["nightly check", "paused", null, "every 5m"]);
     assert.equal(d4.scope, "host", "another directory's task is the host's");
     assert.deepEqual(readDurableViews(join(root, "missing.json")), [], "no store: none");

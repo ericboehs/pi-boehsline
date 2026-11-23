@@ -291,7 +291,9 @@ the review prompt — so a renderer never reaches for a page global.
   and not from `last`, the previous one; it is `null` otherwise. It also has
   `runId` (the run's id, its `runningSince` in ms), from which Botsun builds
   the run's live output log, `scheduler/runs/<id>/<runId>.log`, to tail it:
-  no path goes in the feed. `status` can be `"stopped"`, a run ended by
+  no path goes in the feed. A claim whose runner is gone (or that outlived its
+  timeout by the scheduler's stale-claim margin) is not a run: the task shows
+  its last status, with `since` and `runId` `null`. `status` can be `"stopped"`, a run ended by
   `pi-scheduler stop`. `/fork` (and anything else that starts a new session
   id) leaves a task the parent created behind: in the fork it shows as
   `"host"`, not `"session"`. These fields are additive: an older reader ignores
