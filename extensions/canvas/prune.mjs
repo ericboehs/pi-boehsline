@@ -416,11 +416,12 @@ export function trackingAfterRemovals(fresh, stale) {
  * Prune one session folder. Returns a summary:
  *   { id, live, busy, activeTurn, removedDir, sections: [ids], tracked: [paths],
  *     trackedFiles, orphans: [names], bytes, kept }
+ * The folder cutoff is `opts.dirDays` (or `opts.days`), else the retention default.
  */
 export function pruneSession(root, id, opts = {}) {
   const now = opts.now ?? Date.now();
   const dryRun = Boolean(opts.dryRun);
-  const days = opts.dirDays ?? retentionDays();
+  const days = opts.dirDays ?? opts.days ?? retentionDays();
   const sessionFiles = opts.sessionFiles ?? new Map();
   const dir = join(root, id);
   const state = sessionState(root, id);
@@ -701,7 +702,7 @@ export async function pruneCanvas(opts = {}) {
     await yieldTurn();
     let summary;
     try {
-      summary = pruneSession(root, id, { now, days, dryRun, sessionFiles });
+      summary = pruneSession(root, id, { now, dirDays: days, dryRun, sessionFiles });
     } catch (error) {
       summary = { id, error: error instanceof Error ? error.message : String(error), live: false, busy: false, activeTurn: false, removedDir: false, sections: [], tracked: [], trackedFiles: 0, orphans: [], bytes: 0, kept: "" };
     }

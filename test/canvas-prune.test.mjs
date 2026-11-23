@@ -240,6 +240,30 @@ test("--days moves the folder cutoff", () => {
   assert.equal(existsSync(dir), false);
 });
 
+test("pruneCanvas's days (the CLI's --days) reaches each session: 90 keeps a 40-day-idle folder", async () => {
+  const files = [["status.json", "{}", 40], ["x.md", "x", 40]];
+  const kept = makeRoot();
+  const keptDir = session(kept, "idle", files, { age: 40 });
+  const res = await pruneCanvas({ root: kept, now: NOW, days: 90, sessionFiles: new Map() });
+  assert.equal(res.days, 90);
+  assert.equal(res.sessions.find((s) => s.id === "idle").removedDir, false);
+  assert.equal(existsSync(keptDir), true);
+
+  // The same folder goes at the default 30 days, so 90 is what kept it.
+  const pruned = makeRoot();
+  const prunedDir = session(pruned, "idle", files, { age: 40 });
+  const gone = await pruneCanvas({ root: pruned, now: NOW, days: 30, sessionFiles: new Map() });
+  assert.equal(gone.sessions.find((s) => s.id === "idle").removedDir, true);
+  assert.equal(existsSync(prunedDir), false);
+});
+
+test("pruneSession also takes days, as pruneCanvas's callers pass it", () => {
+  const root = makeRoot();
+  const dir = session(root, "idle", [["status.json", "{}", 40]], { age: 40 });
+  assert.equal(pruneSession(root, "idle", { now: NOW, days: 90, sessionFiles: new Map() }).removedDir, false);
+  assert.equal(existsSync(dir), true);
+});
+
 test("a mid-turn session is left alone entirely", () => {
   const root = makeRoot();
   const dir = session(
