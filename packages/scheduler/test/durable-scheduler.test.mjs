@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import durableScheduler, {
+  createdBy,
   parseLeadingFlags,
   tokenize,
 } from "../extensions/durable-scheduler.ts";
@@ -50,7 +51,7 @@ async function deadPid() {
   return child.pid;
 }
 
-function mount() {
+function mount({ sessionId } = {}) {
   const commands = {};
   const notices = [];
   const statuses = [];
@@ -59,6 +60,7 @@ function mount() {
   const ctx = {
     hasUI: true,
     cwd: "/tmp/some-project",
+    ...(sessionId !== undefined ? { sessionManager: { getSessionId: () => sessionId } } : {}),
     ui: {
       notify: (message, level = "info") => notices.push({ message, level }),
       confirm: async () => true,
@@ -188,6 +190,20 @@ test("a task records the directory it was created in", async (t) => {
 
   await ui.run("--name here daily 9a :: x");
   assert.equal(readRegistry().tasks[0].cwd, "/tmp/some-project", "project extensions and AGENTS.md should be the ones in mind at creation");
+});
+
+test("a task records the session that created it, for the canvas feed's scope", async (t) => {
+  withTempDir(t);
+  await mount({ sessionId: "sess-abc" }).run("--name mine daily 9a :: x");
+  await mount().run("--name bare daily 9a :: y");
+  await mount({ sessionId: "" }).run("--name blank daily 9a :: z");
+  const byName = Object.fromEntries(readRegistry().tasks.map((task) => [task.name, task]));
+  assert.equal(byName.mine.createdBySession, "sess-abc");
+  assert.equal("createdBySession" in byName.bare, false, "no session manager: no field");
+  assert.equal("createdBySession" in byName.blank, false, "an empty id: no field");
+  await mount({ sessionId: "sess-other" }).run("pause mine");
+  assert.equal(readRegistry().tasks.find((task) => task.name === "mine").createdBySession, "sess-abc", "another session's edit keeps who created it");
+  assert.deepEqual(createdBy({ sessionManager: { getSessionId: () => { throw new Error("stale"); } } }), {}, "a stale ctx: nothing");
 });
 
 test("/schedule reports the catch-up policy it chose, since the Mac sleeps", async (t) => {

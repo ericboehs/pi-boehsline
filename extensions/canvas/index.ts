@@ -731,6 +731,10 @@ export function logTail(text: string, n = 20): string {
  * A scheduled task as the Background jobs card shows it: what, when, and how
  * the last run went. Never its prompt (only a short label), deliver command,
  * cwd, model, env, runner pid/host, or run output.
+ *
+ * scope: whose it is. "session" for this session's own timers (session-scheduler's, and a
+ * durable task this session created: its createdBySession), "host" for a durable task that runs
+ * on this Mac on its own. Botsun's info sheet groups by it.
  */
 export type ScheduledView = {
   id: string;
@@ -741,6 +745,7 @@ export type ScheduledView = {
   last: string | null;
   status: "armed" | "paused" | "running" | "ok" | "error" | "timeout" | "skipped";
   source: "session" | "agent" | "durable";
+  scope: "session" | "host";
 };
 export const MAX_SCHEDULED = 20;
 const SCHED_KINDS = new Set(["once", "interval", "daily", "cron"]);
@@ -764,6 +769,7 @@ export function sessionViews(list: unknown): ScheduledView[] {
       last: isoOrNull(t.last),
       status: t.status === "paused" ? "paused" : "armed",
       source: t.source === "agent" ? "agent" : "session",
+      scope: "session",
     });
   }
   return out;
@@ -777,8 +783,11 @@ const realOr = (p: string) => {
   }
 };
 
-/** Durable /schedule tasks whose cwd is this session's (realpath compare), as views. */
-export function durableViews(tasks: unknown, cwd: string): ScheduledView[] {
+/**
+ * Durable /schedule tasks whose cwd is this session's (realpath compare), as views. A task whose
+ * createdBySession is sessionId is this session's (scope "session"); every other is "host".
+ */
+export function durableViews(tasks: unknown, cwd: string, sessionId = ""): ScheduledView[] {
   if (!Array.isArray(tasks)) return [];
   const here = realOr(cwd);
   const out: ScheduledView[] = [];
@@ -796,6 +805,7 @@ export function durableViews(tasks: unknown, cwd: string): ScheduledView[] {
         last: msIso(t.lastRunAt),
         status,
         source: "durable",
+        scope: sessionId && (t as { createdBySession?: unknown }).createdBySession === sessionId ? "session" : "host",
       });
     } catch {
       continue;
@@ -805,9 +815,9 @@ export function durableViews(tasks: unknown, cwd: string): ScheduledView[] {
 }
 
 /** Durable views for cwd straight from the registry file; [] when it is missing or unreadable. Read-only, no lock. */
-export function readDurableViews(cwd: string, path = registryPath()): ScheduledView[] {
+export function readDurableViews(cwd: string, path = registryPath(), sessionId = ""): ScheduledView[] {
   try {
-    return durableViews((JSON.parse(readFileSync(path, "utf8")) as { tasks?: unknown } | null)?.tasks, cwd);
+    return durableViews((JSON.parse(readFileSync(path, "utf8")) as { tasks?: unknown } | null)?.tasks, cwd, sessionId);
   } catch {
     return [];
   }
@@ -2095,16 +2105,17 @@ export default function canvas(pi: ExtensionAPI) {
     if (!autoOn || !bgCtx?.hasUI) return;
     void serial(writeJobs).catch(() => {});
   }
-  /** Re-read the registry only when it changed (or the cwd did); true when the views changed. */
+  /** Re-read the registry only when it changed (or the cwd or session did); true when the views changed. */
   function checkDurable(cwd: string): boolean {
-    let key = cwd;
+    let key = `${cwd}\0${sessionId}`;
     let views: ScheduledView[] = [];
     try {
       const path = registryPath();
       const st = statSync(path);
-      key = `${cwd}\0${st.mtimeMs}\0${st.size}`;
+      key = `${cwd}\0${sessionId}\0${st.mtimeMs}\0${st.size}`;
       if (key === durableKey) return false;
-      views = readDurableViews(cwd, path);
+      // The session id: a task this session created is its own (scope "session").
+      views = readDurableViews(cwd, path, sessionId);
     } catch {} // no registry: no durable tasks
     durableKey = key;
     const changed = JSON.stringify(views) !== JSON.stringify(schedDurable);

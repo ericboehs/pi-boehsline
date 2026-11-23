@@ -104,6 +104,16 @@ export function parseLeadingFlags(input: string): ParsedFlags | { error: string 
   return { flags, rest: remainder };
 }
 
+/** `{ createdBySession }` for the session adding a task, or nothing when it has no id (a stale or bare ctx). */
+export function createdBy(ctx: unknown): { createdBySession?: string } {
+  try {
+    const id = (ctx as { sessionManager?: { getSessionId?: () => unknown } } | undefined)?.sessionManager?.getSessionId?.();
+    return typeof id === "string" && id ? { createdBySession: id } : {};
+  } catch {
+    return {};
+  }
+}
+
 function applyFlags(
   task: DurableTask,
   flags: Record<string, string | boolean>,
@@ -685,6 +695,8 @@ export default function durableScheduler(pi: ExtensionAPI): void {
             // project you were sitting in when you wrote the prompt.
             cwd: ctx.cwd,
             createdAt: Date.now(),
+            // Which session made it: the canvas jobs feed lists it under that session, not the host.
+            ...createdBy(ctx),
             nextRunAt: parsed.nextRunAt,
           }, parsedFlags.flags);
 

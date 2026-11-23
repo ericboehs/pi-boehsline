@@ -574,6 +574,12 @@ against your home directory, so `pi-scheduler show <task>` after moving things
 is worth the two seconds. A directory that still exists but cannot be entered
 is an error, not a fallback.
 
+A task added with `/schedule` also records the session that made it
+(`createdBySession`, its id; the `pi-scheduler` CLI sets none). It changes
+nothing about the run: pi-boehsline's canvas jobs feed only uses it to list the
+task under that session (`scope: "session"`) rather than this Mac's
+(`"host"`).
+
 `--without` strips pieces back out: `extensions`, `skills`, `templates`,
 `context`, `tools`. `--without tools` makes a run answer-only, worth doing for
 anything that just summarizes. `--with` is the inverse allowlist, and `--with

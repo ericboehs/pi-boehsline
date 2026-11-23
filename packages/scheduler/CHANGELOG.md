@@ -7,6 +7,12 @@ change behaviour; each one says what it breaks.
 
 ### Added
 
+- A durable task added with `/schedule` records the session that made it,
+  `createdBySession` (its id; the CLI's `add` sets none, and an edit or
+  pause keeps it). Optional and informational: validation, runs and older
+  registries are unchanged. pi-boehsline's canvas jobs feed lists such a task
+  under that session (`scope: "session"`) and every other durable task under
+  the Mac (`"host"`).
 - **Waking closed sessions**, **off by default**: turn it on per machine with
   `pi-scheduler wake on` after the device test passes there (`wake status`
   says `off (default)` until then). Once on, `pi-scheduler check` reopens a closed
