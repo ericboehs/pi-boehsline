@@ -522,6 +522,20 @@ test("wake on|off|bg on|off edit wake.json; status and run --dry-run report with
   assert.equal(existsSync(join(dir, "wake-state.json")), false, "status and dry runs write no state");
   assert.equal(existsSync(join(dir, "wake.log")), false);
 
+  // bg back on: status names the later of wake.json's bgOnSince and the tick's own.
+  const onAt = Date.UTC(2026, 0, 2, 3, 4, 5);
+  const tickSawOn = onAt + 3_600_000;
+  writeFileSync(join(dir, "wake.json"), JSON.stringify({ enabled: true, bg: true, bgOnSince: onAt }));
+  const quiet = (at) => `exits before ${new Date(at).toLocaleString()} stay quiet`;
+  assert.ok((await cli(dir, ["wake", "status"])).stdout.includes(quiet(onAt)), "wake.json alone");
+  writeFileSync(join(dir, "wake-state.json"), JSON.stringify({ v: 1, ledger: [], bgOnSince: tickSawOn }));
+  const later = (await cli(dir, ["wake", "status"])).stdout;
+  assert.ok(later.includes(quiet(tickSawOn)), later);
+  assert.ok(!later.includes(quiet(onAt)));
+  writeFileSync(join(dir, "wake-state.json"), JSON.stringify({ v: 1, ledger: [], bgOnSince: onAt - 3_600_000 }));
+  assert.ok((await cli(dir, ["wake", "status"])).stdout.includes(quiet(onAt)), "an older tick sighting does not win");
+  rmSync(join(dir, "wake-state.json"));
+
   await assert.rejects(cli(dir, ["wake", "status", "--dry-run"]), /--dry-run goes with wake run/);
   await assert.rejects(cli(dir, ["wake", "run"]), /only takes --dry-run/);
   await assert.rejects(cli(dir, ["wake", "bg", "maybe"]), /wants on or off/);

@@ -88,6 +88,7 @@ import {
 import { piArgsFor, runTask } from "../extensions/lib/runner.ts";
 import {
   absolutePath,
+  bgOnSince,
   bgStateDir,
   bgWakeOff,
   defaultWakeDeps,
@@ -913,10 +914,11 @@ function commandWakeStatus() {
   const pi = resolvePi(config, deps);
   const bgOff = bgWakeOff(config, deps);
   const { state, corrupt } = readWakeState();
+  const quietBefore = bgOnSince(config, state);
   const recent = state.ledger.filter((entry) => entry.host === host && now - entry.at < 3_600_000);
   const lines = [
     `wake        ${switchText}${error ? `  (${error}; using defaults)` : ""}`,
-    `bg wake     ${bgOff ? `off (${bgOff})` : "on, for crash-class closes"}${!bgOff && config.bgOnSince ? `; exits before ${new Date(config.bgOnSince).toLocaleString()} stay quiet` : ""}`,
+    `bg wake     ${bgOff ? `off (${bgOff})` : "on, for crash-class closes"}${!bgOff && quietBefore ? `; exits before ${new Date(quietBefore).toLocaleString()} stay quiet` : ""}`,
     `target      tmux session ${config.tmuxTarget}`,
     `host        ${host}`,
     `caps        ${config.perSessionHourly}/session/hour, ${config.globalHourly}/hour, ${config.perTick}/tick; ${recent.length} used this hour`,

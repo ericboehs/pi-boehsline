@@ -1134,7 +1134,7 @@ function trackBgSwitch(state: WakeState, bgOff: string | undefined, now: number)
 }
 
 /** The later of `wake bg on` and the tick's own sighting of bg wakes coming back. */
-function bgOnSince(config: WakeConfig, state: WakeState): number | undefined {
+export function bgOnSince(config: WakeConfig, state: WakeState): number | undefined {
   const times = [config.bgOnSince, state.bgOnSince].filter((at): at is number => at !== undefined);
   return times.length > 0 ? Math.max(...times) : undefined;
 }
