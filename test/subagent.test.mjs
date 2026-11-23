@@ -38,7 +38,15 @@ function mount({ active = ["read", "bash"], registered = ["read", "bash", "tool_
     getActiveTools: () => state.active,
     getAllTools: () => registered.map((name) => ({ name })),
     setActiveTools: (names) => (state.active = names),
-    events: { on: () => () => {}, emit: (channel, data) => channel === "bg:start" && bgListener?.(data) },
+    events: {
+      on: () => () => {},
+      emit: (channel, data) => {
+        if (channel === "bg:start") bgListener?.(data);
+        // agent-link's answer, when it's loaded: this session's name.
+        if (channel === "agent-link:whoami" && state.whoami) data.name = state.whoami;
+      },
+    },
+    getSessionName: () => state.sessionName,
   });
   const ctx = { cwd: mkdtempSync(path.join(tmpdir(), "pi-subagent-cwd-")), model: undefined };
   return {
@@ -298,4 +306,71 @@ test("a child that can't start reports why", async () => {
   // No child script, and no pi on PATH: the spawn itself fails.
   const text = await runWithChild(undefined, { PATH: "/nonexistent-bin" });
   assert.match(text, /could not start pi: .*ENOENT/);
+});
+
+test("a background pi child is told its title and whose subagent it is, for agent-link", async () => {
+  const h = mount();
+  h.state.whoami = "Parent Session";
+  let req;
+  h.onBgStart((r) => {
+    r.accepted = true;
+    req = r;
+    r.reply({ id: "ee11ff", logPath: "/tmp/pi-bg-test/ee11ff.log" });
+  });
+  await h.run({ agent: "scout", task: "map it", title: "Pill face + Esc", background: true });
+  assert.ok(req.command.startsWith("PI_SUBAGENT_CHILD=1 PI_SUBAGENT_TITLE='Pill face + Esc' PI_SUBAGENT_PARENT='Parent Session' "), req.command.slice(0, 120));
+});
+
+test("without agent-link the parent is the session's name, and without either it's left out", async () => {
+  const named = mount();
+  named.state.sessionName = "it's mine";
+  let req;
+  named.onBgStart((r) => {
+    r.accepted = true;
+    req = r;
+    r.reply({ id: "a1", logPath: "/tmp/pi-bg-test/a1.log" });
+  });
+  await named.run({ agent: "scout", task: "fix the build", background: true });
+  assert.match(req.command, /^PI_SUBAGENT_CHILD=1 PI_SUBAGENT_TITLE='[^']+' PI_SUBAGENT_PARENT='it'\\''s mine' /);
+
+  const bare = mount();
+  bare.onBgStart((r) => {
+    r.accepted = true;
+    req = r;
+    r.reply({ id: "a2", logPath: "/tmp/pi-bg-test/a2.log" });
+  });
+  await bare.run({ agent: "scout", task: "fix the build", title: "Build fix", background: true });
+  assert.match(req.command, /^PI_SUBAGENT_CHILD=1 PI_SUBAGENT_TITLE='Build fix' '/);
+  assert.doesNotMatch(req.command, /PI_SUBAGENT_PARENT/);
+});
+
+test("a foreground pi child gets the title and parent in its environment", async () => {
+  const text = await runWithChild(
+    `process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: [process.env.PI_SUBAGENT_CHILD, process.env.PI_SUBAGENT_TITLE, process.env.PI_SUBAGENT_PARENT].join("|") }] } }) + "\\n");`,
+    {},
+    (h) => (h.state.whoami = "Parent Session"),
+  );
+  assert.equal(text, "1|look around|Parent Session");
+});
+
+test("the progress filter shows a message steered in mid-run, not the task", () => {
+  const user = (text) => ({ type: "message_end", message: { role: "user", content: [{ type: "text", text }] } });
+  const lines = [
+    user("Task: wait"),
+    { type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { command: "sleep 9" } }] } },
+    user("[cross-agent message — from another agent session on this machine (ref 1a2b3c4d), not your user]\nFrom peer: be a peer.\n\nAlso check the README."),
+    { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } },
+  ].map((l) => JSON.stringify(l)).join("\n");
+  const h = mount();
+  let req;
+  h.onBgStart((r) => {
+    r.accepted = true;
+    req = r;
+    r.reply({ id: "f1", logPath: "/tmp/pi-bg-test/f1.log" });
+  });
+  return h.run({ agent: "scout", task: "x", background: true }).then(() => {
+    const out = execFileSync("bash", ["-c", filterOf(req.command)], { input: lines, encoding: "utf8" });
+    assert.match(out, /· turn 1 · bash sleep 9\n· message in · Also check the README\.\n· turn 2 · done/);
+    assert.doesNotMatch(out, /message in · Task: wait/);
+  });
 });

@@ -319,6 +319,11 @@ const FALLBACK_MAX_TOKENS = 1024;
 /** generateNaming's error when there is no model it could ask at all. */
 export const NO_NAMING_MODEL = "no naming model with credentials";
 
+/** A subagent's child with a task title (extensions/subagent sets both): it keeps that title. */
+export function isTitledSubagent(env: NodeJS.ProcessEnv = process.env): boolean {
+  return !!env.PI_SUBAGENT_CHILD && !!env.PI_SUBAGENT_TITLE?.trim();
+}
+
 /** A title alone, for a caller that only wants the words. */
 export async function generateTitle(
   ctx: Pick<ExtensionContext, "modelRegistry"> & { model?: unknown },
@@ -425,6 +430,9 @@ export default function (pi: ExtensionAPI) {
   // reply with text is in, so the name doesn't wait for the whole turn, else when the turn settles.
   async function autoName(ctx: ExtensionContext): Promise<void> {
     if (process.env.PI_AUTO_NAME === "0") return;
+    // A subagent's child goes by its task title (agent-link registers it under that), not a
+    // generated name, and it skips the naming model's round trip.
+    if (isTitledSubagent()) return;
     if (attempted || isUserGivenName(pi.getSessionName())) {
       attempted = true;
       return;

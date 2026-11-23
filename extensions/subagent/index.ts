@@ -39,7 +39,7 @@ const BG_WAKE_CHARS = 24 * 1024; // background: log tail carried by the bg exten
 // turn out, then a result banner and the final answer. Exit 1 when there is no
 // answer, so the bg extension reports the job as failed.
 const PROGRESS_FILTER = `
-let buf = "", turns = 0, final = "", last = 0;
+let buf = "", turns = 0, final = "", last = 0, users = 0;
 // Each turn's calls in full (the log line is cut to 110 characters for reading), one JSON line per
 // turn in the file named by its first argument, for the children tracker: a command shown whole on the phone. Strings
 // over 4000 characters (a write's content) are cut; a failed write only loses the full form.
@@ -54,6 +54,13 @@ const short = (s, n) => { s = String(s ?? "").replace(/\\s+/g, " ").trim(); retu
 const onLine = (line) => {
   let ev; try { ev = JSON.parse(line); } catch { return; }
   const m = ev.type === "message_end" ? ev.message : undefined;
+  // A user message after the task is one steered in mid-run (an agent-link message, say): show it.
+  if (m && m.role === "user" && ++users > 1) {
+    const said = typeof m.content === "string" ? m.content : (Array.isArray(m.content) ? m.content : []).filter((p) => p.type === "text").map((p) => p.text).join("\\n");
+    // An agent-link message is a bracketed header, a blank line, then what was said.
+    const at = said.startsWith("[") ? said.indexOf("\\n\\n") : -1;
+    console.log("· message in · " + short(at >= 0 ? said.slice(at + 2) : said, 110));
+  }
   if (!m || m.role !== "assistant") return;
   turns++;
   const mu = m.usage ?? {};
@@ -414,6 +421,19 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 				}
 			};
 
+			// A local pi child's agent-link registers under its task title, marked as this session's
+			// subagent (packages/agent-link). agent-link answers whoami with its own name.
+			const childEnv = (title: string): Record<string, string> => {
+				const req: { name?: string } = {};
+				try {
+					pi.events.emit("agent-link:whoami", req);
+				} catch {
+					/* no agent-link */
+				}
+				const parent = (req.name || pi.getSessionName?.() || "").trim();
+				return { PI_SUBAGENT_TITLE: title, ...(parent ? { PI_SUBAGENT_PARENT: parent } : {}) };
+			};
+
 			const piInvocation = (args: string[]) => {
 				const currentScript = process.argv[1];
 				return currentScript && !currentScript.startsWith("/$bunfs/root/") && fs.existsSync(currentScript)
@@ -526,6 +546,8 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					}
 					let model = job.model ?? agent.model ?? defaultModel;
 					let inv: { cmd: string; args: string[] };
+					const title = kids.childTitle(job.title, job.task);
+					let envPrefix = "";
 					// The id comes before the job (its completion details name the child) and, sandboxed,
 					// before the invocation (Botsun's run is that child's Computer). Tracked only once
 					// the job started, so a failed start leaves no child behind.
@@ -545,11 +567,11 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						args.push("--append-system-prompt", systemPrompt(agent.prompt)); // accepts text or path
 						args.push(`Task: ${job.task}`);
 						inv = piInvocation(args);
+						envPrefix = Object.entries(childEnv(title)).map(([k, v]) => `${k}=${q(v)} `).join("");
 					}
 					// The filter's sidecar of each turn's calls in full (kids' callsPath): its argument.
 					const callsPath = path.join(os.tmpdir(), `pi-subagent-calls-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.jsonl`);
-					const command = `PI_SUBAGENT_CHILD=1 ${[inv.cmd, ...inv.args].map(q).join(" ")} | ${q(process.execPath)} -e ${q(PROGRESS_FILTER)} ${q(callsPath)}`;
-					const title = kids.childTitle(job.title, job.task);
+					const command = `PI_SUBAGENT_CHILD=1 ${envPrefix}${[inv.cmd, ...inv.args].map(q).join(" ")} | ${q(process.execPath)} -e ${q(PROGRESS_FILTER)} ${q(callsPath)}`;
 					const reply = await new Promise<{ id: string; logPath: string } | { error: string } | null>((resolve) => {
 						const req = {
 							command,
@@ -687,6 +709,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 				let invocation: { cmd: string; args: string[] };
 				let tmpDir: string | undefined;
 				let childId: string | undefined;
+				let extraEnv: Record<string, string> = {};
 				if (sandboxed(job, agent)) {
 					// The id comes before the invocation: Botsun's run is that child's Computer.
 					childId = kids.newChildId("pi");
@@ -704,6 +727,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					args.push("--append-system-prompt", tmpFile);
 					args.push(`Task: ${job.task}`);
 					invocation = piInvocation(args);
+					extraEnv = childEnv(kids.childTitle(job.title, job.task));
 				}
 				const own = new AbortController();
 				const child = kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, title: job.title, model, window: windowOf(model), sessionId, ...(childId ? { id: childId } : {}), stop: () => own.abort() });
@@ -714,7 +738,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					let killedBy: string | undefined;
 					let spawnError: string | undefined;
 					const exitCode: number = await new Promise((resolve) => {
-						const proc = spawn(invocation.cmd, invocation.args, { cwd: job.cwd ?? ctx.cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_SUBAGENT_CHILD: "1" } });
+						const proc = spawn(invocation.cmd, invocation.args, { cwd: job.cwd ?? ctx.cwd, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, PI_SUBAGENT_CHILD: "1", ...extraEnv } });
 						let buf = "";
 						const onLine = (line: string) => {
 							if (!line.trim()) return;

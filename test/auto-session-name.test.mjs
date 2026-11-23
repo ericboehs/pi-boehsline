@@ -522,3 +522,39 @@ test("a settle doesn't hold the handlers after it for the naming call", async ()
   await new Promise((r) => setTimeout(r, 0));
   assert.equal(name, "Cactus Winter Keeper", "the name still lands");
 });
+
+test("a subagent's child with a task title is never auto-named", async (t) => {
+  const { isTitledSubagent } = await import("../extensions/auto-session-name/index.ts");
+  assert.equal(isTitledSubagent({ PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_TITLE: "Fix flaky test" }), true);
+  assert.equal(isTitledSubagent({ PI_SUBAGENT_CHILD: "1", PI_SUBAGENT_TITLE: "  " }), false, "no title: named as usual");
+  assert.equal(isTitledSubagent({ PI_SUBAGENT_TITLE: "Fix flaky test" }), false, "not a child: named as usual");
+
+  process.env.PI_SUBAGENT_CHILD = "1";
+  process.env.PI_SUBAGENT_TITLE = "Fix flaky test";
+  t.after(() => {
+    delete process.env.PI_SUBAGENT_CHILD;
+    delete process.env.PI_SUBAGENT_TITLE;
+  });
+  const s = stubPi();
+  let name;
+  s.pi.getSessionName = () => name;
+  s.pi.setSessionName = (next) => {
+    name = next;
+  };
+  let asked = 0;
+  const ctx = {
+    hasUI: false,
+    ui: { notify: () => {}, setStatus: () => {}, setWidget: () => {} },
+    sessionManager: { getBranch: () => [{ type: "message", message: { role: "user", content: "fix the flaky test" } }] },
+    modelRegistry: {
+      ...fakeRegistry([{ provider: "opencode-go", id: "deepseek-v4.1-flash" }], {}),
+      complete: async () => (asked++, { stopReason: "stop", content: [{ type: "text", text: "Flaky Test Tamer" }] }),
+    },
+  };
+  autoSessionName(s.pi);
+  await s.fire("message_end", { message: { role: "assistant", content: [{ type: "text", text: "On it." }] } }, ctx);
+  await s.fire("agent_settled", {}, ctx);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(asked, 0, "no naming call");
+  assert.equal(name, undefined, "no generated name");
+});
