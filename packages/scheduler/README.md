@@ -256,7 +256,7 @@ never write one, and **no record means never woken**.
 | SIGHUP/SIGTERM, and the tmux server outlived it (`kill-window`, Botsun) | no (someone closed the window) | yes |
 | SIGHUP/SIGTERM, and the tmux server was gone right after (`tmux-gone`) | no (see below) | yes |
 | SIGHUP/SIGTERM, not in tmux (a terminal window closed) | no | yes |
-| SIGHUP/SIGTERM, and the machine booted within an hour after it (`reboot`) | yes, unless the tmux server outlived it | yes |
+| SIGHUP/SIGTERM, and the machine booted within an hour after it (`reboot`) | yes, unless it was a SIGHUP the tmux server outlived | yes |
 | `crash`: exited without a shutdown (uncaught error, dead terminal) | yes | yes |
 | the record says live but its pid is dead (SIGKILL, OOM, power loss) | yes | yes |
 
@@ -275,7 +275,14 @@ or replaced) with `decidedAt`. The tick never looks at the tmux server to
 judge a close: a server that dies an hour later, for whatever reason, does not
 turn an old `kill-window` into a crash. The only later input is the boot time,
 and only within an hour of the close (a restart or an OS update, not
-yesterday's close and this morning's boot).
+yesterday's close and this morning's boot). Without a reboot every signal
+close is skipped whatever its verdict, so the verdict only matters together
+with one: a SIGHUP the server outlived (`kill-window` sends SIGHUP) is never
+blamed on a reboot, while a SIGTERM is, since a shutdown can SIGTERM pi while
+tmux takes longer than 300 ms to exit. The closed record is written before the
+probe and rewritten with the verdict after it, so a pi killed during the probe
+leaves a signal close with no verdict (a user close unless a reboot follows),
+not a `live` record the tick would read as a crash.
 
 **The last window.** Closing the last window on a tmux server takes the
 server with it (tmux exits once it has no sessions), so the closing pi sees
@@ -291,8 +298,12 @@ reopens it. A missed wake beats a surprise reopen.
   (`tmux-gone`, above).
 - A shutdown followed by more than an hour powered off: the boot is too long
   after the close to blame it.
-- A shutdown whose SIGHUP/SIGTERM reached pi while its tmux server stayed up
-  for another 300 ms: recorded as `user`.
+- A shutdown whose SIGHUP reached pi while its tmux server stayed up for
+  another 300 ms: recorded as `user`. (A SIGTERM recorded as `user` still
+  wakes after a reboot within the hour.)
+- A wall clock stepped back after the close (no RTC, an NTP correction at
+  boot) can put the boot time before the close, so the reboot is not counted;
+  one stepped forward can push it past the hour.
 - A bg job that finished while bg wakes were off (see bg jobs).
 
 **Known false positives** (woken, though closed on purpose):
@@ -325,9 +336,12 @@ A job that finished while bg wakes were off never wakes its session later.
 `wake bg on` (when they were off) stamps `bgOnSince` in `wake.json`, and the
 tick keeps its own `bgOffSince`/`bgOnSince` in `wake-state.json` for the
 switches only it sees (`PI_SCHEDULER_WAKE_BG`, `PI_BG_WAKE`); a bg exit at or
-before the later of the two stays quiet. A job that would have woken its
-session while bg wakes are off (a crash-class close, a fresh exit) is logged
-once per job as `skip <id> reason=bg-off`, and `wake run --dry-run` lists it.
+before the later of the two (the last time bg wakes came on) stays quiet,
+including one from before they went off that had not woken yet (held by a cap
+or a backoff). `wake status` shows that time. While bg wakes are off, a session
+a job would have woken (a crash-class close, a fresh exit) is logged as `skip
+<id> reason=bg-off` once per earliest held exit, not once per job, and `wake
+run --dry-run` lists it.
 
 ### How a wake runs
 

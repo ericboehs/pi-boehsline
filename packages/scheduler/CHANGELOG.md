@@ -168,13 +168,18 @@ change behaviour; each one says what it breaks.
   longer crash-class: closing the last window looks exactly like
   `kill-server`, a tmux crash or a logout, so none of them wake (`always`
   timers still do). A reboot counts only within an hour after the close, and
-  never when the server outlived it.
+  never for a SIGHUP the server outlived (a SIGTERM still counts: a shutdown
+  can SIGTERM pi while tmux takes longer to exit). The closed record is
+  written before the probe and rewritten with the verdict, so a pi killed
+  mid-probe reads as a user close rather than a crash, and the probe stops
+  after 300 ms of wall-clock time, `ps` included.
 - **`wake bg on` no longer reopens jobs that finished while bg wakes were
   off.** It stamps `bgOnSince` in `wake.json` (when they were off), and the
   tick records its own `bgOffSince`/`bgOnSince` for switches only it sees
-  (`PI_SCHEDULER_WAKE_BG=0`, `PI_BG_WAKE`); exits at or before that stay
-  quiet. A bg job that would have woken its session while bg wakes are off is
-  logged once per job as `skip … reason=bg-off`, and shown by `wake run
+  (`PI_SCHEDULER_WAKE_BG=0`, `PI_BG_WAKE`); exits at or before the last time
+  bg wakes came on stay quiet, and `wake status` shows the later of the two.
+  A session a bg job would have woken while bg wakes are off is logged as
+  `skip … reason=bg-off` once per earliest held exit, and shown by `wake run
   --dry-run`.
 - A `pi-wake` session the tick creates no longer keeps its idle shell window:
   it is closed once the wake window is in.
