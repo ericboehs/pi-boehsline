@@ -159,17 +159,33 @@ export function pidAlive(pid) {
   }
 }
 
-function newestMtime(dir) {
-  // Start from the folder itself: an empty or half-written folder has no
-  // files, and 0 would read as "idle since 1970" and get pruned on sight.
+/**
+ * When a session folder last changed in a way its page shows: the newest
+ * file, with a hidden section's body (auto-jobs, rewritten every 2 s while a
+ * job runs), staging *.tmp files and sections.json itself left out. For
+ * sections.json, the newest `at` of its visible entries counts instead, so a
+ * hidden entry's fresh `at` doesn't move the session's "ago" or its place on
+ * the index. The folder's own mtime (which every atomic rename moves) is only
+ * the fallback for a folder with nothing else in it: 0 would read as "idle
+ * since 1970" and get it pruned on sight.
+ */
+export function newestMtime(dir, env = process.env) {
   let newest = 0;
   try {
-    newest = statSync(dir).mtimeMs;
     for (const name of readdirSync(dir)) {
+      if (name.endsWith(".tmp") || hiddenChange(name, env)) continue;
       try {
+        if (name === "sections.json") {
+          for (const s of pageSections(readJson(join(dir, name), []), env)) {
+            const at = typeof s?.at === "string" ? Date.parse(s.at) : NaN;
+            if (Number.isFinite(at)) newest = Math.max(newest, at);
+          }
+          continue;
+        }
         newest = Math.max(newest, statSync(join(dir, name)).mtimeMs);
       } catch {}
     }
+    if (!newest) newest = statSync(dir).mtimeMs;
   } catch {}
   return newest;
 }
@@ -199,6 +215,27 @@ export function hiddenChange(relPath, env = process.env) {
   const name = String(relPath).split(/[\\/]/).pop() || "";
   for (const id of hiddenSections(env)) if (name.startsWith(`${id}.`)) return true;
   return false;
+}
+
+/**
+ * sections.json as the page sees it, as one string: hidden entries (and their
+ * `at`, fresh on every auto-jobs tick) left out. Equal strings mean a rewrite
+ * the page would not notice.
+ */
+export function visibleSections(root, id, env = process.env) {
+  return JSON.stringify(pageSections(readJson(join(root, id, "sections.json"), []), env));
+}
+
+/**
+ * Whether a sections.json rewrite changed what the page shows, against the
+ * last one seen for this session (`seen`: id → visibleSections). The first
+ * look at a session counts as a change.
+ */
+export function sectionsChanged(root, id, seen, env = process.env) {
+  const now = visibleSections(root, id, env);
+  if (seen.get(id) === now) return false;
+  seen.set(id, now);
+  return true;
 }
 
 export function sessionState(root, id) {
@@ -986,8 +1023,9 @@ function handler(req, res) {
   if (url.pathname === "/api/events") return subscribe("*", req, res);
   if (parts[0] === "api" && parts[1] === "s" && SESSION_ID.test(parts[2] || "")) {
     const id = parts[2];
-    if (parts.length === 3) return json(res, { ...sessionState(ROOT, id), meeting: meeting.summary() });
-    if (parts.length === 4 && parts[3] === "events") return subscribe(id, req, res);
+    // What the page now has is the baseline its next sections.json change is judged against.
+    if (parts.length === 3) return seenSections.set(id, visibleSections(ROOT, id)), json(res, { ...sessionState(ROOT, id), meeting: meeting.summary() });
+    if (parts.length === 4 && parts[3] === "events") return seenSections.set(id, visibleSections(ROOT, id)), subscribe(id, req, res);
     if (parts.length === 4 && parts[3] === "info") return void sessionInfoOf(ROOT, id).then((d) => json(res, d), () => send(res, 500, "info failed"));
   }
   // Section bodies: /s/<id>/f/<name>, flat names only, never a path.
@@ -1183,6 +1221,8 @@ function watchSystemTheme() {
 }
 
 const pending = new Map();
+/** Per session, sections.json as its page last got it (visibleSections). */
+const seenSections = new Map();
 
 function onChange(relPath) {
   if (!relPath) return;
@@ -1198,7 +1238,13 @@ function onChange(relPath) {
   const id = relPath.split(/[\\/]/)[0];
   if (!id || id.startsWith(".") || !SESSION_ID.test(id)) return;
   if (/^[^\\/]+[\\/]inbox([\\/]|$)/.test(relPath)) return; // talk-back queue: its ack file is what the page waits for
-  if (hiddenChange(relPath)) return; // a body the page doesn't draw (auto-jobs); sections.json still publishes
+  const name = relPath.split(/[\\/]/).pop() || "";
+  if (name.endsWith(".tmp")) return; // a write being staged: its rename fires for the real name
+  if (hiddenChange(relPath)) return; // a body the page doesn't draw (auto-jobs)
+  // sections.json is rewritten with a fresh `at` on every auto-jobs tick: only a change to its visible entries reloads.
+  if (relPath === `${id}/sections.json` || relPath === `${id}\\sections.json`) {
+    if (!sectionsChanged(ROOT, id, seenSections)) return;
+  }
   clearTimeout(pending.get(id));
   pending.set(
     id,

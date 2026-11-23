@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +16,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import canvasExtension, { ActivityTracker, daemonVersion, STATUS_PROMPT, checkChart, compareOptions, normalizeSpec, parseDelimited, diffSkipReason, fileId, filesMarkdown, syncCopies, gitDiff, isSensitivePath, jobsSpec, jobsCard, durableViews, readDurableViews, scheduledSpec, sessionViews, MAX_SCHEDULED, logTail, looksLikeDiff, makePatch, isSectionId, parseExtras, shotsMarkdown, agentTraffic, agentsMarkdown, bashExit, runSpec, streamable, tailLines, readPeers, resolvePeerName, tallyFiles, lastReply, sessionInfo, uniichatInfo, lastTurn, mergeOps, normalizeCode, normalizeOptions, normalizeTracker, normalizeTree, parseLineRange, nextSteps, claimInbox, ackInbox, withoutNextSteps, leftHalfBounds, openTodos, parseStatus, tmuxMeta, todoBoard, turnDigest, upsertSection, worthStatus } from "../extensions/canvas/index.ts";
-import { allowedHost, byteRange, clipTarget, hiddenChange, latestClient, listSessions, pageSections, prune, queueMessage, readAcks, readReply, readWatch, replyPreview, sessionForPane, sessionState, tmuxOf, withKit, PLAN_JS, SANDBOXED_SECTION_CSP, scriptableType, parseGitStatus, usageRows, gitInfo, sessionInfoOf } from "../extensions/canvas/daemon.mjs";
+import { allowedHost, byteRange, clipTarget, hiddenChange, newestMtime, sectionsChanged, visibleSections, latestClient, listSessions, pageSections, prune, queueMessage, readAcks, readReply, readWatch, replyPreview, sessionForPane, sessionState, tmuxOf, withKit, PLAN_JS, SANDBOXED_SECTION_CSP, scriptableType, parseGitStatus, usageRows, gitInfo, sessionInfoOf } from "../extensions/canvas/daemon.mjs";
 
 const msg = (role, content, extra = {}) => ({ type: "message", message: { role, content, ...extra } });
 
@@ -1261,7 +1261,7 @@ test("Background jobs: auto-jobs stays on disk for Botsun but the page never get
     assert.deepEqual(sessionState(root, "s1").sections.map((s) => s.id), ["notes"], "no card, no Contents entry");
     assert.equal("showJobs" in sessionState(root, "s1"), false);
     assert.equal(listSessions(root).find((s) => s.id === "s1").sections, 1, "not counted on the index");
-    assert.equal(hiddenChange("s1/auto-jobs.jobs"), true, "its 2 s rewrites don't reload the page");
+    assert.equal(hiddenChange("s1/auto-jobs.jobs"), true, "its body is a hidden section's");
     assert.equal(hiddenChange("s1/auto-jobs.jobs.tmp-1"), true);
     for (const f of ["s1/sections.json", "s1/notes.md", "s1/auto-jobsx.md", "s1/turn.json"]) assert.equal(hiddenChange(f), false, f);
 
@@ -1463,6 +1463,125 @@ test("tmux follow: pane and socket in meta, pane to live session, last-used clie
     assert.equal(s.tmux, true);
     assert.equal(s.meta.tmux, undefined, "the page never sees the socket path");
     assert.equal(sessionState(root, "old").tmux, false, "not live");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** What canvas.ts's putMarkdown writes for a changed body: the body, then sections.json with a fresh `at`, both via writeAtomic's `<path>.<pid>.tmp` + rename. */
+function putSectionLikeCanvas(d, sec) {
+  const atomic = (path, data) => {
+    writeFileSync(`${path}.${process.pid}.tmp`, data);
+    renameSync(`${path}.${process.pid}.tmp`, path);
+  };
+  const listPath = join(d, "sections.json");
+  const list = existsSync(listPath) ? JSON.parse(readFileSync(listPath, "utf8")) : [];
+  atomic(join(d, sec.file), sec.body);
+  atomic(listPath, JSON.stringify(upsertSection(list, { id: sec.id, title: sec.title, kind: sec.kind, file: sec.file, at: new Date().toISOString(), ...(sec.by ? { by: sec.by } : {}) }), null, 2));
+}
+
+test("daemon: auto-jobs ticks (body + sections.json with a fresh at) neither reload the page nor move updated; a visible change does", async () => {
+  const { root, mk } = tempRoot();
+  const port = 20790 + Math.floor(Math.random() * 1000);
+  const env = { ...process.env };
+  delete env.PI_CANVAS_SHOW_JOBS;
+  const jobs = (tail) => ({ id: "auto-jobs", title: "Background jobs", kind: "jobs", file: "auto-jobs.jobs", by: "auto", body: jobsCard([{ id: "j", name: "vite", command: "vite", logPath: "/t/a.log", startedAt: 0 }], [], () => tail) });
+  const notes = (body) => ({ id: "notes", title: "Notes", kind: "markdown", file: "notes.md", body });
+  mk("s1", { pid: process.pid });
+  const d = join(root, "s1");
+  putSectionLikeCanvas(d, notes("hi"));
+  putSectionLikeCanvas(d, jobs("line 0"));
+  const old = new Date(Date.now() - 60_000);
+  for (const f of readdirSync(d)) utimesSync(join(d, f), old, old);
+  const was = process.env.PI_CANVAS_SHOW_JOBS;
+  delete process.env.PI_CANVAS_SHOW_JOBS;
+  const child = spawn(process.execPath, [fileURLToPath(new URL("../extensions/canvas/daemon.mjs", import.meta.url)), "--port", String(port), "--root", root, "--omarchy", join(root, "none"), "--version", "t4"], { stdio: "ignore", env });
+  const streams = [];
+  try {
+    for (let i = 0; i < 50 && !(await get(port, "/health").catch(() => undefined)); i++) await new Promise((r) => setTimeout(r, 100));
+    const listen = (path) => {
+      const s = { events: "" };
+      return new Promise((resolve) => {
+        const req = request({ host: "127.0.0.1", port, path, headers: { host: `127.0.0.1:${port}` } }, (res) => {
+          res.on("data", (chunk) => {
+            s.events += chunk;
+            if (s.events.includes("event: hello")) resolve(s);
+          });
+        });
+        streams.push(req);
+        req.end();
+      });
+    };
+    const page = await listen("/api/s/s1/events");
+    const index = await listen("/api/events");
+    const updated = sessionState(root, "s1").updated;
+    // Let the watcher see the setup writes go by before the ticks.
+    await new Promise((r) => setTimeout(r, 400));
+    page.events = index.events = "";
+
+    // Two ticks, as writeJobs makes them every 2 s while a job runs: a new log tail each time.
+    putSectionLikeCanvas(d, jobs("line 1"));
+    await new Promise((r) => setTimeout(r, 300));
+    putSectionLikeCanvas(d, jobs("line 2"));
+    await new Promise((r) => setTimeout(r, 700));
+    assert.doesNotMatch(page.events, /event: changed/, "the page doesn't reload");
+    assert.doesNotMatch(index.events, /event: changed/, "nor does the index");
+    assert.equal(sessionState(root, "s1").updated, updated, "updated (the session's ago and order) doesn't move");
+    assert.match(readFileSync(join(d, "auto-jobs.jobs"), "utf8"), /line 2|"jobs"/, "the body Botsun reads still changed");
+
+    // A visible section's change still publishes, and moves updated.
+    putSectionLikeCanvas(d, notes("hello again"));
+    for (let i = 0; i < 40 && !page.events.includes("event: changed"); i++) await new Promise((r) => setTimeout(r, 50));
+    assert.match(page.events, /event: changed\ndata: \{"id":"s1"\}/);
+    assert.match(index.events, /event: changed/);
+    assert.ok(sessionState(root, "s1").updated > updated);
+  } finally {
+    for (const s of streams) s.destroy();
+    child.kill();
+    if (was === undefined) delete process.env.PI_CANVAS_SHOW_JOBS;
+    else process.env.PI_CANVAS_SHOW_JOBS = was;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("newestMtime and sectionsChanged leave hidden sections out (PI_CANVAS_SHOW_JOBS=1 counts them)", () => {
+  const { root, mk } = tempRoot();
+  try {
+    const at = (iso) => ({ at: iso });
+    const list = (jobsAt) => JSON.stringify([
+      { id: "notes", title: "Notes", kind: "markdown", file: "notes.md", ...at("2026-10-31T12:00:00.000Z") },
+      { id: "auto-jobs", title: "Background jobs", kind: "jobs", file: "auto-jobs.jobs", by: "auto", ...at(jobsAt) },
+    ]);
+    mk("s1", { pid: process.pid }, { "sections.json": list("2026-10-31T12:00:00.000Z"), "notes.md": "hi", "auto-jobs.jobs": "{}" });
+    const d = join(root, "s1");
+    const t = new Date("2026-10-31T12:00:00.000Z");
+    for (const f of readdirSync(d)) utimesSync(join(d, f), t, t);
+    const base = newestMtime(d, {});
+    assert.equal(base, t.getTime());
+    const seen = new Map();
+    assert.equal(sectionsChanged(root, "s1", seen, {}), true, "the first look counts");
+
+    // A tick: the body and the hidden entry's at move, and a staging file sits beside them.
+    writeFileSync(join(d, "auto-jobs.jobs"), "{\"jobs\":[]}");
+    writeFileSync(join(d, "sections.json"), list("2026-10-31T13:00:00.000Z"));
+    utimesSync(join(d, "sections.json"), new Date("2026-10-31T13:00:00.000Z"), new Date("2026-10-31T13:00:00.000Z"));
+    writeFileSync(join(d, `sections.json.${process.pid}.tmp`), "[]");
+    assert.equal(newestMtime(d, {}), base, "hidden at, body, sections.json mtime and *.tmp don't count");
+    assert.equal(sectionsChanged(root, "s1", seen, {}), false, "only a hidden entry changed");
+    assert.equal(visibleSections(root, "s1", {}), JSON.stringify([JSON.parse(list("x"))[0]]));
+
+    // Shown again, the same tick counts.
+    assert.ok(newestMtime(d, { PI_CANVAS_SHOW_JOBS: "1" }) > base);
+    assert.equal(sectionsChanged(root, "s1", new Map([["s1", visibleSections(root, "s1", {})]]), { PI_CANVAS_SHOW_JOBS: "1" }), true);
+
+    // A visible entry's change does.
+    writeFileSync(join(d, "sections.json"), list("2026-10-31T13:00:00.000Z").replace("Notes", "Notes 2"));
+    assert.equal(sectionsChanged(root, "s1", seen, {}), true);
+
+    // An empty folder falls back to its own mtime, not 0.
+    mk("s2", {});
+    rmSync(join(root, "s2", "meta.json"));
+    assert.ok(newestMtime(join(root, "s2"), {}) > 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
