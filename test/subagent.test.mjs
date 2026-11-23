@@ -142,6 +142,35 @@ test("a background child goes on its session's subagents list, followed by its b
   resetChildren();
 });
 
+test("a title goes to bg.ts, the completion meta and the subagents list; without one it is derived from the task", async () => {
+  const { listChildren, resetChildren } = await import("../lib/children.ts");
+  resetChildren();
+  const h = mount();
+  h.ctx.sessionManager = { getSessionId: () => "s-title" };
+  const reqs = [];
+  h.onBgStart((r) => {
+    r.accepted = true;
+    reqs.push(r);
+    r.reply({ id: `j${reqs.length}`, logPath: `/tmp/pi-bg-test/j${reqs.length}.log` });
+  });
+  const task = "First `cd ~/tmp/wt-worklog-after-text` (Botsun worktree, branch worklog-after-text off origin/main). Then fix it.";
+  await h.run({ tasks: [{ agent: "worker", task, title: "Work log order" }, { agent: "scout", task }], background: true });
+  assert.deepEqual(reqs.map((r) => r.title), ["Work log order", "Worklog after text"]);
+  assert.deepEqual(reqs.map((r) => r.meta.title), ["Work log order", "Worklog after text"], "the completion details name it too");
+  assert.ok(reqs.every((r) => r.summary.endsWith(task)), "the full prompt stays where it was");
+  const kids = listChildren("s-title");
+  assert.deepEqual(kids.map((k) => k.title), ["Work log order", "Worklog after text"]);
+  assert.ok(kids.every((k) => k.task.startsWith("First `cd ~/tmp/wt-worklog")), "task keeps the prompt");
+  resetChildren();
+});
+
+test("the description asks for a 3-5 word title, on single and parallel tasks", () => {
+  const { tool } = mount();
+  assert.match(tool.description, /3-5 word title/);
+  assert.ok(tool.parameters.properties.title, "single mode's title");
+  assert.ok(tool.parameters.properties.tasks.items.properties.title, "each parallel task's title");
+});
+
 test("the progress filter prints a line per turn, a usage banner, then the answer", async () => {
   const h = mount();
   let command;

@@ -1114,6 +1114,10 @@ test("Background jobs: log tails and the card spec", () => {
   assert.deepEqual([d2.tail, d2.hidden, d2.stopped, d2.exit], [null, true, true, 1], "a secret-printing command never shows its log");
   assert.deepEqual([d1.exit, d1.ended, d1.log], [0, "1970-01-01T00:00:05.000Z", "/t/b.log"]);
   assert.equal(jobsSpec([{ id: "x", name: "x", command: "x", logPath: "/gone.log", startedAt: 0 }], read).jobs[0].tail, null, "an unreadable log");
+  assert.equal("title" in r1, false, "a plain bash job: no title field");
+  const titled = jobsSpec([{ id: "sa", name: "sa:worker", title: "Work log order", command: "PI_SUBAGENT_CHILD=1 pi ... 'Task: First `cd ~/tmp/wt-x`'", logPath: "/t/a.log", startedAt: 0 }], read).jobs[0];
+  assert.deepEqual([titled.name, titled.title], ["sa:worker", "Work log order"], "a subagent's title beside its name; the command stays");
+  assert.match(titled.command, /Task: First/);
 });
 
 test("Scheduled: session views keep only the contract's fields", () => {
@@ -1123,7 +1127,8 @@ test("Scheduled: session views keep only the contract's fields", () => {
     { id: "bad", kind: "weekly" },
     null,
   ]);
-  assert.deepEqual(views.map((v) => Object.keys(v).sort()), [0, 1].map(() => ["every", "id", "kind", "last", "name", "next", "source", "status"]));
+  assert.deepEqual(views.map((v) => Object.keys(v).sort()), [0, 1].map(() => ["every", "id", "kind", "last", "name", "next", "scope", "source", "status"]));
+  assert.deepEqual(views.map((v) => v.scope), ["session", "session"], "session-scheduler timers are this session's");
   assert.equal(views[0].name.length, 40);
   assert.ok(views[0].name.endsWith("…"));
   assert.equal(JSON.stringify(views).includes("SECRET"), false);
@@ -1131,7 +1136,7 @@ test("Scheduled: session views keep only the contract's fields", () => {
   assert.deepEqual(sessionViews("nope"), []);
 });
 
-test("Scheduled: durable tasks come from a temp store, filtered to this cwd by realpath, with no private fields", () => {
+test("Scheduled: durable tasks come from a temp store, every cwd's, with no private fields", () => {
   const root = mkdtempSync(join(tmpdir(), "canvas-sched-"));
   const store = join(root, "scheduler");
   const was = process.env.PI_SCHEDULER_DIR;
@@ -1148,31 +1153,74 @@ test("Scheduled: durable tasks come from a temp store, filtered to this cwd by r
       { ...base, id: "d1", name: "grades", kind: "daily", dailyAt: "15:30", prompt: "SECRET one", cwd: here, lastRunAt: Date.parse("2026-10-30T15:30:00Z"), lastStatus: "ok" },
       { ...base, id: "d2", kind: "cron", cronExpr: "30 15 * * 1-5", prompt: "  first line of the prompt that goes on and on past forty\nSECRET second line", cwd: join(root, "link"), runningSince: 5, runnerPid: 42 },
       { ...base, id: "d3", kind: "interval", intervalMs: 300_000, prompt: "nightly check\nSECRET three", cwd: here, paused: true, lastStatus: "error" },
-      { ...base, id: "d4", kind: "interval", intervalMs: 300_000, prompt: "SECRET elsewhere", cwd: other },
-      { ...base, id: "d5", kind: "once", prompt: "SECRET no cwd" },
+      { ...base, id: "d4", kind: "interval", intervalMs: 300_000, prompt: "elsewhere\nSECRET", cwd: other },
+      { ...base, id: "d5", kind: "once", prompt: "no cwd\nSECRET" },
       { id: "junk", kind: "interval", prompt: "SECRET malformed", cwd: here },
     ];
     writeFileSync(join(store, "tasks.json"), JSON.stringify({ version: 1, tasks }));
-    const views = readDurableViews(here);
-    assert.deepEqual(views.map((v) => v.id), ["d1", "d2", "d3"], "this cwd only (a symlinked cwd counts), valid tasks only");
-    assert.equal(JSON.stringify(views).match(/SECRET|mail me|x\/y|"h"|42|proj/g), null, "no prompt beyond the label, deliver, model, runner or cwd");
-    const [d1, d2, d3] = views;
-    assert.deepEqual(d1, { id: "d1", name: "grades", kind: "daily", every: "daily 15:30", next: "2026-10-31T15:30:00.000Z", last: "2026-10-30T15:30:00.000Z", status: "ok", source: "durable" });
+    const views = readDurableViews();
+    assert.deepEqual(views.map((v) => v.id), ["d1", "d2", "d3", "d4", "d5"], "every valid task on this Mac, whatever its cwd (or none)");
+    assert.equal(JSON.stringify(views).match(/SECRET|mail me|x\/y|"h"|42|proj|other/g), null, "no prompt beyond the label, deliver, model, runner or cwd");
+    const [d1, d2, d3, d4] = views;
+    assert.deepEqual(d1, { id: "d1", name: "grades", kind: "daily", every: "daily 15:30", next: "2026-10-31T15:30:00.000Z", last: "2026-10-30T15:30:00.000Z", status: "ok", source: "durable", scope: "host" });
     assert.equal(d2.name, "first line of the prompt that goes on a…");
     assert.equal(d2.name.length, 40);
     assert.deepEqual([d2.every, d2.status, d2.last], ["cron 30 15 * * 1-5", "running", null]);
     assert.deepEqual([d3.name, d3.status, d3.next, d3.every], ["nightly check", "paused", null, "every 5m"]);
-    assert.deepEqual(readDurableViews(other).map((v) => v.id), ["d4"]);
-    assert.deepEqual(readDurableViews(here, join(root, "missing.json")), [], "no store: none");
+    assert.equal(d4.scope, "host", "another directory's task is the host's");
+    assert.deepEqual(readDurableViews(join(root, "missing.json")), [], "no store: none");
     writeFileSync(join(store, "tasks.json"), "{nope");
-    assert.deepEqual(readDurableViews(here), [], "unreadable: none, no throw");
-    assert.deepEqual(durableViews(tasks, other).map((v) => v.id), ["d4"]);
+    assert.deepEqual(readDurableViews(), [], "unreadable: none, no throw");
     // One odd task (a non-string name, a last run out of Date's range) is skipped, not the list.
     const odd = [{ ...base, id: "o1", kind: "once", prompt: "odd name", cwd: here, name: 5 }, { ...base, id: "o2", kind: "once", prompt: "far", cwd: here, lastRunAt: 1e20 }, tasks[0]];
-    assert.deepEqual(durableViews(odd, here).map((v) => [v.id, v.name]), [["o1", "odd name"], ["d1", "grades"]]);
+    assert.deepEqual(durableViews(odd).map((v) => [v.id, v.name]), [["o1", "odd name"], ["d1", "grades"]]);
   } finally {
     if (was === undefined) delete process.env.PI_SCHEDULER_DIR;
     else process.env.PI_SCHEDULER_DIR = was;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Scheduled: a durable task is this session's only when its createdBySession is this session; else the host's", () => {
+  const here = mkdtempSync(join(tmpdir(), "canvas-scope-"));
+  try {
+    const base = { createdAt: 1, nextRunAt: Date.parse("2026-10-31T15:30:00Z"), kind: "daily", dailyAt: "15:30", cwd: here };
+    const tasks = [
+      { ...base, id: "mine", prompt: "mine", createdBySession: "sess-a" },
+      { ...base, id: "theirs", prompt: "theirs", createdBySession: "sess-b" },
+      { ...base, id: "cli", prompt: "memory-review" },
+      { ...base, id: "odd", prompt: "odd", createdBySession: 7 },
+    ];
+    const scopes = (sid) => Object.fromEntries(durableViews(tasks, sid).map((v) => [v.id, v.scope]));
+    assert.deepEqual(scopes("sess-a"), { mine: "session", theirs: "host", cli: "host", odd: "host" });
+    assert.deepEqual(scopes("sess-b"), { mine: "host", theirs: "session", cli: "host", odd: "host" });
+    assert.deepEqual(scopes(""), { mine: "host", theirs: "host", cli: "host", odd: "host" }, "no session id yet: all the host's");
+    assert.equal(JSON.stringify(durableViews(tasks, "sess-a")).includes("sess-"), false, "the session id itself never goes in the feed");
+    // The card keeps scope beside every existing field.
+    const card = JSON.parse(jobsCard([], [...sessionViews([{ id: "s1", name: "loop", kind: "interval", every: "every 5m", next: null }]), ...durableViews(tasks, "sess-a")], () => null));
+    assert.deepEqual(Object.fromEntries(card.scheduled.map((v) => [v.id, v.scope])), { s1: "session", mine: "session", theirs: "host", cli: "host", odd: "host" });
+  } finally {
+    rmSync(here, { recursive: true, force: true });
+  }
+});
+
+test("Scheduled: host tasks show from any cwd, so every session lists memory-review and kids-grades", () => {
+  const root = mkdtempSync(join(tmpdir(), "canvas-host-"));
+  try {
+    const store = join(root, "tasks.json");
+    const base = { createdAt: 1, nextRunAt: Date.parse("2026-10-31T09:00:00Z"), kind: "daily", dailyAt: "09:00" };
+    const tasks = [
+      { ...base, id: "mr", name: "memory-review", prompt: "review memory", cwd: join(root, "notes") },
+      { ...base, id: "kg", name: "kids-grades", prompt: "check grades", cwd: join(root, "family"), createdBySession: "sess-old" },
+      { ...base, id: "mine", name: "mine", prompt: "mine", cwd: join(root, "proj"), createdBySession: "sess-a" },
+    ];
+    writeFileSync(store, JSON.stringify({ version: 1, tasks }));
+    // No cwd goes in: every session, wherever it runs, gets the same list.
+    const views = readDurableViews(store, "sess-a");
+    assert.deepEqual(views.map((v) => [v.name, v.scope]), [["memory-review", "host"], ["kids-grades", "host"], ["mine", "session"]]);
+    // After /fork the session id is new: the parent's task is the host's in the fork.
+    assert.equal(readDurableViews(store, "sess-fork").find((v) => v.id === "mine").scope, "host");
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });

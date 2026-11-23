@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { after, beforeEach, test } from "node:test";
 import {
 	bindChildren,
+	childTitle,
 	childTranscript,
 	cursorCall,
 	cursorLabel,
@@ -148,6 +149,31 @@ test("a task is its first 200 characters, masked, on one line", () => {
 	const { task } = one(c.id);
 	assert.equal(task.length, 200);
 	assert.match(task, /^Use password=••• then y+…$/);
+});
+
+test("a title: the caller's (one line, masked, capped), else derived from the task, which stays whole", () => {
+	const given = trackChild({ kind: "pi", agent: "worker", task: "First `cd ~/tmp/wt-a-b` and go", title: "Rotate\n password=hunter2", sessionId: "s-t" });
+	assert.equal(one(given.id).title, "Rotate password=•••");
+	const derived = trackChild({ kind: "cursor", agent: "cursor", task: "First `cd ~/tmp/wt-worklog-after-text` (Botsun worktree). Fix it.", sessionId: "s-t" });
+	assert.equal(one(derived.id).title, "Worklog after text");
+	assert.match(one(derived.id).task, /^First `cd ~\/tmp\/wt-worklog-after-text`/, "the task is still the prompt");
+	const long = trackChild({ kind: "pi", agent: "a", task: "t", title: "w ".repeat(60), sessionId: "s-t" });
+	assert.ok(one(long.id).title.length <= 60);
+	assert.equal(childTitle(undefined, ""), "", "nothing to go on: empty");
+});
+
+test("a title never shows a bare token, whole or cut", () => {
+	const ghp = `ghp_${"A1b2C3d4E5".repeat(3)}O5p6Q7`;
+	assert.equal(childTitle(undefined, `Use ${ghp}`), "Use •••");
+	assert.ok(!/AKIA|IOSFODNN/.test(childTitle(undefined, "/tmp/wt-AKIAIOSFODNN7EXAMPLE")));
+	const sk = `sk-ant-api03-${"x9Y8z7W6v5".repeat(4)}`;
+	assert.ok(!/sk-ant|x9Y8/.test(childTitle(undefined, `Please call the API with key ${sk} and report`)));
+	assert.ok(!/sk-ant|x9Y8/.test(childTitle(`Use ${sk}`, "t")), "a given title too");
+});
+
+test("a capped string never ends in half an emoji", () => {
+	const row = trackChild({ kind: "pi", agent: "a", task: "😀".repeat(150), title: "🎉".repeat(40), sessionId: "s-e" });
+	for (const s of [one(row.id).task, one(row.id).title]) assert.ok(!JSON.stringify(s).includes("\\ud"), JSON.stringify(s).slice(-20));
 });
 
 test("states: done, failed, stopped; a stop asked always ends stopped", () => {

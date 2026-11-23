@@ -3689,8 +3689,9 @@ test("subagents: a start or an end goes at once, progress at most once a second,
 	const c = kids.trackChild({ kind: "pi", agent: "scout", task: "look around", model: "anthropic/claude", sessionId: "sid-a" });
 	await until(() => subs().length === 1);
 	const [child] = subs()[0].children;
-	assert.deepEqual(Object.keys(child).sort(), ["activity", "agent", "id", "kind", "last_text", "model", "started_at", "state", "tail", "task", "turns"]);
+	assert.deepEqual(Object.keys(child).sort(), ["activity", "agent", "id", "kind", "last_text", "model", "started_at", "state", "tail", "task", "title", "turns"]);
 	assert.deepEqual([child.id, child.kind, child.agent, child.task, child.state, child.turns], [c.id, "pi", "scout", "look around", "running", 0]);
+	assert.equal(child.title, "look around", "no title given: derived from the task");
 	assert.equal(typeof child.started_at, "number");
 	kids.trackChild({ kind: "pi", agent: "other", task: "t", sessionId: "sid-b" });
 	await sleep(50);
@@ -3737,6 +3738,9 @@ test("subagentsLine keeps the line under the host's limit, running children's ta
 	assert.deepEqual([line[0].context, line[0].window], [1_234, 200_000], "what the phone's context bar reads");
 	const bare = subagentsLine([{ ...kid(0, "running"), window: undefined, usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }])[0];
 	assert.deepEqual([bare.context, bare.window], [undefined, undefined], "nothing known: both left out");
+	assert.equal(bare.title, undefined, "no title (an older children store): none on the wire");
+	const titled = subagentsLine([{ ...kid(0, "running"), title: "Work log order" }])[0];
+	assert.deepEqual([titled.title, titled.task], ["Work log order", "t".repeat(200)], "the title rides beside the whole task");
 	assert.deepEqual(subagentsLine(all.slice(0, 2)).map((k) => k.tail.length), [30, 30], "a small list goes whole");
 	const tiny = subagentsLine(all, 2_000);
 	assert.ok(tiny.length > 0 && tiny.length < 16 && tiny.every((k) => k.state === "running"), "past it, finished ones drop first");

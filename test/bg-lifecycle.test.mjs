@@ -436,6 +436,35 @@ test("bg:start runs another extension's job with its own label, header, and tail
   assert.match(wake, /last 40 lines:\nline 0\n/);
 });
 
+test("bg:start title: on bg:list and bg:jobs, one line and capped, kept across /reload; a plain job has none", async (t) => {
+  const session = sid("title");
+  const h = await mount(t, { session });
+  const req = { command: "pi child | node -e filter", name: "sa:worker", summary: "subagent worker: x", title: "Work log\n  order" };
+  const reply = new Promise((resolve) => (req.reply = resolve));
+  h.emit("bg:start", req);
+  const { id } = await reply;
+  await h.run({ command: "npm run build", background: true });
+  const plain = h.children.at(-1);
+  const listed = h.list();
+  assert.equal(listed.find((j) => j.id === id).title, "Work log order");
+  assert.equal("title" in listed.find((j) => j.id !== id), false, "a bash job: no title field");
+  assert.equal(h.jobEvents.at(-1).find((j) => j.id === id).title, "Work log order", "bg:jobs (canvas) carries it");
+  const { cleanJobTitle } = await import("../extensions/bg/index.ts");
+  assert.equal(cleanJobTitle("x".repeat(100)).length, 60);
+  assert.equal(cleanJobTitle("  \n"), undefined);
+  assert.equal(cleanJobTitle(5), undefined);
+  assert.equal(cleanJobTitle(`Use ghp_${"A1b2C3d4E5".repeat(3)}O5p6Q7`), "Use •••", "a bare token, masked before the cut");
+  assert.ok(!/AKIA/.test(cleanJobTitle("/tmp/wt-AKIAIOSFODNN7EXAMPLE")));
+  assert.ok(!JSON.stringify(cleanJobTitle("😀".repeat(70))).includes("\\ud"), "no half emoji");
+
+  await h.shutdown("reload");
+  h.goStale();
+  const next = await boot(t, h.backgroundTasks, { session, reason: "reload" });
+  assert.equal(next.list().find((j) => j.id === id).title, "Work log order", "the registry entry keeps it");
+  plain.exit(0);
+  h.children[0].exit(0);
+});
+
 test("bg:start meta joins the completion details; failed and stopped jobs say so", async (t) => {
   const h = await mount(t);
   const start = async (extra) => {

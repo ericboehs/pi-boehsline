@@ -713,7 +713,7 @@ export function streamable(command: string): boolean {
 }
 
 /** A job as bg.ts reports it on `bg:jobs`. */
-export type BgJob = { id: string; name: string; command: string; cwd?: string; logPath: string; startedAt: number; endedAt?: number; exitCode?: number | null; signal?: string | null; killedByUser?: boolean };
+export type BgJob = { id: string; name: string; title?: string; command: string; cwd?: string; logPath: string; startedAt: number; endedAt?: number; exitCode?: number | null; signal?: string | null; killedByUser?: boolean };
 
 // eslint-disable-next-line no-control-regex
 const ANSI = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]/g;
@@ -731,6 +731,10 @@ export function logTail(text: string, n = 20): string {
  * A scheduled task as the Background jobs card shows it: what, when, and how
  * the last run went. Never its prompt (only a short label), deliver command,
  * cwd, model, env, runner pid/host, or run output.
+ *
+ * scope: whose it is. "session" for this session's own timers (session-scheduler's, and a
+ * durable task this session created: its createdBySession), "host" for a durable task that runs
+ * on this Mac on its own. Botsun's info sheet groups by it.
  */
 export type ScheduledView = {
   id: string;
@@ -741,6 +745,7 @@ export type ScheduledView = {
   last: string | null;
   status: "armed" | "paused" | "running" | "ok" | "error" | "timeout" | "skipped";
   source: "session" | "agent" | "durable";
+  scope: "session" | "host";
 };
 export const MAX_SCHEDULED = 20;
 const SCHED_KINDS = new Set(["once", "interval", "daily", "cron"]);
@@ -764,26 +769,23 @@ export function sessionViews(list: unknown): ScheduledView[] {
       last: isoOrNull(t.last),
       status: t.status === "paused" ? "paused" : "armed",
       source: t.source === "agent" ? "agent" : "session",
+      scope: "session",
     });
   }
   return out;
 }
 
-const realOr = (p: string) => {
-  try {
-    return realpathSync(p);
-  } catch {
-    return resolve(p);
-  }
-};
-
-/** Durable /schedule tasks whose cwd is this session's (realpath compare), as views. */
-export function durableViews(tasks: unknown, cwd: string): ScheduledView[] {
+/**
+ * Every durable /schedule task on this Mac, as views, whatever its cwd: Botsun's "On this Mac"
+ * shows memory-review, kids-grades and the like in every session. A task whose createdBySession
+ * is sessionId is this session's (scope "session"); every other is "host". After /fork the new
+ * session has a new id, so a task its parent created shows as "host" there.
+ */
+export function durableViews(tasks: unknown, sessionId = ""): ScheduledView[] {
   if (!Array.isArray(tasks)) return [];
-  const here = realOr(cwd);
   const out: ScheduledView[] = [];
   for (const t of tasks) {
-    if (!isDurableTask(t) || typeof t.cwd !== "string" || !t.cwd || realOr(t.cwd) !== here) continue;
+    if (!isDurableTask(t)) continue;
     const status: ScheduledView["status"] = t.runningSince !== undefined ? "running" : t.paused ? "paused" : t.lastStatus && SCHED_STATUSES.has(t.lastStatus) ? t.lastStatus : "armed";
     // One task with an odd field (a non-string name, a time out of range) is skipped, not the list.
     try {
@@ -796,6 +798,7 @@ export function durableViews(tasks: unknown, cwd: string): ScheduledView[] {
         last: msIso(t.lastRunAt),
         status,
         source: "durable",
+        scope: sessionId && (t as { createdBySession?: unknown }).createdBySession === sessionId ? "session" : "host",
       });
     } catch {
       continue;
@@ -804,10 +807,10 @@ export function durableViews(tasks: unknown, cwd: string): ScheduledView[] {
   return out;
 }
 
-/** Durable views for cwd straight from the registry file; [] when it is missing or unreadable. Read-only, no lock. */
-export function readDurableViews(cwd: string, path = registryPath()): ScheduledView[] {
+/** Durable views straight from the registry file; [] when it is missing or unreadable. Read-only, no lock. */
+export function readDurableViews(path = registryPath(), sessionId = ""): ScheduledView[] {
   try {
-    return durableViews((JSON.parse(readFileSync(path, "utf8")) as { tasks?: unknown } | null)?.tasks, cwd);
+    return durableViews((JSON.parse(readFileSync(path, "utf8")) as { tasks?: unknown } | null)?.tasks, sessionId);
   } catch {
     return [];
   }
@@ -837,6 +840,8 @@ export function jobsSpec(jobs: BgJob[], read: (path: string) => string | null, l
       return {
         id: j.id,
         name: j.name,
+        // A subagent's or Cursor run's short title (bg:start's title), for its row; a plain bash job has none.
+        ...(typeof j.title === "string" && j.title ? { title: j.title } : {}),
         command: j.command.replace(/\s+/g, " ").trim().slice(0, 300),
         log: j.logPath,
         started: iso(j.startedAt),
@@ -2095,30 +2100,30 @@ export default function canvas(pi: ExtensionAPI) {
     if (!autoOn || !bgCtx?.hasUI) return;
     void serial(writeJobs).catch(() => {});
   }
-  /** Re-read the registry only when it changed (or the cwd did); true when the views changed. */
-  function checkDurable(cwd: string): boolean {
-    let key = cwd;
+  /** Re-read the registry only when it changed (or the session did); true when the views changed. */
+  function checkDurable(): boolean {
+    let key = sessionId;
     let views: ScheduledView[] = [];
     try {
       const path = registryPath();
       const st = statSync(path);
-      key = `${cwd}\0${st.mtimeMs}\0${st.size}`;
+      key = `${sessionId}\0${st.mtimeMs}\0${st.size}`;
       if (key === durableKey) return false;
-      views = readDurableViews(cwd, path);
+      // The session id: a task this session created is its own (scope "session").
+      views = readDurableViews(path, sessionId);
     } catch {} // no registry: no durable tasks
     durableKey = key;
     const changed = JSON.stringify(views) !== JSON.stringify(schedDurable);
     schedDurable = views;
     return changed;
   }
-  function watchDurable(ctx: ExtensionContext) {
+  function watchDurable() {
     clearInterval(schedTimer);
     durableKey = "";
-    checkDurable(ctx.cwd);
-    const cwd = ctx.cwd; // read once: a stale ctx's getters throw inside the timer
+    checkDurable();
     schedTimer = setInterval(() => {
       try {
-        if (checkDurable(cwd)) void serial(writeJobs).catch(() => {});
+        if (checkDurable()) void serial(writeJobs).catch(() => {});
       } catch {}
     }, SCHED_EVERY_MS);
     schedTimer.unref?.();
@@ -2513,7 +2518,7 @@ export default function canvas(pi: ExtensionAPI) {
       watchTasks(ctx);
       // Catch up with bg.ts (jobs started before a /reload); with none, a stale card goes.
       bgCtx = ctx;
-      watchDurable(ctx);
+      watchDurable();
       pi.events?.emit?.("scheduler:list", { reply: (l: unknown) => void (schedSession = sessionViews(l)) });
       let answered = false;
       pi.events?.emit?.("bg:list", { reply: (l: unknown) => ((answered = true), onJobs(l)) });

@@ -106,9 +106,17 @@ const sandboxField = Type.Optional(
 	}),
 );
 
+const titleField = Type.Optional(
+	Type.String({
+		description:
+			"A 3-5 word title for the task (e.g. \"Work log order\"), shown in running lists instead of the prompt. Omitted: one is guessed from a wt-*/worktree/branch name in the task, else its first sentence.",
+	}),
+);
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Agent name (scout, worker, cursor, or an agents/*.md file)" }),
 	task: Type.String({ description: "Bounded task with concrete deliverable" }),
+	title: titleField,
 	cwd: Type.Optional(Type.String({ description: "Override working directory" })),
 	model: Type.Optional(Type.String({ description: "Model override for this task" })),
 	...cursorFields,
@@ -118,6 +126,7 @@ const TaskItem = Type.Object({
 const Params = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Agent for single mode" })),
 	task: Type.Optional(Type.String({ description: "Task for single mode" })),
+	title: titleField,
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel tasks (max 8)" })),
 	cwd: Type.Optional(Type.String({ description: "Working dir override (single mode)" })),
 	model: Type.Optional(Type.String({ description: "Child model override, e.g. haiku (for cursor: a Cursor model id)" })),
@@ -197,7 +206,7 @@ type Agent = {
 	sandbox?: boolean;
 };
 
-type Job = { agent: string; task: string; cwd?: string; model?: string; cursorMode?: CursorMode; worktree?: boolean; force?: boolean; sandbox?: boolean };
+type Job = { agent: string; task: string; title?: string; cwd?: string; model?: string; cursorMode?: CursorMode; worktree?: boolean; force?: boolean; sandbox?: boolean };
 
 /** What a foreground cursor task reports in details.results[i].cursor. */
 type CursorFacts = {
@@ -235,7 +244,8 @@ const BUILTINS: Record<string, Omit<Agent, "name">> = {
 };
 
 const DESCRIPTION =
-	"Delegate to an isolated fresh-context subagent (subprocess). Single {agent, task} or parallel {tasks}. Use for recon, plans, independent review, parallel exploration. scout=read-only pi, worker=edits (pi), " +
+	"Delegate to an isolated fresh-context subagent (subprocess). Single {agent, task, title} or parallel {tasks: [{agent, task, title}]}. " +
+	"Pass each task a 3-5 word title (e.g. \"Work log order\"): running lists show it instead of the prompt. Use for recon, plans, independent review, parallel exploration. scout=read-only pi, worker=edits (pi), " +
 	"sandbox: true runs the task in Botsun's workers VM instead (the repo is copied in; pi runs as botsun-worker with -ne -na and read-only tools; scout only until the patch gate). " +
 	"cursor=Cursor's agent CLI instead of pi (needs the opt-in cursor-agent extension; billed to the user's Cursor account; edits land uncommitted in a new git worktree unless worktree: false; cursorMode plan/ask is read-only). " +
 	"A cursor task must be self-contained and must never contain PII, PHI, secrets or credentials.";
@@ -279,7 +289,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 		renderCall(args, theme) {
 			const summary = args.tasks?.length
 				? `${args.tasks.length} tasks: ${args.tasks.slice(0, 3).map((t) => t.agent).join(", ")}${args.tasks.length > 3 ? ", …" : ""}`
-				: `${args.agent ?? "?"}: ${(args.task ?? "").slice(0, 60)}`;
+				: `${args.agent ?? "?"}: ${(args.title || args.task || "").slice(0, 60)}`;
 			return new Text(theme.fg("accent", "subagent ") + theme.fg("muted", summary), 0, 0);
 		},
 
@@ -367,7 +377,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 			// a per-task model wins over the agent's.
 			const single: Job[] =
 				params.agent && params.task
-					? [{ agent: params.agent, task: params.task, cwd: params.cwd, cursorMode: params.cursorMode, worktree: params.worktree, force: params.force, sandbox: params.sandbox }]
+					? [{ agent: params.agent, task: params.task, title: params.title, cwd: params.cwd, cursorMode: params.cursorMode, worktree: params.worktree, force: params.force, sandbox: params.sandbox }]
 					: [];
 			const jobs = (params.tasks ?? single) as Job[];
 			if (jobs.length === 0 || jobs.length > MAX_TASKS || (params.tasks && params.agent)) {
@@ -386,11 +396,12 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 			const sessionId = kids.sessionOf(ctx);
 			// A background child's bg:start meta: its completion details then name the tracked child
 			// with the agent and task strings the list shows (Botsun draws the same face from them).
-			const childMeta = (kind: "subagent" | "cursor", childId: string, agent: string, task: string, model: string | undefined) => ({
+			const childMeta = (kind: "subagent" | "cursor", childId: string, agent: string, task: string, title: string, model: string | undefined) => ({
 				kind,
 				child_id: childId,
 				agent: kids.childAgent(agent),
 				task: kids.childTask(task),
+				title,
 				...(model ? { model: kids.clean(model, 80) } : {}),
 			});
 			// The window the phone draws a pi child's context bar against: its model's, when pi's own
@@ -502,12 +513,13 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						// Minted before the job, so its completion details name the child (Botsun's card face).
 						// Tracked only once the job started: a failed start leaves no child behind.
 						const cursorId = kids.newChildId("cursor");
-						const meta = childMeta("cursor", cursorId, job.agent, job.task, prep.spec.model);
-						const reply = await startJob(pi.events, prep.spec, { ctx, name: `sa:${job.agent}`, summary: `subagent ${job.agent}: ${job.task}`, meta });
+						const title = kids.childTitle(job.title, job.task);
+						const meta = childMeta("cursor", cursorId, job.agent, job.task, title, prep.spec.model);
+						const reply = await startJob(pi.events, prep.spec, { ctx, name: `sa:${job.agent}`, summary: `subagent ${job.agent}: ${job.task}`, title, meta });
 						if (reply === null) return noBg;
 						const where = prep.spec.worktree ? "new worktree" : prep.spec.cwd;
 						if (!("error" in reply)) {
-							kids.trackChild({ kind: "cursor", id: cursorId, agent: job.agent, task: job.task, model: prep.spec.model, sessionId, bg: reply });
+							kids.trackChild({ kind: "cursor", id: cursorId, agent: job.agent, task: job.task, title, model: prep.spec.model, sessionId, bg: reply });
 						}
 						lines.push("error" in reply ? `[${job.agent}] failed: ${reply.error}` : `[${job.agent}] bg ${reply.id} · log ${reply.logPath} · ${prep.spec.model} · ${where}`);
 						continue;
@@ -537,6 +549,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					// The filter's sidecar of each turn's calls in full (kids' callsPath): its argument.
 					const callsPath = path.join(os.tmpdir(), `pi-subagent-calls-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.jsonl`);
 					const command = `PI_SUBAGENT_CHILD=1 ${[inv.cmd, ...inv.args].map(q).join(" ")} | ${q(process.execPath)} -e ${q(PROGRESS_FILTER)} ${q(callsPath)}`;
+					const title = kids.childTitle(job.title, job.task);
 					const reply = await new Promise<{ id: string; logPath: string } | { error: string } | null>((resolve) => {
 						const req = {
 							command,
@@ -544,7 +557,8 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 							ctx,
 							name: `sa:${job.agent}`,
 							summary: `subagent ${job.agent}: ${job.task}`,
-							meta: childMeta("subagent", childId, job.agent, job.task, model),
+							title,
+							meta: childMeta("subagent", childId, job.agent, job.task, title, model),
 							tailLines: 1000,
 							tailMaxChars: BG_WAKE_CHARS,
 							accepted: false,
@@ -554,7 +568,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 						if (!req.accepted) resolve(null); // no listener: the bg extension isn't loaded
 					});
 					if (reply === null) return noBg;
-					if (!("error" in reply)) kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, id: childId, bg: { ...reply, callsPath } });
+					if (!("error" in reply)) kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, title, model, window: windowOf(model), sessionId, id: childId, bg: { ...reply, callsPath } });
 					lines.push("error" in reply ? `[${job.agent}] failed: ${reply.error}` : `[${job.agent}] bg ${reply.id} · log ${reply.logPath}`);
 				}
 				return {
@@ -612,7 +626,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 				let lastEmit = 0;
 				let r: Awaited<ReturnType<typeof runAndCharge>>;
 				const own = new AbortController();
-				const child = kids.trackChild({ kind: "cursor", agent: job.agent, task: job.task, model: spec.model, sessionId, stop: () => own.abort() });
+				const child = kids.trackChild({ kind: "cursor", agent: job.agent, task: job.task, title: job.title, model: spec.model, sessionId, stop: () => own.abort() });
 				try {
 					r = await runAndCharge(spec, {
 						signal: signal ? AbortSignal.any([signal, own.signal]) : own.signal,
@@ -692,7 +706,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 					invocation = piInvocation(args);
 				}
 				const own = new AbortController();
-				const child = kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, model, window: windowOf(model), sessionId, ...(childId ? { id: childId } : {}), stop: () => own.abort() });
+				const child = kids.trackChild({ kind: "pi", agent: job.agent, task: job.task, title: job.title, model, window: windowOf(model), sessionId, ...(childId ? { id: childId } : {}), stop: () => own.abort() });
 				try {
 					const usage = newTally();
 					let final = "";

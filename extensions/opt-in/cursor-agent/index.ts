@@ -25,7 +25,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-wo
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
-import { bindChildren, sessionOf, trackChild } from "../../../lib/children.ts";
+import { bindChildren, childTitle, sessionOf, trackChild } from "../../../lib/children.ts";
 import { optIn } from "../../../lib/opt-in.ts";
 import {
 	applyCursorStatusChip,
@@ -74,6 +74,12 @@ interface CursorDetails {
 function params(s: CursorSettings) {
 	return Type.Object({
 		prompt: Type.String({ description: "The task for Cursor's agent, self-contained: it does not see this conversation" }),
+		title: Type.Optional(
+			Type.String({
+				description:
+					"A 3-5 word title for the run (e.g. \"Work log order\"), shown in running lists instead of the prompt. Omitted: one is guessed from the prompt.",
+			}),
+		),
 		model: Type.Optional(
 			Type.String({ description: `Cursor model id (default ${s.defaultModel}); see \`cursor-agent --list-models\`` }),
 		),
@@ -177,8 +183,9 @@ interface BackgroundDetails {
  * Cursor's steps into the job log and ends with a result block that the
  * completion message carries back.
  */
-async function startBackground(pi: ExtensionAPI, spec: RunSpec, prompt: string, ctx: ExtensionContext) {
-	const reply = await startJob(pi.events, spec, { ctx, name: "cursor", summary: `cursor ${spec.model}: ${prompt}` });
+async function startBackground(pi: ExtensionAPI, spec: RunSpec, prompt: string, ctx: ExtensionContext, given?: string) {
+	const title = childTitle(given, prompt);
+	const reply = await startJob(pi.events, spec, { ctx, name: "cursor", summary: `cursor ${spec.model}: ${prompt}`, title });
 	if (reply === null) {
 		return {
 			content: [
@@ -191,7 +198,7 @@ async function startBackground(pi: ExtensionAPI, spec: RunSpec, prompt: string, 
 	if ("error" in reply) {
 		return { content: [{ type: "text" as const, text: `Cursor background job failed to start: ${reply.error}` }], details: undefined, isError: true };
 	}
-	trackChild({ kind: "cursor", agent: "cursor", task: prompt, model: spec.model, sessionId: sessionOf(ctx), bg: reply });
+	trackChild({ kind: "cursor", agent: "cursor", task: prompt, title, model: spec.model, sessionId: sessionOf(ctx), bg: reply });
 	const details: BackgroundDetails = { background: true, id: reply.id, logPath: reply.logPath, model: spec.model };
 	return {
 		content: [
@@ -235,12 +242,12 @@ function registerCursorTool(pi: ExtensionAPI, s: CursorSettings, addCents: (cent
 			const spec = await prepareRun({ ...args, mode }, ctx.cwd, loadSettings());
 			// On the session's list (lib/children.ts), so Eric's phone shows the run and can stop it.
 			bindChildren(pi.events);
-			if (args.background) return startBackground(pi, spec, args.prompt, ctx);
+			if (args.background) return startBackground(pi, spec, args.prompt, ctx, args.title);
 			const { model, cwd } = spec;
 
 			let lastEmit = 0;
 			const own = new AbortController();
-			const child = trackChild({ kind: "cursor", agent: "cursor", task: args.prompt, model, sessionId: sessionOf(ctx), stop: () => own.abort() });
+			const child = trackChild({ kind: "cursor", agent: "cursor", task: args.prompt, title: args.title, model, sessionId: sessionOf(ctx), stop: () => own.abort() });
 			let outcome: Awaited<ReturnType<typeof runCursor>>;
 			try {
 				outcome = await runCursor(spec, {

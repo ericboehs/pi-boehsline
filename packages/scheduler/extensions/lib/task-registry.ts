@@ -147,6 +147,13 @@ export interface DurableTask extends Schedule {
   timeoutMs?: number;
   paused?: boolean;
   createdAt: number;
+  /**
+   * The pi session that created it (`/schedule` in a session; absent from the
+   * pi-scheduler CLI). Informational only: the task still runs on its own. The
+   * canvas jobs feed counts it as that session's (scope "session"), every other
+   * durable task as the host's.
+   */
+  createdBySession?: string;
   nextRunAt: number;
   lastRunAt?: number;
   lastStatus?: RunStatus;

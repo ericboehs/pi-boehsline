@@ -121,6 +121,7 @@ test("background returns at once with the bg job id and log, without running Cur
 	assert.equal(existsSync(path.join(scratch, "never.json")), false, "cursor-agent was not started by the tool");
 	assert.equal(req.name, "cursor");
 	assert.equal(req.summary, "cursor composer-2: Fix it's bug");
+	assert.equal(req.title, "Fix it's bug", "no title given: derived from the prompt");
 	assert.equal(req.cwd, repo);
 	assert.equal(req.tailMaxChars, WAKE_CHARS);
 	assert.ok(req.tailLines >= 100);
@@ -137,6 +138,22 @@ test("background returns at once with the bg job id and log, without running Cur
 	assert.ok(spec.cliArgs.includes("--worktree"));
 	assert.equal(spec.cliArgs.at(-1), "Fix it's bug");
 	rmSync(path.dirname(specPath), { recursive: true, force: true });
+});
+
+test("background: a given title goes to bg.ts, and the prompt stays the task", async () => {
+	const h = await mount();
+	let req;
+	h.pi.events.on("bg:start", (r) => {
+		r.accepted = true;
+		req = r;
+		queueMicrotask(() => r.reply({ id: "abc124", logPath: "/tmp/pi-bg-501/abc124.log" }));
+	});
+	fakeEnv({ FAKE_CURSOR_ARGS: path.join(scratch, "never.json") });
+	assert.ok(h.tool.parameters.properties.title, "the cursor tool declares title");
+	await h.run({ prompt: "In ~/tmp/wt-x fix the flaky spec", title: "Flaky spec", model: "composer-2", worktree: false, background: true });
+	assert.equal(req.title, "Flaky spec");
+	assert.equal(req.summary, "cursor composer-2: In ~/tmp/wt-x fix the flaky spec");
+	rmSync(path.dirname(req.command.match(/'([^']+spec\.json)'$/)[1]), { recursive: true, force: true });
 });
 
 test("background without the bg extension says to rerun without it", async () => {

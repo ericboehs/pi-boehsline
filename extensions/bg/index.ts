@@ -46,7 +46,8 @@
  *   (same widget, /bg panel, kill, and wake). bg.ts sets `req.accepted = true`
  *   synchronously, so the sender can detect that bg.ts is not loaded, then calls
  *   `req.reply({ id, logPath } | { error })`. Optional per-job overrides: `name`
- *   (widget label), `summary` (wake header instead of the command), and
+ *   (widget label), `summary` (wake header instead of the command), `title`
+ *   (a short name for the job's row: saved with the job and on bg:jobs), and
  *   `tailLines`/`tailMaxChars` (how much of the log the wake carries), and
  *   `details` is ignored unless this process's cursor runner marked the request
  *   (an unexported WeakSet in runner.ts; a forged stack cannot). Even then,
@@ -61,7 +62,7 @@
  *   an end with no recorded status is unknown and has no seconds). Meta strings are
  *   secret-masked and capped; meta's `kind` applies only to a plain bash job. A job
  *   whose spawn failed has `start_failed: true` and no `child_id`.
- *   bg.ts emits "bg:jobs" with a snapshot of its jobs (id, name, command, cwd,
+ *   bg.ts emits "bg:jobs" with a snapshot of its jobs (id, name, title?, command, cwd,
  *   logPath, startedAt, endedAt, exitCode, signal, killedByUser; foreground
  *   jobs still racing their budget left out) on every start, adoption and
  *   exit, and answers pi.events.emit("bg:list", { reply }) with the same.
@@ -122,6 +123,7 @@ import {
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { commandRunsCursorRunner, maskDiffSecrets, readJobDetails, trustJobDetails } from "../../lib/cursor-diff.ts";
+import { cleanTitle } from "../../lib/job-title.ts";
 // ps lstart identity, shared with the session-timer index so both read the
 // same "this pid is still that process" answer.
 import {
@@ -354,6 +356,8 @@ interface JobRecord {
 	quiet?: boolean;
 	/** Wake header text instead of the command (event-bus jobs). */
 	summary?: string;
+	/** A bg:start caller's short title (cleanJobTitle): what the canvas jobs feed shows for the row. */
+	title?: string;
 	/** Its name was given (the bash tool's `name`, a bg:start request), not guessed from the command: the wake leads with it. */
 	named?: boolean;
 	/** A bg:start caller's own fields (cleanJobMeta), merged into the completion message's details. */
@@ -399,10 +403,11 @@ export function parseWakeFlag(args: string): { id: string; wake: boolean } | und
 
 function toRecord(job: Job): JobRecord {
 	const { id, name, command, cwd, logPath, pid, pidStart, sessionId, startedAt, endedAt, exitCode, signal } = job;
-	const { exitUnknown, startFailed, killedByUser, wakeOnKill, quiet, summary, named, meta, tailLines, tailMaxChars, reported, adopted, wake } = job;
+	const { exitUnknown, startFailed, killedByUser, wakeOnKill, quiet, summary, title, named, meta, tailLines, tailMaxChars, reported, adopted, wake } = job;
 	return {
 		id, name, command, cwd, logPath, pid, pidStart, sessionId, startedAt, endedAt, exitCode, signal,
 		exitUnknown, startFailed, killedByUser, wakeOnKill, quiet, summary, named, meta, tailLines, tailMaxChars, reported, adopted,
+		...(title ? { title } : {}),
 		seenAt: Date.now(),
 		...(wake === false ? { wake } : {}),
 	};
@@ -449,6 +454,7 @@ function parseRecord(raw: unknown): JobRecord | undefined {
 		wakeOnKill: r.wakeOnKill === true,
 		quiet: r.quiet === true,
 		summary: optional(r.summary, (v): v is string => text(v, 10_000)),
+		...(cleanJobTitle(r.title) ? { title: cleanJobTitle(r.title) } : {}),
 		named: r.named === true ? true : undefined,
 		meta: cleanJobMeta(r.meta),
 		tailLines: optional(r.tailLines, count),
@@ -642,6 +648,16 @@ export function cleanJobName(raw: unknown): string | undefined {
 	const name = raw.replace(/[\p{Cc}\u2028\u2029\u200E\u200F\u202A-\u202E\u2066-\u2069]+/gu, " ").replace(/\s+/g, " ").trim();
 	if (!name) return undefined;
 	return name.length > JOB_NAME_MAX ? `${name.slice(0, JOB_NAME_MAX - 1)}…` : name;
+}
+
+/**
+ * A bg:start caller's short title (a subagent's or Cursor run's, lib/job-title.ts): one line,
+ * secret-masked whole before the cut and again after (cleanTitle), at most GIVEN_TITLE_MAX code
+ * points. What the canvas jobs feed shows for its row.
+ */
+export function cleanJobTitle(raw: unknown): string | undefined {
+	const title = cleanTitle(raw);
+	return title ? cleanTitle(maskDiffSecrets(title)) : undefined;
 }
 
 /** A bg:start caller's opaque fields: flat JSON primitives, at most JOB_META_KEYS keys and JOB_META_BYTES of JSON. */
@@ -948,6 +964,8 @@ interface BgStartRequest {
 	ctx?: unknown;
 	name?: string;
 	summary?: string;
+	/** A short title for the job's row (cleanJobTitle): the canvas jobs feed shows it instead of the command. */
+	title?: string;
 	tailLines?: number;
 	tailMaxChars?: number;
 	/** Ignored unless the cursor runner authorized this request. Not settable by other callers. */
@@ -1385,7 +1403,9 @@ export default function (pi: ExtensionAPI) {
 	const snapshot = () =>
 		[...jobs.values()]
 			.filter((job) => !job.quiet)
-			.map(({ id, name, command, cwd, logPath, startedAt, endedAt, exitCode, signal, killedByUser }) => ({ id, name, command, cwd, logPath, startedAt, endedAt, exitCode, signal, killedByUser }));
+			.map(({ id, name, title, command, cwd, logPath, startedAt, endedAt, exitCode, signal, killedByUser }) => ({
+				id, name, ...(title ? { title } : {}), command, cwd, logPath, startedAt, endedAt, exitCode, signal, killedByUser,
+			}));
 
 	function renderWidget(): void {
 		const ctx = ctxRef;
@@ -1456,6 +1476,7 @@ export default function (pi: ExtensionAPI) {
 			/** The command to guess a name from, when it isn't `command` (the foreground race's has pi's prefix in front). */
 			label?: string;
 			summary?: string;
+			title?: string;
 			tailLines?: number;
 			tailMaxChars?: number;
 			details?: boolean;
@@ -1501,6 +1522,7 @@ export default function (pi: ExtensionAPI) {
 			quiet: opts.quiet === true,
 			own: true,
 			summary: opts.summary,
+			...(cleanJobTitle(opts.title) ? { title: cleanJobTitle(opts.title) } : {}),
 			meta: cleanJobMeta(opts.meta),
 			tailLines: opts.tailLines,
 			tailMaxChars: opts.tailMaxChars,
@@ -2287,6 +2309,7 @@ export default function (pi: ExtensionAPI) {
 				ctx,
 				name: req.name,
 				summary: req.summary,
+				title: req.title,
 				tailLines: req.tailLines,
 				tailMaxChars: req.tailMaxChars,
 				details: cursorDetailsRequested(req),
