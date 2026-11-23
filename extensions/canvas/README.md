@@ -286,9 +286,11 @@ the review prompt — so a renderer never reaches for a page global.
   another session or by the `pi-scheduler` CLI). Every durable task on this
   Mac is listed, whatever its cwd, so "On this Mac" shows memory-review,
   kids-grades and the like in every session (session-scheduler timers are
-  this session's alone). `/fork` (and anything else that starts a new session
+  this session's alone). A running durable task has `since`, when the current
+  run started (its `runningSince`), so a running clock counts from this run
+  and not from `last`, the previous one; it is `null` otherwise. `/fork` (and anything else that starts a new session
   id) leaves a task the parent created behind: in the fork it shows as
-  `"host"`, not `"session"`. Both fields are additive: an older reader ignores
+  `"host"`, not `"session"`. These fields are additive: an older reader ignores
   them. For example:
 
   ```json
@@ -300,9 +302,10 @@ the review prompt — so a renderer never reaches for a page global.
     ],
     "scheduled": [
       { "id": "t1", "name": "check CI", "kind": "interval", "every": "every 5m", "next": "2026-11-22T15:10:00.000Z",
-        "last": null, "status": "armed", "source": "agent", "scope": "session" },
-      { "id": "d1", "name": "memory-review", "kind": "daily", "every": "daily 09:00", "next": "2026-11-23T09:00:00.000Z",
-        "last": "2026-11-22T09:00:00.000Z", "status": "ok", "source": "durable", "scope": "host" }
+        "last": null, "status": "armed", "source": "agent", "scope": "session", "since": null },
+      { "id": "d1", "name": "memory-review", "kind": "daily", "every": "daily 09:00", "next": "2026-11-24T09:00:00.000Z",
+        "last": "2026-11-22T09:00:00.000Z", "status": "running", "source": "durable", "scope": "host",
+        "since": "2026-11-23T09:00:02.000Z" }
     ]
   }
   ```

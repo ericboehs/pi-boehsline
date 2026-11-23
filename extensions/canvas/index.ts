@@ -735,6 +735,9 @@ export function logTail(text: string, n = 20): string {
  * scope: whose it is. "session" for this session's own timers (session-scheduler's, and a
  * durable task this session created: its createdBySession), "host" for a durable task that runs
  * on this Mac on its own. Botsun's info sheet groups by it.
+ *
+ * since: when the current run started (a durable task's runningSince), for a running clock;
+ * null when it isn't running and for session-scheduler timers.
  */
 export type ScheduledView = {
   id: string;
@@ -746,6 +749,7 @@ export type ScheduledView = {
   status: "armed" | "paused" | "running" | "ok" | "error" | "timeout" | "skipped";
   source: "session" | "agent" | "durable";
   scope: "session" | "host";
+  since: string | null;
 };
 export const MAX_SCHEDULED = 20;
 const SCHED_KINDS = new Set(["once", "interval", "daily", "cron"]);
@@ -770,6 +774,7 @@ export function sessionViews(list: unknown): ScheduledView[] {
       status: t.status === "paused" ? "paused" : "armed",
       source: t.source === "agent" ? "agent" : "session",
       scope: "session",
+      since: null,
     });
   }
   return out;
@@ -799,6 +804,7 @@ export function durableViews(tasks: unknown, sessionId = ""): ScheduledView[] {
         status,
         source: "durable",
         scope: sessionId && (t as { createdBySession?: unknown }).createdBySession === sessionId ? "session" : "host",
+        since: msIso(t.runningSince),
       });
     } catch {
       continue;
