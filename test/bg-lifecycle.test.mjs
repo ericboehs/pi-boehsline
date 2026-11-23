@@ -329,6 +329,21 @@ test("a background job's name: given by the tool's name, else guessed past setup
   assert.match(h.sent[1].message.content, /^\[bg \w+\] `cd ~/, "a guessed name doesn't lead the wake");
 });
 
+test("cleanJobName cuts by code point: an emoji at the cut is whole or gone, never half a pair", async () => {
+  const { cleanJobName, JOB_NAME_MAX } = await import("../extensions/bg/index.ts");
+  // The emoji straddles the cut in UTF-16 units: 38 "a" then a surrogate pair.
+  const name = cleanJobName(`${"a".repeat(38)}\u{1F680}${"b".repeat(10)}`);
+  assert.equal(name, `${"a".repeat(38)}\u{1F680}\u2026`);
+  assert.ok(name.isWellFormed(), "no lone surrogate");
+  assert.equal(Array.from(name).length, JOB_NAME_MAX);
+  // Forty emoji are forty code points: kept whole, not cut at twenty.
+  const rockets = "\u{1F680}".repeat(JOB_NAME_MAX);
+  assert.equal(cleanJobName(rockets), rockets);
+  const cut = cleanJobName("\u{1F680}".repeat(JOB_NAME_MAX + 1));
+  assert.equal(cut, `${"\u{1F680}".repeat(JOB_NAME_MAX - 1)}\u2026`);
+  assert.ok(cut.isWellFormed());
+});
+
 test("labelFor: the first step that does the work, as program and first argument", async () => {
   const { labelFor } = await import("../extensions/bg/index.ts");
   const cases = {

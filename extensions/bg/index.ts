@@ -642,12 +642,16 @@ function registryIdOf(ctx: unknown): string | undefined {
 /** A job's name: at most this many characters (the bash tool's `name`, or the guess below). */
 export const JOB_NAME_MAX = 40;
 
-/** A given name as a job keeps it: one line, no control characters, at most JOB_NAME_MAX. */
+/**
+ * A given name as a job keeps it: one line, no control characters, at most JOB_NAME_MAX code
+ * points. Cut by code point, not UTF-16 unit, so an emoji at the cut is never left half a pair.
+ */
 export function cleanJobName(raw: unknown): string | undefined {
 	if (typeof raw !== "string") return undefined;
 	const name = raw.replace(/[\p{Cc}\u2028\u2029\u200E\u200F\u202A-\u202E\u2066-\u2069]+/gu, " ").replace(/\s+/g, " ").trim();
 	if (!name) return undefined;
-	return name.length > JOB_NAME_MAX ? `${name.slice(0, JOB_NAME_MAX - 1)}…` : name;
+	const chars = Array.from(name);
+	return chars.length > JOB_NAME_MAX ? `${chars.slice(0, JOB_NAME_MAX - 1).join("").trimEnd()}…` : name;
 }
 
 /**
