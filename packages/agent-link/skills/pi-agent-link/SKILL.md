@@ -15,7 +15,11 @@ a live session. `@foo check the tests` means talk to the agent-link session name
 
 - `agent-link({ action: "list" })` — show live sessions and their status.
 - `agent-link({ action: "send", to: "<name>", message: "…" })` — deliver a message
-  and move on; nothing comes back automatically.
+  and move on; nothing comes back automatically. To a pi session it reports
+  "Delivered into its conversation", or "Received but not yet in its conversation"
+  (queued behind a running tool; a notice follows if it's dropped), or an error. A
+  subagent (listed as `<title> (subagent of <parent>)`) takes messages only while
+  its run lasts; once it's done, start a new task instead.
 - `agent-link({ action: "ask", to: "<name>", message: "…" })` — send, wait, and return
   the reply as the tool result.
 - `agent-link({ action: "reply", message: "…" })` — answer the sole pending inbound

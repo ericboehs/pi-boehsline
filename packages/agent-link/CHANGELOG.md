@@ -7,6 +7,29 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Two-stage delivery between pi sessions: `send` reports "Delivered into its
+  conversation" only once the receiver's `message_start` shows the message, waits
+  up to 5 s for that, and otherwise says it was received but is still queued; a
+  later drop comes back as a notice. The sender asks with `ack: "conversation"` on
+  the user frame; the receiver answers `delivered` (with `ack`), then
+  `in_conversation` or `dropped`, matched by a `ref <nonce>` in the message header,
+  or `refused` with a reason. Claude Code senders and targets are unaffected. `ask`
+  fails at once on a refusal or drop. See `delivery.ts`.
+- Print-mode sessions (`pi -p`, `--mode json`) take messages only while their run
+  lasts and refuse them otherwise ("… is a print-mode subagent and can't take
+  messages: its run has ended. Start a new task instead.") instead of reporting a
+  message delivered that the exiting process never reads.
+- Subagent children (`PI_SUBAGENT_CHILD` with `PI_SUBAGENT_TITLE`, set by the
+  subagent extension) register under their task title, marked `subagent: true` with
+  their `parent` (`PI_SUBAGENT_PARENT`); `list` shows `<title> (subagent of
+  <parent>)` and has structured `details.sessions`. A label copied from the list
+  resolves as a target. `agent-link:whoami` on `pi.events` returns this session's
+  name.
+
+### Changed
+- Name handles turn every run of spaces and punctuation into one hyphen
+  ("Pill face + Esc" is `@pill-face-esc`); a token with no letters or digits no
+  longer matches every name by prefix.
 - `reload` action: `agent-link({ action: "reload", to })` asks another pi session to
   run pi's `/reload` (a control frame, never a chat message), and gets back
   `reloaded`, `queued (busy, reloads when it is free)`, or a refusal with its

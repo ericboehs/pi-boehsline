@@ -88,6 +88,61 @@ SendMessage to pi-<dir>: "what's the test status?"
 The message appears in the pi session in real time; pi's answer is relayed back to
 your Claude session.
 
+## Delivery: "delivered" means in its conversation
+
+A pi session that is mid-run can't read a message at once: pi queues it as a steer
+and reads it at the next turn boundary (after the current tool calls, before the
+next model call). A message reaching the socket is not the same as the model seeing
+it, so between pi sessions `send` reports how far it actually got:
+
+- **Delivered into "x"'s conversation** — the receiver saw the message enter its
+  conversation (pi's `message_start` for it).
+- **Received by "x" but not yet in its conversation (it may be finishing; the
+  message is queued)** — after 5 s it was still queued (a long tool call, say).
+  If it's dropped later, a notice comes back into this session (and a toast).
+- **Error: not delivered: …** — the receiver refused it (see print mode below), or
+  its run ended, or it shut down, before reading it ("dropped: …").
+
+How: the sender's user frame carries `ack: "conversation"`. The receiver answers
+with two `peer_message_status` receipts: `delivered` with `ack: "conversation"`
+(it's queued, and a second receipt follows), then `in_conversation` or `dropped`.
+It finds its message entering the conversation by a short `ref <nonce>` it puts in
+the message's header line. A receiver that can't take a message answers `refused`
+with the reason. Senders that don't ask (Claude Code) get the single `delivered`
+receipt they always had; Claude targets aren't waited on, and an older agent-link
+that sends only the first receipt is reported as "Delivered (its agent-link can't
+confirm when it's read)". `ask` uses the same receipts: a refusal or drop ends the
+wait at once instead of after 120 s. See `delivery.ts`.
+
+### Print-mode sessions (subagents)
+
+`pi -p` / `pi --mode json` runs one prompt and exits. During that run a message is
+read at the next turn boundary like anywhere else (and shows in its JSON output as a
+`message_start`/`message_end` with role `user`). Outside it there is no turn to read
+it: before the run starts it would collide with the prompt, and after it ends it
+would start a run the exiting process cuts off. So a print-mode session takes
+messages only while its run lasts, and otherwise refuses them:
+
+```
+Error: not delivered: "Fix flaky test" is a print-mode subagent and can't take messages: its run has ended. Start a new task instead.
+```
+
+A steer still queued when its run settles is reported `dropped`.
+
+### Subagents
+
+The [subagent extension](../../extensions/subagent/README.md) starts each pi child
+with `PI_SUBAGENT_CHILD=1`, `PI_SUBAGENT_TITLE=<task title>` and
+`PI_SUBAGENT_PARENT=<this session's agent-link name>`. Such a child registers under
+its title (suffixed `-2`… if a sibling has it), keeps it for its whole run, and its
+registry entry carries `subagent: true`, `parent` and `printMode: true`. `list`
+shows it as `Fix flaky test (subagent of pi-work)`, and its `details.sessions[]`
+entry has `subagent: true` and `parent`. It's reachable by its title, by its handle
+(`@fix-flaky-test`: lowercase, every run of spaces and punctuation one hyphen, or a
+unique prefix of it) or by the label copied from the list. agent-link answers the
+subagent extension's synchronous `agent-link:whoami` event (on `pi.events`) with
+this session's name, which is how the parent's name gets to the child.
+
 ## Remote reload
 
 After changing extension code, other sessions keep running the old version until
@@ -153,7 +208,11 @@ No build step — pi runs TypeScript directly.
 - **`session_start`** → bind a Unix socket at `‹Claude's socket dir›/cc-socks/<pid>.sock`
   and write `~/.claude/sessions/<pid>.json`, registering the pi session as a Claude peer.
 - **inbound** (a `type:"user"` frame) → strip the `<cross-session-message>` envelope →
-  `pi.sendUserMessage(...)` (real-time) + send a delivery receipt + record the sender.
+  `pi.sendUserMessage(...)` (real-time; a steer if a run is going) + send a delivery
+  receipt + record the sender; a print-mode session outside its run refuses instead.
+- **`message_start`** of a user message carrying a queued message's ref → the second
+  receipt, `in_conversation`; **`agent_settled`** / **`session_shutdown`** with one
+  still queued → `dropped`. See `delivery.ts`.
   The sender's display name is resolved from Claude's registry so it matches `/list-agents`.
 - **pi lifecycle events** → keep the registry status current as `idle`, `thinking`,
   or `tool:<name>`.
@@ -202,6 +261,11 @@ node --experimental-strip-types test/reg-test.mjs     # registration + cleanup
 node --experimental-strip-types test/roundtrip.mjs    # inbound relay + outbound tool
 node --experimental-strip-types test/reload-live.mjs  # two throwaway pis, one reloads the other
 ```
+
+No pi needed (stub pi, throwaway HOME, real sockets): `test/delivery.mjs` (the
+two-stage receipts, against fake receivers and a fake sender) and
+`test/subagent.mjs` (a titled print-mode child: naming, list marker, refusals).
+`PI_AGENT_LINK_ACK_WAIT_MS` shortens `send`'s 5 s wait for the second receipt.
 
 `dev-run.sh` launches pi with the extension loaded for interactive testing.
 

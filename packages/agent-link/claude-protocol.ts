@@ -14,6 +14,7 @@ import { execFile } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { nameHandle } from "./mentions.ts";
+import { subagentSuffix } from "./delivery.ts";
 
 export const HOME = homedir();
 export const CLAUDE_REGISTRY = path.join(HOME, ".claude", "sessions");
@@ -31,6 +32,12 @@ export interface ClaudePeer {
   live?: boolean;
   entrypoint?: string;
   nameSource?: string;
+  /** A subagent's child session (the subagent extension's PI_SUBAGENT_TITLE). */
+  subagent?: boolean;
+  /** The agent-link name of the session that started this subagent. */
+  parent?: string;
+  /** Runs in print mode (`pi -p`, `--mode json`): it takes messages only while its run lasts. */
+  printMode?: boolean;
 }
 
 export interface UserFrame {
@@ -98,6 +105,9 @@ export async function listClaudeSessions(opts: { excludeSock?: string } = {}): P
       startedAt: s.startedAt,
       entrypoint: typeof s.entrypoint === "string" ? s.entrypoint : undefined,
       nameSource: typeof s.nameSource === "string" ? s.nameSource : undefined,
+      ...(s.subagent === true && { subagent: true }),
+      ...(typeof s.parent === "string" && s.parent && { parent: s.parent }),
+      ...(s.printMode === true && { printMode: true }),
       sock,
     });
   }
@@ -112,6 +122,14 @@ export function peerLabel(peer: ClaudePeer, rows: ClaudePeer[]): string {
   const shared = rows.filter((r) => r.name === peer.name).length > 1;
   return shared ? `${peer.name} (pid ${peer.pid})` : peer.name;
 }
+
+/** peerLabel plus whose subagent it is: "Fix flaky test (subagent of pi-work)". */
+export function listLabel(peer: ClaudePeer, rows: ClaudePeer[]): string {
+  return peerLabel(peer, rows) + subagentSuffix(peer);
+}
+
+/** A label copied from a list back to the name: drops " (subagent of …)". */
+const SUBAGENT_LABEL = /\s+\(subagent(?: of [^()]*)?\)$/;
 
 /**
  * First unclaimed name in the `base`, `base-2`, `base-3`… series.
@@ -186,6 +204,7 @@ export function renamePeer(sock: string, name: string): Promise<string> {
 
 /** Resolve a target by exact name, name prefix, pid, or sessionId. */
 export async function resolveTarget(nameOrId: string, opts: { excludeSock?: string } = {}): Promise<ResolveResult> {
+  nameOrId = nameOrId.replace(SUBAGENT_LABEL, "");
   const rows = await listClaudeSessions(opts);
   const ambiguous = (matches: ClaudePeer[]): ResolveResult => ({
     error: `"${nameOrId}" matches ${matches.length} live sessions — address one by pid`,
@@ -210,12 +229,14 @@ export async function resolveTarget(nameOrId: string, opts: { excludeSock?: stri
   // Spaced names ("Chicken Door Tamer") also answer to their hyphenated,
   // lowercase handle and its prefixes: chicken-door-tamer, chicken-door.
   const handle = nameHandle(nameOrId);
-  const byHandle = rows.filter((r) => r.name && nameHandle(r.name) === handle);
-  if (byHandle.length === 1) return { target: byHandle[0] };
-  if (byHandle.length > 1) return ambiguous(byHandle);
-  const handlePfx = rows.filter((r) => r.name && nameHandle(r.name).startsWith(handle));
-  if (handlePfx.length === 1) return { target: handlePfx[0] };
-  if (handlePfx.length > 1) return ambiguous(handlePfx);
+  if (handle) {
+    const byHandle = rows.filter((r) => r.name && nameHandle(r.name) === handle);
+    if (byHandle.length === 1) return { target: byHandle[0] };
+    if (byHandle.length > 1) return ambiguous(byHandle);
+    const handlePfx = rows.filter((r) => r.name && nameHandle(r.name).startsWith(handle));
+    if (handlePfx.length === 1) return { target: handlePfx[0] };
+    if (handlePfx.length > 1) return ambiguous(handlePfx);
+  }
 
   return { error: `no live Claude session matches "${nameOrId}"`, candidates: rows.map((r) => peerLabel(r, rows)) };
 }
@@ -253,14 +274,16 @@ export function stripEnvelope(content: unknown): StrippedEnvelope {
 
 // ------------------------------------------------------------------ wire I/O
 
-export function buildUserFrame(o: { content: string; from?: string; priority?: string; sessionId?: string }): UserFrame {
+export function buildUserFrame(o: { content: string; from?: string; priority?: string; sessionId?: string; msgId?: string; ack?: string }): UserFrame {
   return {
     msgV: 1,
-    msg_id: randomUUID(),
+    msg_id: o.msgId || randomUUID(),
     type: "user",
     priority: o.priority || "next",
     ...(o.from && { from: o.from }),
     ...(o.sessionId && { session_id: o.sessionId }),
+    // Asks a pi receiver for a second receipt once the message is in its conversation (delivery.ts).
+    ...(o.ack && { ack: o.ack }),
     message: { role: "user", content: o.content },
   };
 }
@@ -277,9 +300,9 @@ export function sendFrame(sock: string, frame: unknown, opts: { timeout?: number
 }
 
 /** High-level: send a message to a Claude session, wrapped as a peer would. */
-export async function sendToClaude(o: { sock: string; body: string; from?: string; fromName?: string; fromMode?: string; hops?: number; priority?: string }): Promise<string> {
+export async function sendToClaude(o: { sock: string; body: string; from?: string; fromName?: string; fromMode?: string; hops?: number; priority?: string; msgId?: string; ack?: string }): Promise<string> {
   const content = buildEnvelope({ from: o.from, fromName: o.fromName, fromMode: o.fromMode, hops: o.hops, body: o.body });
-  return sendFrame(o.sock, buildUserFrame({ content, from: o.from, priority: o.priority }));
+  return sendFrame(o.sock, buildUserFrame({ content, from: o.from, priority: o.priority, msgId: o.msgId, ack: o.ack }));
 }
 
 // --------------------------------------------------------------- reply relay
@@ -328,8 +351,9 @@ export function shouldArmReply(fromAddr: string, fromMode?: string, hops?: numbe
  *  the answer. Telling a model "your reply is relayed back" when it isn't
  *  invites an answer into a channel that drops it — and telling it nothing is
  *  relayed when somebody is blocked on `ask` invites silence instead. */
-export function frameInbound(o: { who: string; body: string; fromMode?: string }): string {
-  const peer = `another agent session on this machine`;
+export function frameInbound(o: { who: string; body: string; fromMode?: string; ref?: string }): string {
+  // The ref (delivery.ts) lets the receiver spot this message entering its conversation.
+  const peer = `another agent session on this machine${o.ref ? ` (${o.ref})` : ""}`;
   const header =
     o.fromMode === REPLY_MODE
       ? `[reply from ${peer} — this ends the exchange, nothing you write goes back]\n` +
@@ -347,7 +371,7 @@ export function frameInbound(o: { who: string; body: string; fromMode?: string }
   return header + o.body;
 }
 
-export function receiptFrame(o: { status: string; from?: string; origMsgId?: string | null; reason?: string }) {
+export function receiptFrame(o: { status: string; from?: string; origMsgId?: string | null; reason?: string; ack?: string }) {
   return {
     msgV: 1,
     msg_id: randomUUID(),
@@ -355,6 +379,7 @@ export function receiptFrame(o: { status: string; from?: string; origMsgId?: str
     action: "peer_message_status",
     status: o.status,
     ...(o.reason && { reason: o.reason }),
+    ...(o.ack && { ack: o.ack }),
     ...(o.from && { from: o.from }),
     ...(o.origMsgId && { orig_msg_id: o.origMsgId }),
   };
@@ -495,6 +520,7 @@ async function writeEntry(file: string, entry: unknown): Promise<void> {
 export async function registerPeer(o: {
   pid: number; sessionId?: string; name: string; cwd: string; sockPath: string; status?: string;
   startedAt?: number; nameSource?: string;
+  subagent?: boolean; parent?: string; printMode?: boolean;
 }): Promise<void> {
   await mkdir(CLAUDE_REGISTRY, { recursive: true }).catch(() => {});
   const entry = {
@@ -512,6 +538,10 @@ export async function registerPeer(o: {
     name: o.name,
     nameSource: o.nameSource || "derived",
     status: o.status || "idle",
+    // Ours, not Claude's: other agent-links label and route by them.
+    ...(o.subagent && { subagent: true }),
+    ...(o.subagent && o.parent && { parent: o.parent }),
+    ...(o.printMode && { printMode: true }),
   };
   await writeEntry(path.join(CLAUDE_REGISTRY, `${o.pid}.json`), entry);
 }

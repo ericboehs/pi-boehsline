@@ -10,6 +10,9 @@ export type MentionPeer = {
   pid?: number;
   cwd: string;
   status: string;
+  /** A subagent's child session, and whose it is. */
+  subagent?: boolean;
+  parent?: string;
 };
 
 export type AgentMention = {
@@ -45,12 +48,14 @@ export function extractAtQuery(textBeforeCursor: string): { prefix: string; quer
 }
 
 /**
- * A session name as one typeable token: lowercase, spaces to hyphens.
- * "Chicken Door Alert Tamer" is reachable as @chicken-door-alert-tamer (or
- * any unique prefix, like @chicken), since an @mention ends at a space.
+ * A session name as one typeable token: lowercase, every run of spaces and
+ * punctuation to one hyphen. "Chicken Door Alert Tamer" is reachable as
+ * @chicken-door-alert-tamer (or any unique prefix, like @chicken), since an
+ * @mention ends at a space; a subagent titled "Pill face + Esc" as
+ * @pill-face-esc.
  */
 export function nameHandle(name: string): string {
-  return name.trim().toLowerCase().replace(/[\s_]+/g, "-");
+  return name.trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "");
 }
 
 /** Resolve a token the way agent-link `to` does: pid, exact name, then unique prefix. */
@@ -73,6 +78,7 @@ export function matchPeer(token: string, peers: MentionPeer[]): MentionPeer | un
   if (ciPfx.length > 1) return undefined;
   // Spaced names, typed with hyphens: @chicken-door for "Chicken Door Tamer".
   const handle = nameHandle(token);
+  if (!handle) return undefined;
   const byHandle = peers.filter((p) => nameHandle(p.name) === handle);
   if (byHandle.length === 1) return byHandle[0];
   if (byHandle.length > 1) return undefined;
@@ -127,7 +133,7 @@ export function formatAgentItem(peer: MentionPeer, home?: string): AutocompleteI
     // A space would end the @mention, so spaced names complete as their handle.
     value: `@${/\s/.test(peer.name) ? nameHandle(peer.name) : peer.name}`,
     label: peer.name,
-    description: `agent · ${peer.status} · ${cwd}`,
+    description: `${peer.subagent ? `subagent${peer.parent ? ` of ${peer.parent}` : ""}` : "agent"} · ${peer.status} · ${cwd}`,
   };
 }
 

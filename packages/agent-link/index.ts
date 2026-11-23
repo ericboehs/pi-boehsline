@@ -16,7 +16,7 @@ import {
   ccSocksDir, bindSocketOrPrivate, registerPeer, updatePeer, deregisterPeer, deregisterPeerSync,
   firstFreeName, losesNameRace,
   listClaudeSessions, resolveTarget, sendToClaude, stripEnvelope, receiptFrame, sendFrame,
-  peerLabel, planDedupe, renamePeer,
+  peerLabel, listLabel, planDedupe, renamePeer,
   shouldArmReply, frameInbound, REPLY_MODE, ASK_MODE,
   slugFromCwd, peerNameBySock, HOME,
 } from "./claude-protocol.ts";
@@ -33,6 +33,10 @@ import {
   claimBulkReload, describeOutcome, outcomeFromFrame, parseReloadArgs, sharedReloadState, type ReloadOutcome,
 } from "./reload.ts";
 import { randomUUID } from "node:crypto";
+import {
+  ACK_CONVERSATION, ACK_FIELD, CONVERSATION_WAIT_MS, Inbox, Outbox, describeLate, describeSend,
+  messageText, printModeRefusal, refMarker, type Outcome,
+} from "./delivery.ts";
 
 // Debug logging: enabled by env PI_AGENT_LINK_DEBUG or the sentinel /tmp/pi-agent-link-debug.on
 // (pi may not propagate env to extensions in all modes, so the sentinel is handy).
@@ -41,7 +45,7 @@ const dbg = (...a: unknown[]) => {
   try { appendFileSync("/tmp/pi-agent-link-debug.log", `[pi-agent-link ${new Date().toISOString()}] ${a.join(" ")}\n`); } catch { /* */ }
 };
 
-interface AskWaiter { resolve: (body: string) => void; timer: NodeJS.Timeout; }
+interface AskWaiter { resolve: (body: string | { dropped: string }) => void; timer: NodeJS.Timeout; }
 interface PendingReply { hops: number; who: string; receivedAt: number; preview: string; }
 /** The peer identity a reload carries over: the new instance would otherwise re-derive it. */
 interface StashedIdentity { selfName: string; nameSource: "user" | "derived"; startedAt: number; }
@@ -70,6 +74,12 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   let lastCtx: ExtensionContext | undefined;
 
   const fallbackName = () => `pi-${slugFromCwd(sessionCwd || process.cwd())}`;
+
+  // A subagent's child (extensions/subagent sets these): it registers under its
+  // task title, marked as whose it is, and keeps that name for its whole run.
+  const subagentTitle = process.env.PI_SUBAGENT_CHILD ? (process.env.PI_SUBAGENT_TITLE || "").trim() : "";
+  const subagentParent = subagentTitle ? (process.env.PI_SUBAGENT_PARENT || "").trim() : "";
+  const isPrintMode = (ctx?: ExtensionContext) => ctx?.mode === "print" || ctx?.mode === "json";
 
   // Derived names come from the directory, so every pi in one checkout wants
   // the same one. Claim the first free slot instead of shipping a duplicate.
@@ -100,6 +110,7 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   // Apply a (possibly cleared) pi session name to our peer identity. Once we've
   // registered, push it to Claude's registry so /list-agents updates live.
   async function applyName(name?: string): Promise<void> {
+    if (subagentTitle) return; // a subagent child's name is its task title
     const trimmed = (name || "").trim();
     // A name the user chose is theirs verbatim; only derived names get suffixed.
     const next = trimmed || firstFreeName(fallbackName(), started ? await liveNames() : []);
@@ -321,7 +332,12 @@ export default function piMeshExtension(pi: ExtensionAPI) {
       waiter?.(outcomeFromFrame(frame));
       return;
     }
+    if (frame?.type === "control" && frame.action === "peer_message_status") {
+      outbox.onReceipt(frame);
+      return;
+    }
     if (frame?.type === "control" && frame.action === "rename" && typeof frame.name === "string") {
+      if (subagentTitle) return; // keeps its task title
       selfName = frame.name;
       updatePeer(pid, { name: frame.name }).catch(() => {});
       syncSummaryFile();
@@ -349,11 +365,25 @@ export default function piMeshExtension(pi: ExtensionAPI) {
       return;
     }
 
+    const idle = lastCtx?.isIdle?.() ?? true;
+    // A print-mode session (a subagent's child, say) reads a steer at its next
+    // turn boundary while its run lasts. Outside the run there is no turn to
+    // read it: a message sent before the run would collide with its prompt, and
+    // one after it would start a run that the exiting process cuts off.
+    const refusal = printModeRefusal({ mode: lastCtx?.mode, running: !idle, everRan: runEverStarted, name: selfName, subagent: !!subagentTitle });
+    if (refusal) {
+      dbg(`refused inbound from ${who}: ${refusal}`);
+      receipt(fromAddr, { status: "refused", origMsgId: frame.msg_id, reason: refusal });
+      return;
+    }
+
     // Normal inbound: inject into the live pi session (real-time).
     activateTool();
-    const framed = frameInbound({ who, body: env.body, fromMode: env.fromMode });
+    // A sender that asked gets a second receipt once this is in our conversation (delivery.ts).
+    const wantsAck = frame[ACK_FIELD] === ACK_CONVERSATION;
+    const nonce = wantsAck ? inbox.expect({ fromAddr, msgId: frame.msg_id, steered: !idle }) : undefined;
+    const framed = frameInbound({ who, body: env.body, fromMode: env.fromMode, ref: nonce && refMarker(nonce) });
 
-    const idle = lastCtx?.isIdle?.() ?? true;
     dbg(`inbound from ${who} (${fromAddr}) idle=${idle}: ${env.body.slice(0, 60)}`);
     try {
       // sendUserMessage always triggers a turn; when busy, steer into the current one.
@@ -369,18 +399,63 @@ export default function piMeshExtension(pi: ExtensionAPI) {
           preview: env.body.replace(/\s+/g, " ").trim().slice(0, 80),
         });
       }
-      ackDelivered(fromAddr, frame.msg_id);
+      ackDelivered(fromAddr, frame.msg_id, wantsAck);
       notify(`agent-link: message from ${who}`, "info");
     } catch (e) { dbg(`inject failed: ${(e as Error).message}`); }
   }
 
-  function ackDelivered(fromAddr: string, origMsgId?: string) {
-    if (typeof fromAddr === "string" && fromAddr.startsWith("uds:")) {
-      sendFrame(fromAddr.slice(4), receiptFrame({
-        status: "delivered", from: ownFrom, origMsgId,
-        reason: "Delivered to the pi session.",
-      })).catch(() => {});
+  function receipt(fromAddr: string, o: { status: string; origMsgId?: string; reason?: string; ack?: string }): Promise<unknown> {
+    if (typeof fromAddr !== "string" || !fromAddr.startsWith("uds:")) return Promise.resolve();
+    return sendFrame(fromAddr.slice(4), receiptFrame({ ...o, from: ownFrom })).catch(() => {});
+  }
+
+  /** The first receipt: it reached us and is queued. `ack` promises the second (delivery.ts). */
+  function ackDelivered(fromAddr: string, origMsgId?: string, twoStage = false) {
+    void receipt(fromAddr, {
+      status: "delivered", origMsgId,
+      reason: "Delivered to the pi session.",
+      ...(twoStage && { ack: ACK_CONVERSATION }),
+    });
+  }
+
+  // ---- delivery receipts (delivery.ts) --------------------------------------
+  // Ours, sent: receipts by msg_id. Theirs, received: messages queued for our
+  // conversation, matched by their ref when message_start fires for them.
+  const outbox = new Outbox();
+  const inbox = new Inbox();
+  let runEverStarted = false;
+  const DROPPED_RUN = "its run ended before the message reached its conversation";
+
+  function dropExpected(reason: string, filter?: Parameters<Inbox["take"]>[0]): Promise<unknown> {
+    return Promise.all(inbox.take(filter).map((e) => receipt(e.fromAddr, { status: "dropped", origMsgId: e.msgId, reason })));
+  }
+
+  /** A message `send` reported as queued has now been read, or dropped. */
+  function lateNotice(name: string, o: Outcome): void {
+    const msg = describeLate(name, o);
+    notify(msg, o.state === "conversation" ? "info" : "warning");
+    if (o.state === "conversation") return;
+    // The model was told it's queued: tell it, too, that it wasn't read.
+    try {
+      const idle = lastCtx?.isIdle?.() ?? true;
+      pi.sendMessage({ customType: "agent-link-delivery", content: msg, display: true }, { deliverAs: idle ? "nextTurn" : "steer" });
+    } catch (e) { dbg(`late notice failed: ${(e as Error).message}`); }
+  }
+
+  const ackWaitMs = () => Number(process.env.PI_AGENT_LINK_ACK_WAIT_MS) || CONVERSATION_WAIT_MS;
+
+  /** Send one message; pi targets are asked for the two-stage receipt. */
+  async function deliver(target: { sock: string; entrypoint?: string }, message: string, fromMode?: string): Promise<{ msgId: string; staged: boolean }> {
+    const msgId = randomUUID();
+    const staged = target.entrypoint === "pi";
+    if (staged) outbox.track(msgId);
+    try {
+      await sendToClaude({ sock: target.sock, body: message, from: ownFrom, fromName: selfName, fromMode, msgId, ...(staged && { ack: ACK_CONVERSATION }) });
+    } catch (e) {
+      outbox.forget(msgId);
+      throw e;
     }
+    return { msgId, staged };
   }
 
   // ---- reply relay: after the pi turn answers, send its text back ----------
@@ -431,6 +506,10 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     identityStash().delete(pid);
     if (reason === "reload" && stashed && (!chosen || chosen === stashed.selfName)) {
       ({ selfName, nameSource, startedAt } = stashed);
+    } else if (subagentTitle) {
+      // Its title, as the parent's subagents list shows it; suffixed if a sibling has it.
+      nameSource = "user";
+      selfName = firstFreeName(subagentTitle, await liveNames());
     } else {
       nameSource = chosen ? "user" : "derived";
       selfName = chosen || firstFreeName(fallbackName(), await liveNames());
@@ -446,7 +525,10 @@ export default function piMeshExtension(pi: ExtensionAPI) {
         notify(`pi-agent-link: ${bound.refused}; using ${path.dirname(sockPath)} instead (Claude Code won't send delivery receipts there)`, "warning");
       }
       peerStatus = "idle";
-      await registerPeer({ pid, sessionId, name: selfName, cwd, sockPath, status: peerStatus, startedAt, nameSource });
+      await registerPeer({
+        pid, sessionId, name: selfName, cwd, sockPath, status: peerStatus, startedAt, nameSource,
+        subagent: !!subagentTitle, parent: subagentParent || undefined, printMode: isPrintMode(ctx),
+      });
       // session_shutdown cleans up a normal exit; this catches a hard one.
       // Once per process: a reload builds a new instance, and the path is the same.
       const g = globalThis as { __piAgentLinkExitHooked?: boolean };
@@ -470,6 +552,7 @@ export default function piMeshExtension(pi: ExtensionAPI) {
 
   async function stop() {
     reloads.dispose();
+    await dropExpected("the session shut down before the message reached its conversation");
     if (started) identityStash().set(pid, { selfName, nameSource, startedAt });
     try { server?.close(); } catch { /* */ }
     clearSummaryFile();
@@ -486,6 +569,11 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   });
   // The tool is deferred, so tool_search must be active to find it.
   activateToolSearch(pi);
+  // The subagent extension asks for our name (synchronously, like bg:start) to
+  // tell its children whose subagents they are: PI_SUBAGENT_PARENT.
+  pi.events?.on?.("agent-link:whoami", (req: unknown) => {
+    if (req && typeof req === "object" && selfName) (req as { name?: string }).name = selfName;
+  });
   pi.on("before_agent_start", async (event) => {
     const prompt = event.prompt || "";
     if (!prompt || isInboundPeerPrompt(prompt)) return;
@@ -528,10 +616,25 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     lastCtx = ctx;
     relayReply(event);
   });
-  pi.on("agent_start", async () => { runActive = true; });
+  pi.on("agent_start", async () => { runActive = true; runEverStarted = true; });
+  // A queued message enters the conversation: tell its sender (delivery.ts).
+  pi.on("message_start", async (event) => {
+    const m = (event as { message?: { role?: string } }).message;
+    if (m?.role !== "user" || !inbox.size) return;
+    for (const e of inbox.seen(messageText(m))) {
+      void receipt(e.fromAddr, { status: "in_conversation", origMsgId: e.msgId, reason: "In the pi session's conversation." });
+    }
+  });
   pi.on("agent_settled", async (event, ctx) => {
     lastCtx = ctx;
     runActive = false;
+    // pi drains queued steers before a run settles, so one still waiting was
+    // lost (an interrupted run puts it back in the editor). A print-mode run
+    // is over for good: nothing it was sent will be read now.
+    if (inbox.size) {
+      if (isPrintMode(ctx)) void dropExpected(DROPPED_RUN);
+      else if (!(ctx.hasPendingMessages?.() ?? false)) void dropExpected(DROPPED_RUN, (e) => e.steered);
+    }
     activeTools.clear();
     await setPeerStatus("idle");
     reloads.settled((event as { aborted?: boolean })?.aborted === true);
@@ -573,7 +676,13 @@ export default function piMeshExtension(pi: ExtensionAPI) {
       if (params.action === "list") {
         const rows = await listClaudeSessions({ excludeSock });
         if (!rows.length) return text("No live agent sessions found.");
-        return text(`Live sessions (${rows.length}):\n` + rows.map((r) => `- ${peerLabel(r, rows)}  ·  ${r.cwd}  ·  ${r.status}`).join("\n"));
+        const lines = rows.map((r) => `- ${listLabel(r, rows)}  ·  ${r.cwd}  ·  ${r.status}`);
+        const sessions = rows.map((r) => ({
+          name: r.name, pid: r.pid, cwd: r.cwd, status: r.status, entrypoint: r.entrypoint,
+          ...(r.subagent && { subagent: true, parent: r.parent }),
+          ...(r.printMode && { printMode: true }),
+        }));
+        return { ...text(`Live sessions (${rows.length}):\n${lines.join("\n")}`), details: { sessions } };
       }
       if (params.action === "pending") {
         if (!pendingReplies.size) return text("No pending inbound asks.");
@@ -638,36 +747,65 @@ export default function piMeshExtension(pi: ExtensionAPI) {
       }
       const target = res.target!;
       if (params.action === "send") {
+        let sent: { msgId: string; staged: boolean };
         try {
-          await sendToClaude({ sock: target.sock, body: message, from: ownFrom, fromName: selfName });
-          return text(`Delivered to "${target.name}". Nothing comes back automatically — use action:"ask" if you need an answer.`);
+          sent = await deliver(target, message);
         } catch (e) {
           return text(`Error delivering to "${target.name}": ${(e as Error).message}`, true);
         }
+        // Claude Code sessions only confirm the socket: say what we know, as before.
+        if (!sent.staged) return text(`Delivered to "${target.name}". Nothing comes back automatically — use action:"ask" if you need an answer.`);
+        // Delivered means in its conversation: wait briefly for that receipt.
+        const waitMs = ackWaitMs();
+        const outcome = await outbox.wait(sent.msgId, waitMs);
+        if (outcome.state === "received") outbox.onLate(sent.msgId, (late) => lateNotice(target.name, late));
+        else outbox.forget(sent.msgId);
+        const d = describeSend(target.name, outcome, { waitedMs: waitMs });
+        return text(d.text, d.isError);
       }
       // action === "ask": send, then block for the reply. ASK_MODE is what tells
       // the receiver somebody is waiting, and is the only thing that earns an
-      // automatic relay of their next turn.
-      try {
-        await sendToClaude({ sock: target.sock, body: message, from: ownFrom, fromName: selfName, fromMode: ASK_MODE });
-      } catch (e) {
-        return text(`Error delivering to "${target.name}": ${(e as Error).message}`, true);
-      }
-      const reply = await new Promise<string | null>((resolve) => {
-        const timer = setTimeout(() => {
-          const list = askWaiters.get(target.sock) || [];
-          const idx = list.indexOf(waiter);
-          if (idx >= 0) list.splice(idx, 1);
-          resolve(null);
-        }, 120000);
-        const waiter: AskWaiter = { resolve: (b) => resolve(b), timer };
+      // automatic relay of their next turn. The waiter goes in first: a reply
+      // must never beat it and be injected as a fresh message instead.
+      let waiter!: AskWaiter;
+      const reply = new Promise<string | { dropped: string } | null>((resolve) => {
+        const timer = setTimeout(() => { unwait(); resolve(null); }, 120000);
+        waiter = { resolve: (b) => { clearTimeout(timer); resolve(b); }, timer };
         const list = askWaiters.get(target.sock) || [];
         list.push(waiter);
         askWaiters.set(target.sock, list);
       });
-      return reply === null
+      const unwait = () => {
+        const list = askWaiters.get(target.sock) || [];
+        const idx = list.indexOf(waiter);
+        if (idx >= 0) list.splice(idx, 1);
+        if (!list.length) askWaiters.delete(target.sock);
+      };
+      let sent: { msgId: string; staged: boolean };
+      try {
+        sent = await deliver(target, message, ASK_MODE);
+      } catch (e) {
+        unwait(); clearTimeout(waiter.timer);
+        return text(`Error delivering to "${target.name}": ${(e as Error).message}`, true);
+      }
+      if (sent.staged) {
+        // A refusal comes back at once; a drop (its run ended first) can come any time before the answer.
+        const first = await outbox.wait(sent.msgId, ackWaitMs(), "received");
+        if (first.state === "refused" || first.state === "dropped") {
+          unwait(); clearTimeout(waiter.timer); outbox.forget(sent.msgId);
+          return text(describeSend(target.name, first).text, true);
+        }
+        if (first.state === "conversation") outbox.forget(sent.msgId);
+        else outbox.onLate(sent.msgId, (late) => {
+          if (late.state !== "conversation") { unwait(); waiter.resolve({ dropped: late.reason || "it never reached its conversation" }); }
+        });
+      }
+      const answer = await reply;
+      outbox.forget(sent.msgId);
+      if (answer !== null && typeof answer === "object") return text(`Error: not delivered to "${target.name}": dropped: ${answer.dropped}`, true);
+      return answer === null
         ? text(`Sent to "${target.name}", but no reply within 120s.`)
-        : text(`Reply from "${target.name}":\n${reply}`);
+        : text(`Reply from "${target.name}":\n${answer}`);
     },
   });
 
@@ -756,6 +894,6 @@ export default function piMeshExtension(pi: ExtensionAPI) {
       return;
     }
     if (!rows.length) { ctx.ui.notify("No live Claude sessions found.", "info"); return; }
-    ctx.ui.notify(`Reachable: ${rows.map((r) => `${peerLabel(r, rows)} [${r.status}]`).join(", ")}`, "info");
+    ctx.ui.notify(`Reachable: ${rows.map((r) => `${listLabel(r, rows)} [${r.status}]`).join(", ")}`, "info");
   }
 }

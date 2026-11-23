@@ -42,6 +42,7 @@
     "claude-protocol.ts",
     "mentions.ts",
     "reload.ts",
+    "delivery.ts",
     "skills",
     "README.md",
     "LICENSE",
