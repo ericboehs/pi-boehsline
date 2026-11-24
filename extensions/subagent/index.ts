@@ -55,7 +55,7 @@ const onLine = (line) => {
   let ev; try { ev = JSON.parse(line); } catch { return; }
   const m = ev.type === "message_end" ? ev.message : undefined;
   // A user message after the task is one steered in mid-run (an agent-link message, say): show it.
-  // A framed peer message is somebody else's words, not Eric's: only who it was from, never the text.
+  // A framed peer message is somebody else's words, not your user's: only who it was from, never the text.
   if (m && m.role === "user" && ++users > 1) {
     const said = typeof m.content === "string" ? m.content : (Array.isArray(m.content) ? m.content : []).filter((p) => p.type === "text").map((p) => p.text).join("\\n");
     // An agent-link message is a bracketed header, a blank line, then what was said.
