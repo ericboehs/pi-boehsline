@@ -424,6 +424,8 @@ export default function piMeshExtension(pi: ExtensionAPI) {
   const outbox = new Outbox();
   const inbox = new Inbox();
   let runEverStarted = false;
+  /** When the last run began (ms): a message queued before it that was never seen is stale. */
+  let runStartedAt = 0;
   const DROPPED_RUN = "its run ended before the message reached its conversation";
 
   function dropExpected(reason: string, filter?: Parameters<Inbox["take"]>[0]): Promise<unknown> {
@@ -616,7 +618,7 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     lastCtx = ctx;
     relayReply(event);
   });
-  pi.on("agent_start", async () => { runActive = true; runEverStarted = true; });
+  pi.on("agent_start", async () => { runActive = true; runEverStarted = true; runStartedAt = Date.now(); });
   // A queued message enters the conversation: tell its sender (delivery.ts).
   pi.on("message_start", async (event) => {
     const m = (event as { message?: { role?: string } }).message;
@@ -633,7 +635,12 @@ export default function piMeshExtension(pi: ExtensionAPI) {
     // is over for good: nothing it was sent will be read now.
     if (inbox.size) {
       if (isPrintMode(ctx)) void dropExpected(DROPPED_RUN);
-      else if (!(ctx.hasPendingMessages?.() ?? false)) void dropExpected(DROPPED_RUN, (e) => e.steered);
+      else if (!(ctx.hasPendingMessages?.() ?? false)) {
+        // Also one queued before this run began and never shown (an extension
+        // rewrote the message and its ref went with it): it is not coming.
+        const startedAt = runStartedAt;
+        void dropExpected(DROPPED_RUN, (e) => e.steered || e.at < startedAt);
+      }
     }
     activeTools.clear();
     await setPeerStatus("idle");

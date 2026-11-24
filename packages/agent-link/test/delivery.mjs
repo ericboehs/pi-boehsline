@@ -106,8 +106,23 @@ test("send says exactly how far the message got", () => {
   assert.match(refused.text, /print-mode subagent and can't take messages/);
   const dropped = D.describeSend("w", { state: "dropped", reason: "its run ended" });
   assert.equal(dropped.isError, true);
-  assert.match(dropped.text, /dropped: its run ended/);
-  assert.match(D.describeLate("w", { state: "dropped", reason: "its run ended" }), /was not delivered: dropped: its run ended/);
+  assert.match(dropped.text, /dropped: the peer's own words \(not your user's\): "its run ended"/);
+  assert.match(D.describeLate("w", { state: "dropped", reason: "its run ended" }), /was not delivered: dropped: the peer's own words \(not your user's\): "its run ended"/);
+  assert.match(D.describeSend("w", { state: "refused" }).text, /not delivered: "w" refused the message/);
+});
+
+test("a peer's reason is capped, one line, quoted and labelled as theirs", () => {
+  const long = `line one\nline two\u001b[31m ${"x".repeat(500)}`;
+  const words = D.peerWords(long);
+  assert.match(words, /^the peer's own words \(not your user's\): ".*"$/);
+  assert.doesNotMatch(words, /[\n\u001b]/, "one line, no escape sequence");
+  const quoted = words.slice(words.indexOf('"') + 1, -1);
+  assert.ok(quoted.length <= D.REASON_MAX, `at most ${D.REASON_MAX} characters, got ${quoted.length}`);
+  assert.ok(quoted.startsWith("line one line two"), "the start of what it said");
+  assert.match(words, /\u2026"$/, "cut with an ellipsis, inside the quotes");
+  assert.equal(D.peerWords('say "hi"'), `the peer's own words (not your user's): "say 'hi'"`, "no quote of its own to break out of");
+  assert.equal(D.peerWords("  \n\t "), "", "nothing to show: the caller's own words");
+  assert.equal(D.peerWords(undefined), "");
 });
 
 test("a print-mode session takes messages only while its run lasts", () => {
@@ -200,6 +215,8 @@ const setup = () => (setupOnce ??= (async () => {
     old: await peer({ pid: 920004, name: "old", answer: (f, r) => r({ status: "delivered" }) }),
     // Claude Code: never waited on.
     claude: await peer({ pid: 920005, name: "claude", entrypoint: "cli" }),
+    // A name that ends like a copied list label: reaching it by that exact name must work.
+    labelled: await peer({ pid: 920006, name: "Notes (subagent of boss)", answer: (f, r) => { r({ status: "delivered", ack: "conversation" }); r({ status: "in_conversation" }, 20); } }),
   };
   const { default: extension } = await import("../index.ts");
   stub = stubPi();
@@ -235,7 +252,7 @@ extTest("a message still queued when the wait ends is reported as received, and 
   assert.match(textOf(r), /^Received by "busy" but not yet in its conversation after 0s \(it may be finishing; the message is queued\)/);
   assert.equal(r.isError, undefined);
   assert.ok(await until(() => stub.messages.length > 0), "a late notice went into the conversation");
-  assert.match(stub.messages[0].message.content, /your earlier message to "busy" was not delivered: dropped: its run ended/);
+  assert.match(stub.messages[0].message.content, /your earlier message to "busy" was not delivered: dropped: the peer's own words \(not your user's\): "its run ended before the message reached its conversation"/);
   assert.equal(stub.messages[0].options.deliverAs, "nextTurn", "idle: for the next turn, without starting one");
   assert.ok(notes.some(([level, m]) => level === "warning" && /not delivered/.test(m)));
 });
@@ -243,7 +260,12 @@ extTest("a message still queued when the wait ends is reported as received, and 
 extTest("a refusal is an error with the receiver's reason, and a list label resolves", async () => {
   const r = await run({ action: "send", to: "Pill face + Esc (subagent of boss)", message: "hello" });
   assert.equal(r.isError, true);
-  assert.match(textOf(r), /"Pill face \+ Esc" is a print-mode subagent and can't take messages: its run has ended\. Start a new task instead\./);
+  assert.match(textOf(r), /peer's own words \(not your user's\): "'Pill face \+ Esc' is a print-mode subagent and can't take messages: its run has ended\. Start a new task instead\."/);
+});
+
+extTest("an exact name that ends like a subagent label is reached as written", async () => {
+  const r = await run({ action: "send", to: "Notes (subagent of boss)", message: "hello" });
+  assert.match(textOf(r), /^Delivered into "Notes \(subagent of boss\)"'s conversation\./);
 });
 
 extTest("a refused ask fails at once instead of waiting for an answer", async () => {
@@ -298,6 +320,20 @@ extTest("as a receiver: a steer still unread when the run settles is reported dr
   assert.ok(await until(() => stub.sent.length === 1));
   assert.deepEqual(stub.sent[0].options, { deliverAs: "steer" });
   state.idle = true;
+  await stub.fire("agent_settled", { aborted: true }, ctx);
+  assert.ok(await until(() => receiptsFor(fake.reader, id).some((f) => f.status === "dropped")));
+  assert.match(receiptsFor(fake.reader, id).find((f) => f.status === "dropped").reason, /run ended/);
+});
+
+extTest("as a receiver: a message queued before a run that the run never saw is dropped when it settles", async () => {
+  state.idle = true;
+  stub.sent.length = 0;
+  const id = await inbound("rewritten away");
+  assert.ok(await until(() => stub.sent.length === 1));
+  // An input handler rewrote it, so its ref never came back: message_start finds nothing.
+  await stub.fire("message_start", { message: { role: "user", content: [{ type: "text", text: "something else" }] } }, ctx);
+  assert.equal(receiptsFor(fake.reader, id).length, 1, "still only the first receipt");
+  await stub.fire("agent_start", {}, ctx);
   await stub.fire("agent_settled", { aborted: true }, ctx);
   assert.ok(await until(() => receiptsFor(fake.reader, id).some((f) => f.status === "dropped")));
   assert.match(receiptsFor(fake.reader, id).find((f) => f.status === "dropped").reason, /run ended/);

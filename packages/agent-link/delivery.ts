@@ -194,6 +194,22 @@ export function messageText(message: unknown): string {
   return c.map((p) => (p && typeof p === "object" && (p as { type?: unknown }).type === "text" ? String((p as { text?: unknown }).text ?? "") : "")).join("\n");
 }
 
+/** How much of a peer's own words a receipt shows the model. */
+export const REASON_MAX = 200;
+
+/**
+ * A peer's text out of a receipt, made fit to show the model: one line, control characters (an
+ * ANSI escape among them) and quotes taken out, capped, and labelled as the peer's words. The
+ * receiver writes the reason, so it gets none of the "not your user" framing a peer message has.
+ * Empty when there is nothing to show, so callers can fall back to their own words.
+ */
+export function peerWords(reason?: string): string {
+  const one = String(reason ?? "").replace(/\p{Cc}+/gu, " ").replace(/\s+/g, " ").replace(/"/g, "'").trim();
+  if (!one) return "";
+  const capped = one.length > REASON_MAX ? `${one.slice(0, REASON_MAX - 1)}…` : one;
+  return `the peer's own words (not your user's): "${capped}"`;
+}
+
 /** What `send` tells the model. */
 export function describeSend(name: string, o: Outcome, opts: { waitedMs?: number } = {}): { text: string; isError: boolean } {
   const tail = ` Nothing comes back automatically — use action:"ask" if you need an answer.`;
@@ -211,9 +227,9 @@ export function describeSend(name: string, o: Outcome, opts: { waitedMs?: number
     case "receipt":
       return { text: `Delivered to "${name}" (its agent-link can't confirm when it's read).${tail}`, isError: false };
     case "refused":
-      return { text: `Error: not delivered: ${o.reason || `"${name}" refused the message`}`, isError: true };
+      return { text: `Error: not delivered: ${peerWords(o.reason) || `"${name}" refused the message`}`, isError: true };
     case "dropped":
-      return { text: `Error: not delivered to "${name}": dropped: ${o.reason || "its run ended before reading it"}`, isError: true };
+      return { text: `Error: not delivered to "${name}": dropped: ${peerWords(o.reason) || "its run ended before reading it"}`, isError: true };
     default:
       return { text: `Sent to "${name}", but no receipt came back, so it may not have been read.${tail}`, isError: false };
   }
@@ -223,7 +239,7 @@ export function describeSend(name: string, o: Outcome, opts: { waitedMs?: number
 export function describeLate(name: string, o: Outcome): string {
   return o.state === "conversation"
     ? `agent-link: your message to "${name}" is now in its conversation.`
-    : `agent-link: your earlier message to "${name}" was not delivered: ${o.state === "dropped" ? "dropped: " : ""}${o.reason || "it never reached its conversation"}.`;
+    : `agent-link: your earlier message to "${name}" was not delivered: ${o.state === "dropped" ? "dropped: " : ""}${peerWords(o.reason) || "it never reached its conversation"}.`;
 }
 
 /** Why a print-mode session refuses a message, or undefined if it can take one. */

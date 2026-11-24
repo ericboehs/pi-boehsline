@@ -204,7 +204,11 @@ export function renamePeer(sock: string, name: string): Promise<string> {
 
 /** Resolve a target by exact name, name prefix, pid, or sessionId. */
 export async function resolveTarget(nameOrId: string, opts: { excludeSock?: string } = {}): Promise<ResolveResult> {
-  nameOrId = nameOrId.replace(SUBAGENT_LABEL, "");
+  const stripped = nameOrId.replace(SUBAGENT_LABEL, "");
+  // A label copied from a list ends " (subagent of …)", but a real name may end that way too: the
+  // exact name as written is tried first, then what is left once the suffix is dropped.
+  const keys = stripped === nameOrId ? [nameOrId] : [nameOrId, stripped];
+  nameOrId = stripped;
   const rows = await listClaudeSessions(opts);
   const ambiguous = (matches: ClaudePeer[]): ResolveResult => ({
     error: `"${nameOrId}" matches ${matches.length} live sessions — address one by pid`,
@@ -217,10 +221,12 @@ export async function resolveTarget(nameOrId: string, opts: { excludeSock?: stri
   const byPid = /^\d+$/.test(nameOrId) ? rows.filter((r) => String(r.pid) === nameOrId) : [];
   if (byPid.length === 1) return { target: byPid[0] };
 
-  const exact = rows.filter((r) => r.name === nameOrId);
-  if (exact.length === 1) return { target: exact[0] };
-  // Never silently pick one of several same-named peers: that misdelivers.
-  if (exact.length > 1) return ambiguous(exact);
+  for (const key of keys) {
+    const exact = rows.filter((r) => r.name === key);
+    if (exact.length === 1) return { target: exact[0] };
+    // Never silently pick one of several same-named peers: that misdelivers.
+    if (exact.length > 1) return ambiguous(exact);
+  }
 
   const pfx = rows.filter((r) => r.name && r.name.startsWith(nameOrId));
   if (pfx.length === 1) return { target: pfx[0] };

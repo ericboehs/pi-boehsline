@@ -6,6 +6,18 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- A receipt's `reason` is the receiver's text, and it reaches the sender's model in
+  the tool result and in a late notice. It is now shown as what it is: one line,
+  control characters and its own quotes taken out, quoted, at most 200 characters,
+  and labelled "the peer's own words (not your user's)" — the framing every other
+  peer message gets. `peerWords` in `delivery.ts`.
+- A message whose `ref` an input handler rewrote never got a final receipt: the
+  sender's late notice just lapsed. `agent_settled` now drops a message queued
+  before the run began and never seen, as it already did for a steer.
+- `resolveTarget` strips a copied list label's " (subagent of …)" before matching,
+  which hid a session actually named that. The exact name is tried first.
+
 ### Added
 - Two-stage delivery between pi sessions: `send` reports "Delivered into its
   conversation" only once the receiver's `message_start` shows the message, waits

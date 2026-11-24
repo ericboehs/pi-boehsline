@@ -112,7 +112,9 @@ with the reason. Senders that don't ask (Claude Code) get the single `delivered`
 receipt they always had; Claude targets aren't waited on, and an older agent-link
 that sends only the first receipt is reported as "Delivered (its agent-link can't
 confirm when it's read)". `ask` uses the same receipts: a refusal or drop ends the
-wait at once instead of after 120 s. See `delivery.ts`.
+wait at once instead of after 120 s. A reason is the receiver's text, so it is
+shown as theirs: one line, quoted, at most 200 characters, and marked "not your
+user's" (a peer never gets the `frameInbound` header). See `delivery.ts`.
 
 ### Print-mode sessions (subagents)
 
@@ -212,7 +214,8 @@ No build step — pi runs TypeScript directly.
   receipt + record the sender; a print-mode session outside its run refuses instead.
 - **`message_start`** of a user message carrying a queued message's ref → the second
   receipt, `in_conversation`; **`agent_settled`** / **`session_shutdown`** with one
-  still queued → `dropped`. See `delivery.ts`.
+  still queued → `dropped` (also one queued before the run began and never seen:
+  an input handler that rewrote the message took its ref with it). See `delivery.ts`.
   The sender's display name is resolved from Claude's registry so it matches `/list-agents`.
 - **pi lifecycle events** → keep the registry status current as `idle`, `thinking`,
   or `tool:<name>`.
