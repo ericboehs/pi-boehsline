@@ -121,6 +121,7 @@ test("a peer's reason is capped, one line, quoted and labelled as theirs", () =>
   assert.ok(quoted.startsWith("line one line two"), "the start of what it said");
   assert.match(words, /\u2026"$/, "cut with an ellipsis, inside the quotes");
   assert.equal(D.peerWords('say "hi"'), `the peer's own words (not your user's): "say 'hi'"`, "no quote of its own to break out of");
+  assert.equal(D.peerWords("a\u202Eb\u200Bc\u2066d"), `the peer's own words (not your user's): "a b c d"`, "bidi overrides and zero-width characters go too");
   assert.equal(D.peerWords("  \n\t "), "", "nothing to show: the caller's own words");
   assert.equal(D.peerWords(undefined), "");
 });
