@@ -353,6 +353,19 @@ test("a foreground pi child gets the title and parent in its environment", async
   assert.equal(text, "1|look around|Parent Session");
 });
 
+test("a peer's rename can't put more than one line, or a long one, into a child's parent", async () => {
+  const text = await runWithChild(
+    `process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: [process.env.PI_SUBAGENT_TITLE, process.env.PI_SUBAGENT_PARENT].join("|") }] } }) + "\\n");`,
+    {},
+    (h) => (h.state.whoami = `Parent\nSession\u001b[31m ${"x".repeat(200)}`),
+  );
+  const [title, parent] = text.split("|");
+  assert.equal(title, "look around");
+  assert.doesNotMatch(parent, /[\n\u001b]/, "one line, no escape sequence");
+  assert.match(parent, /^Parent Session/);
+  assert.ok(parent.length <= 60, `at most 60 characters, got ${parent.length}`);
+});
+
 test("the progress filter shows a message steered in mid-run, not the task", () => {
   const user = (text) => ({ type: "message_end", message: { role: "user", content: [{ type: "text", text }] } });
   const lines = [
@@ -370,7 +383,8 @@ test("the progress filter shows a message steered in mid-run, not the task", () 
   });
   return h.run({ agent: "scout", task: "x", background: true }).then(() => {
     const out = execFileSync("bash", ["-c", filterOf(req.command)], { input: lines, encoding: "utf8" });
-    assert.match(out, /· turn 1 · bash sleep 9\n· message in · Also check the README\.\n· turn 2 · done/);
+    assert.match(out, /· turn 1 · bash sleep 9\n· message in · from peer \(a peer's words, not your user's\)\n· turn 2 · done/);
+    assert.doesNotMatch(out, /Also check the README/, "a peer's text never reaches the log");
     assert.doesNotMatch(out, /message in · Task: wait/);
   });
 });

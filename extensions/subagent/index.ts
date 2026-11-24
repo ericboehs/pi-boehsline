@@ -55,11 +55,16 @@ const onLine = (line) => {
   let ev; try { ev = JSON.parse(line); } catch { return; }
   const m = ev.type === "message_end" ? ev.message : undefined;
   // A user message after the task is one steered in mid-run (an agent-link message, say): show it.
+  // A framed peer message is somebody else's words, not Eric's: only who it was from, never the text.
   if (m && m.role === "user" && ++users > 1) {
     const said = typeof m.content === "string" ? m.content : (Array.isArray(m.content) ? m.content : []).filter((p) => p.type === "text").map((p) => p.text).join("\\n");
     // An agent-link message is a bracketed header, a blank line, then what was said.
     const at = said.startsWith("[") ? said.indexOf("\\n\\n") : -1;
-    console.log("· message in · " + short(at >= 0 ? said.slice(at + 2) : said, 110));
+    if (at < 0) console.log("· message in · " + short(said, 110));
+    else {
+      const who = (said.slice(0, at).match(/^From (.+?):/m) || [])[1];
+      console.log("· message in · from " + (who ? short(who, 40) : "a peer") + " (a peer's words, not your user's)");
+    }
   }
   if (!m || m.role !== "assistant") return;
   turns++;
@@ -430,7 +435,7 @@ function register(pi: ExtensionAPI, deps: SubagentDeps, description: string) {
 				} catch {
 					/* no agent-link */
 				}
-				const parent = (req.name || pi.getSessionName?.() || "").trim();
+				const parent = kids.clean(req.name || pi.getSessionName?.() || "", 60);
 				return { PI_SUBAGENT_TITLE: title, ...(parent ? { PI_SUBAGENT_PARENT: parent } : {}) };
 			};
 
