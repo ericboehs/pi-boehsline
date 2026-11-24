@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import { stubPi } from "./helpers/stub-pi.mjs";
 
@@ -732,6 +732,43 @@ async function owner() {
 	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)));
 	return m;
 }
+
+/** Fake ffmpeg / ffprobe first on PATH (never the real ones), PATH restored after the test. With a
+ * `gate`, ffmpeg touches `marker` and then waits for that file before writing its frame, so a test
+ * can hold the frames still and see what queues behind them. */
+function fakeFfmpeg(gate) {
+	const bin = join(home, `fakebin-${process.pid}-${Math.random().toString(16).slice(2)}`);
+	mkdirSync(bin, { recursive: true });
+	writeFileSync(join(bin, "ffprobe"), `#!/bin/sh\ncase "$*" in *stream=width,height*) echo 1920x1080 ;; *) echo 192.4 ;; esac\n`, { mode: 0o755 });
+	const hold = gate ? `touch '${gate.marker}'\nwhile [ ! -f '${gate.gate}' ]; do sleep 0.02; done\n` : "";
+	writeFileSync(join(bin, "ffmpeg"), `#!/bin/sh\n${hold}for a; do out=$a; done\nprintf '\\377\\330\\377frame' > "$out"\n`, { mode: 0o755 });
+	const path0 = process.env.PATH;
+	const dirs0 = process.env.BOTSUN_OWNER_FFMPEG_DIRS;
+	cleanups.push(() => {
+		process.env.PATH = path0;
+		if (dirs0 === undefined) delete process.env.BOTSUN_OWNER_FFMPEG_DIRS; else process.env.BOTSUN_OWNER_FFMPEG_DIRS = dirs0;
+	});
+	// Never leave a held ffmpeg waiting: a failure must not keep the test process alive.
+	if (gate) cleanups.push(() => { try { writeFileSync(gate.gate, "go"); } catch {} });
+	// The fake first, and the real PATH behind it: the fake scripts need touch and sleep.
+	process.env.PATH = `${bin}${delimiter}${path0 ?? ""}`;
+	process.env.BOTSUN_OWNER_FFMPEG_DIRS = "";
+}
+
+/** An MP4-looking head: a real "ftyp" box, so the extension wants frames from it. */
+const fakeMp4 = (size = 2000) => Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from("ftypmp42"), Buffer.alloc(size, 7)]);
+/** An upload's own name as Botsun mints it: 16 random bytes in hex, so `.part` is taken. */
+const fakeUploadName = () => Array.from({ length: 32 }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
+/** The upload record Botsun hands on: the signed size and sha256 over exactly these bytes. */
+const fakeUpload = (dir, bytes, name = "Clip.mp4") => {
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const path = join(dir, `${fakeUploadName()}.part`);
+	writeFileSync(path, bytes, { mode: 0o600 });
+	return { path, name, mime: "video/mp4", bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
+};
+/** What a sent message says, whether it went in as plain words or with photos/frames. */
+const sentText = (sent) => typeof sent.content === "string" ? sent.content
+	: sent.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
 
 test("a signed reply goes in as Eric's message; the nonce is single use", async () => {
 	const key = phoneKey();
@@ -3673,6 +3710,51 @@ test("say_id: an id whose delivery was refused isn't recorded, so the next try g
 	assert.equal(m.sent.length, 1);
 });
 
+test("say_id: a delivery that throws isn't recorded, so the next try goes in", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	const say = async (text) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "say", text, client_id: SAID, nonce, device_id: 7, sig_v: 2,
+			signature: signV2(key, nonce, "session", "say", botsunSayPayload(text, SAID)) });
+	};
+	// pi refuses it outright (a throw, not a sentence back): the phone hears a failed request, and the
+	// id mustn't be left behind as delivered.
+	const inject = conn.inject;
+	conn.inject = () => { throw new Error("pi refused the message"); };
+	assert.equal((await say("ship it")).error, "bad request");
+	conn.inject = inject;
+	assert.deepEqual(await say("ship it"), { ok: true, delivered: "prompt" }, "the failed one forgot its id");
+	assert.deepEqual(await say("ship it"), { ok: true, delivered: "duplicate" });
+	assert.equal(m.sent.length, 1, "delivered once");
+});
+
+test("say_id: a video whose frames can't be delivered isn't recorded either", async () => {
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
+	const updir = join(home, "uploads-inject-fail");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	fakeFfmpeg();
+	const m = await owner();
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	const up = fakeUpload(updir, fakeMp4());
+	const videoSay = async () => ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up]));
+	// The frames are injected from a promise of their own, so a throw there doesn't reach the reply:
+	// the id must still be forgotten, or the phone's next try is answered "duplicate" and lost.
+	const inject = conn.inject;
+	conn.inject = () => { throw new Error("pi refused the message"); };
+	assert.deepEqual(await videoSay(), { ok: true, delivered: "prompt" }, "the reply doesn't wait for the frames");
+	await until(() => (conn.said?.size ?? 0) === 0, 10_000); // the failure forgot the id
+	conn.inject = inject;
+	assert.deepEqual(await videoSay(), { ok: true, delivered: "prompt" }, "the forgotten id lets the next try in");
+	await until(() => m.sent.length === 1, 10_000);
+	assert.equal(m.sent.length, 1, "delivered once");
+});
+
 // ---- Subagents (lib/children.ts): the session's children to Botsun, and the phone's stop ----
 
 const kids = await import("../lib/children.ts");
@@ -4460,6 +4542,99 @@ test("uploads: a retry while the video is still hashing is a duplicate, and word
 	assert.equal(m.sent.length, 2, "the video once, and the words after it");
 	assert.ok(String(m.sent[0].content).startsWith("the video\n\n📎 Attached: "), "the video first");
 	assert.equal(m.sent[1].content, text, "and the words behind it, never ahead");
+});
+
+test("uploads: words sent while the video is still hashing wait behind its frames", async () => {
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
+	const updir = join(home, "uploads-frames");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const marker = join(home, "ffmpeg-started");
+	const gate = join(home, "ffmpeg-gate");
+	fakeFfmpeg({ marker, gate });
+	const m = await owner();
+	// A real "ftyp" head, and big enough that the take is still hashing when the words arrive: the
+	// take's job is the queue, so the words chain onto it and must wait for the frames too.
+	const up = fakeUpload(updir, fakeMp4(32 * 1024 * 1024));
+	const video = ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up]));
+	// The inbox copy appears before it is hashed: the take is under way, its queue is not done.
+	const inbox = join(home, "inbox", String(process.pid));
+	const copies = () => { try { return readdirSync(inbox).length; } catch { return 0; } };
+	const before = copies();
+	await until(() => copies() > before, 10_000);
+	const text = "after the video";
+	const n2 = (await ask({ type: "nonce" })).nonce;
+	const words = await ask({ type: "say", text, nonce: n2, device_id: 7, sig_v: 2,
+		signature: signV2(key, n2, "session", "say", `botsun-propose-text-v1\n${text}`) });
+	assert.deepEqual(words, { ok: true, delivered: "prompt" });
+	// The take's own reply doesn't wait for ffmpeg (the socket and Botsun don't wait); the queue does.
+	assert.deepEqual(await video, { ok: true, delivered: "prompt" });
+	// ffmpeg is on the video now, with its frames still to come.
+	await until(() => existsSync(marker), 10_000);
+	await sleep(50);
+	assert.equal(m.sent.length, 0, "the words wait for the frames, not just for the take");
+	writeFileSync(gate, "go");
+	await until(() => m.sent.length === 2, 10_000);
+	assert.ok(sentText(m.sent[0]).startsWith("the video\n\n"), "the video first");
+	assert.equal(sentText(m.sent[1]), text, "then the words behind it, never ahead");
+});
+
+test("uploads: 64 other messages don't evict a video's id while it is still in progress", async () => {
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
+	const updir = join(home, "uploads-evict");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const marker = join(home, "ffmpeg-started-evict");
+	const gate = join(home, "ffmpeg-gate-evict");
+	fakeFfmpeg({ marker, gate });
+	const m = await owner();
+	const up = fakeUpload(updir, fakeMp4());
+	const videoId = "0b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
+	const video = ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up], videoId));
+	await until(() => existsSync(marker), 10_000);
+	// 64 delivered messages after it: one more than the id memory holds, so the oldest would go.
+	for (let i = 0; i < 64; i++) {
+		const id = `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+		const text = `message ${i}`;
+		const { nonce } = await ask({ type: "nonce" });
+		assert.deepEqual(await ask({ type: "say", text, client_id: id, nonce, device_id: 7, sig_v: 2,
+			signature: signV2(key, nonce, "session", "say", botsunSayPayload(text, id)) }), { ok: true, delivered: "prompt" }, text);
+	}
+	// The video's id is still on its way, so the phone's retry is a duplicate, not a second take.
+	const retry = await ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up], videoId));
+	assert.deepEqual(retry, { ok: true, delivered: "duplicate" }, "an in-progress id is never evicted");
+	writeFileSync(gate, "go");
+	assert.deepEqual(await video, { ok: true, delivered: "prompt" });
+	await until(() => m.sent.length === 65, 10_000);
+	assert.equal(m.sent.filter((x) => sentText(x).startsWith("the video")).length, 1, "the video once");
+	assert.ok(sentText(m.sent[0]).startsWith("the video\n\n"), "and first, ahead of the 64 behind it");
+});
+
+test("uploads: checkUploads hands back the real uploads dir it checked", async () => {
+	const { symlinkSync, realpathSync } = await import("node:fs");
+	const { checkUploads } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const updir = join(home, "uploads-checked");
+	const linkTo = join(home, "uploads-link");
+	mkdirSync(updir, { recursive: true, mode: 0o700 });
+	symlinkSync(updir, linkTo);
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const bytes = Buffer.alloc(64, 1);
+	const up = (dir) => ({ path: join(dir, `${randomHex(16)}.part`), name: "a.mp4", mime: "video/mp4", bytes: bytes.length, sha256: "ab".repeat(32) });
+	// Both the dir and a link to it: the open names the file in the real directory, never through a link.
+	for (const dir of [updir, linkTo]) {
+		process.env.BOTSUN_UPLOADS_DIR = dir;
+		const u = up(dir);
+		writeFileSync(u.path, bytes, { mode: 0o600 });
+		assert.deepEqual(checkUploads([u]), { dir: realpathSync(updir) }, dir);
+	}
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	assert.equal(checkUploads([]), undefined, "nothing to check: nothing to hand back");
+	const elsewhere = uploadFile(join(home, "another-dir"), bytes);
+	assert.equal(checkUploads([{ ...up(updir), path: elsewhere }]), "an upload must be in Botsun's uploads dir");
 });
 
 test("videoNote and span: the length, the size, and a path the shell takes as one word", async () => {
