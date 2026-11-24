@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 import { stubPi } from "./helpers/stub-pi.mjs";
@@ -4246,7 +4246,8 @@ test("unsteer: a steer that came in during a compaction waits behind the waiting
 // ---- Long videos (feature "uploads"): Botsun's file, named by path, hashed again here ---------
 // test/fixtures/signing-uploads.json is a byte-identical copy of Botsun's upload vectors.
 const uploadVectors = JSON.parse(readFileSync(new URL("./fixtures/signing-uploads.json", import.meta.url), "utf8"));
-const BOTSUN_UPLOADS_FIXTURE = "/Users/ericboehs/Code/github.com/ericboehs/botsun/test/fixtures/signing-uploads.json";
+// Botsun's own copy of the vectors, for the byte-for-byte check: BOTSUN_DIR, else the usual checkout.
+const BOTSUN_UPLOADS_FIXTURE = join(process.env.BOTSUN_DIR ?? join(homedir(), "Code/github.com/ericboehs/botsun"), "test/fixtures/signing-uploads.json");
 
 test("uploads: listed as a feature; a say's upload lines are Botsun's, byte for byte", async () => {
 	const { sayDigest } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
@@ -4285,7 +4286,7 @@ function uploadFile(dir, bytes) {
 }
 const randomHex = (n) => Array.from({ length: n * 2 }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
 
-test("uploads: a long video is linked into the inbox, hashed again, and named with an ffmpeg hint", async () => {
+test("uploads: a long video is copied into the inbox, hashed again, and named with an ffmpeg hint", async () => {
 	const { statSync, symlinkSync, unlinkSync: rm } = await import("node:fs");
 	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
 	const updir = join(home, "uploads");
@@ -4320,7 +4321,9 @@ test("uploads: a long video is linked into the inbox, hashed again, and named wi
 	assert.ok(first.text.startsWith("it breaks here\n\nVideo: "));
 	assert.ok(first.text.includes(`To view it, extract frames, e.g. ffmpeg -i '${inbox}' -vf fps=1 /tmp/frames/%04d.png, then read the PNGs.`));
 	assert.ok(first.text.includes(`🎞️ Video ${inbox} (3:12): 8 frames`));
-	assert.equal(statSync(inbox).ino, statSync(hostPath).ino, "a hard link, not a copy");
+	assert.equal(statSync(inbox).ino === statSync(hostPath).ino, false, "a copy, never a link to Botsun's file");
+	assert.ok(readFileSync(inbox).equals(mp4), "the bytes that were signed");
+	assert.equal(statSync(hostPath).mode & 0o777, 0o600, "Botsun's own file keeps its mode");
 	assert.equal(statSync(inbox).mode & 0o777, 0o600);
 
 	// A hash that isn't the signed one: refused, and nothing is left in the inbox for it.
@@ -4363,6 +4366,101 @@ test("uploads: a long video is linked into the inbox, hashed again, and named wi
 });
 
 const basenameOf = (p) => p.split("/").pop();
+
+test("uploads: a .part that is a hard link to another file is refused and leaves that file alone", async () => {
+	const { linkSync, statSync: st } = await import("node:fs");
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
+	const updir = join(home, "uploads-hardlink");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	// No "ftyp": a file, not something to pull frames from (this test has no ffmpeg).
+	const bytes = Buffer.alloc(600, 3);
+	const sha = createHash("sha256").update(bytes).digest("hex");
+	const his = join(home, "his-own.mp4");
+	writeFileSync(his, bytes);
+	chmodSync(his, 0o644);
+	mkdirSync(updir, { recursive: true, mode: 0o700 });
+	const part = join(updir, `${randomHex(16)}.part`);
+	linkSync(his, part);
+	assert.equal(st(his).nlink, 2);
+	const up = { path: part, name: "his.mp4", mime: "video/mp4", bytes: bytes.length, sha256: sha };
+	const clientId = "0b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
+
+	let { nonce } = await ask({ type: "nonce" });
+	assert.equal((await ask(uploadSay(key, nonce, "mine", [up], clientId))).error, "an upload is a link to another file");
+	assert.equal(st(his).mode & 0o777, 0o644, "the file it links to keeps its mode, even though it was signed");
+	assert.ok(readFileSync(his).equals(bytes), "and its bytes");
+	assert.equal(m.sent.length, 0);
+
+	// The same link, written as Botsun's own file: the same message id (fresh nonce) now goes in, so
+	// the refused take forgot it rather than leaving it in progress.
+	rmSync(part);
+	writeFileSync(part, bytes, { mode: 0o600 });
+	({ nonce } = await ask({ type: "nonce" }));
+	assert.deepEqual(await ask(uploadSay(key, nonce, "mine", [up], clientId)), { ok: true, delivered: "prompt" });
+	assert.equal(m.sent.length, 1, "delivered once");
+});
+
+test("uploads: an unsigned caller learns nothing about which files are there", async () => {
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
+	const updir = join(home, "uploads-noleak");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	await owner();
+	const bytes = Buffer.alloc(256, 5);
+	const there = uploadFile(updir, bytes);
+	const missing = join(updir, `${randomHex(16)}.part`);
+	const up = (path, size) => ({ path, name: "a.mp4", mime: "video/mp4", bytes: size, sha256: "ab".repeat(32) });
+	const signedOver = up(join(updir, `${randomHex(16)}.part`), 1);
+	// A file that is there, one that isn't, and the right file with the wrong size: one answer for all.
+	for (const bad of [up(there, bytes.length), up(missing, 4096), up(there, bytes.length + 1)]) {
+		const { nonce } = await ask({ type: "nonce" });
+		assert.equal((await ask(uploadSay(key, nonce, "x", [bad], undefined, [signedOver]))).error, "signature does not verify", bad.path);
+	}
+});
+
+test("uploads: a name is capped at 200 bytes of UTF-8, not 200 characters", async () => {
+	const { uploadsOf } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const u = (name) => ({ path: `/${randomHex(16)}.part`, name, mime: "video/mp4", bytes: 1, sha256: "ab".repeat(32) });
+	assert.equal(uploadsOf([u("é".repeat(100))]).length, 1, "200 bytes in 100 two-byte letters is fine");
+	assert.equal(uploadsOf([u("é".repeat(101))]), "bad file name", "202 bytes is not");
+	assert.equal(uploadsOf([u("a".repeat(200))]).length, 1, "200 plain characters is");
+	assert.equal(uploadsOf([u("a".repeat(201))]), "bad file name");
+});
+
+test("uploads: a retry while the video is still hashing is a duplicate, and words sent meanwhile wait behind it", async () => {
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
+	const updir = join(home, "uploads-slow");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	// 32 MB: copying and hashing it takes long enough for the retry and the next message to arrive
+	// while it is still going. No "ftyp", so no frames are wanted (there is no ffmpeg here).
+	const bytes = Buffer.alloc(32 * 1024 * 1024, 7);
+	const sha = createHash("sha256").update(bytes).digest("hex");
+	const up = { path: uploadFile(updir, bytes), name: "Recording.mp4", mime: "video/mp4", bytes: bytes.length, sha256: sha };
+	const clientId = "0b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
+
+	const first = ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up], clientId));
+	const retry = ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up], clientId));
+	const text = "after it";
+	const n3 = (await ask({ type: "nonce" })).nonce;
+	const words = ask({ type: "say", text, nonce: n3, device_id: 7, sig_v: 2, signature: signV2(key, n3, "session", "say", `botsun-propose-text-v1\n${text}`) });
+
+	assert.deepEqual(await first, { ok: true, delivered: "prompt" });
+	assert.deepEqual(await retry, { ok: true, delivered: "duplicate" }, "the id is in progress from before the take");
+	assert.deepEqual(await words, { ok: true, delivered: "prompt" });
+	assert.equal(m.sent.length, 2, "the video once, and the words after it");
+	assert.ok(String(m.sent[0].content).startsWith("the video\n\n📎 Attached: "), "the video first");
+	assert.equal(m.sent[1].content, text, "and the words behind it, never ahead");
+});
 
 test("videoNote and span: the length, the size, and a path the shell takes as one word", async () => {
 	const { videoNote, span } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);

@@ -29,7 +29,8 @@
 
 import { createHash, createPublicKey, randomBytes, randomUUID, verify as verifySignature } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { accessSync, appendFileSync, closeSync, copyFileSync, createReadStream, existsSync, chmodSync, constants as fsConstants, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { accessSync, appendFileSync, closeSync, existsSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { open, type FileHandle } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
@@ -351,19 +352,21 @@ function filesOf(raw: unknown): File[] | string {
 	return raw as File[];
 }
 
-/** A file name the phone may give (a file's or an upload's): one line, no path, no leading dot. */
-const badName = (name: string): boolean => !name.trim() || name.length > 200 || /[\/\0\n\r]/.test(name) || name.startsWith(".");
+/** A file name the phone may give (a file's or an upload's): one line, no path, no leading dot,
+ * and at most NAME_MAX bytes (a name's 200 characters can be 600 bytes of UTF-8, and the inbox's
+ * name adds a stamp to it). */
+const badName = (name: string): boolean =>
+	!name.trim() || Buffer.byteLength(name, "utf8") > NAME_MAX || /[\/\0\n\r]/.test(name) || name.startsWith(".");
 
 /**
- * The long videos a say names (Botsun resolved each upload id to its own file): each path must be
- * a plain file named by its uid right inside the uploads dir (realpath, never a link), of exactly
- * the size signed. The session hashes it again before taking it (takeUploads).
+ * The long videos a say names (Botsun resolved each upload id to its own file): what the phone
+ * signed about each, checked without touching the disk, so an unsigned caller learns nothing about
+ * which files are there (checkUploads does that part, once the signature holds). The session hashes
+ * the file again before taking it (takeUploads).
  */
 export function uploadsOf(raw: unknown): Upload[] | string {
 	if (raw === undefined || raw === null) return [];
 	if (!Array.isArray(raw) || raw.length > ATTACH_MAX) return `at most ${ATTACH_MAX} attachments`;
-	let dir: string;
-	try { dir = realpathSync(uploadsDir()); } catch { return "no uploads dir on this Mac"; }
 	for (const u of raw) {
 		if (!u || typeof u.path !== "string" || typeof u.name !== "string" || typeof u.mime !== "string" || typeof u.sha256 !== "string") return "bad upload";
 		if (badName(u.name)) return "bad file name";
@@ -371,6 +374,21 @@ export function uploadsOf(raw: unknown): Upload[] | string {
 		if (!Number.isSafeInteger(u.bytes) || u.bytes < 1 || u.bytes > UPLOAD_MAX) return "a long video is at most 512 MB";
 		if (!SHA256_HEX.test(u.sha256)) return "bad upload";
 		if (!u.path.startsWith("/") || !UPLOAD_FILE.test(basename(u.path))) return "an upload must be in Botsun's uploads dir";
+	}
+	return raw as Upload[];
+}
+
+/**
+ * Each upload's path must be a plain file named by its uid right inside the uploads dir (realpath,
+ * never a link), of exactly the size signed. It reads the disk, so it runs after the signature:
+ * before one, its answers would tell a caller which files exist and how big they are. takeUploads
+ * checks the same again on the opened file, before it copies.
+ */
+export function checkUploads(uploads: Upload[]): string | undefined {
+	if (!uploads.length) return undefined;
+	let dir: string;
+	try { dir = realpathSync(uploadsDir()); } catch { return "no uploads dir on this Mac"; }
+	for (const u of uploads) {
 		try {
 			if (realpathSync(dirname(u.path)) !== dir) return "an upload must be in Botsun's uploads dir";
 			const st = lstatSync(u.path);
@@ -380,7 +398,7 @@ export function uploadsOf(raw: unknown): Upload[] | string {
 			return "an upload must be in Botsun's uploads dir";
 		}
 	}
-	return raw as Upload[];
+	return undefined;
 }
 
 interface Saved { path: string; note: string; video: boolean; upload?: boolean }
@@ -404,14 +422,6 @@ function saveFiles(files: File[]): Saved[] {
 	});
 }
 
-/** A file's sha256, read in a stream (a 500 MB video is a second or two, never in memory). */
-export function hashFile(path: string): Promise<string> {
-	return new Promise((resolve, reject) => {
-		const hash = createHash("sha256");
-		createReadStream(path).on("error", reject).on("data", (b) => hash.update(b)).on("end", () => resolve(hash.digest("hex")));
-	});
-}
-
 const sizeText = (n: number): string =>
 	n < 1024 ? `${n} B` : n < 1048576 ? `${Math.round(n / 1024)} KB` : `${(n / 1048576).toFixed(1)} MB`;
 
@@ -427,10 +437,11 @@ function startsLikeMovie(path: string): boolean {
 }
 
 /**
- * Long videos into the inbox, as saveFiles names a file (inbox/<pid>/<time>-<n>-<rand>-<name>): a
- * hard link to Botsun's file (the same disk, no copy; a copy across disks), then this session's own
- * sha256 of what it now holds, which must be the one the phone signed. Anything wrong removes what
- * it linked and says why; Botsun keeps its copy until the say's ok.
+ * Long videos into the inbox, as saveFiles names a file (inbox/<pid>/<time>-v<n>-<rand>-<name>): a
+ * copy of Botsun's file (never a link to it: whatever can still write to Botsun's copy could change
+ * a video after the check), hashed as it is copied, and the hash must be the one the phone signed
+ * before the copy's mode is set. Anything wrong removes what it copied and says why; Botsun keeps
+ * its own file until the say's ok.
  */
 export async function takeUploads(uploads: Upload[]): Promise<Saved[] | string> {
 	if (!uploads.length) return [];
@@ -443,24 +454,56 @@ export async function takeUploads(uploads: Upload[]): Promise<Saved[] | string> 
 		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
 		for (const [i, u] of uploads.entries()) {
 			const path = join(dir, `${stamp}-v${i}-${randomBytes(3).toString("hex")}-${u.name}`);
-			try {
-				linkSync(u.path, path);
-			} catch (e) {
-				if ((e as NodeJS.ErrnoException).code !== "EXDEV") throw e;
-				copyFileSync(u.path, path, fsConstants.COPYFILE_EXCL);
-			}
+			const got = await copyUpload(u, path);
+			// A digest is hex; anything else is the sentence saying why it wasn't copied (nothing made).
+			if (!SHA256_HEX.test(got)) { drop(); return got; }
 			const taken: Saved = { path, note: `📎 Attached: ${path} (${sizeText(u.bytes)})`, video: false, upload: true };
 			saved.push(taken);
-			const st = lstatSync(path);
-			if (!st.isFile() || st.size !== u.bytes) { drop(); return "an upload isn't the size that was signed"; }
+			if (got !== u.sha256) { drop(); return "an upload's sha256 doesn't match what was signed"; }
+			// The mode is set only now: a file that isn't the one signed keeps the mode it was made with.
 			chmodSync(path, 0o600);
-			if ((await hashFile(path)) !== u.sha256) { drop(); return "an upload's sha256 doesn't match what was signed"; }
 			taken.video = startsLikeMovie(path);
 		}
 		return saved;
 	} catch (e) {
 		drop();
 		return `couldn't take the video: ${(e as NodeJS.ErrnoException).code ?? "error"}`;
+	}
+}
+
+/** A copy's sha256, or why it won't copy. The source is opened without following a link and must
+ * be, on that open file, a plain file that is nobody else's (one link) and the size signed: a swap
+ * between the checks and the copy, or a hard link to a file of this Mac's user, gets nothing.
+ * Returns the digest (a hex string), or a sentence saying why not. */
+async function copyUpload(u: Upload, path: string): Promise<string> {
+	const src = await open(u.path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+	try {
+		const st = await src.stat();
+		if (!st.isFile()) return "an upload must be a plain file";
+		if (st.nlink !== 1) return "an upload is a link to another file";
+		if (st.size !== u.bytes) return "an upload isn't the size that was signed";
+		let dst: FileHandle | undefined;
+		try {
+			dst = await open(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+			const hash = createHash("sha256");
+			const buf = Buffer.alloc(1 << 20);
+			for (;;) {
+				const { bytesRead } = await src.read(buf, 0, buf.length, null);
+				if (bytesRead === 0) break;
+				hash.update(buf.subarray(0, bytesRead));
+				await dst.write(buf, 0, bytesRead);
+			}
+			return hash.digest("hex");
+		} catch (e) {
+			try { await dst?.close(); } catch {}
+			dst = undefined;
+			try { unlinkSync(path); } catch {}
+			throw e;
+		} finally {
+			if (dst) await dst.close().catch(() => {});
+		}
+	} finally {
+		await src.close().catch(() => {});
 	}
 }
 
@@ -877,27 +920,50 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	const denied = verifyDevice(c, r, { decision: say.decision, digest: () => say.digest,
 		v2: { kind: "session", decision: say.decision, payload: () => say.payload } });
 	if (denied) return { error: denied };
+	// The uploads' disk checks come after the signature: their answers would tell an unsigned caller
+	// whether a file is there and how big it is.
+	const bad = checkUploads(uploads);
+	if (bad) return { error: bad };
 	// The same message again (its first answer was lost on the way to the phone): it went in once.
 	// Only the same id with the same message is a repeat: an id reused for other words (an app bug)
 	// is delivered, never dropped.
 	const said = clientId ? saidKey(c, r, clientId) : undefined;
 	const digest = said ? say.digest : "";
-	if (said && saidBefore(c, said, digest)) return { ok: true, delivered: "duplicate" };
-	// Long videos: linked into the inbox and hashed again here before anything goes in (a second or
-	// two for 500 MB; Botsun waits up to 30 s), so the reply says whether this session has them.
-	if (uploads.length) {
-		return takeUploads(uploads).then((taken) => {
-			if (typeof taken === "string") return { error: taken };
-			const outcome = deliverSay(c, text, images, files, { clientId, uploads: taken });
-			return outcome instanceof Promise
-				? outcome.then((reply) => saidDone(c, said, digest, reply))
-				: saidDone(c, said, digest, outcome);
-		});
+	if (said) {
+		if (saidBefore(c, said, digest)) return { ok: true, delivered: "duplicate" };
+		// In progress from here, not from the reply: a long video hashes for a second or two, and a
+		// retry with a fresh nonce mustn't be delivered a second time while it does.
+		saidNow(c, said, digest);
 	}
+	// Long videos: copied into the inbox and hashed again here before anything goes in (a second or
+	// two for 500 MB; Botsun waits up to 30 s), so the reply says whether this session has them.
+	if (uploads.length) return deliverUploads(c, text, images, files, uploads, clientId, said, digest);
 	const outcome = deliverSay(c, text, images, files, { clientId });
 	return outcome instanceof Promise
 		? outcome.then((reply) => saidDone(c, said, digest, reply))
 		: saidDone(c, said, digest, outcome);
+}
+
+/** A verified say with long videos: the take and then the delivery as one job on the framing queue,
+ * so a text say sent while the video is hashed (or its frames extracted) can't overtake it. */
+async function deliverUploads(c: Conn, text: string, images: Image[], files: File[], uploads: Upload[],
+	clientId: string | undefined, said: string | undefined, digest: string): Promise<Record<string, unknown>> {
+	const job = (c.framing ?? Promise.resolve()).then(async (): Promise<Record<string, unknown>> => {
+		const taken = await takeUploads(uploads);
+		if (typeof taken === "string") return { error: taken };
+		// inOrder: the queue is this job, so deliverSay injects now rather than chaining again.
+		return await deliverSay(c, text, images, files, { clientId, uploads: taken, inOrder: true });
+	});
+	const mark = job.then(() => {}, () => {});
+	c.framing = mark;
+	try {
+		return saidDone(c, said, digest, await job);
+	} catch (e) {
+		saidForget(c, said, digest);
+		throw e;
+	} finally {
+		if (c.framing === mark) c.framing = undefined;
+	}
 }
 
 /** The key a delivered message id is remembered under: this conversation, the device that signed it
@@ -917,10 +983,16 @@ function saidNow(c: Conn, key: string, digest: string): void {
 	while (said.size > SAID_MAX) said.delete(said.keys().next().value as string);
 }
 
-/** Records the id only once the reply says it went in: a refused or failed delivery leaves it
- * unrecorded, so the phone's next try of the same message is delivered. */
+/** Forgets a message id whose delivery failed, so the phone's next try of the same message is
+ * delivered (it is remembered from before the take: see handleOwnerRequest). */
+function saidForget(c: Conn, key: string | undefined, digest: string): void {
+	if (key && c.said?.get(key) === digest) c.said.delete(key);
+}
+
+/** Keeps the in-progress id once the reply says it went in; a refused or failed delivery forgets
+ * it, so the phone's next try of the same message is delivered. */
 function saidDone(c: Conn, key: string | undefined, digest: string, reply: Record<string, unknown>): Record<string, unknown> {
-	if (key && !("error" in reply)) saidNow(c, key, digest);
+	if ("error" in reply) saidForget(c, key, digest);
 	return reply;
 }
 
@@ -1266,7 +1338,7 @@ function sayCall(c: Conn, r: Record<string, unknown>): Record<string, unknown> |
 /** What a locked-phone reply may not start with: "/" (commands, skills, templates) or "!" (bash). */
 export const LOCKED_COMMAND = /^[\s\p{Cf}]*[\/!]/u; // spaces and invisible format chars, then / or ! (as Botsun checks)
 
-function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts: { noCommands?: boolean; clientId?: string; uploads?: Saved[] } = {}): Record<string, unknown> | Promise<Record<string, unknown>> {
+function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts: { noCommands?: boolean; clientId?: string; uploads?: Saved[]; inOrder?: boolean } = {}): Record<string, unknown> | Promise<Record<string, unknown>> {
 	let saved: Saved[];
 	try {
 		saved = [...saveFiles(files), ...(opts.uploads ?? [])];
@@ -1290,10 +1362,10 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 	}
 	// Words a compaction holds are "held": pi would refuse them as a prompt (2026-11-10).
 	const delivered = c.pendingCompact?.() ? "held" : c.busy ? "steer" : "prompt";
-	if (saved.some((s) => s.video) || c.framing) {
+	if (saved.some((s) => s.video) || (!opts.inOrder && c.framing)) {
 		// Frames take ffmpeg a few seconds: reply now (the socket and Botsun don't wait), deliver when
 		// they're ready, and queue later replies behind it so they keep their order.
-		const job: Promise<void> = (c.framing ?? Promise.resolve())
+		const job: Promise<void> = (opts.inOrder ? Promise.resolve() : (c.framing ?? Promise.resolve()))
 			.then(() => withFrames(saved, runFile))
 			.then(({ notes, frames }) => {
 				c.inject(compose(notes, frames), c.busy, { id: opts.clientId, text, withdrawable: false, attachments: attached });
