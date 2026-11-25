@@ -148,8 +148,8 @@ async function mount({ programStatus = true, passthrough = "all" } = {}) {
 		restore,
 		exec: () => execCalls,
 		listeners: () => [...handlers.keys()],
-		start: async () => {
-			handlers.get("session_start")({}, { isIdle: () => true });
+		start: async (mode = "tui") => {
+			handlers.get("session_start")({}, { isIdle: () => true, mode });
 			await settle();
 		},
 		agentStart: () => handlers.get("agent_start")({ type: "agent_start" }),
@@ -252,6 +252,23 @@ test("nothing is written when tmux would drop it, or when the setting is off", a
 		);
 	} finally {
 		disabled.restore();
+	}
+});
+
+test("a print, json or rpc pi (a subagent child) writes no report: its stdout is a pipe, not the terminal", async () => {
+	for (const mode of ["print", "json", "rpc", null]) {
+		const pi = await mount();
+		try {
+			await pi.start(mode);
+			pi.agentStart();
+			pi.reply();
+			await pi.settled();
+			pi.shutdown();
+			assert.deepEqual(pi.reports(), [], `mode ${mode} must stay quiet`);
+			assert.equal(pi.exec().some((c) => c.includes("allow-passthrough")), false);
+		} finally {
+			pi.restore();
+		}
 	}
 });
 

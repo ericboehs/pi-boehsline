@@ -278,10 +278,12 @@ function main(pi: ExtensionAPI): void {
   const reporting = !("PI_PROGRAM_STATUS" in process.env) && attentionSettings().programStatus;
   /** tmux's allow-passthrough, until the session_start probe says otherwise. */
   let passthrough = false;
+  /** Only the TUI owns its terminal: a print, json or rpc child (a subagent) writes to a pipe. */
+  let interactive = false;
   let reported = "";
 
   const writeStatus = (force = false) => {
-    if (!reporting || !passthrough) return;
+    if (!reporting || !interactive || !passthrough) return;
     const current = status.current();
     const key = JSON.stringify(current);
     if (!force && key === reported) return;
@@ -290,14 +292,14 @@ function main(pi: ExtensionAPI): void {
   };
 
   const writeClear = () => {
-    if (!reporting || !passthrough) return;
+    if (!reporting || !interactive || !passthrough) return;
     writeTerminal(tmuxPassthrough(formatProgramStatus({ state: "clear" })));
   };
 
   // allow-passthrough reads `on` (the active pane only) or `all`; anything else
   // would have tmux drop the report, so nothing is written.
   const probePassthrough = async () => {
-    if (!reporting) return;
+    if (!reporting || !interactive) return;
     try {
       const r = await pi.exec("tmux", ["show-options", "-gv", "allow-passthrough"], { timeout: 1000 });
       passthrough = r.code === 0 && passthroughAllowed(r.stdout);
@@ -385,6 +387,7 @@ function main(pi: ExtensionAPI): void {
     void hasRunningBackgroundTasks(pi);
     // Same idea for the terminal: ask tmux once, at startup, whether it forwards
     // what pi would write, then report the state it is already in.
+    interactive = (ctx as { mode?: string }).mode === "tui";
     void probePassthrough();
 
     removeTerminalListener?.();
