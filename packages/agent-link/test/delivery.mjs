@@ -122,6 +122,13 @@ test("a peer's reason is capped, one line, quoted and labelled as theirs", () =>
   assert.match(words, /\u2026"$/, "cut with an ellipsis, inside the quotes");
   assert.equal(D.peerWords('say "hi"'), `the peer's own words (not your user's): "say 'hi'"`, "no quote of its own to break out of");
   assert.equal(D.peerWords("a\u202Eb\u200Bc\u2066d"), `the peer's own words (not your user's): "a b c d"`, "bidi overrides and zero-width characters go too");
+  // Capped by code point: a cut between the halves of an emoji's surrogate pair leaves a lone half,
+  // which Swift's and Ruby's JSON can reject.
+  const emoji = D.peerWords("😀".repeat(D.REASON_MAX + 10));
+  const quote = emoji.slice(emoji.indexOf('"') + 1, -1);
+  assert.ok(Array.from(quote).length <= D.REASON_MAX, `at most ${D.REASON_MAX} code points, got ${Array.from(quote).length}`);
+  assert.doesNotMatch(quote, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, "never half a surrogate pair");
+  assert.match(quote, /\u2026$/, "cut with an ellipsis");
   assert.equal(D.peerWords("  \n\t "), "", "nothing to show: the caller's own words");
   assert.equal(D.peerWords(undefined), "");
 });

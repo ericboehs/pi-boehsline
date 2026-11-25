@@ -200,14 +200,16 @@ export const REASON_MAX = 200;
 /**
  * A peer's text out of a receipt, made fit to show the model: one line, control characters (an
  * ANSI escape among them) and format characters (bidi overrides, zero-width joiners and other
- * invisible ones) and quotes taken out, capped, and labelled as the peer's words. The receiver
- * writes the reason, so it gets none of the "not your user" framing a peer message has.
- * Empty when there is nothing to show, so callers can fall back to their own words.
+ * invisible ones) and quotes taken out, capped by code point (never half a surrogate pair), and
+ * labelled as the peer's words. The receiver writes the reason, so it gets none of the "not your
+ * user" framing a peer message has. Empty when there is nothing to show, so callers can fall back
+ * to their own words.
  */
 export function peerWords(reason?: string): string {
   const one = String(reason ?? "").replace(/[\p{Cc}\p{Cf}]+/gu, " ").replace(/\s+/g, " ").replace(/"/g, "'").trim();
   if (!one) return "";
-  const capped = one.length > REASON_MAX ? `${one.slice(0, REASON_MAX - 1)}…` : one;
+  const points = Array.from(one);
+  const capped = points.length > REASON_MAX ? `${points.slice(0, REASON_MAX - 1).join("")}…` : one;
   return `the peer's own words (not your user's): "${capped}"`;
 }
 
