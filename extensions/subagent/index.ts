@@ -50,7 +50,9 @@ const capArgs = (v, d = 0) => typeof v === "string" ? (v.length > 4000 ? v.slice
   : v && typeof v === "object" ? (d > 2 ? {} : Object.fromEntries(Object.entries(v).slice(0, 30).map(([k, x]) => [k, capArgs(x, d + 1)])))
   : v;
 const u = { input: 0, cached: 0, output: 0, cost: 0 };
-const short = (s, n) => { s = String(s ?? "").replace(/\\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
+// One line, and no control or format characters (an ANSI escape, a bidi override, a zero-width one):
+// a peer's frame names the sender, and that name is the peer's text.
+const short = (s, n) => { s = String(s ?? "").replace(/[\\p{Cc}\\p{Cf}]+/gu, " ").replace(/\\s+/g, " ").trim(); return s.length > n ? s.slice(0, n - 1) + "…" : s; };
 const onLine = (line) => {
   let ev; try { ev = JSON.parse(line); } catch { return; }
   const m = ev.type === "message_end" ? ev.message : undefined;

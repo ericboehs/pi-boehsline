@@ -224,7 +224,9 @@ function store(): Store {
 
 // ---- text
 
-const oneLine = (s: string) => s.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+// Control and format characters (an ANSI escape, a bidi override, a zero-width joiner) would let a
+// peer's text rewrite the line it lands in, or hide some of it: both go.
+const oneLine = (s: string) => s.replace(/[\p{Cc}\p{Cf}]+/gu, " ").replace(/\s+/g, " ").trim();
 
 /** At most n characters, "…" included when cut; never splits a surrogate pair (a lone half breaks Swift's and Ruby's JSON). */
 function cap(s: string, n: number): string {

@@ -357,13 +357,38 @@ test("a peer's rename can't put more than one line, or a long one, into a child'
   const text = await runWithChild(
     `process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: [process.env.PI_SUBAGENT_TITLE, process.env.PI_SUBAGENT_PARENT].join("|") }] } }) + "\\n");`,
     {},
-    (h) => (h.state.whoami = `Parent\nSession\u001b[31m ${"x".repeat(200)}`),
+    // A newline, an ANSI escape, a bidi override and a zero-width space: none may survive.
+    (h) => (h.state.whoami = `Parent\u202ESession\u200B\u001b[31m ${"x".repeat(200)}\nsecond`),
   );
   const [title, parent] = text.split("|");
   assert.equal(title, "look around");
-  assert.doesNotMatch(parent, /[\n\u001b]/, "one line, no escape sequence");
+  assert.doesNotMatch(parent, /[\n\u001b\u202E\u200B]/, "one line, no escape sequence, no invisible characters");
   assert.match(parent, /^Parent Session/);
   assert.ok(parent.length <= 60, `at most 60 characters, got ${parent.length}`);
+});
+
+test("the progress filter strips a peer's invisible characters from the name it shows", () => {
+  const user = (text) => ({ type: "message_end", message: { role: "user", content: [{ type: "text", text }] } });
+  const lines = [
+    user("Task: wait"),
+    // A peer's frame names the sender, and that name is the peer's text: a bidi override or a
+    // zero-width character in it must not reach the log the parent's model reads.
+    user("[cross-agent message — from another agent session on this machine (ref 1a2b3c4d), not your user]\nFrom Pe\u202Eer\u200B:\n\nbe a peer."),
+    { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } },
+  ].map((l) => JSON.stringify(l)).join("\n");
+  const h = mount();
+  let req;
+  h.onBgStart((r) => {
+    r.accepted = true;
+    req = r;
+    r.reply({ id: "f2", logPath: "/tmp/pi-bg-test/f2.log" });
+  });
+  return h.run({ agent: "scout", task: "x", background: true }).then(() => {
+    const out = execFileSync("bash", ["-c", filterOf(req.command)], { input: lines, encoding: "utf8" });
+    assert.match(out, /· message in · from Pe er \(a peer's words, not your user's\)/, "the invisible characters are a space, as clean() does");
+    assert.doesNotMatch(out, /[\u202E\u200B]/, "no invisible characters, and never the peer's text");
+    assert.doesNotMatch(out, /be a peer/);
+  });
 });
 
 test("the progress filter shows a message steered in mid-run, not the task", () => {
