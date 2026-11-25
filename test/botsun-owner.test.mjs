@@ -247,12 +247,16 @@ test("only this pi's own registry entry names the session on the phone", async (
 	await m.fire("session_start", { reason: "startup" });
 	await until(() => srv.lines.length >= 1);
 	assert.equal(srv.lines[0].name, "vic", "this pi's own entry names it");
-	registry({ pid: process.pid + 1, name: "ghost", nameSource: "user", entrypoint: "pi" });
-	assert.equal(await named(() => m.fire("agent_start")), "my-session", "another pid's file (a reused pid) names nothing");
+	// A dead pi whose pid this one reused: the file still says this pid, so its start time is what
+	// tells it apart from a session that is really ours.
+	registry({ pid: process.pid, name: "ghost", nameSource: "user", entrypoint: "pi", startedAt: Date.now() - 3_600_000 });
+	assert.equal(await named(() => m.fire("agent_start")), "my-session", "a dead pi's file (same pid, an hour old) names nothing");
+	registry({ pid: process.pid + 1, name: "other", nameSource: "user", entrypoint: "pi", startedAt: Date.now() });
+	assert.equal(await named(() => m.fire("agent_settled")), "my-session", "another pid's file names nothing");
 	registry({ pid: process.pid, name: "claude-session", nameSource: "user", entrypoint: "claude" });
-	assert.equal(await named(() => m.fire("agent_settled")), "my-session", "Claude Code's file names nothing");
+	assert.equal(await named(() => m.fire("agent_start")), "my-session", "Claude Code's file names nothing");
 	registry({ pid: process.pid, name: "pi-proj", nameSource: "derived", entrypoint: "pi" });
-	assert.equal(await named(() => m.fire("agent_start")), "pi-proj", "a derived name is still what the phone shows");
+	assert.equal(await named(() => m.fire("agent_settled")), "pi-proj", "a derived name is still what the phone shows");
 	await m.fire("session_shutdown", { reason: "quit" });
 	await srv.stop();
 });
@@ -4093,10 +4097,11 @@ test("the prompt ignores a folder-derived or a foreign registry name", async () 
 	};
 	mkdirSync(join(home, ".claude", "sessions"), { recursive: true });
 	const registry = (entry) => writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify(entry));
-	registry({ pid: process.pid, name: "Victor-2", nameSource: "user", entrypoint: "pi" });
+	registry({ pid: process.pid, name: "Victor-2", nameSource: "user", entrypoint: "pi", startedAt: Date.now() });
 	assert.match(await section(), /named Victor-2/, "this pi's own entry names the section");
-	registry({ pid: process.pid + 1, name: "ghost", nameSource: "user", entrypoint: "pi" });
-	assert.match(await section(), /named Victor/, "another pid's name is not this session's");
+	// The same pid, from a dead pi that had it before this one: not this session's either.
+	registry({ pid: process.pid, name: "ghost", nameSource: "user", entrypoint: "pi", startedAt: Date.now() - 3_600_000 });
+	assert.match(await section(), /named Victor/, "a dead pi's file (same pid, an hour old) names nothing");
 	registry({ pid: process.pid, name: "claude-session", nameSource: "user", entrypoint: "claude" });
 	assert.match(await section(), /named Victor/, "Claude Code's name is not this pi's");
 	registry({ pid: process.pid, name: "pi-proj", nameSource: "derived", entrypoint: "pi" });

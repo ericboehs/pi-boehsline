@@ -2471,15 +2471,23 @@ function debug(msg: string): void {
 	} catch {}
 }
 
+/** When this process started (ms): an agent-link registry file from before it was left by a dead
+ * process whose pid this one reused (as extensions/footer reads the same file). */
+const PROCESS_STARTED_AT = Date.now() - process.uptime() * 1000;
+
 /** agent-link's registry entry (~/.claude/sessions, shared with Claude Code) for this process: the
  * name it gave, whether that name is derived from the folder, and when it wrote the file. A file
- * from another pid (a crashed process's, with its pid reused) or another tool's is not this
- * session's, so it is ignored. */
+ * from another pid (a crashed process's, with its pid reused), from before this process started
+ * (the same, since a hard exit skips the cleanup and the registry is keyed by pid), or another
+ * tool's is not this session's, so it is ignored. */
 function linkEntry(): { name?: string; derived: boolean; at: number } | undefined {
 	try {
 		const file = join(homedir(), ".claude", "sessions", `${process.pid}.json`);
 		const raw = JSON.parse(readFileSync(file, "utf8"));
 		if (raw?.pid !== process.pid || raw?.entrypoint !== "pi") return undefined;
+		// A dead pi's file whose pid this process now has still says pid === process.pid: its start
+		// time is what tells it apart (a second's slack for a clock that moved under it).
+		if (typeof raw.startedAt === "number" && raw.startedAt < PROCESS_STARTED_AT - 1_000) return undefined;
 		const name = typeof raw.name === "string" ? raw.name.trim() || undefined : undefined;
 		return { name, derived: raw.nameSource === "derived", at: statSync(file).mtimeMs };
 	} catch {
