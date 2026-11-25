@@ -10,7 +10,8 @@ Before each run the extension sets a `session-identity` section of the system pr
 the phone shows (agent-link's, else the pi session name, `/name`): "This session is named
 Victor…". The session answers to that name in chat, from the phone and on a call, and doesn't
 take another session's name or the phone app's as its own. A session with no name gets no
-section. A forked session keeps its parent's name until it's renamed.
+section: agent-link's folder-derived name isn't the session's own, so it names no section either
+(the phone still shows it). A forked session keeps its parent's name until it's renamed.
 
 ## Reporting state
 

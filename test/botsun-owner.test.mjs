@@ -216,13 +216,43 @@ test("name: agent-link registry, else pi session name; re-read per line", async 
 	await until(() => srv.lines.length >= 1);
 	assert.equal(srv.lines[0].name, "my-session");
 	mkdirSync(join(home, ".claude", "sessions"), { recursive: true });
-	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "vic" }));
+	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "vic", nameSource: "user", entrypoint: "pi" }));
 	await m.fire("agent_start");
 	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), "{\"name\": \"par"); // partial write
 	await m.fire("agent_settled");
 	await until(() => srv.lines.length >= 3);
 	assert.equal(srv.lines[1].name, "vic");
 	assert.equal(srv.lines[2].name, "my-session", "a torn registry file falls back");
+	await m.fire("session_shutdown", { reason: "quit" });
+	await srv.stop();
+});
+
+// The registry (~/.claude/sessions) is keyed by pid and shared with Claude Code: only this pi's own
+// entry is this session's. Another pid's (a crashed process's, its pid reused) or another tool's
+// file names nothing, and a folder-derived name is agent-link's, not the session's own.
+test("only this pi's own registry entry names the session on the phone", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount({ sessionName: "my-session" });
+	mkdirSync(join(home, ".claude", "sessions"), { recursive: true });
+	const registry = (entry) => writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify(entry));
+	// The next line's name, once the connection has written it.
+	const named = async (fire, expected) => {
+		const before = srv.lines.length;
+		await fire();
+		await until(() => srv.lines.length > before);
+		return srv.lines.at(-1).name;
+	};
+	registry({ pid: process.pid, name: "vic", nameSource: "user", entrypoint: "pi" });
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.lines.length >= 1);
+	assert.equal(srv.lines[0].name, "vic", "this pi's own entry names it");
+	registry({ pid: process.pid + 1, name: "ghost", nameSource: "user", entrypoint: "pi" });
+	assert.equal(await named(() => m.fire("agent_start")), "my-session", "another pid's file (a reused pid) names nothing");
+	registry({ pid: process.pid, name: "claude-session", nameSource: "user", entrypoint: "claude" });
+	assert.equal(await named(() => m.fire("agent_settled")), "my-session", "Claude Code's file names nothing");
+	registry({ pid: process.pid, name: "pi-proj", nameSource: "derived", entrypoint: "pi" });
+	assert.equal(await named(() => m.fire("agent_start")), "pi-proj", "a derived name is still what the phone shows");
 	await m.fire("session_shutdown", { reason: "quit" });
 	await srv.stop();
 });
@@ -238,7 +268,7 @@ test("Botsun's name line renames this session in pi and is said back at once", a
 	m.pi.getSessionName = () => piName;
 	m.pi.setSessionName = (name) => { sets.push(name); piName = name; };
 	mkdirSync(join(home, ".claude", "sessions"), { recursive: true });
-	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "vic" }));
+	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "vic", nameSource: "user", entrypoint: "pi" }));
 	await sleep(20); // the registry file is older than the rename
 	await m.fire("session_start", { reason: "startup" });
 	await until(() => srv.types().includes("hello"));
@@ -259,7 +289,7 @@ test("Botsun's name line renames this session in pi and is said back at once", a
 	const said = srv.lines.slice(before).find((l) => l.type === "features");
 	assert.equal(said?.name, "Billing fix", "the next line carries the rename, over agent-link's older name");
 
-	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "vic2" }));
+	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "vic2", nameSource: "user", entrypoint: "pi" }));
 	await m.fire("agent_start");
 	await until(() => srv.lines.at(-1).type === "busy" || srv.lines.at(-1).name === "vic2");
 	assert.equal(srv.lines.at(-1).name, "vic2", "agent-link naming it again afterwards wins again");
@@ -4018,7 +4048,7 @@ test("the prompt names each session the way the phone does, and drops the name w
 	assert.match(await section(), /may call you Victor/);
 	// A name agent-link gave it is the one the phone shows, so the prompt says that one.
 	mkdirSync(join(home, ".claude", "sessions"), { recursive: true });
-	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "Victor-2" }));
+	writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify({ pid: process.pid, name: "Victor-2", nameSource: "user", entrypoint: "pi" }));
 	assert.match(await section(), /named Victor-2/, "agent-link's name, not pi's");
 	// Renamed between two runs: the section changes, so pi resends it.
 	piName = "Billing fix";
@@ -4043,6 +4073,40 @@ test("the prompt names each session the way the phone does, and drops the name w
 	await child.fire("before_agent_start", { prompt: "hi", systemPromptOptions: { sections } });
 	assert.deepEqual(sections, {}, "a subagent child gets no identity section");
 	delete process.env.PI_SUBAGENT_CHILD;
+	await srv.stop();
+});
+
+// The prompt section names the session only by a name that is its own: agent-link's folder-derived
+// name isn't, and another pid's or another tool's registry file isn't this session's at all.
+test("the prompt ignores a folder-derived or a foreign registry name", async () => {
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const piName = "Victor";
+	const m = await mount();
+	m.pi.getSessionName = () => piName;
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => srv.types().includes("hello"));
+	const section = async () => {
+		const sections = {};
+		await m.fire("before_agent_start", { prompt: "hi", systemPromptOptions: { sections } });
+		return sections["session-identity"];
+	};
+	mkdirSync(join(home, ".claude", "sessions"), { recursive: true });
+	const registry = (entry) => writeFileSync(join(home, ".claude", "sessions", `${process.pid}.json`), JSON.stringify(entry));
+	registry({ pid: process.pid, name: "Victor-2", nameSource: "user", entrypoint: "pi" });
+	assert.match(await section(), /named Victor-2/, "this pi's own entry names the section");
+	registry({ pid: process.pid + 1, name: "ghost", nameSource: "user", entrypoint: "pi" });
+	assert.match(await section(), /named Victor/, "another pid's name is not this session's");
+	registry({ pid: process.pid, name: "claude-session", nameSource: "user", entrypoint: "claude" });
+	assert.match(await section(), /named Victor/, "Claude Code's name is not this pi's");
+	registry({ pid: process.pid, name: "pi-proj", nameSource: "derived", entrypoint: "pi" });
+	assert.match(await section(), /named Victor/, "a folder-derived name names no section");
+	assert.equal(
+		m.mod.currentName({ sessionName: () => undefined, cwd: "/tmp/work/proj" }),
+		"pi-proj",
+		"the phone still shows the derived name",
+	);
+	await m.fire("session_shutdown", { reason: "quit" });
 	await srv.stop();
 });
 

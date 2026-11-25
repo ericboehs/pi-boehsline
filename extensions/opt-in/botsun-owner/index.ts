@@ -2471,25 +2471,47 @@ function debug(msg: string): void {
 	} catch {}
 }
 
-/** The name this session is called by, as the phone shows it: agent-link's name for this pid, else
- * the pi session name. A name set through pi from here (Botsun's rename, the phone's /name) after
- * agent-link last wrote its file wins. No folder fallback: an unnamed session has no name. */
-export function identityName(c: Pick<Conn, "sessionName" | "namedAt">): string | undefined {
-	let name: string | undefined;
-	let piName: string | undefined;
-	try { piName = c.sessionName()?.trim() || undefined; } catch {}
+/** agent-link's registry entry (~/.claude/sessions, shared with Claude Code) for this process: the
+ * name it gave, whether that name is derived from the folder, and when it wrote the file. A file
+ * from another pid (a crashed process's, with its pid reused) or another tool's is not this
+ * session's, so it is ignored. */
+function linkEntry(): { name?: string; derived: boolean; at: number } | undefined {
 	try {
 		const file = join(homedir(), ".claude", "sessions", `${process.pid}.json`);
 		const raw = JSON.parse(readFileSync(file, "utf8"));
-		if (typeof raw?.name === "string" && raw.name.trim()) name = raw.name.trim();
-		if (name && piName && c.namedAt && c.namedAt > statSync(file).mtimeMs) name = piName;
-	} catch {}
-	return (name || piName)?.slice(0, NAME_MAX);
+		if (raw?.pid !== process.pid || raw?.entrypoint !== "pi") return undefined;
+		const name = typeof raw.name === "string" ? raw.name.trim() || undefined : undefined;
+		return { name, derived: raw.nameSource === "derived", at: statSync(file).mtimeMs };
+	} catch {
+		return undefined;
+	}
 }
 
-/** What every line to the phone says this session is called: identityName, else its folder. */
+/** The session's two names: agent-link's (unless a rename through pi from here came after agent-link
+ * last wrote its file), and pi's. */
+function sessionNames(c: Pick<Conn, "sessionName" | "namedAt">): { link?: string; linkDerived: boolean; pi?: string } {
+	let pi: string | undefined;
+	try { pi = c.sessionName()?.trim() || undefined; } catch {}
+	const entry = linkEntry();
+	const renamed = !!entry?.name && !!pi && !!c.namedAt && c.namedAt > entry.at;
+	return { link: renamed ? undefined : entry?.name, linkDerived: !!entry?.derived, pi };
+}
+
+/** The name this session is called by, as the phone shows it: agent-link's name for this pid, else
+ * the pi session name. A name set through pi from here (Botsun's rename, the phone's /name) after
+ * agent-link last wrote its file wins. A name agent-link derived from the folder is not the
+ * session's own (agent-link re-picks it as sibling sessions come and go), so it names no prompt
+ * section; the phone still shows it. No folder fallback: an unnamed session has no name. */
+export function identityName(c: Pick<Conn, "sessionName" | "namedAt">): string | undefined {
+	const { link, linkDerived, pi } = sessionNames(c);
+	return (link && !linkDerived ? link : pi)?.slice(0, NAME_MAX);
+}
+
+/** What every line to the phone says this session is called: agent-link's name (derived or not),
+ * else the pi session name, else its folder. */
 export function currentName(c: Conn): string {
-	return (identityName(c) || basename(c.cwd) || c.cwd).slice(0, NAME_MAX);
+	const { link, pi } = sessionNames(c);
+	return (link || pi || basename(c.cwd) || c.cwd).slice(0, NAME_MAX);
 }
 
 function write(c: Conn, type: string, extra: Record<string, unknown> = {}): void {
