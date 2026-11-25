@@ -536,3 +536,44 @@ test("formatAnswerLines leaves out the selected line for a typed-only answer", (
 	assert.deepEqual(formatAnswerLines(["A", "B"], [], ["Meet in the middle"]), ["User wrote: Meet in the middle"]);
 	assert.deepEqual(formatAnswerLines(["A", "B"], ["B"], ["more"]), ["User selected: 2. B", "User wrote: more"]);
 });
+
+test("the TUI pickers report blocked on the terminal, with a title rather than the question", async () => {
+	const { tool } = await mountModule();
+	const options = [];
+	const ctx = {
+		hasUI: true,
+		mode: "tui",
+		ui: {
+			custom: async (_fn, opts) => {
+				// A single pick's value, then a multi pick's checked set.
+				options.push(opts);
+				return options.length === 1 ? "0" : { values: ["0"] };
+			},
+			input: async () => undefined,
+		},
+	};
+
+	// A single-select question, then a multi-select one: both are custom pickers.
+	const single = await tool.execute(
+		"t1",
+		{ question: "Which database password: hunter2 or the prod one?", options: [{ label: "A" }, { label: "B" }] },
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert.equal(single.details.cancelled, false);
+	await tool.execute(
+		"t2",
+		{ question: "Which?", options: [{ label: "A" }, { label: "B" }], multiSelect: true },
+		undefined,
+		undefined,
+		ctx,
+	);
+
+	assert.equal(options.length, 2);
+	for (const opts of options) {
+		assert.equal(opts?.blocked?.kind, "question", "a picker waits on an answer, so the terminal says blocked");
+		assert.equal(opts.blocked.message, "Answer the agent's question");
+		assert.equal(opts.blocked.message.includes("hunter2"), false, "never the prompt text");
+	}
+});

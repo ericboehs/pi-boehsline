@@ -27,9 +27,13 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { withBlocked } from "../../lib/blocked.ts";
 import { offerPrompt, type RemoteAnswer } from "../../lib/remote-prompts.ts";
 
 const CUSTOM_VALUE = "__custom__";
+
+/** What the terminal reports (OSC 7501) while an ask dialog waits: a title, never the question. */
+const BLOCKED_TITLE = "Answer the agent's question";
 
 /** Returned from batch pickers when the user steps back a question (TUI-only). Exported for tests. */
 export const BACK = Symbol("back");
@@ -399,7 +403,7 @@ export default function ask(pi: ExtensionAPI) {
 									return { handled: true };
 								},
 							};
-						});
+						}, withBlocked("question", BLOCKED_TITLE));
 					}
 					// RPC: dialog protocol (custom() is TUI-only and returns undefined).
 					const display = items.map((i) => formatRpcLabel(i.label, i.description));
@@ -563,7 +567,7 @@ export default function ask(pi: ExtensionAPI) {
 									return { handled: true };
 								},
 							};
-						});
+						}, withBlocked("question", BLOCKED_TITLE));
 						if (res === BACK) return BACK;
 						if (res === FORWARD) return FORWARD;
 						if (res === null || res === undefined) return null;

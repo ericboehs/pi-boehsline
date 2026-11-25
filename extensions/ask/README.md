@@ -22,3 +22,8 @@ at session start, so the boot and per-turn cost is near zero.
 
 Pure helpers (`buildItems`, `parseMultiPicks`, `formatAnswerLines`) are
 exported for [`test/ask.test.mjs`](../../test/ask.test.mjs); the dialogs themselves need a terminal.
+
+Both TUI pickers report `blocked` over OSC 7501 (`kind=question`, the title
+"Answer the agent's question") while they wait, so a terminal that shows the
+program status shows a question, not `working`. The question text never goes
+in the report, only in the dialog.
