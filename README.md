@@ -126,6 +126,7 @@ Everything below goes in `~/.pi/agent/boehsline.json`, or comes from a package t
   "failover": { "chain": ["anthropic/claude-opus-5.5", "opencode-go/glm-5.3"], "maxSwitches": 3 },  // see extensions/failover
   "image-prune": { "thresholdMB": 5, "keepTurns": 2, "shrinkMaxPx": 1568, "shrinkMinKB": 512 },  // "enabled": false pauses it; /image-prune now still works
   "scheduler-tool": { "exposure": "deferred", "allowWake": false },  // "direct" puts the schedule tool in every prompt; allowWake lets the agent set wake (reopens the session unattended)
+  "tmux-attention": { "programStatus": true },  // forwards pi's OSC 7501 state through tmux; needs allow-passthrough on|all, and is off unless set
   "update": { "dir": "~/Code/github.com/ericboehs/pi", "args": ["--quick-tests", "--push"] },  // no dir: the checkout pi runs from
   "wiki-session-log": { "command": ["~/bin/pi-session-sync"] }
 }

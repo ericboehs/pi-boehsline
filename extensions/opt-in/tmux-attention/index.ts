@@ -2,11 +2,20 @@
 // window: a settled turn, or a blocking prompt (ask tool, confirm, input)
 // waiting on an answer. Focusing any pane in that window clears the attention
 // state via the pane-focus-in hook in ~/.tmux.conf.
+//
+// With the opt-in `programStatus` setting it also forwards pi's program status
+// (OSC 7501) through tmux's DCS passthrough, so the outer terminal shows pi's
+// state while pi sits in a pane. One ActivityTracker drives both, so the window
+// flag and the terminal's status agree.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { optIn } from "../../../lib/opt-in.ts";
+import { ActivityTracker, formatProgramStatus, passthroughAllowed, tmuxPassthrough, writeTerminal } from "../../../lib/program-status.ts";
+import { attentionSettings } from "./settings.ts";
 
 const TMUX_PANE = process.env.TMUX_PANE;
+/** The name pi's own reporter puts on its OSC 7501 reports. */
+const STATUS_APP = "pi";
 const BG_REQUEST = "pi-background-tasks:request:v1";
 const BG_RESPONSE = "pi-background-tasks:response:v1";
 const BG_TERMINAL = "pi-background-tasks:terminal:v1";
@@ -257,6 +266,69 @@ function main(pi: ExtensionAPI): void {
     }
   };
 
+  // ── program status: OSC 7501, forwarded through tmux ───────────────────────
+  //
+  // tmux answers no 7501 query and drops an OSC it does not know, so pi's own
+  // reporter never sends one here: pi reports only to a terminal that answered
+  // its query. With `programStatus` on (off by default) these states go out
+  // wrapped in tmux's DCS passthrough instead, which tmux unwraps and the outer
+  // terminal draws. Skipped when PI_PROGRAM_STATUS is set, since that means pi
+  // was told to report for itself and every state would then go out twice.
+  const status = new ActivityTracker();
+  const reporting = !("PI_PROGRAM_STATUS" in process.env) && attentionSettings().programStatus;
+  /** tmux's allow-passthrough, until the session_start probe says otherwise. */
+  let passthrough = false;
+  let reported = "";
+
+  const writeStatus = (force = false) => {
+    if (!reporting || !passthrough) return;
+    const current = status.current();
+    const key = JSON.stringify(current);
+    if (!force && key === reported) return;
+    reported = key;
+    writeTerminal(tmuxPassthrough(formatProgramStatus({ ...current, app: STATUS_APP })));
+  };
+
+  const writeClear = () => {
+    if (!reporting || !passthrough) return;
+    writeTerminal(tmuxPassthrough(formatProgramStatus({ state: "clear" })));
+  };
+
+  // allow-passthrough reads `on` (the active pane only) or `all`; anything else
+  // would have tmux drop the report, so nothing is written.
+  const probePassthrough = async () => {
+    if (!reporting) return;
+    try {
+      const r = await pi.exec("tmux", ["show-options", "-gv", "allow-passthrough"], { timeout: 1000 });
+      passthrough = r.code === 0 && passthroughAllowed(r.stdout);
+    } catch {
+      passthrough = false;
+    }
+    writeStatus(true);
+  };
+
+  /**
+   * Feed pi's events to the one tracker both consumers read: a dialog opening
+   * raises this pane's window flag, a dialog closing (or the run moving on)
+   * lowers it, and every state change is one report. Deriving the flag from the
+   * tracker rather than from the raw events keeps the window and the terminal
+   * from ever disagreeing.
+   */
+  const track = (event: { type: string }) => {
+    const before = status.current().state;
+    status.handle(event);
+    const now = status.current().state;
+    if (now !== before && (now === "blocked" || before === "blocked")) void setAttention(now === "blocked");
+    writeStatus();
+  };
+
+  if (reporting) {
+    pi.on("message_end", track);
+    pi.on("session_before_compact", track);
+    pi.on("session_compact", track);
+    pi.on("session_compact_failed", track);
+  }
+
   // A quiet run's settle must not brighten the window. It has no attention of
   // its own; notify_user and the classifier arrive through quiet:attention.
   pi.events.on("quiet:attention", (attention: unknown) => {
@@ -264,7 +336,8 @@ function main(pi: ExtensionAPI): void {
   });
 
   // A working agent dims its background window's index until it settles.
-  pi.on("agent_start", () => {
+  pi.on("agent_start", (event) => {
+    track({ ...event, type: "agent_start" });
     // A run starting clears the window's attention; one the quiet extension still holds
     // (notify_user, the classifier) is put back, since nothing he did cleared it.
     void setRunning(true).then(() => {
@@ -273,7 +346,8 @@ function main(pi: ExtensionAPI): void {
     });
   });
 
-  pi.on("agent_settled", async () => {
+  pi.on("agent_settled", async (event) => {
+    track({ ...event, type: "agent_settled" });
     // Clear this pane's running flag first: a turn that launched background
     // work still counts as settled for dimming purposes — the tasks below get
     // their own announcement path when they finish.
@@ -296,15 +370,11 @@ function main(pi: ExtensionAPI): void {
 
   // A blocking prompt (ask tool, confirm, input, custom dialog) means the user
   // is needed, even if this window is currently focused — the status format
-  // keeps the active window blue, and switching away then shows attention.
-  // ui_prompt_end clears so answering while focused does not leave a stale flag.
-  // Notification-only; pi does not await this.
-  pi.on("ui_prompt_start", () => {
-    void setAttention(true);
-  });
-  pi.on("ui_prompt_end", () => {
-    void setAttention(false);
-  });
+  // keeps the active window blue, and switching away then shows attention. The
+  // dialog's close clears it, so answering while focused leaves no stale flag.
+  // Notification-only; pi does not await these.
+  pi.on("ui_prompt_start", (event) => track({ ...event, type: "ui_prompt_start" }));
+  pi.on("ui_prompt_end", (event) => track({ ...event, type: "ui_prompt_end" }));
 
   let removeTerminalListener: (() => void) | undefined;
 
@@ -313,6 +383,9 @@ function main(pi: ExtensionAPI): void {
     // startup, so the first turn's agent_settled already knows the answer
     // instead of paying the timeout at the worst possible moment.
     void hasRunningBackgroundTasks(pi);
+    // Same idea for the terminal: ask tmux once, at startup, whether it forwards
+    // what pi would write, then report the state it is already in.
+    void probePassthrough();
 
     removeTerminalListener?.();
     removeTerminalListener = pi.events.on(BG_TERMINAL, (value: unknown) => {
@@ -339,6 +412,9 @@ function main(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     removeTerminalListener?.();
     removeTerminalListener = undefined;
+    // A departing pi leaves no state behind in the outer terminal, as pi's own
+    // reporter does when it stops.
+    writeClear();
     // Best effort: a clean exit should leave no dim or stale marker behind.
     // Anything harsher is status-daemon's job (it drops dead markers itself).
     void setRunning(false);

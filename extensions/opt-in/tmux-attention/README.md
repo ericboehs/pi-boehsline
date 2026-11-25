@@ -11,3 +11,33 @@ set-hook -g pane-focus-in 'set -w -u @special_activity ; set -w -u @job_done'
 ```
 
 **Needs:** tmux, with `focus-events on`.
+
+## Program status (OSC 7501)
+
+**Off by default.** pi reports what it is doing to the terminal through the
+[Program Status Protocol](https://mitchellh.com/writing/program-status-osc7501)
+(`working`, `blocked`, `done`, …), but only to a terminal that answered its
+query, and tmux answers none: it drops an OSC it does not know, so a pane's pi
+never reports anything.
+
+With this setting on, the same states are written to stdout wrapped in tmux's
+DCS passthrough (`ESC P tmux; … ESC \`), which tmux unwraps and the outer
+terminal draws — the window tab shows what the pi in it is doing.
+
+```jsonc
+// ~/.pi/agent/boehsline.json
+"tmux-attention": { "programStatus": true }
+```
+
+Checked against tmux 3.8: a pane's raw report never reaches the client (with `allow-passthrough` off or `all`), and the wrapped one arrives as the OSC pi wrote.
+
+It needs tmux's `allow-passthrough` (`on`, the active pane only, or `all`);
+without it nothing is written at all, and the probe is one `tmux show-options` at
+session start. It also stays quiet when pi reports for itself
+(`PI_PROGRAM_STATUS` is set), so no state goes out twice, and it writes `clear`
+on exit.
+
+One `ActivityTracker` (`lib/program-status.ts`) feeds both this and the window
+flag, so the window and the terminal never disagree: a dialog that blocks is
+`blocked` in the terminal and `@special_activity` on the window, and closing it
+clears both.
