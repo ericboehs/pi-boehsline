@@ -36,6 +36,7 @@ import { Type } from "typebox";
 // registry path, validator and schedule wording for the Scheduled group.
 import { describeSchedule, taskLabel, TASK_LABEL_MAX } from "../../packages/scheduler/extensions/lib/schedule-core.ts";
 import { isClaimStale, isDurableTask, registryPath } from "../../packages/scheduler/extensions/lib/task-registry.ts";
+import { ActivityTracker } from "../../lib/program-status.ts";
 
 export const PORT = Number(process.env.PI_CANVAS_PORT || 8790);
 export const STATUS_MODEL = process.env.PI_CANVAS_MODEL || "github-copilot/claude-haiku-5.5";
@@ -1052,81 +1053,10 @@ export function upsertSection(list: Section[], sec: Section): Section[] {
 
 /** Display 1 from `wrangle displays`, as AppleScript bounds for its left half. */
 // ── activity: pi's own program states (OSC 7501), mirrored for the page ─────
+// The tracker is shared with tmux-attention's passthrough (lib/program-status.ts),
+// so the page, tmux and the terminal all agree. Re-exported for tests.
 
-export type ActivityState = "working" | "blocked" | "done" | "error" | "idle";
-export type Activity = { state: ActivityState; message?: string };
-
-const firstLine = (text: unknown) => String(text ?? "").split("\n").map((l) => l.trim()).find(Boolean)?.slice(0, 200) || "";
-
-/**
- * Follows the same events and rules as pi 1.1.0's ProgramStatusReporter, so
- * the page agrees with the terminal: `working` during a run or compaction,
- * `blocked` while a dialog waits, then `done`, `error` or `idle` once the run
- * settles. Messages are dialog titles and first error lines only, never
- * prompts or model output.
- */
-export class ActivityTracker {
-  private runActive = false;
-  private compacting = false;
-  private runResult: Activity = { state: "done" };
-  private resting: Activity = { state: "idle" };
-  private readonly dialogs: { kind: string; title: string }[] = [];
-
-  handle(event: { type: string; [k: string]: any }): void {
-    switch (event.type) {
-      case "agent_start":
-        this.runActive = true;
-        this.compacting = false;
-        this.runResult = { state: "done" };
-        break;
-      case "message_end": {
-        // The latest response decides, so a retried error gives way to its retry.
-        const m = event.message;
-        if (m?.role !== "assistant") return;
-        this.runResult = m.stopReason === "error" ? { state: "error", message: firstLine(m.errorMessage) } : { state: "done" };
-        break;
-      }
-      case "session_before_compact":
-        this.compacting = true;
-        break;
-      case "session_compact":
-        this.compacting = false;
-        if (!this.runActive && event.reason === "manual") this.resting = { state: "done" };
-        break;
-      case "session_compact_failed":
-        this.compacting = false;
-        if (this.runActive) {
-          if (event.aborted) this.runResult = { state: "idle" };
-          else if (event.errorMessage) this.runResult = { state: "error", message: firstLine(event.errorMessage) };
-        } else if (event.aborted) this.resting = { state: "idle" };
-        else if (event.reason === "manual") this.resting = { state: "error", message: firstLine(event.errorMessage) };
-        break;
-      case "agent_settled":
-        this.runActive = false;
-        this.compacting = false;
-        this.resting = event.aborted ? { state: "idle" } : this.runResult;
-        break;
-      case "ui_prompt_start":
-        this.dialogs.push({ kind: String(event.kind || ""), title: firstLine(event.title) });
-        break;
-      case "ui_prompt_end": {
-        const title = firstLine(event.title);
-        let i = this.dialogs.findLastIndex((d) => d.kind === String(event.kind || "") && d.title === title);
-        if (i < 0) i = this.dialogs.length - 1;
-        if (i >= 0) this.dialogs.splice(i, 1);
-        break;
-      }
-    }
-  }
-
-  current(): Activity {
-    const dialog = this.dialogs.at(-1);
-    if (dialog) return { state: "blocked", ...(dialog.title ? { message: dialog.title } : {}) };
-    if (this.compacting) return { state: "working", message: "Compacting context" };
-    if (this.runActive) return { state: "working" };
-    return this.resting;
-  }
-}
+export { ActivityTracker, type Activity, type ActivityState } from "../../lib/program-status.ts";
 
 export function leftHalfBounds(displays: string, index = 1): [number, number, number, number] | undefined {
   for (const line of displays.split("\n")) {
