@@ -243,8 +243,10 @@ interface Conn {
 	 * is the first guard; this one holds even if Botsun loses it). In memory only, never a file. */
 	said?: Map<string, string>;
 	/** The message ids in `said` whose delivery is still on its way (a video hashing or its frames
-	 * being pulled): never evicted, or the phone's retry would be delivered a second time. */
-	saidPending?: Set<string>;
+	 * being pulled), each with the promise that settles when it is done: never evicted (or the
+	 * phone's retry would be delivered a second time), and a retry of the same message waits for it
+	 * rather than hearing "duplicate" for a message that may still fail. */
+	saidPending?: Map<string, Promise<void>>;
 	/** What the host says it takes (its features line: model_pages for a paged catalogue), and so what
 	 * this session may send it. Undefined until that line arrives: until then, only what an older host takes. */
 	hostFeatures?: Set<string>;
@@ -389,7 +391,9 @@ export function uploadsOf(raw: unknown): Upload[] | string {
  *
  * Hands back the real directory it checked (`dir`), or undefined when there is nothing to check: the
  * open then names the file by its basename in that directory, so no path part can be swapped after
- * the check. A string is the sentence saying why not.
+ * the check. (O_NOFOLLOW in that open guards the file itself; the directory is one this check
+ * realpath'd, and a swap of it would need write access this user's own state dir doesn't give
+ * another account.) A string is the sentence saying why not.
  */
 export function checkUploads(uploads: Upload[]): { dir: string } | string | undefined {
 	if (!uploads.length) return undefined;
@@ -454,7 +458,7 @@ export async function takeUploads(uploads: Upload[], checkedDir?: string): Promi
 	if (!uploads.length) return [];
 	const dir = join(inboxDir(), String(process.pid));
 	const saved: Saved[] = [];
-	const drop = () => { for (const s of saved) { try { unlinkSync(s.path); } catch {} } };
+	const drop = () => dropTaken(saved);
 	try {
 		mkdirSync(dir, { recursive: true, mode: 0o700 });
 		chmodSync(dir, 0o700);
@@ -476,6 +480,11 @@ export async function takeUploads(uploads: Upload[], checkedDir?: string): Promi
 		drop();
 		return `couldn't take the video: ${(e as NodeJS.ErrnoException).code ?? "error"}`;
 	}
+}
+
+/** Removes inbox copies a failed say took: a retry mustn't leave another copy (up to 512 MB each) behind. */
+export function dropTaken(saved: Saved[]): void {
+	for (const s of saved) { try { unlinkSync(s.path); } catch {} }
 }
 
 /** A copy's sha256, or why it won't copy. The source is opened without following a link and must
@@ -504,7 +513,14 @@ async function copyUpload(u: Upload, path: string, dir?: string): Promise<string
 				const { bytesRead } = await src.read(buf, 0, Math.min(buf.length, left), null);
 				if (bytesRead === 0) break;
 				hash.update(buf.subarray(0, bytesRead));
-				await dst.write(buf, 0, bytesRead);
+				// write may take less than the whole chunk (a signal, a full pipe): keep going until it
+				// is all there, or the copy would differ from the bytes hashed.
+				let off = 0;
+				while (off < bytesRead) {
+					const { bytesWritten } = await dst.write(buf, off, bytesRead - off);
+					if (bytesWritten <= 0) throw new Error("the copy couldn't be written");
+					off += bytesWritten;
+				}
 				left -= bytesRead;
 			}
 			return hash.digest("hex");
@@ -937,79 +953,110 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	const denied = verifyDevice(c, r, { decision: say.decision, digest: () => say.digest,
 		v2: { kind: "session", decision: say.decision, payload: () => say.payload } });
 	if (denied) return { error: denied };
-	// The uploads' disk checks come after the signature: their answers would tell an unsigned caller
-	// whether a file is there and how big it is.
-	const checked = checkUploads(uploads);
-	if (typeof checked === "string") return { error: checked };
 	// The same message again (its first answer was lost on the way to the phone): it went in once.
 	// Only the same id with the same message is a repeat: an id reused for other words (an app bug)
-	// is delivered, never dropped.
+	// is delivered, never dropped. This goes before the uploads' disk checks: a retry of a message
+	// already delivered is a duplicate even when Botsun has removed its `.part`.
 	const said = clientId ? saidKey(c, r, clientId) : undefined;
 	const digest = said ? say.digest : "";
-	if (said) {
-		if (saidBefore(c, said, digest)) return { ok: true, delivered: "duplicate" };
+	// The uploads' disk checks come after the signature (their answers would tell an unsigned caller
+	// whether a file is there and how big it is; checkUploads).
+	const deliver = (): Record<string, unknown> | Promise<Record<string, unknown>> => {
+		if (said) {
+			if (saidBefore(c, said, digest)) return { ok: true, delivered: "duplicate" };
+		}
+		const checked = checkUploads(uploads);
+		if (typeof checked === "string") return { error: checked };
 		// In progress from here, not from the reply: a long video hashes for a second or two, and a
 		// retry with a fresh nonce mustn't be delivered a second time while it does.
-		saidNow(c, said, digest);
-	}
-	// Long videos: copied into the inbox and hashed again here before anything goes in (a second or
-	// two for 500 MB; Botsun waits up to 30 s), so the reply says whether this session has them.
-	if (uploads.length) return deliverUploads(c, text, images, files, uploads, checked?.dir, clientId, said, digest);
-	let outcome: Record<string, unknown> | Promise<Record<string, unknown>>;
-	try {
-		outcome = deliverSay(c, text, images, files, { clientId });
-	} catch (e) {
-		// A delivery that threw didn't go in: forget the id, so the phone's next try is delivered.
-		saidForget(c, said, digest);
-		throw e;
-	}
-	if (!(outcome instanceof Promise)) return saidDone(c, said, digest, outcome);
-	return outcome.then((reply) => saidDone(c, said, digest, reply), (e) => {
-		saidForget(c, said, digest);
-		throw e;
-	});
+		if (said) saidNow(c, said, digest);
+		// Long videos: copied into the inbox and hashed again here before anything goes in (a second or
+		// two for 500 MB; Botsun waits up to 30 s), so the reply says whether this session has them.
+		if (uploads.length) return deliverUploads(c, text, images, files, uploads, checked?.dir, clientId, said, digest);
+		let outcome: Record<string, unknown> | Promise<Record<string, unknown>>;
+		const before = c.framing;
+		try {
+			// A queued say's frames are injected from a promise of their own: a throw there never reaches
+			// this reply, so it forgets the id through onFail.
+			outcome = deliverSay(c, text, images, files, { clientId, onFail: () => saidForget(c, said, digest) });
+		} catch (e) {
+			// A delivery that threw didn't go in: forget the id, so the phone's next try is delivered.
+			saidForget(c, said, digest);
+			throw e;
+		}
+		// Frames still coming (a small video, or words queued behind one): the id stays on its way until
+		// they are in, so a retry waits for them instead of hearing "duplicate" for a message that may
+		// still fail.
+		if (said && c.framing && c.framing !== before) saidOnItsWay(c, said, digest, c.framing);
+		if (!(outcome instanceof Promise)) return saidDone(c, said, digest, outcome);
+		return outcome.then((reply) => saidDone(c, said, digest, reply), (e) => {
+			saidForget(c, said, digest);
+			throw e;
+		});
+	};
+	// The same message is on its way right now (a big video hashing, its frames being pulled): wait
+	// for that delivery rather than answering "duplicate" now. If it fails, its id is forgotten by
+	// then and this try goes in; answering "duplicate" would lose the phone's only copy.
+	const onItsWay = said && c.said?.get(said) === digest ? c.saidPending?.get(said) : undefined;
+	return onItsWay ? onItsWay.then(deliver) : deliver();
 }
 
-/** A verified say with long videos: the take as one job on the framing queue, so a text say sent
- * while the video is hashed (or its frames extracted) can't overtake it. The reply goes once the
- * take is done (the socket and Botsun don't wait for ffmpeg); the queue is held until the frames
- * are in. */
+/** A verified say with long videos: the take starts at once (hashing Botsun's own file needs nothing
+ * from the queue), and the reply goes once the take is done. Only the inject waits for the framing
+ * queue, so an earlier video's ffmpeg (up to FRAMES_TIMEOUT_MS) can't hold this reply past the owner
+ * socket's idle timeout. The queue is held from the moment the take starts, so a text say sent while
+ * the video is hashed can't overtake it, and the id stays on its way until the frames are in. */
 async function deliverUploads(c: Conn, text: string, images: Image[], files: File[], uploads: Upload[], dir: string | undefined,
 	clientId: string | undefined, said: string | undefined, digest: string): Promise<Record<string, unknown>> {
-	let frames: Promise<void> | undefined;
-	const job = (c.framing ?? Promise.resolve()).then(async (): Promise<Record<string, unknown>> => {
-		const taken = await takeUploads(uploads, dir);
-		if (typeof taken === "string") return { error: taken };
-		// inOrder: the queue is this job, so deliverSay injects now rather than chaining again, and
-		// hands the frames' own promise back on the reply (below the phone never sees it).
-		const reply = await deliverSay(c, text, images, files, { clientId, uploads: taken, inOrder: true });
-		frames = (reply as Record<symbol, unknown>)[FRAMES] as Promise<void> | undefined;
-		return reply;
-	});
-	// The reply goes now; the queue and the id stay held until the frames are in. A failure there
-	// means nothing went in: the id is forgotten, and the phone's next try is delivered.
-	const mark: Promise<void> = job.then(async (reply) => {
-		let wentIn = !("error" in reply);
-		if (frames) {
-			try {
-				await frames;
-			} catch (e) {
-				wentIn = false;
-				debug(`owner say with a video: ${(e as Error).message}`);
-			}
-		}
-		if (!wentIn) saidForget(c, said, digest);
-		else if (said) c.saidPending?.delete(said);
-	}, () => {}).finally(() => { if (c.framing === mark) c.framing = undefined; });
-	c.framing = mark;
-	let reply: Record<string, unknown>;
+	const prev = c.framing ?? Promise.resolve();
+	// The queue from now on: a say sent during the take chains behind this, which opens once the
+	// video's frames are in.
+	let open!: () => void;
+	const held = new Promise<void>((r) => { open = r; });
+	const queue: Promise<void> = prev.catch(() => {}).then(() => held);
+	c.framing = queue;
+	const letGo = () => { open(); if (c.framing === queue) c.framing = undefined; };
+	let taken: Saved[] | string;
 	try {
-		reply = await job;
+		taken = await takeUploads(uploads, dir);
 	} catch (e) {
+		letGo();
 		saidForget(c, said, digest);
 		throw e;
 	}
-	// A take that failed forgets its id before the reply goes, so a retry isn't answered "duplicate".
+	if (typeof taken === "string") {
+		// Nothing went in: the id is forgotten before the reply, so a retry isn't answered "duplicate".
+		letGo();
+		return saidDone(c, said, digest, { error: taken });
+	}
+	// inOrder: this reply's frames are chained here (behind the earlier ones, not behind the take),
+	// and handed back on the reply rather than on c.framing (below the phone never sees them).
+	let reply: Record<string, unknown>;
+	try {
+		reply = deliverSay(c, text, images, files, { clientId, uploads: taken, inOrder: true, after: prev }) as Record<string, unknown>;
+	} catch (e) {
+		// pi refused the message as it went in (a video's frames are the only other way to throw, and
+		// that is below): nothing went in, so the copies go, the id is forgotten, and the queue this
+		// take holds opens rather than leaving every later say waiting behind it.
+		letGo();
+		dropTaken(taken);
+		saidForget(c, said, digest);
+		throw e;
+	}
+	const frames = (reply as Record<symbol, unknown>)[FRAMES] as Promise<void> | undefined;
+	let wentIn = !("error" in reply);
+	const mark: Promise<void> = (frames ?? Promise.resolve()).catch((e) => {
+		wentIn = false;
+		debug(`owner say with a video: ${(e as Error).message}`);
+	}).then(() => {
+		if (wentIn) return;
+		// Nothing went in: the id is forgotten (so the phone's next try is delivered) and the copies
+		// taken are removed (a retry mustn't leave another 512 MB behind).
+		saidForget(c, said, digest);
+		dropTaken(taken);
+	}).finally(letGo);
+	if (c.framing === queue) c.framing = mark;
+	if (said) saidOnItsWay(c, said, digest, mark);
 	return "error" in reply ? saidDone(c, said, digest, reply) : reply;
 }
 
@@ -1027,8 +1074,7 @@ function saidNow(c: Conn, key: string, digest: string): void {
 	const said = (c.said ??= new Map());
 	said.delete(key); // the newest use is the last one out
 	said.set(key, digest);
-	const pending = (c.saidPending ??= new Set());
-	pending.add(key);
+	const pending = (c.saidPending ??= new Map());
 	// Evict the oldest that has settled. An id still on its way (a big video hashing) keeps its
 	// place: evicting it would let the phone's retry be delivered a second time.
 	for (const old of said.keys()) {
@@ -1036,6 +1082,20 @@ function saidNow(c: Conn, key: string, digest: string): void {
 		if (old === key || pending.has(old)) continue;
 		said.delete(old);
 	}
+}
+
+/** Holds a message id on its way until `job` settles (a video hashing, its frames being pulled, a
+ * say queued behind one): a retry of the same message waits for it instead of hearing "duplicate"
+ * for a delivery that may still fail and forget the id. The entry goes when the job does, and only
+ * if it is still this job's (a newer use of the id has its own). */
+export function saidOnItsWay(c: Pick<Conn, "said" | "saidPending">, key: string, digest: string, job: Promise<unknown>): void {
+	const pending = (c.saidPending ??= new Map());
+	const settled = job.then(() => {}, () => {});
+	pending.set(key, settled);
+	void settled.then(() => {
+		if (pending.get(key) !== settled) return;
+		if (c.said?.get(key) === digest) pending.delete(key);
+	});
 }
 
 /** Forgets a message id whose delivery failed, so the phone's next try of the same message is
@@ -1051,7 +1111,6 @@ function saidForget(c: Conn, key: string | undefined, digest: string): void {
  * it, so the phone's next try of the same message is delivered. */
 function saidDone(c: Conn, key: string | undefined, digest: string, reply: Record<string, unknown>): Record<string, unknown> {
 	if ("error" in reply) saidForget(c, key, digest);
-	else if (key) c.saidPending?.delete(key);
 	return reply;
 }
 
@@ -1401,13 +1460,19 @@ export const LOCKED_COMMAND = /^[\s\p{Cf}]*[\/!]/u; // spaces and invisible form
  * so the phone never sees it), and deliverUploads holds the framing queue until they are in. */
 const FRAMES = Symbol("frames");
 
-function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts: { noCommands?: boolean; clientId?: string; uploads?: Saved[]; inOrder?: boolean } = {}): Record<string, unknown> | Promise<Record<string, unknown>> {
+function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts: { noCommands?: boolean; clientId?: string; uploads?: Saved[]; inOrder?: boolean; after?: Promise<void>; onFail?: () => void } = {}): Record<string, unknown> | Promise<Record<string, unknown>> {
+	// The copies this call made itself (opts.uploads are its caller's: deliverUploads drops those).
+	let mine: Saved[] = [];
 	let saved: Saved[];
 	try {
-		saved = [...saveFiles(files), ...(opts.uploads ?? [])];
+		mine = saveFiles(files);
+		saved = [...mine, ...(opts.uploads ?? [])];
 	} catch (e) {
+		dropTaken(mine);
 		return { error: `couldn't save the file: ${(e as NodeJS.ErrnoException).code ?? "error"}` };
 	}
+	// A delivery that didn't go in leaves its copies behind for nothing: they go with it.
+	const dropMine = () => dropTaken(mine);
 	const attached = images.length + files.length + (opts.uploads?.length ?? 0);
 	const compose = (notes: string[], frames: UserContent[]): string | UserContent[] => {
 		const said = [text, ...notes].filter((t) => t.trim()).join("\n\n");
@@ -1417,7 +1482,7 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 	const notes = saved.map((s) => s.note);
 	if (!opts.noCommands && !images.length && !notes.length && c.command) {
 		const outcome = c.command(text, c.busy);
-		if (typeof outcome === "string") return { error: outcome };
+		if (typeof outcome === "string") { dropMine(); return { error: outcome }; }
 		if (outcome === null) {
 			debug("owner say ran a slash command");
 			return { ok: true, delivered: "command" };
@@ -1427,8 +1492,10 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 	const delivered = c.pendingCompact?.() ? "held" : c.busy ? "steer" : "prompt";
 	if (saved.some((s) => s.video) || (!opts.inOrder && c.framing)) {
 		// Frames take ffmpeg a few seconds: reply now (the socket and Botsun don't wait), deliver when
-		// they're ready, and queue later replies behind it so they keep their order.
-		const frames: Promise<void> = (opts.inOrder ? Promise.resolve() : (c.framing ?? Promise.resolve()))
+		// they're ready, and queue later replies behind it so they keep their order. `after` is the
+		// queue an inOrder reply's frames wait for (its caller owns c.framing).
+		const queue = opts.after ?? (opts.inOrder ? Promise.resolve() : (c.framing ?? Promise.resolve()));
+		const frames: Promise<void> = queue
 			.then(() => withFrames(saved, runFile))
 			.then(({ notes, frames }) => {
 				c.inject(compose(notes, frames), c.busy, { id: opts.clientId, text, withdrawable: false, attachments: attached });
@@ -1437,12 +1504,21 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 			// This job is the framing queue (deliverUploads' take), so nothing is chained here: hand the
 			// frames' promise back on the reply. The reply itself goes now (Botsun doesn't wait for
 			// ffmpeg); the take holds its queue until the frames are in, so nothing overtakes them.
+			// The caller drops the uploads it took; the files saved here are this call's own.
+			void frames.catch(() => dropMine());
 			const awaiting: Record<string, unknown> = { ok: true, delivered };
 			(awaiting as Record<symbol, unknown>)[FRAMES] = frames;
 			return awaiting;
 		}
 		const job: Promise<void> = frames
-			.catch((e) => debug(`owner say with a video: ${(e as Error).message}`))
+			.catch((e) => {
+				debug(`owner say with a video: ${(e as Error).message}`);
+				// A throw in the frames (ffmpeg, or pi refusing the message) means nothing went in: the
+				// copies go, and the caller forgets the message id, so the phone's next try is delivered,
+				// not "duplicate".
+				dropMine();
+				opts.onFail?.();
+			})
 			.finally(() => { if (c.framing === job) c.framing = undefined; });
 		c.framing = job;
 		debug(`owner say accepted (${text.length} chars, ${images.length} photos, ${files.length} files, frames pending)`);
@@ -1450,7 +1526,14 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 	}
 	// Words alone can be taken back from the phone while they wait for the turn's end; a message with
 	// photos or files can't (yet): the reply that brings a steer back has no room for them.
-	const kept = c.inject(compose(notes, []), c.busy, { id: opts.clientId, text, withdrawable: !attached, attachments: attached });
+	let kept: ReturnType<Conn["inject"]>;
+	try {
+		kept = c.inject(compose(notes, []), c.busy, { id: opts.clientId, text, withdrawable: !attached, attachments: attached });
+	} catch (e) {
+		// pi refused it: nothing went in, so the copies this reply made go with it.
+		dropMine();
+		throw e;
+	}
 	debug(`owner say accepted (${text.length} chars, ${images.length} photos, ${files.length} files)`); // never the text
 	// The inject knows what happened just now (`delivered` was guessed before it): a compaction it
 	// held them for, or a send pi refused, and the phone hears "held" rather than a prompt it lost.
@@ -2335,6 +2418,22 @@ function reloadOrRestart(c: Conn, r: Record<string, unknown>, what: "reload" | "
 	return { ok: true, [AFTER_REPLY]: acting.run };
 }
 
+/** How long the owner socket waits for a reply (a say with files takes a moment to save). */
+const OWNER_IDLE_MS = 5_000;
+/** A say carrying a long video hashes (and copies) it before the reply, and a retry of one may wait
+ * for a delivery whose frames are still being pulled: Botsun waits up to 30 s for such a say, so the
+ * socket's idle timeout is longer for one (idleTimeoutOf). */
+const SAY_UPLOADS_TIMEOUT_MS = 35_000;
+
+/** How long the owner socket waits for this request's reply. A say with a long video (or a message
+ * id, whose retry may wait for a delivery that is still going) is hashed here first, and Botsun
+ * waits up to 30 s for one, so the 5 s that fit anything else would drop the connection first. */
+export function idleTimeoutOf(req: unknown): number {
+	const say = req && typeof req === "object" ? req as Record<string, unknown> : undefined;
+	const long = say?.type === "say" && ((Array.isArray(say.uploads) && say.uploads.length > 0) || typeof say.client_id === "string");
+	return long ? SAY_UPLOADS_TIMEOUT_MS : OWNER_IDLE_MS;
+}
+
 function listenOwner(c: Conn): void {
 	if (c.server || c.closed) return;
 	const path = ownerSock();
@@ -2347,7 +2446,10 @@ function listenOwner(c: Conn): void {
 		return;
 	}
 	const server = createServer((sock) => {
-		sock.setTimeout(5_000, () => sock.destroy());
+		// One idle timeout for every request; a long-video say sets a longer one on its own socket
+		// (idleTimeoutOf), so no second handler is ever registered for it.
+		sock.setTimeout(OWNER_IDLE_MS);
+		sock.on("timeout", () => sock.destroy());
 		const chunks: Buffer[] = [];
 		let size = 0;
 		let done = false;
@@ -2361,8 +2463,17 @@ function listenOwner(c: Conn): void {
 			const all = Buffer.concat(chunks);
 			const line = all.subarray(0, all.indexOf(10)).toString("utf8");
 			let reply: Record<string, unknown> | Promise<Record<string, unknown>>;
+			let req: unknown;
 			try {
-				reply = handleOwnerRequest(c, JSON.parse(line));
+				req = JSON.parse(line);
+			} catch {
+				req = undefined;
+			}
+			// A say with a long video is hashed here before its reply (and a retry of it may wait for that
+			// delivery): Botsun waits up to 30 s, so the idle timeout is longer for one.
+			sock.setTimeout(idleTimeoutOf(req));
+			try {
+				reply = handleOwnerRequest(c, req);
 			} catch {
 				reply = { error: "bad request" };
 			}

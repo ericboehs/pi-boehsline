@@ -3789,6 +3789,31 @@ test("say_id: a video whose frames can't be delivered isn't recorded either", as
 	assert.equal(m.sent.length, 1, "delivered once");
 });
 
+test("say_id: a `files:` video whose frames can't be delivered isn't recorded either", async () => {
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	fakeFfmpeg();
+	const m = await owner();
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	// A short video sent as a file (not a long-video upload): its frames are injected from a promise
+	// of their own, so a throw there never reaches the reply.
+	const video = { name: "IMG_1234.mp4", data: fakeMp4().toString("base64") };
+	const videoSay = async () => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "say", text: "the clip", files: [video], client_id: SAID, nonce, device_id: 7, sig_v: 2,
+			signature: signV2(key, nonce, "session", "say_attach", botsunSayPayload("the clip", SAID, [], [video])) });
+	};
+	const inject = conn.inject;
+	conn.inject = () => { throw new Error("pi refused the message"); };
+	assert.deepEqual(await videoSay(), { ok: true, delivered: "prompt" }, "the reply doesn't wait for the frames");
+	await until(() => (conn.said?.size ?? 0) === 0, 10_000); // the failure forgot the id
+	conn.inject = inject;
+	assert.deepEqual(await videoSay(), { ok: true, delivered: "prompt" }, "the forgotten id lets the next try in");
+	await until(() => m.sent.length === 1, 10_000);
+	assert.equal(m.sent.length, 1, "delivered once");
+});
+
 // ---- Subagents (lib/children.ts): the session's children to Botsun, and the phone's stop ----
 
 const kids = await import("../lib/children.ts");
@@ -4584,33 +4609,152 @@ test("uploads: a name is capped at 200 bytes of UTF-8, not 200 characters", asyn
 	assert.equal(uploadsOf([u("a".repeat(201))]), "bad file name");
 });
 
-test("uploads: a retry while the video is still hashing is a duplicate, and words sent meanwhile wait behind it", async () => {
+test("uploads: a retry of a video whose frames are still coming waits for it, then is a duplicate", async () => {
 	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
 	const updir = join(home, "uploads-slow");
 	process.env.BOTSUN_UPLOADS_DIR = updir;
 	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
 	const key = phoneKey();
 	writeKeys({ 7: key.raw.toString("base64") });
+	const marker = join(home, "ffmpeg-started-slow");
+	const gate = join(home, "ffmpeg-gate-slow");
+	fakeFfmpeg({ marker, gate });
 	const m = await owner();
-	// 32 MB: copying and hashing it takes long enough for the retry and the next message to arrive
-	// while it is still going. No "ftyp", so no frames are wanted (there is no ffmpeg here).
-	const bytes = Buffer.alloc(32 * 1024 * 1024, 7);
-	const sha = createHash("sha256").update(bytes).digest("hex");
-	const up = { path: uploadFile(updir, bytes), name: "Recording.mp4", mime: "video/mp4", bytes: bytes.length, sha256: sha };
+	// The frames are held still, so the delivery is plainly still on its way when the retry arrives:
+	// no timing to depend on (a 32 MB hash can finish before a retry on a fast Mac).
+	const up = fakeUpload(updir, fakeMp4());
 	const clientId = "0b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
-
 	const first = ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up], clientId));
-	const retry = ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up], clientId));
-	const text = "after it";
-	const n3 = (await ask({ type: "nonce" })).nonce;
-	const words = ask({ type: "say", text, nonce: n3, device_id: 7, sig_v: 2, signature: signV2(key, n3, "session", "say", `botsun-propose-text-v1\n${text}`) });
+	assert.deepEqual(await first, { ok: true, delivered: "prompt" }, "the reply doesn't wait for ffmpeg");
+	await until(() => existsSync(marker), 10_000);
+	let answered = false;
+	const retry = ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up], clientId)).finally(() => { answered = true; });
+	await sleep(200);
+	assert.equal(answered, false, "the retry waits for the delivery, never a premature duplicate");
+	writeFileSync(gate, "go");
+	assert.deepEqual(await retry, { ok: true, delivered: "duplicate" }, "it went in: the retry is a duplicate");
+	assert.equal(m.sent.length, 1, "the video once");
+	assert.ok(sentText(m.sent[0]).startsWith("the video\n\n"), "and it went in");
+});
 
+test("uploads: a retry whose first delivery failed goes in, never lost as a duplicate", async () => {
+	const inbox = join(home, "inbox-retry-failed");
+	process.env.BOTSUN_OWNER_INBOX = inbox;
+	const updir = join(home, "uploads-retry-failed");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const marker = join(home, "ffmpeg-started-retry");
+	const gate = join(home, "ffmpeg-gate-retry");
+	fakeFfmpeg({ marker, gate });
+	const m = await owner();
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	// pi refuses the first video's frames; the second try goes in.
+	const inject = conn.inject;
+	let tries = 0;
+	conn.inject = (...args) => { if (++tries === 1) throw new Error("pi refused the message"); return inject(...args); };
+	cleanups.push(() => { conn.inject = inject; });
+	const up = fakeUpload(updir, fakeMp4());
+	const clientId = "1b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
+	const first = ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up], clientId));
 	assert.deepEqual(await first, { ok: true, delivered: "prompt" });
-	assert.deepEqual(await retry, { ok: true, delivered: "duplicate" }, "the id is in progress from before the take");
-	assert.deepEqual(await words, { ok: true, delivered: "prompt" });
-	assert.equal(m.sent.length, 2, "the video once, and the words after it");
-	assert.ok(String(m.sent[0].content).startsWith("the video\n\n📎 Attached: "), "the video first");
-	assert.equal(m.sent[1].content, text, "and the words behind it, never ahead");
+	await until(() => existsSync(marker), 10_000);
+	// A retry while that delivery is still on its way: it must wait for it, and go in when it fails.
+	const retry = ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up], clientId));
+	await sleep(100);
+	writeFileSync(gate, "go");
+	assert.deepEqual(await retry, { ok: true, delivered: "prompt" }, "the first delivery failed, so the retry went in");
+	await until(() => m.sent.length === 1, 10_000);
+	assert.equal(m.sent.length, 1, "delivered once");
+	// The failed take's inbox copy went with it: a retry doesn't leave another behind.
+	assert.equal(readdirSync(join(inbox, String(process.pid))).length, 1, "one copy, the one that went in");
+});
+
+test("uploads: a retry after Botsun removed its .part is a duplicate, not a missing file", async () => {
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
+	const updir = join(home, "uploads-gone");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	// No "ftyp": a file, not something to pull frames from (this test has no ffmpeg).
+	const up = fakeUpload(updir, Buffer.alloc(600, 3));
+	const clientId = "2b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
+	let { nonce } = await ask({ type: "nonce" });
+	assert.deepEqual(await ask(uploadSay(key, nonce, "mine", [up], clientId)), { ok: true, delivered: "prompt" });
+	// Botsun keeps its own file only until the say's ok, then cleans up.
+	rmSync(up.path);
+	({ nonce } = await ask({ type: "nonce" }));
+	assert.deepEqual(await ask(uploadSay(key, nonce, "mine", [up], clientId)), { ok: true, delivered: "duplicate" },
+		"the duplicate check comes before the disk check");
+	assert.equal(m.sent.length, 1, "delivered once");
+});
+
+test("uploads: a say pi throws on doesn't hold the framing queue, and leaves no copy behind", async () => {
+	const inbox = join(home, "inbox-thrown");
+	process.env.BOTSUN_OWNER_INBOX = inbox;
+	const updir = join(home, "uploads-thrown");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	// No "ftyp": not a video, so it is injected as the reply comes, not from a frames job.
+	const up = fakeUpload(updir, Buffer.alloc(600, 3));
+	const clientId = "3b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
+	const inject = conn.inject;
+	conn.inject = () => { throw new Error("pi refused the message"); };
+	cleanups.push(() => { conn.inject = inject; });
+	assert.deepEqual(await ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the clip", [up], clientId)),
+		{ error: "bad request" }, "a delivery that threw is answered as one");
+	assert.deepEqual(readdirSync(join(inbox, String(process.pid))), [], "the copy the take made went with it");
+	// The queue the take held must be open: words behind a queue that never opens never go in.
+	conn.inject = inject;
+	const text = "after it";
+	const nonce = (await ask({ type: "nonce" })).nonce;
+	assert.deepEqual(await ask({ type: "say", text, nonce, device_id: 7, sig_v: 2,
+		signature: signV2(key, nonce, "session", "say", `botsun-propose-text-v1\n${text}`) }), { ok: true, delivered: "prompt" });
+	await until(() => m.sent.some((x) => sentText(x) === text), 5_000);
+	assert.ok(m.sent.some((x) => sentText(x) === text), "the words after it went in");
+	// And the id was forgotten: the phone's next try of the clip is delivered, once.
+	const retry = uploadSay(key, (await ask({ type: "nonce" })).nonce, "the clip", [up], clientId);
+	assert.deepEqual(await ask(retry), { ok: true, delivered: "prompt" }, "the failed try left no id behind");
+	await until(() => m.sent.length === 2, 5_000);
+	assert.equal(m.sent.length, 2, "the words once, the clip once");
+});
+
+test("a say that may wait on a video gets a longer socket timeout than any other request", async () => {
+	// The owner socket's 5 s idle timeout would drop Botsun's connection while a long video is hashed
+	// (or a retry of one waits for its frames, up to 20 s of ffmpeg): such a say gets 35 s.
+	const { idleTimeoutOf } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	assert.equal(idleTimeoutOf({ type: "say", text: "hi" }), 5_000, "words alone go in at once");
+	assert.equal(idleTimeoutOf({ type: "say", text: "hi", uploads: [{ path: "/x" }] }), 35_000, "a long video is hashed first");
+	assert.equal(idleTimeoutOf({ type: "say", text: "hi", client_id: "ab" }), 35_000, "a retry of one waits for its frames");
+	assert.equal(idleTimeoutOf({ type: "say", text: "hi", uploads: [] }), 5_000, "nothing to take");
+	assert.equal(idleTimeoutOf({ type: "nonce" }), 5_000);
+	assert.equal(idleTimeoutOf(undefined), 5_000, "not even a request");
+});
+
+test("say_id: a settled delivery never unpins a newer message that reuses its id", async () => {
+	// A finished older message used to delete the id's pending entry whatever it now held, so a newer
+	// message reusing the id lost its "on its way" mark and a retry of it could be answered
+	// "duplicate" for a delivery that may still fail.
+	const { saidOnItsWay } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const c = { said: new Map(), saidPending: new Map() };
+	let finishOld;
+	saidOnItsWay(c, "sid-a:7:x", "old", new Promise((r) => { finishOld = r; }));
+	let finishNew;
+	saidOnItsWay(c, "sid-a:7:x", "new", new Promise((r) => { finishNew = r; }));
+	c.said.set("sid-a:7:x", "new");
+	finishOld();
+	await sleep(20);
+	assert.ok(c.saidPending.has("sid-a:7:x"), "the older delivery's end leaves the newer one's mark alone");
+	finishNew();
+	await sleep(20);
+	assert.equal(c.saidPending.has("sid-a:7:x"), false, "the newer one's own end clears it");
 });
 
 test("uploads: words sent while the video is still hashing wait behind its frames", async () => {
@@ -4673,11 +4817,13 @@ test("uploads: 64 other messages don't evict a video's id while it is still in p
 		assert.deepEqual(await ask({ type: "say", text, client_id: id, nonce, device_id: 7, sig_v: 2,
 			signature: signV2(key, nonce, "session", "say", botsunSayPayload(text, id)) }), { ok: true, delivered: "prompt" }, text);
 	}
-	// The video's id is still on its way, so the phone's retry is a duplicate, not a second take.
-	const retry = await ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up], videoId));
-	assert.deepEqual(retry, { ok: true, delivered: "duplicate" }, "an in-progress id is never evicted");
+	// The video's id is still on its way, so a retry of it waits for that delivery and is then a
+	// duplicate, not a second take.
+	const retry = ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [up], videoId));
+	await sleep(100);
 	writeFileSync(gate, "go");
 	assert.deepEqual(await video, { ok: true, delivered: "prompt" });
+	assert.deepEqual(await retry, { ok: true, delivered: "duplicate" }, "an in-progress id is never evicted");
 	await until(() => m.sent.length === 65, 10_000);
 	assert.equal(m.sent.filter((x) => sentText(x).startsWith("the video")).length, 1, "the video once");
 	assert.ok(sentText(m.sent[0]).startsWith("the video\n\n"), "and first, ahead of the 64 behind it");
