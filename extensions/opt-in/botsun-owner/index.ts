@@ -166,7 +166,7 @@ interface Conn {
 	/** Whether words sent now would wait for a compaction pi hasn't finished: deliverSay says "held". */
 	pendingCompact?: () => boolean;
 	/** Runs a slash command from the phone: undefined = not one (send as text), null = ran, string = why not. */
-	command?: (text: string, busy: boolean) => string | null | undefined;
+	command?: (text: string, busy: boolean) => PhoneCommandRun;
 	/** Stop one of this session's bg jobs (stopBgJob over this pi's events); the phone's Stop on a job row. */
 	stopJob?: (id: string) => StopJobResult;
 	/** The commands the phone can run here, for its "/" list; read lazily. */
@@ -1486,6 +1486,11 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 		if (outcome === null) {
 			debug("owner say ran a slash command");
 			return { ok: true, delivered: "command" };
+		}
+		if (outcome !== undefined) {
+			// Busy: pi took it as typed mid-turn (a steer), or it waits here for the settle (/compact).
+			debug(`owner say had a slash command ${outcome.delivered}`);
+			return { ok: true, delivered: outcome.delivered };
 		}
 	}
 	// Words a compaction holds are "held": pi would refuse them as a prompt (2026-11-10).
@@ -2939,9 +2944,10 @@ export function findModel<M extends ModelLike>(models: M[], query: string): M | 
 }
 
 /**
- * Slash commands from the phone. Extension commands, prompt templates and skills run as typed;
+ * Slash commands from the phone. Extension commands, prompt templates and skills run as typed (and
+ * mid-turn too: pi runs a command's handler at once, queues a template or skill as a steer);
  * of pi's built-ins, /compact, /model, /thinking and /name are rebuilt on the extension API, and
- * the rest (pickers, /reload, /new…) need the keyboard.
+ * the rest (pickers, /reload, /new…) need the keyboard. A /compact mid-turn waits for the settle.
  */
 export interface PhoneCommand {
 	name: string;
@@ -2966,13 +2972,30 @@ export function phoneCommands(pi: Pick<ExtensionAPI, "getCommands">): PhoneComma
 	return [...PHONE_BUILTINS, ...rest].slice(0, 300);
 }
 
-function runCommand(pi: ExtensionAPI, ctx: ExtensionContext, text: string, busy: boolean): string | null | undefined {
+/**
+ * What a phone slash command did: `null` ran it now, a string is why it didn't, `undefined` isn't a
+ * command (it goes in as text), and `{delivered}` says how it went in when the turn was busy: as a
+ * steer, exactly as typing it mid-turn does, or waiting for the settle (a /compact).
+ */
+export type PhoneCommandRun = string | null | undefined | { delivered: "steer" | "queued" };
+
+/**
+ * A /compact the phone sent while pi was busy: it waits for the run's end (agent_settled), where it
+ * runs as typed after the turn would have. One at a time: a later one replaces it.
+ */
+let queuedCompact: { customInstructions?: string } | null = null;
+
+function runCommand(pi: ExtensionAPI, ctx: ExtensionContext, text: string, busy: boolean): PhoneCommandRun {
 	const cmd = slashCommand(text);
 	if (!cmd) return undefined;
 	const { name, args } = cmd;
-	const wait = `wait for the turn to finish before /${name}`;
 	if (name === "compact") {
-		if (busy) return wait;
+		if (busy) {
+			// pi refuses a prompt (and so a compaction) mid-turn, as it refuses the keyboard's Enter:
+			// the words wait for the settle, where the run's own end is.
+			queuedCompact = { ...(args ? { customInstructions: args } : {}) };
+			return { delivered: "queued" };
+		}
 		ctx.compact({
 			...(args ? { customInstructions: args } : {}),
 			onError: (e) => ctx.ui.notify(`Compaction from the phone failed: ${e.message}`, "error"),
@@ -3013,9 +3036,10 @@ function runCommand(pi: ExtensionAPI, ctx: ExtensionContext, text: string, busy:
 	}
 	if (BUILTINS.has(name)) return `/${name} only works at the keyboard`;
 	if (pi.getCommands().some((c) => c.name === name)) {
-		if (busy) return wait;
-		sendUser(pi, text.trim(), { expandPromptTemplates: true });
-		return null;
+		// As typed: pi runs an extension command's handler at once, even mid-turn, and queues a skill
+		// or template as a steer (the turn's next boundary reads it). Idle, it is a plain prompt.
+		sendUser(pi, text.trim(), { expandPromptTemplates: true, ...(busy ? { deliverAs: "steer" as const } : {}) });
+		return busy ? { delivered: "steer" } : null;
 	}
 	return undefined; // not a command pi knows: plain text, as typing it would send
 }
@@ -3758,7 +3782,8 @@ function main(pi: ExtensionAPI): void {
 		// for Eric there: none is the phone's to take back now.
 		queuedSteers = [];
 		settleSteers((event as { aborted?: boolean } | undefined)?.aborted === true);
-		if (afterStop.length) {
+		const released = afterStop.length > 0;
+		if (released) {
 			// As if typed after Esc; through the hold guard, so a compaction starting now waits with them.
 			const text = afterStop.join("\n\n");
 			afterStop = [];
@@ -3767,13 +3792,31 @@ function main(pi: ExtensionAPI): void {
 				else sendOrHold(ctx, text);
 			} catch {}
 		}
-		if (!conn || conn.closed || !conn.busy) return;
-		conn.busy = false;
-		conn.quietSent = undefined;
-		// The run's done signal, with settle_ms: how long the settle handlers ahead of this one held it.
-		writeIdle(conn);
-		reportContext();
+		if (conn && !conn.closed && conn.busy) {
+			conn.busy = false;
+			conn.quietSent = undefined;
+			// The run's done signal, with settle_ms: how long the settle handlers ahead of this one held it.
+			writeIdle(conn);
+			reportContext();
+		}
+		// A /compact the phone sent during the run waited for this end, as typed after the turn would be.
+		runQueuedCompact(ctx, released);
 	});
+
+	/**
+	 * The phone's /compact while pi was busy, run once the run settled. Left waiting when a stop just
+	 * released words into a run of their own (it would abort that): it runs at that run's settle.
+	 */
+	const runQueuedCompact = (ctx: ExtensionContext, released: boolean): void => {
+		if (!queuedCompact || released) return;
+		const waiting = queuedCompact;
+		queuedCompact = null;
+		if (!conn || conn.closed) return;
+		ctx.compact({
+			...waiting,
+			onError: (e) => ctx.ui.notify(`Compaction from the phone failed: ${e.message}`, "error"),
+		});
+	};
 
 	// Context use for the phone's info sheet: after each run, and after a compaction.
 	const reportContext = () => {
@@ -3969,6 +4012,7 @@ function main(pi: ExtensionAPI): void {
 		// Stop it, and the words it waited for go back to the phone rather than dying here.
 		stopRelease();
 		dropHeld("stopped");
+		queuedCompact = null; // the phone's /compact waited for a run that won't settle here
 		const c = conn;
 		conn = undefined;
 		if (!c || c.closed) return;

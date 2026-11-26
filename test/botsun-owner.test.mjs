@@ -1292,8 +1292,64 @@ test("slash commands from the phone run instead of reaching the model", async ()
 	assert.deepEqual(await say("/whatever"), { ok: true, delivered: "prompt" }, "unknown commands go in as typed");
 
 	await m.fire("agent_start", {});
-	assert.equal((await say("/compact")).error, "wait for the turn to finish before /compact");
-	assert.equal((await say("/review")).error, "wait for the turn to finish before /review");
+	// Busy: as typed mid-turn. pi runs an extension command's handler at once, and a template or skill
+	// is queued as a steer (deliverAs), so none of them is refused any more.
+	assert.deepEqual(await say("/compact"), { ok: true, delivered: "queued" }, "waits for the settle");
+	assert.deepEqual(await say("/review"), { ok: true, delivered: "steer" });
+	assert.deepEqual(m.sent.at(-1), { content: "/review", options: { expandPromptTemplates: true, deliverAs: "steer" } });
+	// And /model, /thinking and /name still run now, mid-turn as before.
+	assert.deepEqual(await say("/thinking high"), { ok: true, delivered: "command" });
+	assert.deepEqual(await say("/model haiku"), { ok: true, delivered: "command" });
+	assert.equal((await say("/reload")).error, "/reload only works at the keyboard", "built-ins that need the keyboard stay refused");
+});
+
+test("a template or a skill from the phone while pi is busy goes in as a steer too", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const m = await mount();
+	m.pi.getCommands = () => [{ name: "deploy", source: "prompt" }, { name: "skill:lint", source: "skill" }];
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)));
+	const say = async (text) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) });
+	};
+	// Idle: a plain prompt, as before.
+	assert.deepEqual(await say("/deploy staging"), { ok: true, delivered: "command" });
+	assert.deepEqual(m.sent.at(-1), { content: "/deploy staging", options: { expandPromptTemplates: true } });
+	await m.fire("agent_start", {});
+	assert.deepEqual(await say("/deploy production"), { ok: true, delivered: "steer" });
+	assert.deepEqual(m.sent.at(-1), { content: "/deploy production", options: { expandPromptTemplates: true, deliverAs: "steer" } });
+	assert.deepEqual(await say("/skill:lint src"), { ok: true, delivered: "steer" });
+	assert.deepEqual(m.sent.at(-1), { content: "/skill:lint src", options: { expandPromptTemplates: true, deliverAs: "steer" } });
+});
+
+test("a /compact from the phone while pi is busy waits for the settle, runs once, and the last one wins", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const ran = [];
+	const m = await mount({ ctx: { compact: (o) => ran.push(o.customInstructions ?? null), ui: { notify: () => {} } } });
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)));
+	const say = async (text) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) });
+	};
+	await m.fire("agent_start", {});
+	assert.deepEqual(await say("/compact keep the plan"), { ok: true, delivered: "queued" });
+	assert.deepEqual(await say("/compact actually the tests"), { ok: true, delivered: "queued" }, "replaces the earlier one");
+	assert.deepEqual(ran, [], "not mid-turn: pi refuses a compaction then");
+	await m.fire("agent_settled", { aborted: false });
+	assert.deepEqual(ran, ["actually the tests"], "run once, at the settle, with the last notes");
+	await m.fire("agent_settled", { aborted: false });
+	assert.deepEqual(ran, ["actually the tests"], "and only once");
+	// Idle again: /compact runs at once, as before.
+	assert.deepEqual(await say("/compact"), { ok: true, delivered: "command" });
+	assert.deepEqual(ran, ["actually the tests", null]);
 });
 
 test("hello lists the commands the phone can run; a reload sends the list again", async () => {
