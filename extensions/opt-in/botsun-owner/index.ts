@@ -471,8 +471,7 @@ export async function takeUploads(uploads: Upload[], checkedDir?: string): Promi
 			const taken: Saved = { path, note: `📎 Attached: ${path} (${sizeText(u.bytes)})`, video: false, upload: true };
 			saved.push(taken);
 			if (got !== u.sha256) { drop(); return "an upload's sha256 doesn't match what was signed"; }
-			// The mode is set only now: a file that isn't the one signed keeps the mode it was made with.
-			chmodSync(path, 0o600);
+			// copyUpload made it 0600 and nothing has touched it since; the mode is never loosened.
 			taken.video = startsLikeMovie(path);
 		}
 		return saved;
@@ -897,8 +896,10 @@ function askPin(c: Conn, kind: KeyKind, deviceId: string, ask: { pinned: string 
 		.finally(() => open.delete(id));
 }
 
-/** One request line → one reply object. Exported for tests. */
-export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknown> | Promise<Record<string, unknown>> {
+/** One request line → one reply object. Exported for tests. `opts.longerTimeout` is called once a
+ * say's signature holds: only then may the owner socket wait longer for it (a long video hashed
+ * here, a retry waiting for frames still coming), so an unsigned caller can't hold one open. */
+export function handleOwnerRequest(c: Conn, req: unknown, opts: { longerTimeout?: () => void } = {}): Record<string, unknown> | Promise<Record<string, unknown>> {
 	if (!req || typeof req !== "object") return { error: "bad request" };
 	const r = req as Record<string, unknown>;
 	if (r.type === "nonce") {
@@ -953,6 +954,10 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	const denied = verifyDevice(c, r, { decision: say.decision, digest: () => say.digest,
 		v2: { kind: "session", decision: say.decision, payload: () => say.payload } });
 	if (denied) return { error: denied };
+	// The signature holds (and its nonce is spent): this say may hash a long video for a second or
+	// two, and a retry of one may wait for frames still coming. Botsun waits up to 30 s for one, so
+	// the socket's 5 s idle timeout gets longer from here.
+	opts.longerTimeout?.();
 	// The same message again (its first answer was lost on the way to the phone): it went in once.
 	// Only the same id with the same message is a repeat: an id reused for other words (an app bug)
 	// is delivered, never dropped. This goes before the uploads' disk checks: a retry of a message
@@ -972,7 +977,15 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 		if (said) saidNow(c, said, digest);
 		// Long videos: copied into the inbox and hashed again here before anything goes in (a second or
 		// two for 500 MB; Botsun waits up to 30 s), so the reply says whether this session has them.
-		if (uploads.length) return deliverUploads(c, text, images, files, uploads, checked?.dir, clientId, said, digest);
+		if (uploads.length) {
+			const uploadsSay = deliverUploads(c, text, images, files, uploads, checked?.dir, clientId, said, digest);
+			// On its way from now, not only once the take is done: a retry that arrives while a long
+			// video is copied and hashed must wait for that delivery, not be answered "duplicate" for
+			// a message that may still fail. deliverUploads hands the wait over to its frames below
+			// (saidOnItsWay replaces this mark, and the older mark leaves the newer one alone).
+			if (said) saidOnItsWay(c, said, digest, uploadsSay);
+			return uploadsSay;
+		}
 		let outcome: Record<string, unknown> | Promise<Record<string, unknown>>;
 		const before = c.framing;
 		try {
@@ -996,9 +1009,17 @@ export function handleOwnerRequest(c: Conn, req: unknown): Record<string, unknow
 	};
 	// The same message is on its way right now (a big video hashing, its frames being pulled): wait
 	// for that delivery rather than answering "duplicate" now. If it fails, its id is forgotten by
-	// then and this try goes in; answering "duplicate" would lose the phone's only copy.
-	const onItsWay = said && c.said?.get(said) === digest ? c.saidPending?.get(said) : undefined;
-	return onItsWay ? onItsWay.then(deliver) : deliver();
+	// then and this try goes in; answering "duplicate" would lose the phone's only copy. A take
+	// hands the wait over to its frames when it replies, so keep waiting while the id is still on
+	// its way rather than going in as soon as the reply is out.
+	const onItsWay = async (): Promise<Record<string, unknown>> => {
+		for (;;) {
+			const job = said && c.said?.get(said) === digest ? c.saidPending?.get(said) : undefined;
+			if (!job) return deliver();
+			await job;
+		}
+	};
+	return said && c.said?.get(said) === digest && c.saidPending?.get(said) ? onItsWay() : deliver();
 }
 
 /** A verified say with long videos: the take starts at once (hashing Botsun's own file needs nothing
@@ -1495,7 +1516,9 @@ function deliverSay(c: Conn, text: string, images: Image[], files: File[], opts:
 	}
 	// Words a compaction holds are "held": pi would refuse them as a prompt (2026-11-10).
 	const delivered = c.pendingCompact?.() ? "held" : c.busy ? "steer" : "prompt";
-	if (saved.some((s) => s.video) || (!opts.inOrder && c.framing)) {
+	// A reply chained behind an earlier one (`after`) goes in from a promise of its own, even when none
+	// of its files is a video: injecting it now would overtake the video ahead of it.
+	if (saved.some((s) => s.video) || (opts.inOrder ? opts.after !== undefined : c.framing !== undefined)) {
 		// Frames take ffmpeg a few seconds: reply now (the socket and Botsun don't wait), deliver when
 		// they're ready, and queue later replies behind it so they keep their order. `after` is the
 		// queue an inOrder reply's frames wait for (its caller owns c.framing).
@@ -2427,17 +2450,8 @@ function reloadOrRestart(c: Conn, r: Record<string, unknown>, what: "reload" | "
 const OWNER_IDLE_MS = 5_000;
 /** A say carrying a long video hashes (and copies) it before the reply, and a retry of one may wait
  * for a delivery whose frames are still being pulled: Botsun waits up to 30 s for such a say, so the
- * socket's idle timeout is longer for one (idleTimeoutOf). */
+ * socket's idle timeout is longer for one, once its signature holds (handleOwnerRequest). */
 const SAY_UPLOADS_TIMEOUT_MS = 35_000;
-
-/** How long the owner socket waits for this request's reply. A say with a long video (or a message
- * id, whose retry may wait for a delivery that is still going) is hashed here first, and Botsun
- * waits up to 30 s for one, so the 5 s that fit anything else would drop the connection first. */
-export function idleTimeoutOf(req: unknown): number {
-	const say = req && typeof req === "object" ? req as Record<string, unknown> : undefined;
-	const long = say?.type === "say" && ((Array.isArray(say.uploads) && say.uploads.length > 0) || typeof say.client_id === "string");
-	return long ? SAY_UPLOADS_TIMEOUT_MS : OWNER_IDLE_MS;
-}
 
 function listenOwner(c: Conn): void {
 	if (c.server || c.closed) return;
@@ -2451,8 +2465,9 @@ function listenOwner(c: Conn): void {
 		return;
 	}
 	const server = createServer((sock) => {
-		// One idle timeout for every request; a long-video say sets a longer one on its own socket
-		// (idleTimeoutOf), so no second handler is ever registered for it.
+		// One idle timeout for every request; a say that may take a while (a long video hashed here, a
+		// retry waiting for frames still coming) sets a longer one once its signature holds, from
+		// handleOwnerRequest (opts.longerTimeout), so no second handler is ever registered for it.
 		sock.setTimeout(OWNER_IDLE_MS);
 		sock.on("timeout", () => sock.destroy());
 		const chunks: Buffer[] = [];
@@ -2475,10 +2490,10 @@ function listenOwner(c: Conn): void {
 				req = undefined;
 			}
 			// A say with a long video is hashed here before its reply (and a retry of it may wait for that
-			// delivery): Botsun waits up to 30 s, so the idle timeout is longer for one.
-			sock.setTimeout(idleTimeoutOf(req));
+			// delivery), and Botsun waits up to 30 s for one: handleOwnerRequest lengthens this socket's
+			// idle timeout, but only once the request's signature holds (and its nonce is spent).
 			try {
-				reply = handleOwnerRequest(c, req);
+				reply = handleOwnerRequest(c, req, { longerTimeout: () => sock.setTimeout(SAY_UPLOADS_TIMEOUT_MS) });
 			} catch {
 				reply = { error: "bad request" };
 			}
@@ -2975,26 +2990,34 @@ export function phoneCommands(pi: Pick<ExtensionAPI, "getCommands">): PhoneComma
 /**
  * What a phone slash command did: `null` ran it now, a string is why it didn't, `undefined` isn't a
  * command (it goes in as text), and `{delivered}` says how it went in when the turn was busy: as a
- * steer, exactly as typing it mid-turn does, or waiting for the settle (a /compact).
+ * steer, exactly as typing it mid-turn does, or held for the settle (a /compact).
  */
-export type PhoneCommandRun = string | null | undefined | { delivered: "steer" };
+export type PhoneCommandRun = string | null | undefined | { delivered: "steer" | "held" };
 
 /**
  * A /compact the phone sent while pi was busy: it waits for the run's end (agent_settled), where it
- * runs as typed after the turn would have. One at a time: a later one replaces it.
+ * runs as typed after the turn would have. One at a time: a later one replaces it. It remembers the
+ * conversation it was sent in, so a /new or /resume in between drops it rather than compacting the
+ * session that took its place.
  */
-let queuedCompact: { customInstructions?: string } | null = null;
+let queuedCompact: { customInstructions?: string; sessionId: string | null } | null = null;
+
+/** Whether pi is idle now; a stale ctx (a session that has since switched) counts as busy. */
+function idleNow(ctx: ExtensionContext): boolean {
+	try { return ctx.isIdle(); } catch { return false; }
+}
 
 function runCommand(pi: ExtensionAPI, ctx: ExtensionContext, text: string, busy: boolean): PhoneCommandRun {
 	const cmd = slashCommand(text);
 	if (!cmd) return undefined;
 	const { name, args } = cmd;
 	if (name === "compact") {
-		if (busy) {
+		if (busy && !idleNow(ctx)) {
 			// pi refuses a prompt (and so a compaction) mid-turn, as it refuses the keyboard's Enter:
-			// the words wait for the settle, where the run's own end is.
-			queuedCompact = { ...(args ? { customInstructions: args } : {}) };
-			return null; // nothing lands in the thread: the phone shows its "ran" note, as for an idle one
+			// the words wait for the settle, where the run's own end is. A stale busy flag (pi is
+			// already idle) would leave it waiting for a settle that never comes, so run it now then.
+			queuedCompact = { ...(args ? { customInstructions: args } : {}), sessionId: sessionInfo(ctx).sessionId };
+			return { delivered: "held" }; // not "ran": nothing has run yet
 		}
 		ctx.compact({
 			...(args ? { customInstructions: args } : {}),
@@ -3612,6 +3635,8 @@ function main(pi: ExtensionAPI): void {
 	// The restart extension writes its record in its own session_start, before or after this one:
 	// once every handler ran, say whether restart is possible now, if that changed.
 	pi.on("session_start", () => {
+		// A /compact queued for the run that ended here isn't this conversation's to run.
+		queuedCompact = null;
 		setTimeout(() => {
 			if (conn && !conn.closed) try { reportFeatures(conn, false); } catch {}
 		}, 0);
@@ -3807,15 +3832,17 @@ function main(pi: ExtensionAPI): void {
 
 	/**
 	 * The phone's /compact while pi was busy, run once the run settled. Left waiting when a stop just
-	 * released words into a run of their own (it would abort that): it runs at that run's settle.
+	 * released words into a run of their own (it would abort that): it runs at that run's settle. One
+	 * sent in another conversation (a /new or /resume since) is dropped, not run against this one.
 	 */
 	const runQueuedCompact = (ctx: ExtensionContext, released: boolean): void => {
 		if (!queuedCompact || released) return;
 		const waiting = queuedCompact;
 		queuedCompact = null;
 		if (!conn || conn.closed) return;
+		if (waiting.sessionId !== null && waiting.sessionId !== sessionInfo(ctx).sessionId) return;
 		ctx.compact({
-			...waiting,
+			...(waiting.customInstructions ? { customInstructions: waiting.customInstructions } : {}),
 			onError: (e) => ctx.ui.notify(`Compaction from the phone failed: ${e.message}`, "error"),
 		});
 	};

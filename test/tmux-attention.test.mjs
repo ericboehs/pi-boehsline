@@ -197,6 +197,25 @@ test("a blocking prompt marks even the focused window", async () => {
   );
 });
 
+test("a second dialog raises attention again after a focus-in cleared it", async () => {
+  const pi = await mount({ windowActive: "1" });
+  const raised = () =>
+    pi.execCalls.filter((call) => call.includes("@special_activity") && !call.includes("-u")).length;
+
+  await pi.prompt({ kind: "custom" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const first = raised();
+  assert.ok(first >= 1, "the first dialog shows attention");
+
+  // Focusing the pane runs tmux's focus-in hook, which clears @special_activity, while the first
+  // dialog still holds the tracker's state: a dialog opening on top changes no state, and must
+  // still mark the window again rather than leave it unflagged.
+  await pi.prompt({ kind: "confirm" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(raised(), first + 1, "every dialog raises the flag, not only a state change");
+});
+
 test("answering a prompt clears attention", async () => {
   const pi = await mount({ windowActive: "1" });
 

@@ -1261,8 +1261,11 @@ test("slash commands from the phone run instead of reaching the model", async ()
 	const srv = await server();
 	process.env.BOTSUN_OWNER_SOCK = srv.path;
 	const ran = [];
+	// pi's own idle flag: the phone's compact looks at it before holding a /compact for the settle.
+	let idle = true;
 	const m = await mount({ ctx: {
 		compact: (o) => ran.push(["compact", o.customInstructions]),
+		isIdle: () => idle,
 		modelRegistry: { getAvailable: () => [{ provider: "anthropic", id: "claude-haiku-4-5", name: "Claude Haiku 4.5" }] },
 		ui: { notify: () => {} },
 	} });
@@ -1292,9 +1295,10 @@ test("slash commands from the phone run instead of reaching the model", async ()
 	assert.deepEqual(await say("/whatever"), { ok: true, delivered: "prompt" }, "unknown commands go in as typed");
 
 	await m.fire("agent_start", {});
+	idle = false; // a turn is running, so pi says so too
 	// Busy: as typed mid-turn. pi runs an extension command's handler at once, and a template or skill
 	// is queued as a steer (deliverAs), so none of them is refused any more.
-	assert.deepEqual(await say("/compact"), { ok: true, delivered: "command" }, "waits for the settle; nothing lands in the thread");
+	assert.deepEqual(await say("/compact"), { ok: true, delivered: "held" }, "waits for the settle; nothing lands in the thread");
 	assert.deepEqual(await say("/review"), { ok: true, delivered: "command" }, "an extension command runs at once, as typed mid-turn");
 	assert.deepEqual(m.sent.at(-1), { content: "/review", options: { expandPromptTemplates: true, deliverAs: "steer" } });
 	// And /model, /thinking and /name still run now, mid-turn as before.
@@ -1332,7 +1336,8 @@ test("a /compact from the phone while pi is busy waits for the settle, runs once
 	const srv = await server();
 	process.env.BOTSUN_OWNER_SOCK = srv.path;
 	const ran = [];
-	const m = await mount({ ctx: { compact: (o) => ran.push(o.customInstructions ?? null), ui: { notify: () => {} } } });
+	let idle = true;
+	const m = await mount({ ctx: { compact: (o) => ran.push(o.customInstructions ?? null), isIdle: () => idle, ui: { notify: () => {} } } });
 	await m.fire("session_start", { reason: "startup" });
 	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)));
 	const say = async (text) => {
@@ -1340,16 +1345,67 @@ test("a /compact from the phone while pi is busy waits for the settle, runs once
 		return ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) });
 	};
 	await m.fire("agent_start", {});
-	assert.deepEqual(await say("/compact keep the plan"), { ok: true, delivered: "command" });
-	assert.deepEqual(await say("/compact actually the tests"), { ok: true, delivered: "command" }, "replaces the earlier one");
+	idle = false;
+	assert.deepEqual(await say("/compact keep the plan"), { ok: true, delivered: "held" }, "held: it hasn't run yet");
+	assert.deepEqual(await say("/compact actually the tests"), { ok: true, delivered: "held" }, "replaces the earlier one");
 	assert.deepEqual(ran, [], "not mid-turn: pi refuses a compaction then");
 	await m.fire("agent_settled", { aborted: false });
+	idle = true;
 	assert.deepEqual(ran, ["actually the tests"], "run once, at the settle, with the last notes");
 	await m.fire("agent_settled", { aborted: false });
 	assert.deepEqual(ran, ["actually the tests"], "and only once");
 	// Idle again: /compact runs at once, as before.
 	assert.deepEqual(await say("/compact"), { ok: true, delivered: "command" });
 	assert.deepEqual(ran, ["actually the tests", null]);
+});
+
+test("a /compact sent to a busy-looking session that is really idle runs now, not at a settle that won't come", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const ran = [];
+	const m = await mount({ ctx: { compact: (o) => ran.push(o.customInstructions ?? null), ui: { notify: () => {} } } });
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)));
+	// conn.busy says a turn is running, but pi is idle (a stale flag: the turn's end was missed).
+	await m.fire("agent_start", {});
+	m.ctx.isIdle = () => true;
+	const { nonce } = await ask({ type: "nonce" });
+	assert.deepEqual(await ask({ type: "say", text: "/compact", nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", "/compact") }),
+		{ ok: true, delivered: "command" });
+	assert.deepEqual(ran, [null], "run at once, never held for a settle that never comes");
+});
+
+test("a /compact queued in one conversation is dropped, not run against the next one", async () => {
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const srv = await server();
+	process.env.BOTSUN_OWNER_SOCK = srv.path;
+	const ran = [];
+	let sessionId = "sid-a";
+	let idle = false;
+	const m = await mount({ ctx: {
+		compact: (o) => ran.push(o.customInstructions ?? null),
+		isIdle: () => idle,
+		ui: { notify: () => {} },
+		sessionManager: { getSessionFile: () => `/tmp/sessions/${sessionId}.jsonl`, getSessionId: () => sessionId },
+	} });
+	await m.fire("session_start", { reason: "startup" });
+	await until(() => existsSync(join(ownerDir, `${process.pid}.sock`)));
+	await m.fire("agent_start", {});
+	const tell = async (text) => {
+		const { nonce } = await ask({ type: "nonce" });
+		return ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, sessionId, text) });
+	};
+	assert.deepEqual(await tell("/compact keep the plan"), { ok: true, delivered: "held" });
+	// /new and /resume carry a session_shutdown and a session_start of their own; the run this /compact
+	// waited for settles in the one that took its place.
+	await m.fire("session_start", { reason: "new" });
+	sessionId = "sid-b";
+	idle = true;
+	await m.fire("agent_settled", { aborted: false });
+	assert.deepEqual(ran, [], "the conversation it was sent in is gone: nothing runs here");
 });
 
 test("hello lists the commands the phone can run; a reload sends the list again", async () => {
@@ -4758,14 +4814,16 @@ test("uploads: a say pi throws on doesn't hold the framing queue, and leaves no 
 	writeKeys({ 7: key.raw.toString("base64") });
 	const m = await owner();
 	const conn = globalThis[Symbol.for("botsun-owner.v1")];
-	// No "ftyp": not a video, so it is injected as the reply comes, not from a frames job.
+	// No "ftyp": not a video, so there are no frames to pull, but the take still hands the inject to a
+	// promise of its own (it is in order), so a throw there never reaches the reply.
 	const up = fakeUpload(updir, Buffer.alloc(600, 3));
 	const clientId = "3b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
 	const inject = conn.inject;
 	conn.inject = () => { throw new Error("pi refused the message"); };
 	cleanups.push(() => { conn.inject = inject; });
 	assert.deepEqual(await ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the clip", [up], clientId)),
-		{ error: "bad request" }, "a delivery that threw is answered as one");
+		{ ok: true, delivered: "prompt" }, "the reply doesn't wait for the inject");
+	await until(() => readdirSync(join(inbox, String(process.pid))).length === 0, 5_000);
 	assert.deepEqual(readdirSync(join(inbox, String(process.pid))), [], "the copy the take made went with it");
 	// The queue the take held must be open: words behind a queue that never opens never go in.
 	conn.inject = inject;
@@ -4782,16 +4840,91 @@ test("uploads: a say pi throws on doesn't hold the framing queue, and leaves no 
 	assert.equal(m.sent.length, 2, "the words once, the clip once");
 });
 
-test("a say that may wait on a video gets a longer socket timeout than any other request", async () => {
+test("uploads: a retry that arrives while the video is still being taken waits for that delivery", async () => {
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox-during-take");
+	const updir = join(home, "uploads-during-take");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	// pi refuses the first delivery, so the id is forgotten and the retry belongs in, not "duplicate".
+	const inject = conn.inject;
+	let tries = 0;
+	conn.inject = (...args) => { if (++tries === 1) throw new Error("pi refused the message"); return inject(...args); };
+	cleanups.push(() => { conn.inject = inject; });
+	// No "ftyp": a file, not a video, so it goes in as the take's reply comes (no ffmpeg here).
+	const up = fakeUpload(updir, Buffer.alloc(600, 3));
+	const clientId = "4b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
+	const request = async () => uploadSay(key, (await ask({ type: "nonce" })).nonce, "the clip", [up], clientId);
+	// Both signed first, then dispatched in one tick: the retry is handled while the first is still
+	// copying and hashing (the take has only just started), so it must wait for that delivery rather
+	// than take it for a message already in. A slow copy can't be forced here, and mustn't be needed:
+	// the take's first await is always still pending when the second request is handled.
+	const firstReq = await request();
+	const retryReq = await request();
+	const first = m.mod.handleOwnerRequest(conn, firstReq);
+	assert.equal(typeof first.then, "function", "the take is still running: its reply is a promise");
+	assert.deepEqual([...conn.saidPending.keys()], [`sid-a:7:${clientId}`], "on its way from the moment the take starts");
+	const retry = m.mod.handleOwnerRequest(conn, retryReq);
+	assert.equal(typeof retry.then, "function", "the retry waits for the delivery instead of answering now");
+	const firstReply = await first;
+	assert.deepEqual([firstReply.ok, firstReply.delivered], [true, "prompt"], "the reply doesn't wait for the inject");
+	// pi refused the first inject: the id is forgotten, so the retry goes in instead of being dropped.
+	const retryReply = await retry;
+	assert.deepEqual([retryReply.ok, retryReply.delivered], [true, "prompt"], "waited for the failed delivery, then went in");
+	await until(() => m.sent.length === 1, 5_000);
+	assert.equal(m.sent.length, 1, "delivered once");
+	assert.equal(readdirSync(join(home, "inbox-during-take", String(process.pid))).length, 1, "one copy, the one that went in");
+});
+
+test("uploads: an upload that isn't a movie still waits behind an earlier video's frames", async () => {
+	process.env.BOTSUN_OWNER_INBOX = join(home, "inbox");
+	const updir = join(home, "uploads-not-a-movie");
+	process.env.BOTSUN_UPLOADS_DIR = updir;
+	cleanups.push(() => { delete process.env.BOTSUN_UPLOADS_DIR; });
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const marker = join(home, "ffmpeg-started-not-a-movie");
+	const gate = join(home, "ffmpeg-gate-not-a-movie");
+	fakeFfmpeg({ marker, gate });
+	const m = await owner();
+	// The first say is a real video: its frames are held still, so the queue is plainly busy.
+	const video = ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the video", [fakeUpload(updir, fakeMp4())]));
+	assert.deepEqual(await video, { ok: true, delivered: "prompt" });
+	await until(() => existsSync(marker), 10_000);
+	// The second is an upload that doesn't start like a movie: no frames of its own, but it was still
+	// taken in order, so it must not overtake the video's frames.
+	const plain = fakeUpload(updir, Buffer.alloc(600, 3), "Notes.mp4");
+	assert.deepEqual(await ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the file", [plain])),
+		{ ok: true, delivered: "prompt" });
+	await sleep(100);
+	assert.equal(m.sent.length, 0, "nothing overtakes the video whose frames are still coming");
+	writeFileSync(gate, "go");
+	await until(() => m.sent.length === 2, 10_000);
+	assert.ok(sentText(m.sent[0]).startsWith("the video\n\n"), "the video first");
+	assert.ok(sentText(m.sent[1]).startsWith("the file\n\n"), "then the file behind it, never ahead");
+});
+
+test("only a signed say may extend the owner socket's idle timeout", async () => {
 	// The owner socket's 5 s idle timeout would drop Botsun's connection while a long video is hashed
-	// (or a retry of one waits for its frames, up to 20 s of ffmpeg): such a say gets 35 s.
-	const { idleTimeoutOf } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
-	assert.equal(idleTimeoutOf({ type: "say", text: "hi" }), 5_000, "words alone go in at once");
-	assert.equal(idleTimeoutOf({ type: "say", text: "hi", uploads: [{ path: "/x" }] }), 35_000, "a long video is hashed first");
-	assert.equal(idleTimeoutOf({ type: "say", text: "hi", client_id: "ab" }), 35_000, "a retry of one waits for its frames");
-	assert.equal(idleTimeoutOf({ type: "say", text: "hi", uploads: [] }), 5_000, "nothing to take");
-	assert.equal(idleTimeoutOf({ type: "nonce" }), 5_000);
-	assert.equal(idleTimeoutOf(undefined), 5_000, "not even a request");
+	// (or a retry of one waits for its frames, up to 20 s of ffmpeg): such a say gets 35 s, but only
+	// once its signature holds, so an unsigned caller can't hold an owner socket open longer.
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	const longer = [];
+	const call = (req) => m.mod.handleOwnerRequest(conn, req, { longerTimeout: () => longer.push(req.type) });
+	const id = "5b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
+	let { nonce } = await ask({ type: "nonce" });
+	assert.ok((await call({ type: "say", text: "hi", client_id: id, nonce, device_id: 7, sig_v: 2, signature: "AAAA" })).error);
+	assert.deepEqual(longer, [], "no signature: the short timeout stays");
+	nonce = (await ask({ type: "nonce" })).nonce;
+	assert.equal((await call({ type: "say", text: "hi", client_id: id, nonce, device_id: 7, sig_v: 2,
+		signature: signV2(key, nonce, "session", "say", botsunSayPayload("hi", id)) })).error, undefined);
+	assert.deepEqual(longer, ["say"], "a signed say may take a while: the socket waits longer");
 });
 
 test("say_id: a settled delivery never unpins a newer message that reuses its id", async () => {
