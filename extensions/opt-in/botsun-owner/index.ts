@@ -2977,7 +2977,7 @@ export function phoneCommands(pi: Pick<ExtensionAPI, "getCommands">): PhoneComma
  * command (it goes in as text), and `{delivered}` says how it went in when the turn was busy: as a
  * steer, exactly as typing it mid-turn does, or waiting for the settle (a /compact).
  */
-export type PhoneCommandRun = string | null | undefined | { delivered: "steer" | "queued" };
+export type PhoneCommandRun = string | null | undefined | { delivered: "steer" };
 
 /**
  * A /compact the phone sent while pi was busy: it waits for the run's end (agent_settled), where it
@@ -2994,7 +2994,7 @@ function runCommand(pi: ExtensionAPI, ctx: ExtensionContext, text: string, busy:
 			// pi refuses a prompt (and so a compaction) mid-turn, as it refuses the keyboard's Enter:
 			// the words wait for the settle, where the run's own end is.
 			queuedCompact = { ...(args ? { customInstructions: args } : {}) };
-			return { delivered: "queued" };
+			return null; // nothing lands in the thread: the phone shows its "ran" note, as for an idle one
 		}
 		ctx.compact({
 			...(args ? { customInstructions: args } : {}),
@@ -3035,11 +3035,13 @@ function runCommand(pi: ExtensionAPI, ctx: ExtensionContext, text: string, busy:
 		return request.handled ? null : "no approval guardian here to bypass";
 	}
 	if (BUILTINS.has(name)) return `/${name} only works at the keyboard`;
-	if (pi.getCommands().some((c) => c.name === name)) {
-		// As typed: pi runs an extension command's handler at once, even mid-turn, and queues a skill
-		// or template as a steer (the turn's next boundary reads it). Idle, it is a plain prompt.
+	const known = pi.getCommands().find((c) => c.name === name);
+	if (known) {
+		// As typed: pi runs an extension command's handler at once, even mid-turn (no message in the
+		// thread, so the phone shows its "ran" note), and queues a skill or template as a steer (the
+		// turn's next boundary reads it, and it lands in the thread). Idle, it is a plain prompt.
 		sendUser(pi, text.trim(), { expandPromptTemplates: true, ...(busy ? { deliverAs: "steer" as const } : {}) });
-		return busy ? { delivered: "steer" } : null;
+		return busy && known.source !== "extension" ? { delivered: "steer" } : null;
 	}
 	return undefined; // not a command pi knows: plain text, as typing it would send
 }

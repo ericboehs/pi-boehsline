@@ -1294,8 +1294,8 @@ test("slash commands from the phone run instead of reaching the model", async ()
 	await m.fire("agent_start", {});
 	// Busy: as typed mid-turn. pi runs an extension command's handler at once, and a template or skill
 	// is queued as a steer (deliverAs), so none of them is refused any more.
-	assert.deepEqual(await say("/compact"), { ok: true, delivered: "queued" }, "waits for the settle");
-	assert.deepEqual(await say("/review"), { ok: true, delivered: "steer" });
+	assert.deepEqual(await say("/compact"), { ok: true, delivered: "command" }, "waits for the settle; nothing lands in the thread");
+	assert.deepEqual(await say("/review"), { ok: true, delivered: "command" }, "an extension command runs at once, as typed mid-turn");
 	assert.deepEqual(m.sent.at(-1), { content: "/review", options: { expandPromptTemplates: true, deliverAs: "steer" } });
 	// And /model, /thinking and /name still run now, mid-turn as before.
 	assert.deepEqual(await say("/thinking high"), { ok: true, delivered: "command" });
@@ -1340,8 +1340,8 @@ test("a /compact from the phone while pi is busy waits for the settle, runs once
 		return ask({ type: "say", text, nonce, device_id: 7, signature: signed(key, 7, nonce, "sid-a", text) });
 	};
 	await m.fire("agent_start", {});
-	assert.deepEqual(await say("/compact keep the plan"), { ok: true, delivered: "queued" });
-	assert.deepEqual(await say("/compact actually the tests"), { ok: true, delivered: "queued" }, "replaces the earlier one");
+	assert.deepEqual(await say("/compact keep the plan"), { ok: true, delivered: "command" });
+	assert.deepEqual(await say("/compact actually the tests"), { ok: true, delivered: "command" }, "replaces the earlier one");
 	assert.deepEqual(ran, [], "not mid-turn: pi refuses a compaction then");
 	await m.fire("agent_settled", { aborted: false });
 	assert.deepEqual(ran, ["actually the tests"], "run once, at the settle, with the last notes");
