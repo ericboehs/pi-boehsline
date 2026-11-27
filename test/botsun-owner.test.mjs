@@ -4814,16 +4814,15 @@ test("uploads: a say pi throws on doesn't hold the framing queue, and leaves no 
 	writeKeys({ 7: key.raw.toString("base64") });
 	const m = await owner();
 	const conn = globalThis[Symbol.for("botsun-owner.v1")];
-	// No "ftyp": not a video, so there are no frames to pull, but the take still hands the inject to a
-	// promise of its own (it is in order), so a throw there never reaches the reply.
+	// No "ftyp": not a video, and nothing is ahead of it in the framing queue, so the inject goes in as
+	// the reply does: a throw there is the reply, and the phone keeps its copy for another try.
 	const up = fakeUpload(updir, Buffer.alloc(600, 3));
 	const clientId = "3b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
 	const inject = conn.inject;
 	conn.inject = () => { throw new Error("pi refused the message"); };
 	cleanups.push(() => { conn.inject = inject; });
 	assert.deepEqual(await ask(uploadSay(key, (await ask({ type: "nonce" })).nonce, "the clip", [up], clientId)),
-		{ ok: true, delivered: "prompt" }, "the reply doesn't wait for the inject");
-	await until(() => readdirSync(join(inbox, String(process.pid))).length === 0, 5_000);
+		{ error: "bad request" }, "a delivery that threw is answered as one, never as delivered");
 	assert.deepEqual(readdirSync(join(inbox, String(process.pid))), [], "the copy the take made went with it");
 	// The queue the take held must be open: words behind a queue that never opens never go in.
 	conn.inject = inject;
@@ -4869,8 +4868,9 @@ test("uploads: a retry that arrives while the video is still being taken waits f
 	assert.deepEqual([...conn.saidPending.keys()], [`sid-a:7:${clientId}`], "on its way from the moment the take starts");
 	const retry = m.mod.handleOwnerRequest(conn, retryReq);
 	assert.equal(typeof retry.then, "function", "the retry waits for the delivery instead of answering now");
-	const firstReply = await first;
-	assert.deepEqual([firstReply.ok, firstReply.delivered], [true, "prompt"], "the reply doesn't wait for the inject");
+	// The take had nothing ahead of it, so its inject goes in as the reply does and pi's refusal is the
+	// reply (the socket answers it `{error:"bad request"}`): never a `prompt` for a message that stayed out.
+	await assert.rejects(first, /pi refused the message/, "a refused delivery is never answered as delivered");
 	// pi refused the first inject: the id is forgotten, so the retry goes in instead of being dropped.
 	const retryReply = await retry;
 	assert.deepEqual([retryReply.ok, retryReply.delivered], [true, "prompt"], "waited for the failed delivery, then went in");
@@ -4934,9 +4934,9 @@ test("say_id: a settled delivery never unpins a newer message that reuses its id
 	const { saidOnItsWay } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
 	const c = { said: new Map(), saidPending: new Map() };
 	let finishOld;
-	saidOnItsWay(c, "sid-a:7:x", "old", new Promise((r) => { finishOld = r; }));
+	saidOnItsWay(c, "sid-a:7:x", new Promise((r) => { finishOld = r; }));
 	let finishNew;
-	saidOnItsWay(c, "sid-a:7:x", "new", new Promise((r) => { finishNew = r; }));
+	saidOnItsWay(c, "sid-a:7:x", new Promise((r) => { finishNew = r; }));
 	c.said.set("sid-a:7:x", "new");
 	finishOld();
 	await sleep(20);
@@ -4944,6 +4944,53 @@ test("say_id: a settled delivery never unpins a newer message that reuses its id
 	finishNew();
 	await sleep(20);
 	assert.equal(c.saidPending.has("sid-a:7:x"), false, "the newer one's own end clears it");
+});
+
+test("say_id: a delivery's mark goes when it settles, even if the id was reused meanwhile", async () => {
+	// An id reused for other words takes a path that sets no new mark (a slash command, a say with no
+	// uploads), so a cleanup that also waited for the recorded digest to still be this delivery's left
+	// the settled entry behind for good. A retry of the newer message then found it and waited on it.
+	const { saidOnItsWay } = await import(`../extensions/opt-in/botsun-owner/index.ts?t=${Math.random()}`);
+	const c = { said: new Map(), saidPending: new Map() };
+	let finish;
+	saidOnItsWay(c, "sid-a:7:x", new Promise((r) => { finish = r; }));
+	c.said.set("sid-a:7:x", "new");
+	finish();
+	await sleep(20);
+	assert.equal(c.saidPending.has("sid-a:7:x"), false, "its own mark never outlives it");
+});
+
+test("say_id: a wait never spins on a settled mark left behind", async () => {
+	// The wait loop went round on any promise it was handed, so a stale settled entry starved the event
+	// loop and froze pi. The fake stops answering after a few reads, so a regression fails here rather
+	// than hanging the run.
+	const key = phoneKey();
+	writeKeys({ 7: key.raw.toString("base64") });
+	const m = await owner();
+	const conn = globalThis[Symbol.for("botsun-owner.v1")];
+	const clientId = "6b9e6a4e-1f2c-4c55-9a3e-6d1f2b3c4d5e";
+	const say = async () => {
+		const { nonce } = await ask({ type: "nonce" });
+		return m.mod.handleOwnerRequest(conn, { type: "say", text: "hi", client_id: clientId, nonce, device_id: 7, sig_v: 2,
+			signature: signV2(key, nonce, "session", "say", botsunSayPayload("hi", clientId)) });
+	};
+	assert.deepEqual(await say(), { ok: true, delivered: "prompt" });
+	const real = conn.saidPending;
+	const stale = Promise.resolve();
+	let reads = 0;
+	conn.saidPending = {
+		get: () => (++reads > 5 ? undefined : stale),
+		set: (k, v) => real.set(k, v),
+		delete: (k) => real.delete(k),
+		has: (k) => real.has(k),
+		keys: () => real.keys(),
+	};
+	try {
+		assert.deepEqual(await say(), { ok: true, delivered: "duplicate" }, "the settled mark isn't waited on twice");
+		assert.ok(reads <= 3, `the wait read the mark ${reads} times, not once and once again`);
+	} finally {
+		conn.saidPending = real;
+	}
 });
 
 test("uploads: words sent while the video is still hashing wait behind its frames", async () => {

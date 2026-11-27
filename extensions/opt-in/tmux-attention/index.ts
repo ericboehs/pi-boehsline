@@ -374,12 +374,13 @@ function main(pi: ExtensionAPI): void {
   // is needed, even if this window is currently focused — the status format
   // keeps the active window blue, and switching away then shows attention. The
   // dialog's close clears it, so answering while focused leaves no stale flag.
-  // Notification-only; pi does not await these. Every prompt re-raises the flag: the pane-focus-in
-  // hook clears it when the window is focused, and a dialog opening on top of one already cleared
-  // (a second dialog while the first still holds the tracker's state) must still show attention.
+  // Notification-only; pi does not await these. A dialog opening on top of one that still holds the
+  // tracker's state changes nothing there, and the pane-focus-in hook clears the flag when the window
+  // is focused, so that second dialog raises it here; the first is already raised by track.
   pi.on("ui_prompt_start", (event) => {
+    const wasBlocked = status.current().state === "blocked";
     track({ ...event, type: "ui_prompt_start" });
-    void setAttention(true);
+    if (wasBlocked) void setAttention(true);
   });
   pi.on("ui_prompt_end", (event) => track({ ...event, type: "ui_prompt_end" }));
 

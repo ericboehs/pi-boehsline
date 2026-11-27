@@ -983,7 +983,7 @@ export function handleOwnerRequest(c: Conn, req: unknown, opts: { longerTimeout?
 			// video is copied and hashed must wait for that delivery, not be answered "duplicate" for
 			// a message that may still fail. deliverUploads hands the wait over to its frames below
 			// (saidOnItsWay replaces this mark, and the older mark leaves the newer one alone).
-			if (said) saidOnItsWay(c, said, digest, uploadsSay);
+			if (said) saidOnItsWay(c, said, uploadsSay);
 			return uploadsSay;
 		}
 		let outcome: Record<string, unknown> | Promise<Record<string, unknown>>;
@@ -1000,7 +1000,7 @@ export function handleOwnerRequest(c: Conn, req: unknown, opts: { longerTimeout?
 		// Frames still coming (a small video, or words queued behind one): the id stays on its way until
 		// they are in, so a retry waits for them instead of hearing "duplicate" for a message that may
 		// still fail.
-		if (said && c.framing && c.framing !== before) saidOnItsWay(c, said, digest, c.framing);
+		if (said && c.framing && c.framing !== before) saidOnItsWay(c, said, c.framing);
 		if (!(outcome instanceof Promise)) return saidDone(c, said, digest, outcome);
 		return outcome.then((reply) => saidDone(c, said, digest, reply), (e) => {
 			saidForget(c, said, digest);
@@ -1011,11 +1011,14 @@ export function handleOwnerRequest(c: Conn, req: unknown, opts: { longerTimeout?
 	// for that delivery rather than answering "duplicate" now. If it fails, its id is forgotten by
 	// then and this try goes in; answering "duplicate" would lose the phone's only copy. A take
 	// hands the wait over to its frames when it replies, so keep waiting while the id is still on
-	// its way rather than going in as soon as the reply is out.
+	// its way rather than going in as soon as the reply is out. A job that hands the same promise
+	// back (a settled entry left behind) is not waited on twice: that loop would never yield again.
 	const onItsWay = async (): Promise<Record<string, unknown>> => {
+		let last: Promise<void> | undefined;
 		for (;;) {
 			const job = said && c.said?.get(said) === digest ? c.saidPending?.get(said) : undefined;
-			if (!job) return deliver();
+			if (!job || job === last) return deliver();
+			last = job;
 			await job;
 		}
 	};
@@ -1029,12 +1032,15 @@ export function handleOwnerRequest(c: Conn, req: unknown, opts: { longerTimeout?
  * the video is hashed can't overtake it, and the id stays on its way until the frames are in. */
 async function deliverUploads(c: Conn, text: string, images: Image[], files: File[], uploads: Upload[], dir: string | undefined,
 	clientId: string | undefined, said: string | undefined, digest: string): Promise<Record<string, unknown>> {
-	const prev = c.framing ?? Promise.resolve();
+	// What was ahead before this take (nothing, usually): only an inject with something ahead of it
+	// is handed to a promise of its own, so a refusal with nothing ahead reaches the reply and the
+	// phone keeps its copy to try again.
+	const earlier = c.framing;
 	// The queue from now on: a say sent during the take chains behind this, which opens once the
 	// video's frames are in.
 	let open!: () => void;
 	const held = new Promise<void>((r) => { open = r; });
-	const queue: Promise<void> = prev.catch(() => {}).then(() => held);
+	const queue: Promise<void> = (earlier ?? Promise.resolve()).catch(() => {}).then(() => held);
 	c.framing = queue;
 	const letGo = () => { open(); if (c.framing === queue) c.framing = undefined; };
 	let taken: Saved[] | string;
@@ -1054,7 +1060,7 @@ async function deliverUploads(c: Conn, text: string, images: Image[], files: Fil
 	// and handed back on the reply rather than on c.framing (below the phone never sees them).
 	let reply: Record<string, unknown>;
 	try {
-		reply = deliverSay(c, text, images, files, { clientId, uploads: taken, inOrder: true, after: prev }) as Record<string, unknown>;
+		reply = deliverSay(c, text, images, files, { clientId, uploads: taken, inOrder: true, after: earlier }) as Record<string, unknown>;
 	} catch (e) {
 		// pi refused the message as it went in (a video's frames are the only other way to throw, and
 		// that is below): nothing went in, so the copies go, the id is forgotten, and the queue this
@@ -1077,7 +1083,7 @@ async function deliverUploads(c: Conn, text: string, images: Image[], files: Fil
 		dropTaken(taken);
 	}).finally(letGo);
 	if (c.framing === queue) c.framing = mark;
-	if (said) saidOnItsWay(c, said, digest, mark);
+	if (said) saidOnItsWay(c, said, mark);
 	return "error" in reply ? saidDone(c, said, digest, reply) : reply;
 }
 
@@ -1108,14 +1114,14 @@ function saidNow(c: Conn, key: string, digest: string): void {
 /** Holds a message id on its way until `job` settles (a video hashing, its frames being pulled, a
  * say queued behind one): a retry of the same message waits for it instead of hearing "duplicate"
  * for a delivery that may still fail and forget the id. The entry goes when the job does, and only
- * if it is still this job's (a newer use of the id has its own). */
-export function saidOnItsWay(c: Pick<Conn, "said" | "saidPending">, key: string, digest: string, job: Promise<unknown>): void {
+ * if it is still this job's (a newer use of the id has its own): an id reused for other words gets
+ * no entry of its own, so a check on the digest here would leave this one behind forever. */
+export function saidOnItsWay(c: Pick<Conn, "saidPending">, key: string, job: Promise<unknown>): void {
 	const pending = (c.saidPending ??= new Map());
 	const settled = job.then(() => {}, () => {});
 	pending.set(key, settled);
 	void settled.then(() => {
-		if (pending.get(key) !== settled) return;
-		if (c.said?.get(key) === digest) pending.delete(key);
+		if (pending.get(key) === settled) pending.delete(key);
 	});
 }
 

@@ -205,7 +205,7 @@ test("a second dialog raises attention again after a focus-in cleared it", async
   await pi.prompt({ kind: "custom" });
   await new Promise((resolve) => setTimeout(resolve, 20));
   const first = raised();
-  assert.ok(first >= 1, "the first dialog shows attention");
+  assert.equal(first, 1, "the first dialog shows attention once, not once per raiser");
 
   // Focusing the pane runs tmux's focus-in hook, which clears @special_activity, while the first
   // dialog still holds the tracker's state: a dialog opening on top changes no state, and must
