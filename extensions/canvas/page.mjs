@@ -756,7 +756,8 @@ function loadMermaid() {
 const drawMermaid = (el, source) => renderMermaid(el, source, { loadMermaid });
 
 // The page's own files (/s/<id>/f/<name>) as well as data: images; PAGE_CSP keeps anything else out anyway.
-const PAGE_IMG = /^(data:|\/(?![/\\]))/i;
+// A data: URL is only allowed to be an image, so a markdown data:text/html never becomes a link.
+const PAGE_IMG = /^(data:image\/|\/(?![/\\]))/i;
 
 /** A data route's JSON; any other answer (a daemon error, a gone session) throws. */
 async function apiJson(url) {
@@ -1854,7 +1855,7 @@ function renderCompare(spec, src, sizes = {}) {
   const [la, lb] = spec.labels || ["Before", "After"];
   let mode = spec.mode || localStorage.getItem("canvas:compare-mode") || "slider";
   // The two files' pixel sizes (the daemon's), so the stage has a height before they load.
-  const sizeOf = (file) => (file === spec.before ? sizes?.before : file === spec.after ? sizes?.after : null);
+  const sizeOf = (file) => (sizes?.before?.file === file ? sizes.before : sizes?.after?.file === file ? sizes.after : null);
   const img = (file, alt, cls) => sizedImg({ src: src(file), alt, class: cls, draggable: "false" }, sizeOf(file));
   const stage = h("div", { class: "cmp-stage" });
   const fade = h("input", { type: "range", min: 0, max: 100, value: 50, class: "cmp-fade", "aria-label": `${lb} opacity` });
@@ -2506,6 +2507,7 @@ function modalEl() {
     const from = touch;
     touch = null;
     if (!from || !dlgSteps || e.touches.length) return;
+    if ((window.visualViewport?.scale ?? 1) > 1.01) return; // zoomed in: a one-finger pan is the pan, not a swipe
     const t = e.changedTouches?.[0];
     if (!t) return;
     const dx = t.clientX - from.x;
@@ -2705,12 +2707,14 @@ function infoRefresh(id) {
  */
 let sectionById = new Map();
 
-/** An icon, an avatar or a control's face — anything under 48 px, or inside one — is not a photo. */
+/** An icon, an avatar or a control's face — anything under 48 px, or inside one — is not a photo. A linked image is not one either. */
 const PHOTO_MIN = 48;
 const NOT_A_PHOTO = ".m-slide, .ico, button, summary, header.top, .segs, .tag, .tip-pop, dialog";
 
 function isPhoto(img) {
   if (!img || img.classList.contains("lightbox") || img.closest(NOT_A_PHOTO)) return false;
+  const link = img.closest("a[href]");
+  if (link && !link.closest(".gallery")) return false; // a linked image follows its link
   const w = img.naturalWidth || Number(img.getAttribute("width")) || 0;
   const ht = img.naturalHeight || Number(img.getAttribute("height")) || 0;
   return !(w > 0 && w < PHOTO_MIN) && !(ht > 0 && ht < PHOTO_MIN);
@@ -2772,10 +2776,13 @@ function photoOf(img, title, cardId) {
 function photoAt(photos, target) {
   const img = target.closest?.("img");
   if (!img) {
-    // A tap on a gallery figure's caption still opens its photo.
-    const inner = target.closest?.("a[href]")?.querySelector("img");
+    // A gallery figure's caption sits outside its link; a tap on one still opens its photo.
+    if (target.closest?.("a[href]")) return -1; // a link holding no image follows its link
+    const inner = target.closest?.("figure")?.querySelector("img");
     return inner ? photos.findIndex((p) => p.el === inner) : -1;
   }
+  const link = img.closest("a[href]");
+  if (link && !link.closest(".gallery")) return -1; // a linked image follows its link
   const i = photos.findIndex((p) => p.el === img);
   if (i < 0) return -1;
   const box = img.closest(".cmp-stack");
@@ -2899,6 +2906,8 @@ document.addEventListener("click", (e) => {
   }
   // Any photo on the page — a section image, either side of a compare, a gallery
   // thumbnail, an image in markdown — opens the page-wide gallery at itself.
+  // Only what can hold one is worth the walk over the whole page.
+  if (!e.target.closest?.("img, figure, .gallery a[href]")) return;
   const photos = pagePhotos();
   const at = photoAt(photos, e.target);
   if (at < 0) return;

@@ -149,16 +149,51 @@ function readJson(path, fallback) {
   }
 }
 
+// A reserved box bigger than this (or more than 50:1 on either side) is a bad
+// header, not a picture: `height: auto` would hold a two-billion-pixel column.
+const SIZE_MAX = 65535;
+const SIZE_RATIO = 50;
+
+/**
+ * The EXIF orientation (1–8) in an APP1 segment, or 0 when the segment isn't
+ * EXIF or carries no usable tag 0x0112. Every offset is checked against the
+ * segment, so a truncated or hostile one reads nothing.
+ */
+function exifOrientation(seg) {
+  if (seg.length < 14 || seg.toString("latin1", 0, 6) !== "Exif\0\0") return 0;
+  const tiff = seg.subarray(6);
+  const le = tiff.toString("latin1", 0, 2) === "II";
+  if (!le && tiff.toString("latin1", 0, 2) !== "MM") return 0;
+  const u16 = (at) => (at >= 0 && at + 2 <= tiff.length ? (le ? tiff.readUInt16LE(at) : tiff.readUInt16BE(at)) : 0);
+  const u32 = (at) => (at >= 0 && at + 4 <= tiff.length ? (le ? tiff.readUInt32LE(at) : tiff.readUInt32BE(at)) : 0);
+  if (u16(2) !== 42) return 0;
+  const ifd = u32(4);
+  const count = u16(ifd);
+  for (let k = 0; k < count; k++) {
+    const at = ifd + 2 + k * 12;
+    if (at + 12 > tiff.length) return 0;
+    if (u16(at) !== 0x0112) continue;
+    // SHORT: the value sits in the first two bytes of the entry's value field.
+    const value = u16(at + 8);
+    return u16(at + 2) === 3 && value >= 1 && value <= 8 ? value : 0;
+  }
+  return 0;
+}
+
 /**
  * An image's pixel size from the bytes at the front of its file, or null for a
  * format (or a header) this doesn't read. Header reads only: PNG's IHDR, GIF's
- * screen descriptor, JPEG's first SOFn and WebP's VP8/VP8L/VP8X chunk. The page
- * uses it to reserve an image's box before it loads, so the scroll doesn't jump.
+ * screen descriptor, JPEG's first SOFn (turned upright by its EXIF orientation)
+ * and WebP's VP8/VP8L/VP8X chunk. The page uses it to reserve an image's box
+ * before it loads, so the scroll doesn't jump.
  */
 export function imageSize(bytes) {
   const b = bytes;
   if (!b || b.length < 10) return null;
-  const size = (width, height) => (width > 0 && height > 0 ? { width, height } : null);
+  const size = (width, height) => {
+    if (!(width > 0 && height > 0) || width > SIZE_MAX || height > SIZE_MAX) return null;
+    return Math.max(width, height) / Math.min(width, height) > SIZE_RATIO ? null : { width, height };
+  };
   // PNG: 8-byte signature, then the IHDR chunk (length, type, width, height: big endian).
   if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 && b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a) {
     if (b.length < 24 || b.toString("latin1", 12, 16) !== "IHDR") return null;
@@ -169,6 +204,7 @@ export function imageSize(bytes) {
   // JPEG: segment markers until the frame header (SOF0…SOF15), minus DHT/JPG/DAC.
   if (b[0] === 0xff && b[1] === 0xd8) {
     let i = 2;
+    let orientation = 0; // the first EXIF segment's, if any
     while (i + 9 < b.length) {
       if (b[i] !== 0xff) return null;
       const marker = b[i + 1];
@@ -182,8 +218,16 @@ export function imageSize(bytes) {
       }
       const len = b.readUInt16BE(i + 2);
       if (len < 2) return null;
+      if (marker === 0xe1 && !orientation) orientation = exifOrientation(b.subarray(i + 4, i + 2 + len));
       // SOF0…SOF15 hold the frame size; C4 (DHT), C8 (JPG) and CC (DAC) are not frame headers.
-      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) return size(b.readUInt16BE(i + 7), b.readUInt16BE(i + 5));
+      // len 8 is the shortest that holds the precision, both sides and the component count.
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        if (len < 8) return null;
+        const width = b.readUInt16BE(i + 7);
+        const height = b.readUInt16BE(i + 5);
+        // 5…8 are the orientations that stand the picture on its side.
+        return orientation >= 5 && orientation <= 8 ? size(height, width) : size(width, height);
+      }
       i += 2 + len;
     }
     return null;

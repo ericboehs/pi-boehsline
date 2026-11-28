@@ -9,7 +9,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -40,20 +40,49 @@ const gif = (w, h) => {
   return b;
 };
 
-/** A JPEG: SOI, an APP0 segment, a DQT segment, then the SOF0 that carries the frame size. */
-const jpeg = (w, h) => {
-  const seg = (marker, payload) => {
-    const len = Buffer.alloc(2);
-    len.writeUInt16BE(payload.length + 2);
-    return Buffer.concat([Buffer.from([0xff, marker]), len, payload]);
-  };
+/** A JPEG segment: its marker, a 2-byte length, then the payload. */
+const seg = (marker, payload) => {
+  const len = Buffer.alloc(2);
+  len.writeUInt16BE(payload.length + 2);
+  return Buffer.concat([Buffer.from([0xff, marker]), len, payload]);
+};
+
+/** SOFn's payload: precision, height, width, component count. */
+const sofPayload = (w, h) => {
   const sof = Buffer.alloc(15);
   sof[0] = 8; // precision
   sof.writeUInt16BE(h, 1);
   sof.writeUInt16BE(w, 3);
   sof[5] = 3; // components
-  return Buffer.concat([Buffer.from([0xff, 0xd8]), seg(0xe0, Buffer.from("JFIF\0", "latin1")), seg(0xdb, Buffer.alloc(4)), seg(0xc0, sof), Buffer.from([0xff, 0xd9])]);
+  return sof;
 };
+
+const SOI = Buffer.from([0xff, 0xd8]);
+const EOI = Buffer.from([0xff, 0xd9]);
+
+/** A JPEG: SOI, an APP0 segment, a DQT segment, then the SOF0 that carries the frame size. */
+const jpeg = (w, h) => Buffer.concat([SOI, seg(0xe0, Buffer.from("JFIF\0", "latin1")), seg(0xdb, Buffer.alloc(4)), seg(0xc0, sofPayload(w, h)), EOI]);
+
+/** An APP1 EXIF payload holding IFD0's orientation tag (0x0112), in either byte order. */
+const exif = (orientation, le = true, ifd = 8) => {
+  const tiff = Buffer.alloc(26);
+  tiff.write(le ? "II" : "MM", 0, "latin1");
+  const u16 = (at, v) => (le ? tiff.writeUInt16LE(v, at) : tiff.writeUInt16BE(v, at));
+  const u32 = (at, v) => (le ? tiff.writeUInt32LE(v, at) : tiff.writeUInt32BE(v, at));
+  u16(2, 42);
+  u32(4, ifd); // where IFD0 starts
+  if (ifd + 18 > tiff.length) return Buffer.concat([Buffer.from("Exif\0\0", "latin1"), tiff]); // a hostile offset
+  u16(ifd, 1); // one entry
+  u16(ifd + 2, 0x0112); // orientation
+  u16(ifd + 4, 3); // SHORT
+  u32(ifd + 6, 1); // one value
+  u16(ifd + 10, orientation); // in the first two bytes of the value field
+  u32(ifd + 14, 0); // no next IFD
+  return Buffer.concat([Buffer.from("Exif\0\0", "latin1"), tiff]);
+};
+
+/** A JPEG whose EXIF orientation says how the picture is turned. */
+const jpegExif = (w, h, orientation, le = true, ifd = 8) => Buffer.concat([SOI, seg(0xe1, exif(orientation, le, ifd)), seg(0xc0, sofPayload(w, h)), EOI]);
 
 /** WebP, lossless (VP8L): the size packs into the 4 bytes after 0x2f. */
 const webpLossless = (w, h) => {
@@ -95,6 +124,37 @@ const webpExtended = (w, h) => {
   return b;
 };
 
+test("imageSize: a JPEG's EXIF orientation 5…8 turns the box upright", () => {
+  // A phone's portrait shot is stored landscape and tagged 6 (or 8): the box has to swap.
+  assert.deepEqual(imageSize(jpegExif(400, 300, 6)), { width: 300, height: 400 }, "orientation 6, little endian");
+  assert.deepEqual(imageSize(jpegExif(400, 300, 8, false)), { width: 300, height: 400 }, "orientation 8, big endian");
+  assert.deepEqual(imageSize(jpegExif(400, 300, 5)), { width: 300, height: 400 }, "orientation 5");
+  assert.deepEqual(imageSize(jpegExif(400, 300, 7)), { width: 300, height: 400 }, "orientation 7");
+  for (const o of [0, 1, 2, 3, 4, 9, 0xffff]) assert.deepEqual(imageSize(jpegExif(400, 300, o)), { width: 400, height: 300 }, `orientation ${o} is not a swap`);
+  // An IFD offset pointing far outside the segment reads nothing: the size stands as it is.
+  assert.deepEqual(imageSize(jpegExif(400, 300, 6, true, 0x7ffffff0)), { width: 400, height: 300 }, "a hostile IFD offset");
+  assert.deepEqual(imageSize(jpeg(400, 300)), { width: 400, height: 300 }, "a JPEG with no EXIF at all");
+});
+
+test("imageSize: a mad header is null, never a throw and never an out-of-range read", () => {
+  // 200 KB of fill bytes after SOI: the marker walk steps one byte at a time and ends.
+  assert.equal(imageSize(Buffer.concat([SOI, Buffer.alloc(200_000, 0xff)])), null, "a run of 0xff");
+  // A SOF whose length (2) can't hold its own fields: the next segment's bytes are not a size.
+  assert.equal(imageSize(Buffer.concat([SOI, seg(0xc0, Buffer.alloc(0)), seg(0xdb, Buffer.from([0, 7, 0, 5, 0, 0, 0, 0])), EOI])), null, "a SOF too short for its fields");
+  assert.equal(imageSize(Buffer.concat([SOI, Buffer.from([0xff, 0xc0, 0, 6, 8, 0, 7, 0, 5]), EOI])), null, "a SOF under 8 bytes long");
+  assert.equal(imageSize(Buffer.concat([SOI, Buffer.from([0xff, 0xe0, 0xff, 0xff, 1, 2, 3])])), null, "a segment longer than the bytes there are");
+  assert.equal(imageSize(Buffer.concat([SOI, SOI.subarray(0, 1)])), null, "a truncated marker");
+  // A PNG claiming 2³¹ tall, or a 1:2000 sliver, would reserve a column nothing can fill.
+  assert.equal(imageSize(png(1, 2147483647)), null, "a PNG 2³¹ tall");
+  assert.equal(imageSize(png(2, 400)), null, "a PNG 1:200 sliver");
+  assert.equal(imageSize(png(65536, 10)), null, "a PNG over 65535 wide");
+  assert.deepEqual(imageSize(png(1000, 20000)), { width: 1000, height: 20000 }, "a tall one still gets its box (1:20)");
+  assert.equal(imageSize(webpExtended(1, 65536)), null, "a VP8X canvas over 65535");
+  // Truncations at every length: whatever the format, either a size or null.
+  const samples = [png(800, 600), jpeg(200, 100), jpegExif(200, 100, 6), gif(40, 30), webpLossless(40, 30), webpLossy(40, 30), webpExtended(40, 30)];
+  for (const s of samples) for (let n = 0; n <= s.length; n++) assert.doesNotThrow(() => imageSize(s.subarray(0, n)), `truncated at ${n} of ${s.length}`);
+});
+
 test("imageSize: PNG, GIF, JPEG and the three WebP flavours, from their headers alone", () => {
   assert.deepEqual(imageSize(png(3, 5)), { width: 3, height: 5 });
   assert.deepEqual(imageSize(png(2880, 1800)), { width: 2880, height: 1800 });
@@ -118,6 +178,17 @@ test("imageSizeOf: a file's head, cached, and null for whatever it can't read", 
     assert.deepEqual(imageSizeOf(join(dir, "c.webp")), { width: 40, height: 30 });
     assert.equal(imageSizeOf(join(dir, "d.svg")), null, "an SVG has no pixel size in its header");
     assert.equal(imageSizeOf(join(dir, "gone.png")), null, "a missing file");
+    // The cache is keyed by size and mtime: same file, same answer, no second read.
+    const when = new Date(Math.floor(Date.now() / 1000) * 1000 - 60_000);
+    const a = join(dir, "a.png");
+    writeFileSync(a, png(800, 600));
+    utimesSync(a, when, when);
+    assert.deepEqual(imageSizeOf(a), { width: 800, height: 600 });
+    writeFileSync(a, png(100, 50)); // same 33 bytes, another picture
+    utimesSync(a, when, when);
+    assert.deepEqual(imageSizeOf(a), { width: 800, height: 600 }, "an unchanged size and mtime hits the cache");
+    utimesSync(a, when, new Date(when.getTime() + 1000));
+    assert.deepEqual(imageSizeOf(a), { width: 100, height: 50 }, "a touched file is read again");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -223,7 +294,7 @@ function state() {
   };
 }
 
-async function runPage({ metas = {}, data = state() } = {}) {
+async function runPage({ metas = {}, data = state(), md = MD_HTML, compare = COMPARE } = {}) {
   const head = Object.entries(metas)
     .map(([k, v]) => `<meta name="${k}" content="${v}">`)
     .join("");
@@ -236,8 +307,8 @@ async function runPage({ metas = {}, data = state() } = {}) {
   w.fetch = async (u) => {
     const path = String(u);
     fetches.push(path);
-    const body = /\/api\/s\/s1$/.test(path) ? data : /profile\.compare/.test(path) ? JSON.parse(COMPARE) : /notes\.md/.test(path) ? "Notes" : /\/api\/sessions$/.test(path) ? [] : {};
-    return { ok: true, status: 200, json: async () => body, text: async () => (typeof body === "string" ? body : /profile\.compare/.test(path) ? COMPARE : "") };
+    const body = /\/api\/s\/s1$/.test(path) ? data : /profile\.compare/.test(path) ? JSON.parse(compare) : /notes\.md/.test(path) ? "Notes" : /\/api\/sessions$/.test(path) ? [] : {};
+    return { ok: true, status: 200, json: async () => body, text: async () => (typeof body === "string" ? body : /profile\.compare/.test(path) ? compare : "") };
   };
   const streams = [];
   w.EventSource = class {
@@ -255,7 +326,7 @@ async function runPage({ metas = {}, data = state() } = {}) {
   w.Element.prototype.setPointerCapture = () => {};
   w.Element.prototype.releasePointerCapture = () => {};
   w.Element.prototype.hasPointerCapture = () => true;
-  w.marked = { parse: () => MD_HTML, lexer: () => ({ links: [] }) };
+  w.marked = { parse: () => md, lexer: () => ({ links: [] }) };
   w.DOMPurify = { sanitize: (s) => s };
   const intervals = [];
   const realSetInterval = w.setInterval.bind(w);
@@ -396,6 +467,74 @@ test("page modal: a horizontal swipe steps next/prev; vertical, short and pinchi
   assert.equal(pos(doc), "2 / 5", "and a plain swipe works again after it");
 });
 
+test("page modal: a swipe while the page is zoomed in pans, it doesn't step", async () => {
+  const { w, doc } = await runPage();
+  dialogs(w);
+  click(w, doc.querySelector("#sec-shot img.shot"));
+  const body = () => dialog(doc).querySelector(".mbody");
+  w.visualViewport = { scale: 2 };
+  swipe(w, body(), [300, 200], [100, 200]);
+  assert.equal(pos(doc), "1 / 5", "zoomed in, a one-finger pan is the pan");
+  w.visualViewport = { scale: 1 };
+  swipe(w, body(), [300, 200], [100, 200]);
+  assert.equal(pos(doc), "2 / 5", "back at 1× the swipe steps again");
+});
+
+test("page photos: a gallery caption opens its photo, a linked image follows its link", async () => {
+  const md = `<p>Notes</p>${GALLERY}<p><a href="https://example.com/album"><img src="${PICTURE}" alt="Linked pic" width="800" height="600"></a></p>`;
+  const { w, doc } = await runPage({ md });
+  dialogs(w);
+  click(w, doc.querySelector("#sec-notes .gallery figcaption"));
+  assert.equal(dialog(doc).hasAttribute("open"), true, "a tap on the caption opens the gallery");
+  assert.deepEqual([title(doc), pos(doc)], ["shot-1 · now", "4 / 4"], "at the caption's own photo");
+  dialog(doc).close();
+  click(w, doc.querySelector('#sec-notes .md img[alt="Linked pic"]'));
+  assert.equal(dialog(doc).hasAttribute("open"), false, "a linked image opens nothing");
+});
+
+test("page photos: a small image, and an image inside a button, are not photos", async () => {
+  const md = `<p><img src="${PICTURE}" alt="Big" width="800" height="600"></p><p><img src="${PICTURE}" alt="Small" width="20" height="20"></p><p><button type="button"><img src="${PICTURE}" alt="In a button" width="800" height="600"></button></p>`;
+  const { w, doc } = await runPage({ md });
+  dialogs(w);
+  click(w, doc.querySelector("#sec-shot img.shot"));
+  assert.equal(pos(doc), "1 / 4", "the shot, the compare's two sides and the big markdown image");
+  for (let i = 0; i < 3; i++) dialog(doc).querySelector(".mstep.next").click();
+  assert.equal(title(doc), "Big", "the last photo is the full-size one");
+  dialog(doc).close();
+  click(w, doc.querySelector('img[alt="Small"]'));
+  assert.equal(dialog(doc).hasAttribute("open"), false, "a 20 px image is an icon");
+  click(w, doc.querySelector('img[alt="In a button"]'));
+  assert.equal(dialog(doc).hasAttribute("open"), false, "an image inside a button is a control's face");
+});
+
+test("page photos: a tap that can't be a photo doesn't walk the whole page", async () => {
+  const { w, doc } = await runPage();
+  dialogs(w);
+  const qsa = doc.body.querySelectorAll.bind(doc.body);
+  let walks = 0;
+  doc.body.querySelectorAll = (sel) => (walks++, qsa(sel));
+  click(w, doc.querySelector("#sec-notes .md > p"));
+  assert.equal(walks, 0, "a tap on text builds no photo list");
+  click(w, doc.querySelector("#sec-shot img.shot"));
+  assert.ok(walks > 0, "a tap on an image walks the page");
+});
+
+test("page compare: the state's sizes hold only for the same file names", async () => {
+  // The body names another before file than the state did: its old size must not land on this one.
+  const { doc } = await runPage({ compare: JSON.stringify({ before: "other.png", after: "after.png", labels: ["Before", "After"] }) });
+  const [before, after] = doc.querySelectorAll("#sec-profile .cmp-stack img");
+  assert.equal(before.getAttribute("width"), null, "another file gets no box from the old name");
+  assert.equal(after.getAttribute("width"), "640", "the unchanged side keeps its size");
+});
+
+test("page images: markdown's img src takes data: images and the page's own files, nothing else", () => {
+  const m = pageSrc.match(/const PAGE_IMG = \/(.+)\/i;/);
+  assert.ok(m, "page.mjs declares PAGE_IMG");
+  const imgSrc = new RegExp(m[1], "i");
+  for (const src of ["data:image/png;base64,AA", "data:image/svg+xml,<svg/>", "/s/s1/f/shot.png", "/a/b.png"]) assert.equal(imgSrc.test(src), true, src);
+  for (const src of ["data:text/html,<script>alert(1)</script>", "data:,x", "//evil.example/x.png", "https://evil.example/x.png", "javascript:alert(1)", "\\\\host\\x.png"]) assert.equal(imgSrc.test(src), false, src);
+});
+
 test("page images: width/height from the file reserve the box, with lazy loading and async decoding", async () => {
   const { doc } = await runPage();
   const shot = doc.querySelector("#sec-shot img.shot");
@@ -426,8 +565,7 @@ test("page redraw: a replaced card keeps its height until the new image loads", 
   assert.equal(card.style.minHeight, "", "released as soon as it arrives");
 });
 
-test("sectionSizes reads no file outside the session dir", async () => {
-  const { sectionSizes } = await import("../extensions/canvas/daemon.mjs");
+test("sectionSizes reads no file outside the session dir", () => {
   const root = mkdtempSync(join(tmpdir(), "canvas-size-"));
   try {
     mkdirSync(join(root, "s"));
