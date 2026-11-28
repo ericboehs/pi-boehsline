@@ -425,3 +425,18 @@ test("page redraw: a replaced card keeps its height until the new image loads", 
   card.querySelector("img.shot").dispatchEvent(new w.Event("load"));
   assert.equal(card.style.minHeight, "", "released as soon as it arrives");
 });
+
+test("sectionSizes reads no file outside the session dir", async () => {
+  const { sectionSizes } = await import("../extensions/canvas/daemon.mjs");
+  const root = mkdtempSync(join(tmpdir(), "canvas-size-"));
+  try {
+    mkdirSync(join(root, "s"));
+    writeFileSync(join(root, "out.png"), png(10, 10));
+    writeFileSync(join(root, "s", "x.compare"), JSON.stringify({ before: "../out.png", after: "../out.png" }));
+    const out = sectionSizes(join(root, "s"), [{ kind: "image", file: "../out.png" }, { kind: "compare", file: "x.compare" }]);
+    assert.equal(out[0].size, undefined);
+    assert.equal(out[1].files, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

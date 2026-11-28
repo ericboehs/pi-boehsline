@@ -248,15 +248,15 @@ export function imageSizeOf(path) {
 export function sectionSizes(dir, sections) {
   if (!Array.isArray(sections)) return sections;
   return sections.map((s) => {
-    if (s?.kind === "image" && typeof s.file === "string") {
+    if (s?.kind === "image" && typeof s.file === "string" && FILE_NAME.test(s.file)) {
       const size = imageSizeOf(join(dir, s.file));
       return size ? { ...s, size } : s;
     }
-    if (s?.kind === "compare" && typeof s.file === "string") {
+    if (s?.kind === "compare" && typeof s.file === "string" && FILE_NAME.test(s.file)) {
       const spec = readJson(join(dir, s.file), null);
       const files = {};
       for (const side of ["before", "after"]) {
-        const file = typeof spec?.[side] === "string" ? spec[side] : "";
+        const file = typeof spec?.[side] === "string" && FILE_NAME.test(spec[side]) ? spec[side] : "";
         const size = file ? imageSizeOf(join(dir, file)) : null;
         if (size) files[side] = { file, ...size };
       }
