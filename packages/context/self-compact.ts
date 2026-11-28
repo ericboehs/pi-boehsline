@@ -204,7 +204,7 @@ export function registerSelfCompact(pi: ExtensionAPI, estimate?: EstimateTokens)
 		pi.sendMessage({
 			customType: COMPACTED_TYPE,
 			content: `${parts[0]}. No need to compact again.`,
-			display: true,
+			display: false,
 		});
 	});
 
