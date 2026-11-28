@@ -489,8 +489,14 @@ the review prompt — so a renderer never reaches for a page global.
   changed shows +/− counts, and clicking a path opens it in the modal with
   Diff and File tabs; markdown files get Diff, Preview (rendered, frontmatter
   as a code block) and Source. The tab you pick holds as you step through files.
-  Clicking a screenshot opens it large. Both use one modal: ←/→ step through the card's items, Esc closes, and ↗
-  (or a ⌘-click) opens the raw file. **Clippy** (the paperclip on each section, and in the
+  Clicking a screenshot — or any other photo the page draws, including both
+  sides of a compare, a Screenshots thumbnail and an image embedded in markdown
+  — opens it large, captioned by its section (a compare's sides "before" and
+  "after"). Diffs and photos use one modal: Esc closes it, ↗ (or a ⌘-click)
+  opens the raw file, and for photos ←/→ (or h/l, the ‹ › at the edges, or a
+  sideways swipe on a phone) step through every photo on the page, in page
+  order. An icon or a control's own image is not a photo, and nothing under 48
+  px is. **Clippy** (the paperclip on each section, and in the
   modal) puts the file itself on the clipboard via `clippy <file>`, to paste
   into Slack, Mail or Finder: a changed file's real path, a diff as
   `<name>.patch`, else the section's file. It is the daemon's one write

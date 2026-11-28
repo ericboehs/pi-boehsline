@@ -19,7 +19,7 @@
 
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmodSync, copyFileSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, watch, writeFileSync, renameSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, createReadStream, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync, watch, writeFileSync, renameSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve, sep } from "node:path";
@@ -149,6 +149,123 @@ function readJson(path, fallback) {
   }
 }
 
+/**
+ * An image's pixel size from the bytes at the front of its file, or null for a
+ * format (or a header) this doesn't read. Header reads only: PNG's IHDR, GIF's
+ * screen descriptor, JPEG's first SOFn and WebP's VP8/VP8L/VP8X chunk. The page
+ * uses it to reserve an image's box before it loads, so the scroll doesn't jump.
+ */
+export function imageSize(bytes) {
+  const b = bytes;
+  if (!b || b.length < 10) return null;
+  const size = (width, height) => (width > 0 && height > 0 ? { width, height } : null);
+  // PNG: 8-byte signature, then the IHDR chunk (length, type, width, height: big endian).
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 && b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a) {
+    if (b.length < 24 || b.toString("latin1", 12, 16) !== "IHDR") return null;
+    return size(b.readUInt32BE(16), b.readUInt32BE(20));
+  }
+  // GIF: "GIF87a" or "GIF89a", then a little-endian logical screen width and height.
+  if (b.toString("latin1", 0, 6) === "GIF87a" || b.toString("latin1", 0, 6) === "GIF89a") return size(b.readUInt16LE(6), b.readUInt16LE(8));
+  // JPEG: segment markers until the frame header (SOF0…SOF15), minus DHT/JPG/DAC.
+  if (b[0] === 0xff && b[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xff) return null;
+      const marker = b[i + 1];
+      if (marker === 0xff) {
+        i += 1; // a fill byte before the real marker
+        continue;
+      }
+      if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) {
+        i += 2; // standalone markers carry no length
+        continue;
+      }
+      const len = b.readUInt16BE(i + 2);
+      if (len < 2) return null;
+      // SOF0…SOF15 hold the frame size; C4 (DHT), C8 (JPG) and CC (DAC) are not frame headers.
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) return size(b.readUInt16BE(i + 7), b.readUInt16BE(i + 5));
+      i += 2 + len;
+    }
+    return null;
+  }
+  // WebP: RIFF container, then the first chunk: lossy VP8, lossless VP8L or extended VP8X.
+  if (b.length >= 30 && b.toString("latin1", 0, 4) === "RIFF" && b.toString("latin1", 8, 12) === "WEBP") {
+    const chunk = b.toString("latin1", 12, 16);
+    if (chunk === "VP8 ") {
+      // A 3-byte frame tag, then the 3-byte start code, then 14-bit width and height.
+      if (b[23] !== 0x9d || b[24] !== 0x01 || b[25] !== 0x2a) return null;
+      return size(b.readUInt16LE(26) & 0x3fff, b.readUInt16LE(28) & 0x3fff);
+    }
+    if (chunk === "VP8L") {
+      if (b[20] !== 0x2f || b.length < 25) return null;
+      const bits = b.readUInt32LE(21);
+      return size((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1);
+    }
+    if (chunk === "VP8X") {
+      if (b.length < 30) return null;
+      return size(b.readUIntLE(24, 3) + 1, b.readUIntLE(27, 3) + 1);
+    }
+  }
+  return null;
+}
+
+const IMAGE_HEAD = 1 << 17; // 128 KB: enough for a JPEG's EXIF and its SOF
+const sizeCache = new Map(); // "<path>\0<size>\0<mtime>" → { width, height } | null
+
+/** imageSize() for a file on disk, reading only its head; cached by size and mtime. Null when unreadable or unknown. */
+export function imageSizeOf(path) {
+  let st;
+  try {
+    st = statSync(path, { throwIfNoEntry: false });
+  } catch {
+    return null;
+  }
+  if (!st?.isFile()) return null;
+  const key = `${path}\0${st.size}\0${st.mtimeMs}`;
+  if (sizeCache.has(key)) return sizeCache.get(key);
+  let fd;
+  let out = null;
+  try {
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(Math.min(IMAGE_HEAD, Math.max(st.size, 24)));
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    out = imageSize(buf.subarray(0, n));
+  } catch {
+    out = null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  if (sizeCache.size > 500) sizeCache.clear();
+  sizeCache.set(key, out);
+  return out;
+}
+
+/**
+ * Sections with the pixel size of what they show, given (the page's `size` on
+ * an image section, `files` on a compare): so an image's box can be reserved
+ * before it loads. Files the reader doesn't know are left as they were.
+ */
+export function sectionSizes(dir, sections) {
+  if (!Array.isArray(sections)) return sections;
+  return sections.map((s) => {
+    if (s?.kind === "image" && typeof s.file === "string") {
+      const size = imageSizeOf(join(dir, s.file));
+      return size ? { ...s, size } : s;
+    }
+    if (s?.kind === "compare" && typeof s.file === "string") {
+      const spec = readJson(join(dir, s.file), null);
+      const files = {};
+      for (const side of ["before", "after"]) {
+        const file = typeof spec?.[side] === "string" ? spec[side] : "";
+        const size = file ? imageSizeOf(join(dir, file)) : null;
+        if (size) files[side] = { file, ...size };
+      }
+      return Object.keys(files).length ? { ...s, files } : s;
+    }
+    return s;
+  });
+}
+
 export function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -255,7 +372,7 @@ export function sessionState(root, id) {
   // The current or last turn, so the page can mark what it touched.
   const t = readJson(join(dir, "turn.json"), null);
   const turn = typeof t?.started === "string" ? { started: t.started, ...(typeof t.ended === "string" ? { ended: t.ended } : {}) } : undefined;
-  return { meta: { ...pageMeta(meta), id }, live, tmux: live && Boolean(tmuxOf(meta)), activity, activityMessage, activityAt, turn, status, reply: readReply(dir), acks: live ? readAcks(dir) : [], sections: pageSections(sections), ...(hiddenSections().has("auto-jobs") ? {} : { showJobs: true }), watch: readWatch(root), updated: newestMtime(dir) };
+  return { meta: { ...pageMeta(meta), id }, live, tmux: live && Boolean(tmuxOf(meta)), activity, activityMessage, activityAt, turn, status, reply: readReply(dir), acks: live ? readAcks(dir) : [], sections: sectionSizes(dir, pageSections(sections)), ...(hiddenSections().has("auto-jobs") ? {} : { showJobs: true }), watch: readWatch(root), updated: newestMtime(dir) };
 }
 
 /**

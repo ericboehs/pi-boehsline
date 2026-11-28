@@ -68,6 +68,8 @@ header.top .tools .back { margin-left: 8px; }
 .state.working { color: var(--ok); } .state.done { color: var(--warn); } .state.blocked { color: var(--accent); } .state.error { color: var(--bad); } .state.idle, .state.ended { color: var(--dim); font-weight: 400; }
 .state .msg { font-weight: 400; max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 14px; overflow: hidden; scroll-margin-top: 14px; }
+/* No overflow-anchor: none anywhere: the browser's scroll anchoring is what keeps
+   the page still while a lazily loaded image fills the box reserved for it. */
 @media (min-width: 1200px) {
   #app.session { max-width: 1460px; }
   .layout { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
@@ -488,7 +490,9 @@ body.rv-on .toast { bottom: 76px; }
 iframe { display: block; width: 100%; border: 0; background: #fff; }
 iframe.fit { background: var(--card); }
 iframe.plan { height: 82vh; }
-img.shot { display: block; max-width: 100%; margin: 0 auto; border-radius: 6px; }
+img.shot { display: block; max-width: 100%; height: auto; margin: 0 auto; border-radius: 6px; }
+/* Markdown images: the box comes from their width/height (or the file) and never outgrows the card. */
+.md img { max-width: 100%; height: auto; border-radius: 6px; }
 .tag.auto { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .fold-more { display: block; margin: 6px 0 0; }
 .gallery figure[hidden], details.agent[hidden] { display: none; }
@@ -779,6 +783,11 @@ function renderMarkdown(text) {
     },
   });
   if (!window.marked || !window.DOMPurify) return el;
+  // Markdown images arrive late: lazy, decoded off the main thread (CSS keeps their width in the card).
+  for (const img of el.querySelectorAll("img")) {
+    img.loading = "lazy";
+    img.decoding = "async";
+  }
   relTimes(el);
   // Paths in table cells may wrap at their slashes, not mid-name.
   for (const code of el.querySelectorAll("td code")) {
@@ -803,6 +812,16 @@ function renderMarkdown(text) {
 
 function fitFrame(frame) {
   frame.classList.add("fit");
+}
+
+/**
+ * An <img> whose box is reserved before it loads: width and height attributes
+ * from the size the daemon read off the file's header (CSS keeps height auto,
+ * so they only fix the aspect ratio), lazy and decoded off the main thread.
+ */
+function sizedImg(attrs, size) {
+  const dim = size?.width > 0 && size?.height > 0 ? { width: size.width, height: size.height } : {};
+  return h("img", { ...dim, loading: "lazy", decoding: "async", ...attrs });
 }
 
 // html frames are cross-origin to this page (no allow-same-origin), so the
@@ -856,7 +875,7 @@ async function sectionBody(id, sec) {
       return h("iframe", { class: "plan", src: url, name: `canvas-store:${localStorage.getItem(key) || "{}"}`, "data-store-key": key, sandbox: "allow-scripts allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads", allow: "clipboard-write" });
     }
     case "image":
-      return h("img", { class: "shot", src: url, alt: sec.title });
+      return sizedImg({ class: "shot", src: url, alt: sec.title }, sec.size);
     case "diff":
       return renderDiffView(await (await fetch(url)).text(), { title: sec.title || sec.id, href: rawUrl(id, sec, false) });
     case "chart":
@@ -880,7 +899,7 @@ async function sectionBody(id, sec) {
     case "timeline":
       return renderTimeline(JSON.parse(await (await fetch(url)).text()));
     case "compare":
-      return renderCompare(JSON.parse(await (await fetch(url)).text()), (f) => bodyUrl(id, { file: f, at: sec.at }));
+      return renderCompare(JSON.parse(await (await fetch(url)).text()), (f) => bodyUrl(id, { file: f, at: sec.at }), sec.files);
     case "code":
       return renderCode(JSON.parse(await (await fetch(url)).text()), { loadHighlight });
     case "tree":
@@ -1770,7 +1789,27 @@ function foldAgents(root) {
   btn.setAttribute("aria-expanded", String(open));
 }
 
-function sectionCard(id, sec) {
+/**
+ * Keep a replaced card at its old height until the new image has arrived: a
+ * live update that swaps a screenshot then can't jump the page under a thumb.
+ * Images already in hand release it at once; one that never loads (below the
+ * fold, behind loading="lazy") keeps the height, which is what it had anyway.
+ */
+function holdHeight(el, body, px) {
+  if (!(px > 0)) return;
+  el.style.minHeight = `${px}px`;
+  const release = () => (el.style.minHeight = "");
+  let waiting = 0;
+  for (const img of body.querySelectorAll("img")) {
+    if (img.complete) continue;
+    waiting++;
+    img.addEventListener("load", () => --waiting <= 0 && release(), { once: true });
+    img.addEventListener("error", () => --waiting <= 0 && release(), { once: true });
+  }
+  if (!waiting) release();
+}
+
+function sectionCard(id, sec, held = 0) {
   const meta = h("span", { class: "meta" });
   if (["markdown", "mermaid", "diff", "chart", "stats", "table", "steps", "pipeline", "kanban", "timeline", "code", "tree", "options"].includes(sec.kind)) {
     // code, tree and options copy what they show (the lines, the tree as text, the choices as markdown), not their JSON.
@@ -1798,8 +1837,9 @@ function sectionCard(id, sec) {
           bd.replaceChildren(FOLDS[sec.id] ? foldItems(body, sec.id, ...FOLDS[sec.id]) : body);
           if (sec.id === "auto-agents") foldAgents(bd), wireAgents(bd);
           if (REVIEWABLE.has(sec.kind)) for (const box of bd.querySelectorAll("[data-rv-file]")) reviewPaintBox(box);
+          holdHeight(el, bd, held);
         },
-        (e) => bd.replaceChildren(h("div", { class: "err" }, String(e))),
+        (e) => ((el.style.minHeight = ""), bd.replaceChildren(h("div", { class: "err" }, String(e)))),
       ),
     WIDGETS.includes(sec.id) ? undefined : sec.at, // widgets never fold by age
   );
@@ -1810,10 +1850,12 @@ function sectionCard(id, sec) {
 // arrow keys), side by side, or onion skin (after over before, faded). The
 // view is remembered per browser unless the section asks for one.
 
-function renderCompare(spec, src) {
+function renderCompare(spec, src, sizes = {}) {
   const [la, lb] = spec.labels || ["Before", "After"];
   let mode = spec.mode || localStorage.getItem("canvas:compare-mode") || "slider";
-  const img = (file, alt, cls) => h("img", { src: src(file), alt, class: cls, draggable: "false" });
+  // The two files' pixel sizes (the daemon's), so the stage has a height before they load.
+  const sizeOf = (file) => (file === spec.before ? sizes?.before : file === spec.after ? sizes?.after : null);
+  const img = (file, alt, cls) => sizedImg({ src: src(file), alt, class: cls, draggable: "false" }, sizeOf(file));
   const stage = h("div", { class: "cmp-stage" });
   const fade = h("input", { type: "range", min: 0, max: 100, value: 50, class: "cmp-fade", "aria-label": `${lb} opacity` });
   const modes = h("span", { class: "segs" });
@@ -1857,11 +1899,23 @@ function renderCompare(spec, src) {
       const r = box.getBoundingClientRect();
       set(((e.clientX - r.left) / r.width) * 100);
     };
+    // A tap that isn't a drag opens that side's image (the page's photo gallery reads
+    // these two data attributes); a drag only moves the slider.
+    let down = null;
     box.addEventListener("pointerdown", (e) => {
+      const r = box.getBoundingClientRect();
+      const pos = Number(box.dataset.pos || 50);
+      box.dataset.tapSide = r.width > 0 && ((e.clientX - r.left) / r.width) * 100 < pos ? "before" : "after";
+      delete box.dataset.dragged;
+      down = { x: e.clientX, y: e.clientY };
       box.setPointerCapture(e.pointerId);
       at(e);
     });
     box.addEventListener("pointermove", (e) => box.hasPointerCapture(e.pointerId) && at(e));
+    box.addEventListener("pointerup", (e) => {
+      if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 8) box.dataset.dragged = "1";
+      down = null;
+    });
     box.addEventListener("keydown", (e) => {
       const step = e.shiftKey ? 10 : 2;
       if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
@@ -2429,13 +2483,41 @@ function setDiffMode(m) {
 
 let dlg;
 let dlgKeys = null;
+let dlgSteps = null; // { prev, next } for a horizontal touch swipe on an image
+const SWIPE_MIN = 50; // px: shorter moves are taps, and a mostly-vertical one is the page's own scroll
 
 function modalEl() {
   if (dlg) return dlg;
   dlg = h("dialog", { class: "modal" });
   dlg.addEventListener("click", (e) => e.target === dlg && dlg.close());
+  // Touch: swiping across the image steps to the next or previous one. A pinch
+  // (two fingers) is the browser's zoom, so it never reaches this, and a mostly
+  // vertical move is a scroll.
+  let touch = null;
+  dlg.addEventListener(
+    "touchstart",
+    (e) => {
+      touch = e.touches.length === 1 && dlg.classList.contains("image") && e.target.closest?.(".mbody") ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : null;
+    },
+    { passive: true },
+  );
+  dlg.addEventListener("touchcancel", () => (touch = null), { passive: true });
+  dlg.addEventListener("touchend", (e) => {
+    const from = touch;
+    touch = null;
+    if (!from || !dlgSteps || e.touches.length) return;
+    const t = e.changedTouches?.[0];
+    if (!t) return;
+    const dx = t.clientX - from.x;
+    const dy = t.clientY - from.y;
+    if (Math.abs(dx) < SWIPE_MIN || Math.abs(dx) < Math.abs(dy)) return;
+    e.preventDefault();
+    if (dx < 0) dlgSteps.next();
+    else dlgSteps.prev();
+  });
   dlg.addEventListener("close", () => {
     dlg.replaceChildren();
+    dlgSteps = null;
     if (dlgKeys) document.removeEventListener("keydown", dlgKeys);
     dlgKeys = null;
   });
@@ -2485,6 +2567,7 @@ function showModal(items, i, render) {
     );
   };
   if (dlgKeys) document.removeEventListener("keydown", dlgKeys);
+  dlgSteps = items.length > 1 ? { prev: () => show(i - 1), next: () => show(i + 1) } : null;
   let gAt = 0; // gg: two g's within 600 ms
   dlgKeys = (e) => {
     if (e.metaKey || e.altKey || e.target?.closest?.("input, textarea, select")) return;
@@ -2528,7 +2611,7 @@ function modalHelp(d, count = 1) {
     h(
       "table",
       {},
-      count > 1 ? row(["←", "→", "h", "l"], "previous / next (‹ › at an image's edges too)") : null,
+      count > 1 ? row(["←", "→", "h", "l"], "previous / next (‹ › at an image's edges too, or swipe)") : null,
       row(["j", "k"], "scroll down / up"),
       row(["Ctrl-d", "Ctrl-u"], "half a page down / up"),
       row(["gg", "G"], "top / bottom"),
@@ -2616,15 +2699,101 @@ function infoRefresh(id) {
   }, 400);
 }
 
-/** The session's image sections in page order, folded ones too (theirs load only when opened), for the popup's ← →. */
-let pageShots = [];
+/**
+ * The sections the page is showing, by id (the state's entries: an undrawn card's
+ * files are known from here even when its body never loaded).
+ */
+let sectionById = new Map();
 
-const imageItem = (a) => ({
-  kind: "image",
-  title: a.closest("figure")?.querySelector("figcaption")?.textContent || a.querySelector("img")?.alt || "Image",
-  href: a.href,
-  body: h("img", { class: "lightbox", src: a.href, alt: "" }),
-});
+/** An icon, an avatar or a control's face — anything under 48 px, or inside one — is not a photo. */
+const PHOTO_MIN = 48;
+const NOT_A_PHOTO = ".m-slide, .ico, button, summary, header.top, .segs, .tag, .tip-pop, dialog";
+
+function isPhoto(img) {
+  if (!img || img.classList.contains("lightbox") || img.closest(NOT_A_PHOTO)) return false;
+  const w = img.naturalWidth || Number(img.getAttribute("width")) || 0;
+  const ht = img.naturalHeight || Number(img.getAttribute("height")) || 0;
+  return !(w > 0 && w < PHOTO_MIN) && !(ht > 0 && ht < PHOTO_MIN);
+}
+
+/** What the state knows of a card whose body isn't drawn (folded, or not loaded yet): its files, in page order. */
+function statePhotos(sec) {
+  if (!currentSession) return [];
+  const url = (file) => new URL(bodyUrl(currentSession, { file, at: sec.at }), location.href).href;
+  if (sec?.kind === "image" && sec.file) return [{ src: url(sec.file), title: sec.title || "Image" }];
+  if (sec?.kind === "compare" && sec.files) {
+    const title = sec.title || "Compare";
+    return ["before", "after"].filter((side) => sec.files[side]?.file).map((side) => ({ src: url(sec.files[side].file), title: `${title} (${side})`, side, cmp: sec.id }));
+  }
+  return [];
+}
+
+/**
+ * Every photo on the page, in the order it appears: image sections, both sides
+ * of a compare (captioned "<title> (before)" / "(after)"), the Screenshots
+ * gallery's thumbnails and images in markdown. Built from the drawn DOM, so it
+ * follows whatever the page shows; a card whose body hasn't loaded yet adds the
+ * files its state knows (a folded image or compare section).
+ */
+function pagePhotos() {
+  const out = [];
+  for (const el of document.body.querySelectorAll(".card, img")) {
+    if (el.tagName !== "IMG") {
+      const sec = sectionById.get(el.id.startsWith("sec-") ? el.id.slice(4) : "");
+      const drawn = [...el.querySelectorAll("img")].filter(isPhoto);
+      if (!drawn.length) {
+        out.push(...statePhotos(sec));
+        continue;
+      }
+      const title = el.querySelector(":scope > h2 .title")?.textContent?.trim() || sec?.title || "Image";
+      for (const img of drawn) out.push(photoOf(img, title, el.id));
+      continue;
+    }
+    // An image outside any card (a host's or a script's own): still a photo on the page.
+    if (!el.closest(".card") && isPhoto(el)) out.push({ src: new URL(el.getAttribute("src") || el.src, location.href).href, title: el.alt || "Image", el });
+  }
+  return out;
+}
+
+/** One image of a card as a gallery item: a compare's sides captioned, a figure's caption, else its alt text. */
+function photoOf(img, title, cardId) {
+  const src = new URL(img.getAttribute("src") || img.src, location.href).href;
+  const cmp = img.closest(".cmp");
+  if (!cmp) return { src, title: img.closest("figure")?.querySelector("figcaption")?.textContent?.trim() || img.alt || "Image", el: img, cmp: cardId };
+  // Before is the stack's own image, after the one over it (side by side, the first figure is before).
+  const side = [...cmp.querySelectorAll("img")].indexOf(img) === 0 ? "before" : "after";
+  return { src, title: `${title} (${side})`, side, el: img, cmp: cardId };
+}
+
+/**
+ * The photo a tap landed on, or -1. A compare slider opens the side tapped
+ * (the one its handle has shown so far), and a drag on it opens nothing.
+ */
+function photoAt(photos, target) {
+  const img = target.closest?.("img");
+  if (!img) {
+    // A tap on a gallery figure's caption still opens its photo.
+    const inner = target.closest?.("a[href]")?.querySelector("img");
+    return inner ? photos.findIndex((p) => p.el === inner) : -1;
+  }
+  const i = photos.findIndex((p) => p.el === img);
+  if (i < 0) return -1;
+  const box = img.closest(".cmp-stack");
+  if (!box) return i;
+  if (box.classList.contains("slide")) {
+    if (box.dataset.dragged === "1") return -1; // that was a drag across the slider, not a tap
+    const side = box.dataset.tapSide;
+    if (side !== "before" && side !== "after") return i; // no pointer down (a click from script): the image itself
+    const j = photos.findIndex((p) => p.side === side && p.cmp === photos[i].cmp);
+    return j >= 0 ? j : i;
+  }
+  // Onion skin: the after image is the one on top.
+  const top = box.querySelector("img.top");
+  const j = photos.findIndex((p) => p.el === top);
+  return j >= 0 ? j : i;
+}
+
+const photoItem = (p) => ({ kind: "image", title: p.title, href: p.src, body: h("img", { class: "lightbox", src: p.src, alt: "" }) });
 
 const fetchText = (url) => fetch(url, { cache: "no-store" }).then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))));
 
@@ -2723,24 +2892,18 @@ document.addEventListener("click", (e) => {
   const a = e.target.closest?.("a[href]");
   // The modal's own links (↗, links in a preview) open normally.
   if (a?.closest("dialog")) return;
-  const gallery = a?.closest(".gallery");
-  if (gallery) {
-    e.preventDefault();
-    const links = [...gallery.querySelectorAll("a[href]")];
-    return showModal(links, links.indexOf(a), imageItem);
-  }
   if (a && fileLink(a)) {
     e.preventDefault();
     const links = [...(a.closest(".md") || document).querySelectorAll("a[href]")].filter(fileLink);
     return showModal(links, links.indexOf(a), fileItem);
   }
-  const shot = e.target.closest?.("img.shot");
-  if (!shot) return;
-  // Every screenshot on the page, so ← → step through them all.
-  const listed = pageShots.findIndex((x) => x.src === shot.src);
-  const shots = listed >= 0 ? pageShots : [...document.querySelectorAll("img.shot")].map((x) => ({ src: x.src, alt: x.alt || "Image" }));
-  const at = listed >= 0 ? listed : Math.max(0, shots.findIndex((x) => x.src === shot.src));
-  showModal(shots, at, (img) => ({ kind: "image", title: img.alt, href: img.src, body: h("img", { class: "lightbox", src: img.src, alt: "" }) }));
+  // Any photo on the page — a section image, either side of a compare, a gallery
+  // thumbnail, an image in markdown — opens the page-wide gallery at itself.
+  const photos = pagePhotos();
+  const at = photoAt(photos, e.target);
+  if (at < 0) return;
+  e.preventDefault();
+  showModal(photos, at, photoItem);
 });
 
 // ── session view ─────────────────────────────────────────────────────────────
@@ -3057,13 +3220,14 @@ async function sessionView(id) {
     }
 
     const sections = sortSections(withMeeting(withWatch(shownSections(state), state.watch), state.meeting));
-    pageShots = sections.filter((s) => s.kind === "image").map((s) => ({ src: new URL(bodyUrl(id, s), location.href).href, alt: s.title || "Image" }));
+    sectionById = new Map(sections.map((s) => [s.id, s]));
     const keep = new Set(sections.map((s) => s.id));
     for (const [sid, c] of cards) if (!keep.has(sid)) (c.el.remove(), cards.delete(sid));
     for (const sec of sections) {
       let c = cards.get(sec.id);
       if (!c || c.at !== sec.at) {
-        const el = sectionCard(id, sec);
+        const held = c ? c.el.offsetHeight : 0; // a replaced card keeps its height until its image arrives
+        const el = sectionCard(id, sec, held);
         if (c) {
           if (sec.id === "auto-jobs" || (sec.id === "auto-meeting" && meetingLastAlert(sec) === meetingLastAlert(c.sec)) || (sec.id === "auto-watch" && !watchGrew(c.sec, sec))) {
             // Rewritten every few seconds while a job runs (the watcher: every read; the meeting: each caption): no

@@ -689,7 +689,7 @@ export type Shot = { file: string; name: string; at: string };
 export function shotsMarkdown(shots: Shot[], sessionId: string): string {
   const src = (f: string) => `/s/${encodeURIComponent(sessionId)}/f/${encodeURIComponent(f)}`;
   const esc = (t: string) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
-  return `<div class="gallery">${shots.map((x) => `<figure><a href="${src(x.file)}"><img src="${src(x.file)}" alt="${esc(x.name)}" loading="lazy"></a><figcaption>${esc(x.name)} · ${relTime(x.at)}</figcaption></figure>`).join("")}</div>`;
+  return `<div class="gallery">${shots.map((x) => `<figure><a href="${src(x.file)}"><img src="${src(x.file)}" alt="${esc(x.name)}" loading="lazy" decoding="async"></a><figcaption>${esc(x.name)} · ${relTime(x.at)}</figcaption></figure>`).join("")}</div>`;
 }
 
 // ── Running: a live card for long bash commands ──
